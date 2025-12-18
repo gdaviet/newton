@@ -293,7 +293,7 @@ def subtract_body_force(
     body_qd: wp.array(dtype=wp.spatial_vector),
     body_f: wp.array(dtype=wp.spatial_vector),
     body_inv_inertia: wp.array(dtype=wp.mat33),
-    body_inv_mass: wp.array(dtype=float),
+    body_mass: wp.array(dtype=float),
     body_q_res: wp.array(dtype=wp.transform),
     body_qd_res: wp.array(dtype=wp.spatial_vector),
 ):
@@ -307,7 +307,8 @@ def subtract_body_force(
 
     # Remove previously applied force
     f = body_f[body_id]
-    delta_v = dt * body_inv_mass[body_id] * wp.spatial_top(f)
+    inv_mass = wp.where(body_mass[body_id] > 0.0, 1.0 / body_mass[body_id], 0.0)
+    delta_v = dt * inv_mass * wp.spatial_top(f)
     r = wp.transform_get_rotation(body_q[body_id])
 
     delta_w = dt * wp.quat_rotate(r, body_inv_inertia[body_id] * wp.quat_rotate_inv(r, wp.spatial_bottom(f)))
@@ -404,10 +405,13 @@ class NewtonEnv:
 
         mpm_model = SolverImplicitMPM.Model(self.sand_model, mpm_options)
         # read colliders from the RB model rather than the sand model
+
+        coupling_relaxation = 10.0
         mpm_model.setup_collider(
             model=self.model, 
             # body_mass=wp.zeros_like(self.model.body_mass) # kinematic setup
-            body_mass=self.model.body_mass + 0.1 * 50.0 * wp.ones_like(self.model.body_mass)  # add mass to body
+            body_mass=self.model.body_mass * coupling_relaxation,
+            body_inv_inertia=self.model.body_inv_inertia / coupling_relaxation,
         )
         self.mpm_solver = SolverImplicitMPM(mpm_model, mpm_options)
 
@@ -662,8 +666,8 @@ class NewtonEnv:
     def simulate(self):
         # simulate robot
         self.simulate_robot()
-        # simulate sand
-        self.simulate_sand()
+        # # simulate sand
+        # self.simulate_sand()
 
     def simulate_robot(self):
         # robot substeps
@@ -674,7 +678,7 @@ class NewtonEnv:
                 compute_body_forces,
                 dim=self.collider_impulse_ids.shape[0],
                 inputs=[
-                    self.frame_dt,
+                    self.sim_dt,
                     self.collider_impulse_ids,
                     self.collider_impulses,
                     self.collider_impulse_pos,
@@ -696,6 +700,8 @@ class NewtonEnv:
             # swap states
             self.state_0, self.state_1 = self.state_1, self.state_0
 
+            self.simulate_sand()
+
     def simulate_sand(self):
         # Subtract previously applied impulses from body velocities
 
@@ -704,18 +710,18 @@ class NewtonEnv:
                 subtract_body_force,
                 dim=self.sand_state_0.body_q.shape,
                 inputs=[
-                    self.frame_dt,
+                    self.sim_dt,
                     self.state_0.body_q,
                     self.state_0.body_qd,
                     self.body_sand_forces,
-                    self.model.body_inv_inertia,
-                    self.model.body_inv_mass,
+                    self.mpm_solver.mpm_model.collider_body_inv_inertia,
+                    self.mpm_solver.mpm_model.collider_body_mass,
                     self.sand_state_0.body_q,
                     self.sand_state_0.body_qd,
                 ],
             )
 
-        self.mpm_solver.step(self.sand_state_0, self.sand_state_0, contacts=None, control=None, dt=self.frame_dt)
+        self.mpm_solver.step(self.sand_state_0, self.sand_state_0, contacts=None, control=None, dt=self.sim_dt)
 
         # Save impulses to apply back to rigid bodies
         self.collect_collider_impulses()
