@@ -17,7 +17,7 @@ import enum
 import os
 import warnings
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import warp as wp
@@ -991,35 +991,40 @@ class TetMesh:
             tet_mesh = newton.TetMesh(vertices, tet_indices)
     """
 
-    _RESERVED_ATTR_KEYS = frozenset({"vertices", "tet_indices", "k_mu", "k_lambda", "k_damp", "density"})
+    _RESERVED_ATTR_KEYS = frozenset({"vertices", "tet_indices"})
+    _KNOWN_FREQUENCIES: ClassVar[dict[str, str]] = {
+        "k_mu": "TETRAHEDRON",
+        "k_lambda": "TETRAHEDRON",
+        "k_damp": "TETRAHEDRON",
+        "density": "ONCE",
+    }
 
     def __init__(
         self,
         vertices: Sequence[Vec3] | nparray,
         tet_indices: Sequence[int] | nparray,
-        k_mu: nparray | float | None = None,
-        k_lambda: nparray | float | None = None,
-        k_damp: nparray | float | None = None,
-        density: float | None = None,
         custom_attributes: ("dict[str, nparray] | dict[str, tuple[nparray, Model.AttributeFrequency]] | None") = None,
+        **kwargs,
     ):
         """Construct a TetMesh from vertex positions and tet connectivity.
+
+        Additional keyword arguments are treated as named attributes, just like
+        entries in *custom_attributes*.  For keys listed in
+        :attr:`_KNOWN_FREQUENCIES` (``k_mu``, ``k_lambda``, ``k_damp``,
+        ``density``) the frequency is determined automatically; other keys are
+        inferred from array length.
 
         Args:
             vertices: Vertex positions [m], shape (N, 3).
             tet_indices: Tetrahedral element indices, flattened (4 per tet).
-            k_mu: First elastic Lame parameter [Pa]. Scalar (uniform) or
-                per-element array of shape (tet_count,).
-            k_lambda: Second elastic Lame parameter [Pa]. Scalar (uniform) or
-                per-element array of shape (tet_count,).
-            k_damp: Rayleigh damping coefficient [-] (dimensionless). Scalar
-                (uniform) or per-element array of shape (tet_count,).
-            density: Uniform density [kg/m^3] for mass computation.
-            custom_attributes: Dictionary of named custom arrays with their
-                :class:`~newton.Model.AttributeFrequency`. Each value can be
-                either a bare array (frequency auto-inferred from length) or a
+            custom_attributes: Dictionary of named arrays. Each value can be a
+                bare array (frequency auto-inferred from length) or an
                 ``(array, frequency)`` tuple.
+            **kwargs: Named attributes. Bare values are processed the same way
+                as *custom_attributes* entries.
         """
+        from ..sim.model import Model as _Model  # noqa: PLC0415
+
         self._vertices = np.array(vertices, dtype=np.float32).reshape(-1, 3)
         self._tet_indices = np.array(tet_indices, dtype=np.int32).flatten()
         if len(self._tet_indices) % 4 != 0:
@@ -1036,23 +1041,36 @@ class TetMesh:
 
         tet_count = len(self._tet_indices) // 4
 
-        self._k_mu = self._broadcast_material(k_mu, tet_count, "k_mu")
-        self._k_lambda = self._broadcast_material(k_lambda, tet_count, "k_lambda")
-        self._k_damp = self._broadcast_material(k_damp, tet_count, "k_damp")
-        self._density = density
-        self.custom_attributes: dict[str, tuple[np.ndarray, int]] = {}
-        for k, v in (custom_attributes or {}).items():
+        # Merge kwargs into custom_attributes (skip None values)
+        all_attrs: dict[str, nparray | tuple] = dict(custom_attributes or {})
+        for k, v in kwargs.items():
+            if v is None:
+                continue
+            if k in all_attrs:
+                raise ValueError(f"Attribute '{k}' specified both as keyword argument and in custom_attributes")
+            all_attrs[k] = v
+
+        # Unified attribute store
+        self._attributes: dict[str, tuple[np.ndarray, int]] = {}
+
+        for k, v in all_attrs.items():
             if k in self._RESERVED_ATTR_KEYS:
                 raise ValueError(
                     f"Custom attribute name '{k}' is reserved. Reserved names: {sorted(self._RESERVED_ATTR_KEYS)}"
                 )
             if isinstance(v, tuple):
                 arr, freq = v
-                self.custom_attributes[k] = (np.asarray(arr), freq)
+                self._attributes[k] = (np.asarray(arr), freq)
+            elif k in self._KNOWN_FREQUENCIES:
+                freq = _Model.AttributeFrequency[self._KNOWN_FREQUENCIES[k]]
+                if freq == _Model.AttributeFrequency.TETRAHEDRON:
+                    self._attributes[k] = (self._broadcast_material(v, tet_count, k), freq)
+                elif freq == _Model.AttributeFrequency.ONCE:
+                    self._attributes[k] = (np.atleast_1d(np.asarray(v, dtype=np.float32)), freq)
             else:
                 arr = np.asarray(v)
                 freq = self._infer_frequency(arr, vertex_count, tet_count, k)
-                self.custom_attributes[k] = (arr, freq)
+                self._attributes[k] = (arr, freq)
 
         # Compute surface triangles from boundary faces
         self._surface_tri_indices = self._compute_surface_triangles()
@@ -1143,25 +1161,36 @@ class TetMesh:
         """
         return self._surface_tri_indices
 
-    @property
-    def k_mu(self) -> nparray | None:
-        """Per-element first Lame parameter [Pa], shape (tet_count,) or None."""
-        return self._k_mu
+    def __getitem__(self, key: str) -> np.ndarray:
+        """Look up an attribute array by name.
+
+        Args:
+            key: Attribute name (e.g. ``"k_mu"``, ``"density"``, or a custom name).
+
+        Returns:
+            The attribute's data array.
+
+        Raises:
+            KeyError: If *key* is not present.
+        """
+        try:
+            return self._attributes[key][0]
+        except KeyError:
+            raise KeyError(f"TetMesh has no attribute '{key}'") from None
+
+    def __contains__(self, key: str) -> bool:
+        """Return whether *key* is a stored attribute."""
+        return key in self._attributes
+
+    def get(self, key: str, default=None) -> np.ndarray | None:
+        """Return ``self[key]`` if present, else *default*."""
+        entry = self._attributes.get(key)
+        return entry[0] if entry is not None else default
 
     @property
-    def k_lambda(self) -> nparray | None:
-        """Per-element second Lame parameter [Pa], shape (tet_count,) or None."""
-        return self._k_lambda
-
-    @property
-    def k_damp(self) -> nparray | None:
-        """Per-element Rayleigh damping coefficient [-], shape (tet_count,) or None."""
-        return self._k_damp
-
-    @property
-    def density(self) -> float | None:
-        """Uniform density [kg/m^3] or None."""
-        return self._density
+    def attributes(self) -> dict[str, tuple[np.ndarray, int]]:
+        """All stored attributes (physics and custom), as ``{name: (array, frequency)}``."""
+        return dict(self._attributes)
 
     # ---- Factory methods ---------------------------------------------------
 
@@ -1203,37 +1232,30 @@ class TetMesh:
 
         if ext == ".npz":
             data = np.load(filename)
-            kwargs = {}
-            for key in ("k_mu", "k_lambda", "k_damp"):
-                if key in data:
-                    kwargs[key] = data[key]
-            if "density" in data:
-                kwargs["density"] = float(data["density"])
+            kwargs: dict = {}
             known_keys = {
                 "vertices",
                 "tet_indices",
-                "k_mu",
-                "k_lambda",
-                "k_damp",
-                "density",
                 "__custom_names__",
                 "__custom_freqs__",
             }
-            freq_map: dict[str, int] = {}
-            if "__custom_names__" in data and "__custom_freqs__" in data:
-                from ..sim.model import Model as _Model  # noqa: PLC0415
 
+            from ..sim.model import Model as _Model  # noqa: PLC0415
+
+            freq_map: dict[str, int] = {
+                name: _Model.AttributeFrequency[freq] for name, freq in TetMesh._KNOWN_FREQUENCIES.items()
+            }
+            if "__custom_names__" in data and "__custom_freqs__" in data:
                 names = data["__custom_names__"]
                 freqs = data["__custom_freqs__"]
                 for n, f in zip(names, freqs, strict=True):
                     freq_map[str(n)] = int(f)
+
             custom: dict[str, np.ndarray | tuple] = {}
             for k in data.files:
                 if k not in known_keys:
                     arr = np.asarray(data[k])
                     if k in freq_map:
-                        from ..sim.model import Model as _Model  # noqa: PLC0415
-
                         custom[k] = (arr, _Model.AttributeFrequency(freq_map[k]))
                     else:
                         custom[k] = arr
@@ -1265,18 +1287,17 @@ class TetMesh:
 
         # Read material arrays from cell data
         kwargs: dict = {}
-        material_keys = {"k_mu", "k_lambda", "k_damp", "density"}
         if m.cell_data and tet_cell_idx is not None:
-            for key in material_keys:
+            for key, freq_name in TetMesh._KNOWN_FREQUENCIES.items():
                 if key in m.cell_data:
                     arr = np.asarray(m.cell_data[key][tet_cell_idx], dtype=np.float32)
-                    if key == "density":
+                    if freq_name == "ONCE":
                         if arr.size > 1 and not np.allclose(arr, arr[0]):
                             raise ValueError(
-                                f"Non-uniform per-element density found in '{filename}'. "
-                                f"TetMesh only supports a single uniform density value."
+                                f"Non-uniform per-element '{key}' found in '{filename}'. "
+                                f"TetMesh only supports a single uniform '{key}' value."
                             )
-                        kwargs["density"] = float(arr[0])
+                        kwargs[key] = float(arr[0])
                     else:
                         kwargs[key] = arr
 
@@ -1286,7 +1307,7 @@ class TetMesh:
         custom: dict[str, tuple[np.ndarray, _Model.AttributeFrequency]] = {}
         if m.cell_data and tet_cell_idx is not None:
             for key, arrays in m.cell_data.items():
-                if key not in material_keys:
+                if key not in TetMesh._KNOWN_FREQUENCIES:
                     custom[key] = (np.asarray(arrays[tet_cell_idx]), _Model.AttributeFrequency.TETRAHEDRON)
         if m.point_data:
             for key, arr in m.point_data.items():
@@ -1313,51 +1334,38 @@ class TetMesh:
                 "vertices": self._vertices,
                 "tet_indices": self._tet_indices,
             }
-            if self._k_mu is not None:
-                save_dict["k_mu"] = self._k_mu
-            if self._k_lambda is not None:
-                save_dict["k_lambda"] = self._k_lambda
-            if self._k_damp is not None:
-                save_dict["k_damp"] = self._k_damp
-            if self._density is not None:
-                save_dict["density"] = np.array(self._density)
-            custom_names = []
-            custom_freqs = []
-            for k, (arr, freq) in self.custom_attributes.items():
+            attr_names = []
+            attr_freqs = []
+            for k, (arr, freq) in self._attributes.items():
                 save_dict[k] = arr
-                custom_names.append(k)
-                custom_freqs.append(int(freq))
-            if custom_names:
-                save_dict["__custom_names__"] = np.array(custom_names)
-                save_dict["__custom_freqs__"] = np.array(custom_freqs, dtype=np.int32)
+                attr_names.append(k)
+                attr_freqs.append(int(freq))
+            if attr_names:
+                save_dict["__custom_names__"] = np.array(attr_names)
+                save_dict["__custom_freqs__"] = np.array(attr_freqs, dtype=np.int32)
             np.savez(filename, **save_dict)
             return
 
         import meshio
 
+        from ..sim.model import Model as _Model  # noqa: PLC0415
+
         cells = [("tetra", self._tet_indices.reshape(-1, 4))]
         cell_data: dict[str, list[np.ndarray]] = {}
         point_data: dict[str, np.ndarray] = {}
 
-        # Save material arrays as cell data
-        for name, arr in [("k_mu", self._k_mu), ("k_lambda", self._k_lambda), ("k_damp", self._k_damp)]:
-            if arr is not None:
-                cell_data[name] = [arr]
-        if self._density is not None:
-            cell_data["density"] = [np.full(self.tet_count, self._density, dtype=np.float32)]
-
-        # Save custom attributes as point or cell data based on frequency
-        from ..sim.model import Model as _Model  # noqa: PLC0415
-
-        for name, (arr, freq) in self.custom_attributes.items():
+        for name, (arr, freq) in self._attributes.items():
             if freq == _Model.AttributeFrequency.TETRAHEDRON:
                 cell_data[name] = [arr]
             elif freq == _Model.AttributeFrequency.PARTICLE:
                 point_data[name] = arr
+            elif freq == _Model.AttributeFrequency.ONCE:
+                # Broadcast scalar attributes to per-element cell data
+                cell_data[name] = [np.full(self.tet_count, arr[0], dtype=arr.dtype)]
             else:
                 warnings.warn(
-                    f"Custom attribute '{name}' with frequency {freq} cannot be saved to meshio format "
-                    f"(only PARTICLE and TETRAHEDRON are supported). Skipping.",
+                    f"Attribute '{name}' with frequency {freq} cannot be saved to meshio format "
+                    f"(only PARTICLE, TETRAHEDRON, and ONCE are supported). Skipping.",
                     stacklevel=2,
                 )
 

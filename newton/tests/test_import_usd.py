@@ -6846,8 +6846,8 @@ class TestTetMesh(unittest.TestCase):
         self.assertEqual(tm.tet_count, 2)
         self.assertEqual(tm.vertices.shape, (5, 3))
         self.assertEqual(len(tm.tet_indices), 8)
-        self.assertIsNone(tm.k_mu)
-        self.assertIsNone(tm.density)
+        self.assertIsNone(tm.get("k_mu"))
+        self.assertIsNone(tm.get("density"))
 
     def test_tetmesh_surface_triangles(self):
         """Test that surface triangles are correctly extracted from a single tet."""
@@ -6879,11 +6879,11 @@ class TestTetMesh(unittest.TestCase):
         tet_indices = np.array([0, 1, 2, 3, 1, 2, 3, 4], dtype=np.int32)
         tm = newton.TetMesh(vertices, tet_indices, k_mu=1000.0, k_lambda=2000.0, k_damp=5.0, density=1.0)
 
-        self.assertEqual(tm.k_mu.shape, (2,))
-        assert_np_equal(tm.k_mu, np.array([1000.0, 1000.0], dtype=np.float32))
-        assert_np_equal(tm.k_lambda, np.array([2000.0, 2000.0], dtype=np.float32))
-        assert_np_equal(tm.k_damp, np.array([5.0, 5.0], dtype=np.float32))
-        self.assertEqual(tm.density, 1.0)
+        self.assertEqual(tm["k_mu"].shape, (2,))
+        assert_np_equal(tm["k_mu"], np.array([1000.0, 1000.0], dtype=np.float32))
+        assert_np_equal(tm["k_lambda"], np.array([2000.0, 2000.0], dtype=np.float32))
+        assert_np_equal(tm["k_damp"], np.array([5.0, 5.0], dtype=np.float32))
+        self.assertEqual(float(tm["density"][0]), 1.0)
 
     def test_tetmesh_material_per_element(self):
         """Test per-element material arrays."""
@@ -6892,7 +6892,7 @@ class TestTetMesh(unittest.TestCase):
         k_mu = np.array([1000.0, 5000.0], dtype=np.float32)
         tm = newton.TetMesh(vertices, tet_indices, k_mu=k_mu)
 
-        assert_np_equal(tm.k_mu, k_mu)
+        assert_np_equal(tm["k_mu"], k_mu)
 
     def test_tetmesh_invalid_tet_indices_length(self):
         """Test that non-multiple-of-4 tet_indices raises ValueError."""
@@ -7024,11 +7024,11 @@ def Mesh "JustAMesh" ()
         # E = 300000, nu = 0.3
         # k_mu = E / (2 * (1 + nu)) = 300000 / 2.6 = 115384.615...
         # k_lambda = E * nu / ((1 + nu) * (1 - 2*nu)) = 90000 / (1.3 * 0.4) = 173076.923...
-        self.assertIsNotNone(tm.k_mu)
-        self.assertIsNotNone(tm.k_lambda)
-        self.assertAlmostEqual(tm.k_mu[0], 300000.0 / (2.0 * 1.3), places=0)
-        self.assertAlmostEqual(tm.k_lambda[0], 300000.0 * 0.3 / (1.3 * 0.4), places=0)
-        self.assertAlmostEqual(tm.density, 40.0)
+        self.assertIsNotNone(tm.get("k_mu"))
+        self.assertIsNotNone(tm.get("k_lambda"))
+        self.assertAlmostEqual(tm["k_mu"][0], 300000.0 / (2.0 * 1.3), places=0)
+        self.assertAlmostEqual(tm["k_lambda"][0], 300000.0 * 0.3 / (1.3 * 0.4), places=0)
+        self.assertAlmostEqual(float(tm["density"][0]), 40.0)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_get_tetmesh_no_material(self):
@@ -7039,9 +7039,9 @@ def Mesh "JustAMesh" ()
         prim = stage.GetPrimAtPath("/SimpleTetMesh")
         tm = usd.get_tetmesh(prim)
 
-        self.assertIsNone(tm.k_mu)
-        self.assertIsNone(tm.k_lambda)
-        self.assertIsNone(tm.density)
+        self.assertIsNone(tm.get("k_mu"))
+        self.assertIsNone(tm.get("k_lambda"))
+        self.assertIsNone(tm.get("density"))
 
     def test_tetmesh_save_load_npz(self):
         """Test TetMesh round-trip save/load via .npz."""
@@ -7059,9 +7059,9 @@ def Mesh "JustAMesh" ()
 
             assert_np_equal(tm2.vertices, tm.vertices)
             assert_np_equal(tm2.tet_indices, tm.tet_indices)
-            assert_np_equal(tm2.k_mu, tm.k_mu)
-            assert_np_equal(tm2.k_lambda, tm.k_lambda)
-            self.assertAlmostEqual(tm2.density, 40.0)
+            assert_np_equal(tm2["k_mu"], tm["k_mu"])
+            assert_np_equal(tm2["k_lambda"], tm["k_lambda"])
+            self.assertAlmostEqual(float(tm2["density"][0]), 40.0)
         finally:
             os.unlink(path)
 
@@ -7099,18 +7099,16 @@ def Mesh "JustAMesh" ()
             assert_np_equal(tm2.tet_indices[4:], np.array([1, 2, 3, 4], dtype=np.int32))
 
             # Material arrays round-trip
-            self.assertIsNotNone(tm2.k_mu)
-            assert_np_equal(tm2.k_mu, np.array([1000.0, 1000.0], dtype=np.float32))
-            assert_np_equal(tm2.k_lambda, np.array([2000.0, 2000.0], dtype=np.float32))
-            self.assertAlmostEqual(tm2.density, 40.0)
+            self.assertIsNotNone(tm2.get("k_mu"))
+            assert_np_equal(tm2["k_mu"], np.array([1000.0, 1000.0], dtype=np.float32))
+            assert_np_equal(tm2["k_lambda"], np.array([2000.0, 2000.0], dtype=np.float32))
+            self.assertAlmostEqual(float(tm2["density"][0]), 40.0)
 
             # Custom attributes round-trip (check values, not just keys)
-            self.assertIn("regionId", tm2.custom_attributes)
-            self.assertIn("temperature", tm2.custom_attributes)
-            region_arr, _region_freq = tm2.custom_attributes["regionId"]
-            temp_arr, _temp_freq = tm2.custom_attributes["temperature"]
-            assert_np_equal(region_arr.flatten(), per_tet_region)
-            assert_np_equal(temp_arr.flatten(), per_vertex_temp)
+            self.assertIn("regionId", tm2)
+            self.assertIn("temperature", tm2)
+            assert_np_equal(tm2["regionId"].flatten(), per_tet_region)
+            assert_np_equal(tm2["temperature"].flatten(), per_vertex_temp)
         finally:
             os.unlink(path)
 
@@ -7119,9 +7117,50 @@ def Mesh "JustAMesh" ()
         vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
         tet_indices = np.array([0, 1, 2, 3], dtype=np.int32)
 
-        for reserved in ("vertices", "tet_indices", "k_mu", "k_lambda", "k_damp", "density"):
+        for reserved in ("vertices", "tet_indices"):
             with self.assertRaisesRegex(ValueError, "reserved", msg=f"Should reject reserved name '{reserved}'"):
                 newton.TetMesh(vertices, tet_indices, custom_attributes={reserved: np.array([1.0])})
+
+    def test_tetmesh_getitem(self):
+        """Test __getitem__, __contains__, get(), and attributes on TetMesh."""
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+        tet_indices = np.array([0, 1, 2, 3], dtype=np.int32)
+        temperature = np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32)
+
+        tm = newton.TetMesh(
+            vertices,
+            tet_indices,
+            k_mu=1000.0,
+            density=5.0,
+            custom_attributes={"temperature": temperature},
+        )
+
+        # __getitem__ returns the array directly
+        assert_np_equal(tm["k_mu"], np.array([1000.0], dtype=np.float32))
+        assert_np_equal(tm["temperature"], temperature)
+
+        # __contains__
+        self.assertIn("k_mu", tm)
+        self.assertIn("density", tm)
+        self.assertIn("temperature", tm)
+        self.assertNotIn("nonexistent", tm)
+
+        # get() returns array or default
+        self.assertIsNone(tm.get("nonexistent"))
+        self.assertEqual(tm.get("nonexistent", 42), 42)
+        self.assertIsNotNone(tm.get("k_mu"))
+
+        # KeyError on missing
+        with self.assertRaises(KeyError):
+            tm["nonexistent"]
+
+        # attributes returns (array, frequency) pairs
+        attrs = tm.attributes
+        self.assertIn("k_mu", attrs)
+        self.assertIn("density", attrs)
+        self.assertIn("temperature", attrs)
+        _, freq = attrs["temperature"]
+        self.assertEqual(freq, newton.Model.AttributeFrequency.PARTICLE)
 
     def test_tetmesh_custom_attributes_constructor(self):
         """Test TetMesh stores custom attributes passed at construction."""
@@ -7134,13 +7173,13 @@ def Mesh "JustAMesh" ()
             vertices, tet_indices, custom_attributes={"temperature": temperature, "regionId": region_id}
         )
 
-        self.assertIn("temperature", tm.custom_attributes)
-        self.assertIn("regionId", tm.custom_attributes)
-        arr, freq = tm.custom_attributes["temperature"]
-        assert_np_equal(arr, temperature)
+        self.assertIn("temperature", tm)
+        self.assertIn("regionId", tm)
+        assert_np_equal(tm["temperature"], temperature)
+        _, freq = tm.attributes["temperature"]
         self.assertEqual(freq, newton.Model.AttributeFrequency.PARTICLE)
-        arr, freq = tm.custom_attributes["regionId"]
-        assert_np_equal(arr, region_id)
+        assert_np_equal(tm["regionId"], region_id)
+        _, freq = tm.attributes["regionId"]
         self.assertEqual(freq, newton.Model.AttributeFrequency.TETRAHEDRON)
 
     def test_tetmesh_custom_attributes_empty_by_default(self):
@@ -7148,7 +7187,7 @@ def Mesh "JustAMesh" ()
         vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
         tet_indices = np.array([0, 1, 2, 3], dtype=np.int32)
         tm = newton.TetMesh(vertices, tet_indices)
-        self.assertEqual(len(tm.custom_attributes), 0)
+        self.assertEqual(len(tm.attributes), 0)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_tetmesh_custom_attributes_from_usd(self):
@@ -7164,21 +7203,21 @@ def Mesh "JustAMesh" ()
         self.assertEqual(tm.tet_count, 2)
 
         # Per-vertex temperature primvar
-        self.assertIn("temperature", tm.custom_attributes)
-        arr, freq = tm.custom_attributes["temperature"]
-        assert_np_equal(arr, np.array([100, 200, 300, 400, 500], dtype=np.float32))
+        self.assertIn("temperature", tm)
+        assert_np_equal(tm["temperature"], np.array([100, 200, 300, 400, 500], dtype=np.float32))
+        _, freq = tm.attributes["temperature"]
         self.assertEqual(freq, newton.Model.AttributeFrequency.PARTICLE)
 
         # Per-tet regionId primvar
-        self.assertIn("regionId", tm.custom_attributes)
-        arr, freq = tm.custom_attributes["regionId"]
-        assert_np_equal(arr, np.array([0, 1], dtype=np.int32))
+        self.assertIn("regionId", tm)
+        assert_np_equal(tm["regionId"], np.array([0, 1], dtype=np.int32))
+        _, freq = tm.attributes["regionId"]
         self.assertEqual(freq, newton.Model.AttributeFrequency.TETRAHEDRON)
 
         # Per-vertex vector primvar
-        self.assertIn("velocityField", tm.custom_attributes)
-        arr, freq = tm.custom_attributes["velocityField"]
-        self.assertEqual(arr.shape, (5, 3))
+        self.assertIn("velocityField", tm)
+        self.assertEqual(tm["velocityField"].shape, (5, 3))
+        _, freq = tm.attributes["velocityField"]
         self.assertEqual(freq, newton.Model.AttributeFrequency.PARTICLE)
 
     def test_tetmesh_custom_attributes_npz_roundtrip(self):
@@ -7199,13 +7238,13 @@ def Mesh "JustAMesh" ()
             tm.save(path)
             tm2 = newton.TetMesh.create_from_file(path)
 
-            self.assertIn("temperature", tm2.custom_attributes)
-            arr, freq = tm2.custom_attributes["temperature"]
-            assert_np_equal(arr, temperature)
+            self.assertIn("temperature", tm2)
+            assert_np_equal(tm2["temperature"], temperature)
+            _, freq = tm2.attributes["temperature"]
             self.assertEqual(freq, newton.Model.AttributeFrequency.PARTICLE)
-            self.assertIn("regionId", tm2.custom_attributes)
-            arr, freq = tm2.custom_attributes["regionId"]
-            assert_np_equal(arr, region_id)
+            self.assertIn("regionId", tm2)
+            assert_np_equal(tm2["regionId"], region_id)
+            _, freq = tm2.attributes["regionId"]
             self.assertEqual(freq, newton.Model.AttributeFrequency.TETRAHEDRON)
         finally:
             os.unlink(path)

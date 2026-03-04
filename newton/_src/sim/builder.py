@@ -7445,15 +7445,15 @@ class ModelBuilder:
                 Required if ``mesh`` is not provided.
             indices: A list of tetrahedron indices, 4 entries per-element,
                 flattened array. Required if ``mesh`` is not provided.
-            density: The density [kg/m^3] of the mesh. Overrides ``mesh.density``
+            density: The density [kg/m^3] of the mesh. Overrides ``mesh["density"]``
                 if both are provided.
             k_mu: The first elastic Lame parameter [Pa]. Scalar or per-element
-                array. Overrides ``mesh.k_mu`` if both are provided.
+                array. Overrides ``mesh["k_mu"]`` if both are provided.
             k_lambda: The second elastic Lame parameter [Pa]. Scalar or
-                per-element array. Overrides ``mesh.k_lambda`` if both are
+                per-element array. Overrides ``mesh["k_lambda"]`` if both are
                 provided.
             k_damp: The damping stiffness. Scalar or per-element array.
-                Overrides ``mesh.k_damp`` if both are provided.
+                Overrides ``mesh["k_damp"]`` if both are provided.
             tri_ke: Stiffness for surface mesh triangles. Defaults to 0.0.
             tri_ka: Area stiffness for surface mesh triangles. Defaults to 0.0.
             tri_kd: Damping for surface mesh triangles. Defaults to 0.0.
@@ -7487,13 +7487,14 @@ class ModelBuilder:
             if indices is None:
                 indices = mesh.tet_indices
             if density is None:
-                density = mesh.density
+                arr = mesh.get("density")
+                density = float(arr[0]) if arr is not None else None
             if k_mu is None:
-                k_mu = mesh.k_mu
+                k_mu = mesh.get("k_mu")
             if k_lambda is None:
-                k_lambda = mesh.k_lambda
+                k_lambda = mesh.get("k_lambda")
             if k_damp is None:
-                k_damp = mesh.k_damp
+                k_damp = mesh.get("k_damp")
 
         if vertices is None or indices is None:
             raise ValueError("Either 'mesh' or both 'vertices' and 'indices' must be provided.")
@@ -7515,8 +7516,10 @@ class ModelBuilder:
         particle_custom: dict[str, np.ndarray] = {}
         tet_custom: dict[str, np.ndarray] = {}
         tri_custom: dict[str, np.ndarray] = {}
-        if mesh is not None and mesh.custom_attributes:
-            for attr_name, (arr, freq) in mesh.custom_attributes.items():
+        if mesh is not None:
+            for attr_name, (arr, freq) in mesh.attributes.items():
+                if attr_name in TetMesh._KNOWN_FREQUENCIES:
+                    continue
                 if freq == Model.AttributeFrequency.PARTICLE:
                     particle_custom[attr_name] = arr
                 elif freq == Model.AttributeFrequency.TETRAHEDRON:
