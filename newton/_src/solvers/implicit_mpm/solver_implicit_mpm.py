@@ -25,6 +25,7 @@ from .rasterized_collisions import (
     project_outside_collider,
     rasterize_collider,
 )
+from .particle_surface import ParticleSurface
 from .render_grains import sample_render_grains, update_render_grains
 from .solve_rheology import CollisionData, MomentumData, RheologyData, YieldParamVec, solve_rheology
 
@@ -1220,6 +1221,52 @@ class SolverImplicitMPM(SolverBase):
         """
 
         return update_render_grains(state_prev, state, grains, self._mpm_model.particle_radius, dt)
+
+    def create_particle_surface(self, voxel_size: float | None = None, **kwargs) -> ParticleSurface:
+        """Create a reusable particle surface extraction context.
+
+        Args:
+            voxel_size: Voxel size for the density grid [m].
+                Defaults to the solver's grid voxel size.
+            **kwargs: Forwarded to :class:`ParticleSurface`.
+
+        Returns:
+            A :class:`ParticleSurface` context for use with
+            :meth:`extract_particle_surface`.
+        """
+        if voxel_size is None:
+            voxel_size = self._mpm_model.voxel_size
+        return ParticleSurface(voxel_size=voxel_size, **kwargs)
+
+    def extract_particle_surface(
+        self,
+        state: newton.State,
+        surface: ParticleSurface,
+        compute_normals: bool = True,
+        transforms: wp.array | None = None,
+    ) -> tuple[wp.array | None, wp.array | None, wp.array | None]:
+        """Extract a triangle mesh from the current particle state.
+
+        Args:
+            state: Current simulation state.
+            surface: Reusable extraction context from
+                :meth:`create_particle_surface`.
+            compute_normals: Whether to compute per-vertex normals.
+            transforms: Optional per-particle deformation frames
+                (``wp.mat33``) for anisotropic splatting.  Pass
+                ``state.mpm.particle_transform`` after calling
+                :meth:`update_particle_frames` each substep.
+
+        Returns:
+            Tuple of ``(vertices, indices, normals)``.  All ``None`` when
+            no surface can be extracted.
+        """
+        return surface.extract(
+            state.particle_q,
+            radii=self._mpm_model.particle_radius,
+            transforms=transforms,
+            compute_normals=compute_normals,
+        )
 
     def _allocate_grid(
         self,
