@@ -1,4 +1,4 @@
-# Quick B2 indicator test: sphere stability + cube rounding
+# Quick diagnostic with density field
 
 import numpy as np
 import warp as wp
@@ -7,43 +7,43 @@ from newton.solvers import SolverImplicitMPM
 
 wp.init()
 
+builder = newton.ModelBuilder()
+SolverImplicitMPM.register_custom_attributes(builder)
 
-def make_model(positions, spacing, density=1000.0, sigma=50.0, viscosity=10.0, voxel_size=0.008):
-    builder = newton.ModelBuilder()
-    SolverImplicitMPM.register_custom_attributes(builder)
-    mass = spacing**3 * density
-    radius = spacing * 0.5
-    for p in positions:
-        builder.add_particle(pos=tuple(p), vel=(0, 0, 0), mass=mass, radius=radius)
-    model = builder.finalize(device="cuda:0")
-    model.set_gravity([0.0, 0.0, 0.0])
-    model.mpm.tensile_yield_ratio.fill_(1.0)
-    model.mpm.friction.fill_(0.0)
-    model.mpm.viscosity.fill_(viscosity)
-    model.mpm.surface_tension.fill_(sigma)
-    config = SolverImplicitMPM.Config(
-        voxel_size=voxel_size, grid_type="sparse",
-        max_iterations=100, tolerance=1e-4,
-    )
-    return SolverImplicitMPM(model, config), model
+n, spacing = 10, 0.005
+half = (n - 1) * spacing / 2.0
+for i in range(n):
+    for j in range(n):
+        for k in range(n):
+            builder.add_particle(
+                pos=(-half + i * spacing, -half + j * spacing, -half + k * spacing),
+                vel=(0, 0, 0), mass=spacing**3 * 1000.0, radius=spacing * 0.5)
 
+model = builder.finalize(device="cuda:0")
+model.set_gravity([0.0, 0.0, 0.0])
+model.mpm.tensile_yield_ratio.fill_(1.0)
+model.mpm.friction.fill_(0.0)
+model.mpm.viscosity.fill_(10.0)
+model.mpm.surface_tension.fill_(30.0)
 
-def make_sphere(R, spacing):
-    n = int(2 * R / spacing) + 1
-    half = (n - 1) * spacing / 2.0
-    return np.array([
-        [-half + i * spacing, -half + j * spacing, -half + k * spacing]
-        for i in range(n) for j in range(n) for k in range(n)
-        if np.linalg.norm([-half + i * spacing, -half + j * spacing, -half + k * spacing]) <= R
-    ])
+solver = SolverImplicitMPM(model, SolverImplicitMPM.Config(
+    voxel_size=0.008, grid_type="sparse", max_iterations=100, tolerance=1e-4))
 
+s0, s1 = model.state(), model.state()
+ctrl, cont = model.control(), model.contacts()
 
-def make_cube(n, spacing):
-    half = (n - 1) * spacing / 2.0
-    return np.array([
-        [-half + i * spacing, -half + j * spacing, -half + k * spacing]
-        for i in range(n) for j in range(n) for k in range(n)
-    ])
+solver.step(s0, s1, ctrl, cont, dt=1.0 / 480.0)
+
+vel = s1.particle_qd.numpy()
+print(f"max velocity: {np.linalg.norm(vel, axis=1).max():.6e}")
+
+fields = solver.gather_surface_tension_fields()
+if fields:
+    c = fields["indicator"].numpy()
+    k = fields["curvature"].numpy()
+    print(f"indicator: min={c.min():.4f} max={c.max():.4f} mean={c.mean():.4f}")
+    print(f"  at surface (0.1<c<0.9): {np.sum((c > 0.1) & (c < 0.9))}/{len(c)}")
+    print(f"curvature: min={k.min():.4f} max={k.max():.4f} mean abs={np.abs(k).mean():.4f}")
 
 
 def corner_face_ratio(pos):
@@ -53,48 +53,12 @@ def corner_face_ratio(pos):
     return d[d > med].mean() / d[d <= med].mean()
 
 
-fps = 120.0
-substeps = 4
-dt = 1.0 / (fps * substeps)
-
-# Sphere
-print("=== Sphere (sigma=50/3, 60 frames) ===")
-sphere_pts = make_sphere(0.025, 0.004)
-solver, model = make_model(sphere_pts, 0.004, sigma=50.0 / 3.0)
-s0, s1 = model.state(), model.state()
-ctrl, cont = model.control(), model.contacts()
-rms_init = None
+# Run 60 frames
 for frame in range(60):
-    for _ in range(substeps):
-        solver.step(s0, s1, ctrl, cont, dt)
-        s0, s1 = s1, s0
-    pos = s0.particle_q.numpy()
-    rms = np.sqrt(np.mean(np.sum((pos - pos.mean(0)) ** 2, 1)))
-    if rms_init is None:
-        rms_init = rms
-    if (frame + 1) % 20 == 0:
-        drift = (rms - rms_init) / rms_init * 100
-        vel = s0.particle_qd.numpy()
-        maxv = np.linalg.norm(vel, axis=1).max()
-        print(f"  frame {frame+1}: drift={drift:+.2f}%  max_vel={maxv:.4e}")
-
-# Cube
-print("\n=== Cube (sigma=50, 60 frames) ===")
-cube_pts = make_cube(10, 0.005)
-solver, model = make_model(cube_pts, 0.005, sigma=50.0)
-s0, s1 = model.state(), model.state()
-ctrl, cont = model.control(), model.contacts()
-ratio_init = corner_face_ratio(s0.particle_q.numpy())
-for frame in range(60):
-    for _ in range(substeps):
-        solver.step(s0, s1, ctrl, cont, dt)
+    for _ in range(4):
+        solver.step(s0, s1, ctrl, cont, dt=1.0 / 480.0)
         s0, s1 = s1, s0
     if (frame + 1) % 20 == 0:
-        pos = s0.particle_q.numpy()
-        ratio = corner_face_ratio(pos)
-        vel = s0.particle_qd.numpy()
-        maxv = np.linalg.norm(vel, axis=1).max()
-        print(f"  frame {frame+1}: ratio={ratio:.4f}  max_vel={maxv:.4e}")
-
-ratio_final = corner_face_ratio(s0.particle_q.numpy())
-print(f"\nCube ratio: {ratio_init:.4f} → {ratio_final:.4f}")
+        ratio = corner_face_ratio(s0.particle_q.numpy())
+        maxv = np.linalg.norm(s0.particle_qd.numpy(), axis=1).max()
+        print(f"frame {frame+1}: ratio={ratio:.4f}  max_vel={maxv:.4e}")

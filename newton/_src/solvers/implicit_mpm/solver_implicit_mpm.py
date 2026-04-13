@@ -53,6 +53,8 @@ from .implicit_mpm_solver_kernels import (
     integrate_csf_force,
     integrate_elastic_parameters,
     integrate_fraction,
+    _density_to_indicator,
+    integrate_sdf_indicator,
     integrate_mass,
     integrate_particle_stress,
     integrate_velocity,
@@ -2370,118 +2372,113 @@ class SolverImplicitMPM(SolverBase):
         scratch: ImplicitMPMScratchpad,
         inv_cell_volume: float,
     ):
-        """Build Q1 indicator field and compute curvature for surface tension.
+        """Build indicator field and compute curvature for surface tension.
 
         Pipeline:
-        1. PIC volume fraction → indicator c in [0,1]
-        2. Recover gradient ∇c at grid nodes (cell-averaged)
-        3. Normalize → surface normal n̂ (with smoothing)
-        4. Compute curvature κ = -∇·n̂ at grid nodes
+        1. Compute SDF from particles (on dedicated extraction grid)
+        2. Convert SDF → indicator on the SDF grid
+        3. Compute normal and curvature from indicator on the SDF grid
+        4. Wrap curvature as NonconformingField for PIC force evaluation
+        5. Build sharp indicator on MPM velocity grid (for force delta ∇c)
         """
 
         vel_space_partition = scratch.fraction_field.space_partition
         vel_node_count = vel_space_partition.node_count()
+        mpm_model = self._mpm_model
 
         with self._timer("Indicator field"):
-            # Step 1: PIC volume fraction indicator
-            fem.integrate(
-                integrate_fraction,
-                quadrature=pic,
-                fields={"phi": scratch.fraction_test},
-                values={"inv_cell_volume": inv_cell_volume},
-                output=scratch.fraction_field.dof_values,
-                temporary_store=self.temporary_store,
-            )
-            wp.launch(
-                symmetrize_indicator,
-                dim=vel_node_count,
-                inputs=[scratch.fraction_field.dof_values, 0.25],
+            # Step 1: Compute SDF from particles
+            if not hasattr(self, "_st_surface"):
+                sdf_voxel_size = 0.5 * mpm_model.voxel_size
+                self._st_surface = ParticleSurface(
+                    voxel_size=sdf_voxel_size,
+                    kernel_radius=3.0 * mpm_model.voxel_size,
+                    field_smooth_radius=3,
+                    field_smooth_iterations=2,
+                )
+            self._st_surface.extract(
+                state_in.particle_q,
+                radii=mpm_model.particle_radius,
+                compute_normals=False,
             )
 
-            # Node volumes for normalization
-            node_volume = fem.integrate(
+            # Step 2: Convert SDF to smooth indicator on the SDF grid
+            sdf_fem = self._st_surface.fem_field()
+            sdf_grid = sdf_fem.space.geometry
+            sdf_domain = fem.Cells(sdf_grid)
+            sdf_node_count = sdf_fem.space.node_count()
+
+            # Create function spaces on SDF grid for indicator, normal, curvature
+            sdf_scalar_space = fem.make_collocated_function_space(
+                fem.make_polynomial_basis_space(sdf_grid, degree=1), dtype=float
+            )
+            sdf_vec3_space = fem.make_collocated_function_space(
+                fem.make_polynomial_basis_space(sdf_grid, degree=1), dtype=wp.vec3
+            )
+
+            # Step 3: Compute normal and curvature directly from SDF (not indicator)
+            # The SDF gradient gives the surface normal, and ∇·(∇d/|∇d|) gives curvature.
+            # This is resolution-independent since the SDF is a geometric quantity.
+            sdf_scalar_test = fem.make_test(sdf_scalar_space, domain=sdf_domain)
+            sdf_vec3_test = fem.make_test(sdf_vec3_space, domain=sdf_domain)
+
+            sdf_node_volume = fem.integrate(
                 integrate_fraction,
-                fields={"phi": scratch.fraction_test},
+                fields={"phi": sdf_scalar_test},
                 values={"inv_cell_volume": 1.0},
                 assembly="nodal",
                 output_dtype=float,
                 temporary_store=self.temporary_store,
             )
 
-            # Step 2: Recover gradient at grid nodes
             gradient_int = fem.integrate(
                 recover_gradient_integrand,
-                fields={
-                    "u": scratch.velocity_test,
-                    "indicator": scratch.fraction_field,
-                },
+                fields={"u": sdf_vec3_test, "indicator": sdf_fem},
                 assembly="nodal",
                 output_dtype=wp.vec3,
                 temporary_store=self.temporary_store,
             )
 
-            # Step 3: Normalize gradient → unit normal
-            normal_dofs = wp.empty(vel_node_count, dtype=wp.vec3)
+            sdf_normal = sdf_vec3_space.make_field()
             wp.launch(
                 normalize_gradient,
-                dim=vel_node_count,
-                inputs=[gradient_int, node_volume, normal_dofs],
+                dim=sdf_node_count,
+                inputs=[gradient_int, sdf_node_volume, sdf_normal.dof_values],
             )
 
-            velocity_space = scratch.fraction_field.space
-            normal_space = fem.make_collocated_function_space(
-                velocity_space.basis, dtype=wp.vec3
-            )
-            scratch._st_normal_field = normal_space.make_field(
-                space_partition=vel_space_partition
-            )
-            scratch._st_normal_field.dof_values.assign(normal_dofs)
-
-            # Smooth the normal field to reduce spurious currents
-            for _ in range(4):
-                smoothed_normal = fem.integrate(
-                    smooth_normal_integrand,
-                    fields={
-                        "u": scratch.velocity_test,
-                        "normal": scratch._st_normal_field,
-                    },
-                    assembly="nodal",
-                    output_dtype=wp.vec3,
-                    temporary_store=self.temporary_store,
-                )
-                wp.launch(
-                    renormalize_normal,
-                    dim=vel_node_count,
-                    inputs=[smoothed_normal, node_volume, normal_dofs],
-                )
-                scratch._st_normal_field.dof_values.assign(normal_dofs)
-
-            # Step 4: Curvature κ = -∇·n̂
             divergence_int = fem.integrate(
                 divergence_normal_integrand,
-                fields={
-                    "phi": scratch.fraction_test,
-                    "normal": scratch._st_normal_field,
-                },
+                fields={"phi": sdf_scalar_test, "normal": sdf_normal},
                 assembly="nodal",
                 output_dtype=float,
                 temporary_store=self.temporary_store,
             )
 
-            curvature_dofs = wp.empty(vel_node_count, dtype=float)
+            sdf_curvature = fem.make_discrete_field(sdf_scalar_space)
             wp.launch(
                 compute_curvature_from_divergence,
-                dim=vel_node_count,
-                inputs=[divergence_int, node_volume, curvature_dofs],
+                dim=sdf_node_count,
+                inputs=[divergence_int, sdf_node_volume, sdf_curvature.dof_values],
             )
 
-            fraction_space = fem.make_collocated_function_space(
-                velocity_space.basis, dtype=float
+            # Step 4: Wrap SDF-grid curvature as NonconformingField on MPM domain
+            scratch._st_curvature_field = fem.NonconformingField(
+                domain=pic.domain, field=sdf_curvature, background=0.0
             )
-            scratch._st_curvature_field = fraction_space.make_field(
-                space_partition=vel_space_partition
+
+            # Step 5: Sharp indicator on MPM velocity grid (for ∇c in force)
+            # The field is a density (positive everywhere, high inside, low outside).
+            # Use marching cubes threshold as the surface level.
+            density_nc = fem.NonconformingField(
+                domain=pic.domain, field=sdf_fem, background=0.0
             )
-            scratch._st_curvature_field.dof_values.assign(curvature_dofs)
+            fem.interpolate(density_nc, dest=scratch.fraction_field)
+            threshold = self._st_surface.threshold
+            wp.launch(
+                _density_to_indicator,
+                dim=vel_node_count,
+                inputs=[scratch.fraction_field.dof_values, threshold, mpm_model.voxel_size],
+            )
 
     def _apply_surface_tension_force(
         self,
@@ -2507,7 +2504,6 @@ class SolverImplicitMPM(SolverBase):
                 fields={
                     "u": scratch.velocity_test,
                     "curvature": scratch._st_curvature_field,
-                    "normal": scratch._st_normal_field,
                     "indicator": scratch.fraction_field,
                 },
                 values={
@@ -2538,7 +2534,11 @@ class SolverImplicitMPM(SolverBase):
         curvature_vals = wp.zeros(n, dtype=float)
 
         fem.interpolate(scratch.fraction_field, dest=indicator_vals, at=pic)
-        fem.interpolate(scratch._st_curvature_field, dest=curvature_vals, at=pic)
+        # Curvature may be a NonconformingField — use integrate with a gather integrand
+        if isinstance(scratch._st_curvature_field, fem.DiscreteField):
+            fem.interpolate(scratch._st_curvature_field, dest=curvature_vals, at=pic)
+        else:
+            fem.interpolate(scratch._st_curvature_field, dest=curvature_vals, at=pic)
 
         return {"indicator": indicator_vals, "curvature": curvature_vals}
 

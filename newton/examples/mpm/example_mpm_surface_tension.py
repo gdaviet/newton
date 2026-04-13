@@ -5,7 +5,8 @@
 
 A cube of fluid particles is initialized in zero gravity with surface tension
 enabled. The CSF force pulls corners inward, causing the cube to evolve
-toward a spherical shape.
+toward a spherical shape. The reconstructed surface mesh can be displayed
+alongside the particles.
 """
 
 import numpy as np
@@ -75,12 +76,19 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
 
+        # Surface extraction for visualization
+        self.surface_ctx = self.solver.create_particle_surface(
+            voxel_size=0.5 * options.voxel_size,
+            mesh_smooth_iterations=0,
+        )
+        self.show_surface = options.show_surface
+
         self.color_mode = options.color_mode
         self.particle_colors = wp.full(
             shape=self.model.particle_count, value=wp.vec3(0.2, 0.4, 0.8), device=self.model.device
         )
 
-        self.viewer.show_particles = True
+        self.viewer.show_particles = options.show_particles
         self.viewer.set_model(self.model)
         if hasattr(self.viewer, "camera"):
             self.viewer.set_camera(pos=wp.vec3(0.15, -0.15, 0.0), pitch=0.0, yaw=150.0)
@@ -109,7 +117,8 @@ class Example:
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
 
-        if self.color_mode != "none":
+        # Particle coloring (only when viewer.show_particles is on)
+        if self.color_mode != "none" and self.viewer.show_particles:
             fields = self.solver.gather_surface_tension_fields()
             if fields:
                 if self.color_mode == "curvature":
@@ -118,7 +127,6 @@ class Example:
                     s = fields["indicator"].numpy()
                 else:
                     s = np.zeros(self.model.particle_count)
-
                 self._apply_colormap(s)
 
             self.viewer.log_points(
@@ -128,10 +136,20 @@ class Example:
                 colors=self.particle_colors,
             )
 
+        # Reconstructed surface mesh
+        verts, indices, normals = self.solver.extract_particle_surface(
+            self.state_0, self.surface_ctx
+        )
+        if verts is not None and verts.shape[0] > 0:
+            self.viewer.log_mesh(
+                "/model/particle_surface", verts, indices, normals,
+                dynamic=True, hidden=not self.show_surface,
+            )
+
         self.viewer.end_frame()
 
     def _apply_colormap(self, values):
-        """Blue→green→red colormap from 10th to 90th percentile."""
+        """Blue->green->red colormap from 10th to 90th percentile."""
         s_min, s_max = np.percentile(values, [10, 90])
         s_range = s_max - s_min if s_max > s_min else 1.0
         s_norm = np.clip((values - s_min) / s_range, 0.0, 1.0)
@@ -153,12 +171,12 @@ class Example:
         self.particle_colors.assign(colors_np)
 
     def render_ui(self, imgui):
-        changed = False
+        _, self.show_surface = imgui.checkbox("Show Surface", self.show_surface)
+
         for mode in ["none", "indicator", "curvature"]:
             clicked, _ = imgui.selectable(mode.capitalize(), self.color_mode == mode)
             if clicked:
                 self.color_mode = mode
-                changed = True
 
     @staticmethod
     def create_parser():
@@ -173,7 +191,7 @@ class Example:
 
         # Material
         parser.add_argument("--density", type=float, default=1000.0)
-        parser.add_argument("--surface-tension", "-st", type=float, default=50.0, help="Surface tension [N/m]")
+        parser.add_argument("--surface-tension", "-st", type=float, default=30.0, help="Surface tension coefficient")
         parser.add_argument("--viscosity", type=float, default=10.0, help="Viscosity [Pa*s]")
 
         # Visualization
@@ -181,6 +199,9 @@ class Example:
             "--color-mode", type=str, default="curvature", choices=["none", "indicator", "curvature"],
             help="Particle color mode",
         )
+        parser.add_argument("--show-surface", action="store_true", default=True, help="Show reconstructed surface mesh")
+        parser.add_argument("--no-surface", dest="show_surface", action="store_false", help="Hide surface mesh")
+        parser.add_argument("--show-particles", action="store_true", default=False, help="Show particles")
 
         # Solver
         parser.add_argument("--max-iterations", "-it", type=int, default=100)

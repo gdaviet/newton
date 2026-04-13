@@ -117,6 +117,36 @@ def normalize_nodal_vec3(
     output[i] = integral[i] / vol
 
 
+@fem.integrand
+def integrate_sdf_indicator(
+    s: fem.Sample,
+    phi: fem.Field,
+    sdf_field: fem.Field,
+    inv_cell_volume: float,
+    interface_width: float,
+):
+    """Splat SDF-based indicator from particles to grid nodes.
+
+    Evaluates the SDF at each particle position (cross-grid interpolation),
+    converts to a symmetric indicator c = clamp(0.5 - d/(2*epsilon), 0, 1),
+    and accumulates onto velocity grid nodes via PIC.
+    """
+    d = sdf_field(s)
+    c = wp.clamp(0.5 - d / (2.0 * interface_width), 0.0, 1.0)
+    return phi(s) * c * inv_cell_volume
+
+
+@wp.kernel
+def _density_to_indicator(values: wp.array[float], threshold: float, interface_width: float):
+    """Convert density field to indicator: c = clamp(0.5 + (d - threshold)/(2*eps), 0, 1).
+
+    Density > threshold → c > 0.5 (inside), density < threshold → c < 0.5 (outside).
+    """
+    i = wp.tid()
+    d = values[i]
+    values[i] = wp.clamp(0.5 + (d - threshold) / (2.0 * interface_width), 0.0, 1.0)
+
+
 @wp.kernel
 def symmetrize_indicator(values: wp.array[float], interface_half_width: float):
     """Symmetrize the indicator profile around the 0.5 iso-level.
@@ -213,23 +243,21 @@ def integrate_csf_force(
     domain: fem.Domain,
     u: fem.Field,
     curvature: fem.Field,
-    normal: fem.Field,
     indicator: fem.Field,
     dt: float,
     inv_cell_volume: float,
     surface_tension_coefficient: float,
 ):
-    """CSF body force: f = sigma * kappa * n_hat * delta(c), added like gravity.
+    """CSF body force: f = sigma * kappa * grad(c), added like gravity.
 
-    Uses a parabolic surface delta function delta(c) = 6*c*(1-c) which is
-    resolution-independent: it peaks at c=0.5 (the surface), vanishes in the
-    bulk (c=0 or c=1), and integrates to 1 regardless of grid spacing.
+    Uses grad(c) as the surface delta function: it concentrates force at the
+    interface where the indicator transitions, and its direction gives the
+    surface normal. With an SDF-based indicator the profile is symmetric,
+    so the integrated force is balanced (no net translation).
     """
     kappa = curvature(s)
-    n_hat = normal(s)
-    c = indicator(s)
-    delta_s = 6.0 * c * (1.0 - c)
-    f_st = surface_tension_coefficient * kappa * n_hat * delta_s
+    grad_c = fem.grad(indicator, s)
+    f_st = surface_tension_coefficient * kappa * grad_c
     return wp.dot(u(s), dt * f_st) * inv_cell_volume
 
 
