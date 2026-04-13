@@ -85,7 +85,7 @@ class Example:
                 verts,
                 indices,
                 normals,
-                backface_culling=False,
+                dynamic=True,
             )
 
         self.viewer.end_frame()
