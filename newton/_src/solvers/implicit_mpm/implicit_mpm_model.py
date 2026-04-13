@@ -274,6 +274,8 @@ class MaterialParameters:
     """Softening rate for the material."""
     dilatancy: wp.array[float]
     """Dilatancy for the material."""
+    surface_tension: wp.array[float]
+    """Surface tension coefficient [N/m]."""
 
 
 class ImplicitMPMModel:
@@ -327,8 +329,9 @@ class ImplicitMPMModel:
         - ``particle_radius``, ``particle_volume``, and ``particle_density``,
           from ``model.particle_radius`` and ``model.particle_mass``.
         - Cached extrema (``min_young_modulus``, ``max_hardening``) and feature
-          flags (``has_viscosity``, ``has_dilatancy``) used to toggle code
-          paths without rescanning every step.
+          flags (``has_viscosity``, ``has_dilatancy``,
+          ``has_surface_tension``) used to toggle code paths without
+          rescanning every step.
         """
         model = self.model
 
@@ -344,11 +347,13 @@ class ImplicitMPMModel:
         self.material_parameters.softening_rate = model.mpm.softening_rate
         self.material_parameters.dilatancy = model.mpm.dilatancy
         self.material_parameters.viscosity = model.mpm.viscosity
+        self.material_parameters.surface_tension = model.mpm.surface_tension
 
         self.min_young_modulus = float(np.min(self.material_parameters.young_modulus.numpy()))
         self.max_hardening = float(np.max(self.material_parameters.hardening.numpy()))
         self.has_viscosity = bool(np.any(self.material_parameters.viscosity.numpy() > 0))
         self.has_dilatancy = bool(np.any(self.material_parameters.dilatancy.numpy() > 0))
+        self._has_surface_tension = bool(np.any(self.material_parameters.surface_tension.numpy() > 0))
 
         # Recompute particle volume and density from available particle data.
         # Assume that particles represent a cuboid volume of space, i.e., V = 8 r**3
@@ -591,6 +596,10 @@ class ImplicitMPMModel:
     @property
     def has_hardening(self):
         return self.max_hardening > 0.0
+
+    @property
+    def has_surface_tension(self):
+        return self._has_surface_tension
 
     @property
     def has_compliant_colliders(self):

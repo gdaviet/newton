@@ -59,6 +59,202 @@ mat11 = wp.types.matrix(shape=(1, 1), dtype=wp.float32)
 YIELD_PARAM_LENGTH = type_size(YieldParamVec)
 
 
+@wp.func
+def _smooth_min(a: float, b: float, k: float) -> float:
+    """Polynomial smooth-min for SDF blending (from particle_surface.py)."""
+    h = wp.max(k - wp.abs(a - b), 0.0) / wp.max(k, 1.0e-10)
+    return wp.min(a, b) - h * h * h * k * (1.0 / 6.0)
+
+
+@fem.integrand
+def compute_sdf_indicator(
+    s: fem.Sample,
+    phi: fem.Field,
+    domain: fem.Domain,
+    grid_id: wp.uint64,
+    positions: wp.array[wp.vec3],
+    radii: wp.array[float],
+    search_radius: float,
+    smooth_radius: float,
+    interface_width: float,
+):
+    """Compute smooth-union SDF from particles, convert to indicator at grid nodes."""
+    x = domain(s)
+    min_sdf = search_radius
+    query = wp.hash_grid_query(grid_id, x, search_radius)
+    idx = int(0)
+    while wp.hash_grid_query_next(query, idx):
+        pid = wp.hash_grid_point_id(grid_id, idx)
+        dist = wp.length(x - positions[pid])
+        sdf_val = dist - radii[pid]
+        min_sdf = _smooth_min(min_sdf, sdf_val, smooth_radius)
+    # Symmetric indicator: 1 inside, 0 outside, linear transition over 2*epsilon
+    c = wp.clamp(0.5 - min_sdf / (2.0 * interface_width), 0.0, 1.0)
+    return phi(s) * c
+
+
+@wp.kernel
+def normalize_nodal_scalar(
+    integral: wp.array[float],
+    node_volume: wp.array[float],
+    output: wp.array[float],
+):
+    """Divide nodal integral by node volume to recover nodal value."""
+    i = wp.tid()
+    vol = wp.max(node_volume[i], EPSILON)
+    output[i] = integral[i] / vol
+
+
+@wp.kernel
+def normalize_nodal_vec3(
+    integral: wp.array[wp.vec3],
+    node_volume: wp.array[float],
+    output: wp.array[wp.vec3],
+):
+    """Divide nodal vec3 integral by node volume to recover nodal value."""
+    i = wp.tid()
+    vol = wp.max(node_volume[i], EPSILON)
+    output[i] = integral[i] / vol
+
+
+@wp.kernel
+def symmetrize_indicator(values: wp.array[float], interface_half_width: float):
+    """Symmetrize the indicator profile around the 0.5 iso-level.
+
+    Converts raw volume fraction to a linear ramp centered at c=0.5
+    with controlled transition width, giving a symmetric profile that
+    reduces parasitic currents in the CSF force computation.
+    """
+    i = wp.tid()
+    c = values[i]
+    # Treat c=0.5 as the surface; remap to symmetric [-1,1] and back
+    values[i] = wp.clamp(0.5 + (c - 0.5) / (2.0 * interface_half_width), 0.0, 1.0)
+
+
+@wp.kernel
+def clamp_indicator(values: wp.array[float]):
+    i = wp.tid()
+    values[i] = wp.clamp(values[i], 0.0, 1.0)
+
+
+@wp.kernel
+def normalize_gradient(
+    gradient: wp.array[wp.vec3],
+    node_volume: wp.array[float],
+    normal: wp.array[wp.vec3],
+):
+    """Recover averaged gradient and normalize to unit normal."""
+    i = wp.tid()
+    vol = wp.max(node_volume[i], EPSILON)
+    g = gradient[i] / vol
+    g_len = wp.length(g)
+    normal[i] = wp.where(g_len > EPSILON, g / g_len, wp.vec3(0.0))
+
+
+@wp.kernel
+def renormalize_normal(
+    smoothed: wp.array[wp.vec3],
+    node_volume: wp.array[float],
+    normal: wp.array[wp.vec3],
+):
+    """Renormalize a volume-weighted smoothed normal to unit length."""
+    i = wp.tid()
+    vol = wp.max(node_volume[i], EPSILON)
+    n = smoothed[i] / vol
+    n_len = wp.length(n)
+    normal[i] = wp.where(n_len > EPSILON, n / n_len, wp.vec3(0.0))
+
+
+@fem.integrand
+def smooth_normal_integrand(
+    s: fem.Sample,
+    u: fem.Field,
+    normal: fem.Field,
+):
+    """Project normal field onto Q1 space: ∫ φ_i · n̂ dV."""
+    return wp.dot(u(s), normal(s))
+
+
+@wp.kernel
+def compute_curvature_from_divergence(
+    divergence: wp.array[float],
+    node_volume: wp.array[float],
+    curvature: wp.array[float],
+):
+    """Curvature = -div(normal), recovered from nodal divergence integral."""
+    i = wp.tid()
+    vol = wp.max(node_volume[i], EPSILON)
+    curvature[i] = -divergence[i] / vol
+
+
+@fem.integrand
+def recover_gradient_integrand(
+    s: fem.Sample,
+    u: fem.Field,
+    indicator: fem.Field,
+):
+    """Recover gradient of indicator at grid nodes: integral(phi_i * grad(c) dV)."""
+    return wp.dot(u(s), fem.grad(indicator, s))
+
+
+@fem.integrand
+def divergence_normal_integrand(
+    s: fem.Sample,
+    phi: fem.Field,
+    normal: fem.Field,
+):
+    """Compute divergence of normal field: integral(phi_i * div(n) dV)."""
+    return phi(s) * wp.trace(fem.grad(normal, s))
+
+
+@fem.integrand
+def integrate_csf_force(
+    s: fem.Sample,
+    domain: fem.Domain,
+    u: fem.Field,
+    curvature: fem.Field,
+    normal: fem.Field,
+    indicator: fem.Field,
+    dt: float,
+    inv_cell_volume: float,
+    surface_tension_coefficient: float,
+):
+    """CSF body force: f = sigma * kappa * n_hat * delta(c), added like gravity.
+
+    Uses a parabolic surface delta function delta(c) = 6*c*(1-c) which is
+    resolution-independent: it peaks at c=0.5 (the surface), vanishes in the
+    bulk (c=0 or c=1), and integrates to 1 regardless of grid spacing.
+    """
+    kappa = curvature(s)
+    n_hat = normal(s)
+    c = indicator(s)
+    delta_s = 6.0 * c * (1.0 - c)
+    f_st = surface_tension_coefficient * kappa * n_hat * delta_s
+    return wp.dot(u(s), dt * f_st) * inv_cell_volume
+
+
+@fem.integrand
+def gather_scalar_at_particles(
+    s: fem.Sample,
+    field: fem.Field,
+    output: wp.array[float],
+):
+    """Evaluate a scalar grid field at each particle position."""
+    output[s.qp_index] = field(s)
+
+
+@fem.integrand
+def project_scalar(s: fem.Sample, phi: fem.Field, source: fem.Field):
+    """L2 projection of a scalar field: ∫ φ_i · f dV."""
+    return phi(s) * source(s)
+
+
+@fem.integrand
+def project_vector(s: fem.Sample, u: fem.Field, source: fem.Field):
+    """L2 projection of a vec3 field: ∫ φ_i · f dV."""
+    return wp.dot(u(s), source(s))
+
+
 @fem.integrand
 def integrate_fraction(s: fem.Sample, phi: fem.Field, domain: fem.Domain, inv_cell_volume: float):
     return phi(s) * inv_cell_volume
@@ -156,6 +352,7 @@ def integrate_velocity_apic(
     rho = particle_density[s.qp_index]
     vel_adv = wp.where(rho > 0.0, rho, INFINITY) * vel_apic
     return wp.dot(u(s), vel_adv) * inv_cell_volume
+
 
 
 @wp.kernel

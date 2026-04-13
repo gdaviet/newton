@@ -42,12 +42,15 @@ from .implicit_mpm_solver_kernels import (
     compliance_form,
     compute_bounds,
     compute_color_offsets,
+    compute_curvature_from_divergence,
     compute_eigenvalues,
     compute_unilateral_strain_offset,
+    divergence_normal_integrand,
     fill_uniform_color_block_indices,
     free_velocity,
     integrate_collider_fraction,
     integrate_collider_fraction_apic,
+    integrate_csf_force,
     integrate_elastic_parameters,
     integrate_fraction,
     integrate_mass,
@@ -63,16 +66,21 @@ from .implicit_mpm_solver_kernels import (
     make_rotate_vectors,
     mark_active_cells,
     mass_form,
+    normalize_gradient,
     mat11,
     mat13,
     mat31,
     mat66,
     node_color,
+    recover_gradient_integrand,
+    renormalize_normal,
     rotate_matrix_columns,
     rotate_matrix_rows,
     scatter_field_dof_values,
+    smooth_normal_integrand,
     strain_delta_form,
     strain_rhs,
+    symmetrize_indicator,
     update_particle_frames,
     update_particle_strains,
 )
@@ -731,6 +739,7 @@ class SolverImplicitMPM(SolverBase):
             - ``mpm:softening_rate``: Softening rate for plasticity
             - ``mpm:dilatancy``: Dilatancy factor for plasticity
             - ``mpm:viscosity``: Viscosity for plasticity [Pa·s]
+            - ``mpm:surface_tension``: Surface tension coefficient [N/m]
 
         Attributes registered on State (per-particle):
             - ``mpm:particle_qd_grad``: Velocity gradient for APIC transfer
@@ -853,6 +862,16 @@ class SolverImplicitMPM(SolverBase):
         builder.add_custom_attribute(
             newton.ModelBuilder.CustomAttribute(
                 name="viscosity",
+                frequency=newton.Model.AttributeFrequency.PARTICLE,
+                assignment=newton.Model.AttributeAssignment.MODEL,
+                dtype=wp.float32,
+                default=0.0,
+                namespace="mpm",
+            )
+        )
+        builder.add_custom_attribute(
+            newton.ModelBuilder.CustomAttribute(
+                name="surface_tension",
                 frequency=newton.Model.AttributeFrequency.PARTICLE,
                 assignment=newton.Model.AttributeAssignment.MODEL,
                 dtype=wp.float32,
@@ -1083,6 +1102,7 @@ class SolverImplicitMPM(SolverBase):
             pic = self._particles_to_cells(state_in.particle_q)
             scratch = self._rebuild_scratchpad(pic)
             self._step_impl(state_in, state_out, dt, pic, scratch)
+            self._last_pic = pic
             scratch.release_temporaries()
 
     @override
@@ -1627,6 +1647,10 @@ class SolverImplicitMPM(SolverBase):
         # Rasterize colliders to discrete space
         self._rasterize_colliders(state_in, dt, last_step_data, scratch, inv_cell_volume)
 
+        # Build indicator field for surface tension
+        if mpm_model.has_surface_tension:
+            self._build_indicator_field(state_in, pic, scratch, inv_cell_volume)
+
         # Velocity right-hand side and inverse mass matrix
         self._compute_unconstrained_velocity(state_in, dt, pic, scratch, inv_cell_volume)
 
@@ -1700,6 +1724,9 @@ class SolverImplicitMPM(SolverBase):
                     add=True,
                     temporary_store=self.temporary_store,
                 )
+
+            if self._mpm_model.has_surface_tension:
+                self._apply_surface_tension_force(dt, pic, scratch, velocity_int, inv_cell_volume)
 
             node_particle_mass = fem.integrate(
                 integrate_mass,
@@ -2333,6 +2360,187 @@ class SolverImplicitMPM(SolverBase):
         # Necessary fields for grains rendering
         # Re-generated at each step, defined on space partition
         state_out.velocity_field = scratch.velocity_field
+
+    # --- Surface tension methods ---
+
+    def _build_indicator_field(
+        self,
+        state_in: newton.State,
+        pic: fem.PicQuadrature,
+        scratch: ImplicitMPMScratchpad,
+        inv_cell_volume: float,
+    ):
+        """Build Q1 indicator field and compute curvature for surface tension.
+
+        Pipeline:
+        1. PIC volume fraction → indicator c in [0,1]
+        2. Recover gradient ∇c at grid nodes (cell-averaged)
+        3. Normalize → surface normal n̂ (with smoothing)
+        4. Compute curvature κ = -∇·n̂ at grid nodes
+        """
+
+        vel_space_partition = scratch.fraction_field.space_partition
+        vel_node_count = vel_space_partition.node_count()
+
+        with self._timer("Indicator field"):
+            # Step 1: PIC volume fraction indicator
+            fem.integrate(
+                integrate_fraction,
+                quadrature=pic,
+                fields={"phi": scratch.fraction_test},
+                values={"inv_cell_volume": inv_cell_volume},
+                output=scratch.fraction_field.dof_values,
+                temporary_store=self.temporary_store,
+            )
+            wp.launch(
+                symmetrize_indicator,
+                dim=vel_node_count,
+                inputs=[scratch.fraction_field.dof_values, 0.25],
+            )
+
+            # Node volumes for normalization
+            node_volume = fem.integrate(
+                integrate_fraction,
+                fields={"phi": scratch.fraction_test},
+                values={"inv_cell_volume": 1.0},
+                assembly="nodal",
+                output_dtype=float,
+                temporary_store=self.temporary_store,
+            )
+
+            # Step 2: Recover gradient at grid nodes
+            gradient_int = fem.integrate(
+                recover_gradient_integrand,
+                fields={
+                    "u": scratch.velocity_test,
+                    "indicator": scratch.fraction_field,
+                },
+                assembly="nodal",
+                output_dtype=wp.vec3,
+                temporary_store=self.temporary_store,
+            )
+
+            # Step 3: Normalize gradient → unit normal
+            normal_dofs = wp.empty(vel_node_count, dtype=wp.vec3)
+            wp.launch(
+                normalize_gradient,
+                dim=vel_node_count,
+                inputs=[gradient_int, node_volume, normal_dofs],
+            )
+
+            velocity_space = scratch.fraction_field.space
+            normal_space = fem.make_collocated_function_space(
+                velocity_space.basis, dtype=wp.vec3
+            )
+            scratch._st_normal_field = normal_space.make_field(
+                space_partition=vel_space_partition
+            )
+            scratch._st_normal_field.dof_values.assign(normal_dofs)
+
+            # Smooth the normal field to reduce spurious currents
+            for _ in range(4):
+                smoothed_normal = fem.integrate(
+                    smooth_normal_integrand,
+                    fields={
+                        "u": scratch.velocity_test,
+                        "normal": scratch._st_normal_field,
+                    },
+                    assembly="nodal",
+                    output_dtype=wp.vec3,
+                    temporary_store=self.temporary_store,
+                )
+                wp.launch(
+                    renormalize_normal,
+                    dim=vel_node_count,
+                    inputs=[smoothed_normal, node_volume, normal_dofs],
+                )
+                scratch._st_normal_field.dof_values.assign(normal_dofs)
+
+            # Step 4: Curvature κ = -∇·n̂
+            divergence_int = fem.integrate(
+                divergence_normal_integrand,
+                fields={
+                    "phi": scratch.fraction_test,
+                    "normal": scratch._st_normal_field,
+                },
+                assembly="nodal",
+                output_dtype=float,
+                temporary_store=self.temporary_store,
+            )
+
+            curvature_dofs = wp.empty(vel_node_count, dtype=float)
+            wp.launch(
+                compute_curvature_from_divergence,
+                dim=vel_node_count,
+                inputs=[divergence_int, node_volume, curvature_dofs],
+            )
+
+            fraction_space = fem.make_collocated_function_space(
+                velocity_space.basis, dtype=float
+            )
+            scratch._st_curvature_field = fraction_space.make_field(
+                space_partition=vel_space_partition
+            )
+            scratch._st_curvature_field.dof_values.assign(curvature_dofs)
+
+    def _apply_surface_tension_force(
+        self,
+        dt: float,
+        pic: fem.PicQuadrature,
+        scratch: ImplicitMPMScratchpad,
+        velocity_int: wp.array,
+        inv_cell_volume: float,
+    ):
+        """Apply CSF surface tension force to the velocity RHS."""
+
+        with self._timer("Surface tension"):
+            surface_tension_coeff = float(
+                np.max(self._mpm_model.material_parameters.surface_tension.numpy())
+            )
+            if surface_tension_coeff <= 0.0:
+                return
+
+            # CSF body force via PIC quadrature (all fields Q1, momentum-consistent)
+            fem.integrate(
+                integrate_csf_force,
+                quadrature=pic,
+                fields={
+                    "u": scratch.velocity_test,
+                    "curvature": scratch._st_curvature_field,
+                    "normal": scratch._st_normal_field,
+                    "indicator": scratch.fraction_field,
+                },
+                values={
+                    "dt": dt,
+                    "inv_cell_volume": inv_cell_volume,
+                    "surface_tension_coefficient": surface_tension_coeff,
+                },
+                output=velocity_int,
+                add=True,
+                temporary_store=self.temporary_store,
+            )
+
+    def gather_surface_tension_fields(self) -> dict[str, wp.array]:
+        """Gather surface tension indicator and curvature at particle positions.
+
+        Returns a dict with ``"indicator"`` and ``"curvature"`` arrays (float,
+        per-particle). Only valid after a :meth:`step` call with ``surface_tension > 0``.
+        Returns empty dict if surface tension is not active.
+        """
+        scratch = self._scratchpad
+        if not self._mpm_model.has_surface_tension or not hasattr(scratch, "_st_curvature_field"):
+            return {}
+
+        pic = self._last_pic
+        n = self.model.particle_count
+
+        indicator_vals = wp.zeros(n, dtype=float)
+        curvature_vals = wp.zeros(n, dtype=float)
+
+        fem.interpolate(scratch.fraction_field, dest=indicator_vals, at=pic)
+        fem.interpolate(scratch._st_curvature_field, dest=curvature_vals, at=pic)
+
+        return {"indicator": indicator_vals, "curvature": curvature_vals}
 
     def _require_velocity_space_fields(self, scratch: ImplicitMPMScratchpad, has_compliant_particles: bool):
         """Ensure velocity-space fields exist and match current spaces."""
