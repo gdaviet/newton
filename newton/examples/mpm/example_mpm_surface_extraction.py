@@ -50,6 +50,7 @@ class Example:
             field_smooth_radius=args.field_smooth_radius,
             mesh_smooth_iterations=args.mesh_smooth_iterations,
             anisotropic=args.anisotropic,
+            redistance_iterations=args.redistance_iterations,
         )
 
         self.viewer.set_model(self.model)
@@ -139,6 +140,8 @@ class Example:
                             help="Gaussian blur half-width in voxels (default 2)")
         parser.add_argument("--mesh-smooth-iterations", type=int, default=0,
                             help="Laplacian mesh smoothing passes (default 0)")
+        parser.add_argument("--redistance-iterations", type=int, default=0,
+                            help="Eikonal redistancing iterations for SDF quality (default 0)")
         parser.add_argument("--anisotropic", action="store_true",
                             help="Enable per-particle WPCA anisotropic kernels")
         parser.add_argument("--hide-particles", action="store_true",

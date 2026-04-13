@@ -384,10 +384,13 @@ def _redistance_step(
     sdf_out: wp.array3d[wp.float32],
     inv_dx: float,
 ):
-    """One step of the fast-sweeping Eikonal redistancing.
+    """One step of Eikonal redistancing with Godunov upwind scheme.
 
     Enforces |∇d| = 1 by shifting each node toward the signed distance
-    implied by its upwind neighbors, using Godunov's scheme.
+    implied by its upwind neighbors.  Uses the smeared sign function of
+    Peng et al. (1999) to preserve the zero level set:
+
+        S(d) = d / sqrt(d² + |∇d|²·dx²)
     """
     i, j, k = wp.tid()
     nx = sdf.shape[0]
@@ -412,10 +415,15 @@ def _redistance_step(
 
     grad_mag = wp.sqrt(ax * ax + ay * ay + az * az)
 
-    # PDE: d_t + sign(d0) * (|∇d| - 1) = 0
+    # Smeared sign function (Peng et al. 1999) — suppresses updates near
+    # the zero level set so the isosurface position is preserved.
+    dx_sq = 1.0 / (inv_dx * inv_dx)
+    s_smooth = d / wp.sqrt(d * d + grad_mag * grad_mag * dx_sq + 1.0e-20)
+
+    # PDE: d_t + S(d) * (|∇d| - 1) = 0
     # Explicit Euler with CFL-limited dt = 0.5 * dx
     dt = 0.5 / inv_dx
-    sdf_out[i, j, k] = d - dt * s * (grad_mag - 1.0)
+    sdf_out[i, j, k] = d - dt * s_smooth * (grad_mag - 1.0)
 
 
 # ---------------------------------------------------------------------------
