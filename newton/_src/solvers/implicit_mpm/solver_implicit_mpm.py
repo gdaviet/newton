@@ -1227,7 +1227,7 @@ class SolverImplicitMPM(SolverBase):
 
         Args:
             voxel_size: Voxel size for the density grid [m].
-                Defaults to the solver's grid voxel size.
+                Defaults to half the solver's grid voxel size.
             **kwargs: Forwarded to :class:`ParticleSurface`.
 
         Returns:
@@ -1235,7 +1235,7 @@ class SolverImplicitMPM(SolverBase):
             :meth:`extract_particle_surface`.
         """
         if voxel_size is None:
-            voxel_size = self._mpm_model.voxel_size
+            voxel_size = self._mpm_model.voxel_size * 0.5
         return ParticleSurface(voxel_size=voxel_size, **kwargs)
 
     def extract_particle_surface(
@@ -1243,7 +1243,6 @@ class SolverImplicitMPM(SolverBase):
         state: newton.State,
         surface: ParticleSurface,
         compute_normals: bool = True,
-        transforms: wp.array | None = None,
     ) -> tuple[wp.array | None, wp.array | None, wp.array | None]:
         """Extract a triangle mesh from the current particle state.
 
@@ -1252,10 +1251,6 @@ class SolverImplicitMPM(SolverBase):
             surface: Reusable extraction context from
                 :meth:`create_particle_surface`.
             compute_normals: Whether to compute per-vertex normals.
-            transforms: Optional per-particle deformation frames
-                (``wp.mat33``) for anisotropic splatting.  Pass
-                ``state.mpm.particle_transform`` after calling
-                :meth:`update_particle_frames` each substep.
 
         Returns:
             Tuple of ``(vertices, indices, normals)``.  All ``None`` when
@@ -1264,7 +1259,6 @@ class SolverImplicitMPM(SolverBase):
         return surface.extract(
             state.particle_q,
             radii=self._mpm_model.particle_radius,
-            transforms=transforms,
             compute_normals=compute_normals,
         )
 

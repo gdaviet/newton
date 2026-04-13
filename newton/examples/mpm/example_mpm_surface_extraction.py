@@ -46,6 +46,8 @@ class Example:
             voxel_size=args.surface_voxel_size,
             kernel_radius=args.kernel_radius,
             threshold=args.threshold,
+            field_smooth_iterations=args.field_smooth_iterations,
+            field_smooth_radius=args.field_smooth_radius,
             mesh_smooth_iterations=args.mesh_smooth_iterations,
             anisotropic=args.anisotropic,
         )
@@ -129,10 +131,14 @@ class Example:
                             help="Voxel size for the surface grid (default: same as --voxel-size)")
         parser.add_argument("--kernel-radius", type=float, default=None,
                             help="Splatting kernel radius (default: 3 * surface_voxel_size)")
-        parser.add_argument("--threshold", type=float, default=0.2,
+        parser.add_argument("--threshold", type=float, default=0.5,
                             help="Isosurface level (field ~1.0 inside, default 0.5)")
-        parser.add_argument("--mesh-smooth-iterations", type=int, default=3,
-                            help="Taubin mesh smoothing passes (default 3)")
+        parser.add_argument("--field-smooth-iterations", type=int, default=1,
+                            help="Gaussian blur passes on the scalar field before MC (default 1)")
+        parser.add_argument("--field-smooth-radius", type=int, default=2,
+                            help="Gaussian blur half-width in voxels (default 2)")
+        parser.add_argument("--mesh-smooth-iterations", type=int, default=0,
+                            help="Laplacian mesh smoothing passes (default 0)")
         parser.add_argument("--anisotropic", action="store_true",
                             help="Enable per-particle WPCA anisotropic kernels")
         parser.add_argument("--hide-particles", action="store_true",
@@ -145,7 +151,7 @@ if __name__ == "__main__":
     viewer, args = newton.examples.init(parser)
 
     if args.surface_voxel_size is None:
-        args.surface_voxel_size = args.voxel_size
+        args.surface_voxel_size = args.voxel_size * 0.5
 
     example = Example(viewer, args)
     newton.examples.run(example, args)
