@@ -53,7 +53,7 @@ from .implicit_mpm_solver_kernels import (
     integrate_csf_force,
     integrate_elastic_parameters,
     integrate_fraction,
-    _density_to_indicator,
+    _sdf_to_indicator,
     integrate_sdf_indicator,
     integrate_mass,
     integrate_particle_stress,
@@ -2387,7 +2387,7 @@ class SolverImplicitMPM(SolverBase):
         mpm_model = self._mpm_model
 
         with self._timer("Indicator field"):
-            # Step 1: Compute SDF from particles
+            # Step 1: Compute density field from particles
             if not hasattr(self, "_st_surface"):
                 sdf_voxel_size = 0.5 * mpm_model.voxel_size
                 self._st_surface = ParticleSurface(
@@ -2402,23 +2402,20 @@ class SolverImplicitMPM(SolverBase):
                 compute_normals=False,
             )
 
-            # Step 2: Convert SDF to smooth indicator on the SDF grid
-            sdf_fem = self._st_surface.fem_field()
-            sdf_grid = sdf_fem.space.geometry
+            # Step 2: Get SDF fem field (already converted from density in ParticleSurface)
+            sdf_field = self._st_surface.fem_field()
+            sdf_grid = sdf_field.space.geometry
             sdf_domain = fem.Cells(sdf_grid)
-            sdf_node_count = sdf_fem.space.node_count()
+            sdf_node_count = sdf_field.space.node_count()
 
-            # Create function spaces on SDF grid for indicator, normal, curvature
-            sdf_scalar_space = fem.make_collocated_function_space(
-                fem.make_polynomial_basis_space(sdf_grid, degree=1), dtype=float
-            )
+            sdf_scalar_space = sdf_field.space
             sdf_vec3_space = fem.make_collocated_function_space(
-                fem.make_polynomial_basis_space(sdf_grid, degree=1), dtype=wp.vec3
+                sdf_scalar_space.basis, dtype=wp.vec3
             )
 
-            # Step 3: Compute normal and curvature directly from SDF (not indicator)
-            # The SDF gradient gives the surface normal, and ∇·(∇d/|∇d|) gives curvature.
-            # This is resolution-independent since the SDF is a geometric quantity.
+            # Step 3: Compute normal and curvature from SDF
+            # ∇(SDF) points outward (from negative to positive), so n̂ = ∇d/|∇d| points outward.
+            # κ = ∇·n̂ for outward normal → positive for convex surfaces.
             sdf_scalar_test = fem.make_test(sdf_scalar_space, domain=sdf_domain)
             sdf_vec3_test = fem.make_test(sdf_vec3_space, domain=sdf_domain)
 
@@ -2433,7 +2430,7 @@ class SolverImplicitMPM(SolverBase):
 
             gradient_int = fem.integrate(
                 recover_gradient_integrand,
-                fields={"u": sdf_vec3_test, "indicator": sdf_fem},
+                fields={"u": sdf_vec3_test, "indicator": sdf_field},
                 assembly="nodal",
                 output_dtype=wp.vec3,
                 temporary_store=self.temporary_store,
@@ -2466,18 +2463,15 @@ class SolverImplicitMPM(SolverBase):
                 domain=pic.domain, field=sdf_curvature, background=0.0
             )
 
-            # Step 5: Sharp indicator on MPM velocity grid (for ∇c in force)
-            # The field is a density (positive everywhere, high inside, low outside).
-            # Use marching cubes threshold as the surface level.
-            density_nc = fem.NonconformingField(
-                domain=pic.domain, field=sdf_fem, background=0.0
+            # Step 5: Sharp indicator on MPM velocity grid from SDF
+            sdf_nc = fem.NonconformingField(
+                domain=pic.domain, field=sdf_field, background=3.0 * mpm_model.voxel_size
             )
-            fem.interpolate(density_nc, dest=scratch.fraction_field)
-            threshold = self._st_surface.threshold
+            fem.interpolate(sdf_nc, dest=scratch.fraction_field)
             wp.launch(
-                _density_to_indicator,
+                _sdf_to_indicator,
                 dim=vel_node_count,
-                inputs=[scratch.fraction_field.dof_values, threshold, mpm_model.voxel_size],
+                inputs=[scratch.fraction_field.dof_values, mpm_model.voxel_size],
             )
 
     def _apply_surface_tension_force(

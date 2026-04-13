@@ -137,14 +137,23 @@ def integrate_sdf_indicator(
 
 
 @wp.kernel
-def _density_to_indicator(values: wp.array[float], threshold: float, interface_width: float):
-    """Convert density field to indicator: c = clamp(0.5 + (d - threshold)/(2*eps), 0, 1).
+def _density_to_sdf(density: wp.array[float], threshold: float, sdf: wp.array[float]):
+    """Convert density field to signed distance approximation.
 
-    Density > threshold → c > 0.5 (inside), density < threshold → c < 0.5 (outside).
+    SDF convention: negative inside (density > threshold), positive outside.
     """
     i = wp.tid()
-    d = values[i]
-    values[i] = wp.clamp(0.5 + (d - threshold) / (2.0 * interface_width), 0.0, 1.0)
+    sdf[i] = threshold - density[i]
+
+
+@wp.kernel
+def _sdf_to_indicator(sdf: wp.array[float], interface_width: float):
+    """Convert SDF to indicator: c = clamp(0.5 - d/(2*eps), 0, 1).
+
+    SDF < 0 (inside) → c > 0.5, SDF > 0 (outside) → c < 0.5.
+    """
+    i = wp.tid()
+    sdf[i] = wp.clamp(0.5 - sdf[i] / (2.0 * interface_width), 0.0, 1.0)
 
 
 @wp.kernel
@@ -211,10 +220,14 @@ def compute_curvature_from_divergence(
     node_volume: wp.array[float],
     curvature: wp.array[float],
 ):
-    """Curvature = -div(normal), recovered from nodal divergence integral."""
+    """Curvature = div(normal), recovered from nodal divergence integral.
+
+    With outward-pointing normal (SDF convention: ∇d points from negative to positive),
+    div(n) > 0 for convex surfaces.
+    """
     i = wp.tid()
     vol = wp.max(node_volume[i], EPSILON)
-    curvature[i] = -divergence[i] / vol
+    curvature[i] = divergence[i] / vol
 
 
 @fem.integrand

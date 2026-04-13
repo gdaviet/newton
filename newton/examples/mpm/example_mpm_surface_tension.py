@@ -191,8 +191,8 @@ class Example:
 
         # Material
         parser.add_argument("--density", type=float, default=1000.0)
-        parser.add_argument("--surface-tension", "-st", type=float, default=30.0, help="Surface tension coefficient")
-        parser.add_argument("--viscosity", type=float, default=10.0, help="Viscosity [Pa*s]")
+        parser.add_argument("--surface-tension", "-st", type=float, default=1.0, help="Surface tension coefficient")
+        parser.add_argument("--viscosity", type=float, default=1.0, help="Viscosity [Pa*s]")
 
         # Visualization
         parser.add_argument(
@@ -206,7 +206,7 @@ class Example:
         # Solver
         parser.add_argument("--max-iterations", "-it", type=int, default=100)
         parser.add_argument("--tolerance", "-tol", type=float, default=1.0e-4)
-        parser.add_argument("--voxel-size", "-dx", type=float, default=0.008)
+        parser.add_argument("--voxel-size", "-dx", type=float, default=0.004)
 
         return parser
 

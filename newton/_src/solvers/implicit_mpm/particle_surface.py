@@ -364,6 +364,61 @@ def _laplacian_apply(
 
 
 # ---------------------------------------------------------------------------
+# Density → SDF conversion and redistancing
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def _density_to_sdf_3d(
+    field: wp.array3d[wp.float32],
+    threshold: float,
+):
+    """Convert density field to SDF in-place: sdf = threshold - density."""
+    i, j, k = wp.tid()
+    field[i, j, k] = threshold - field[i, j, k]
+
+
+@wp.kernel
+def _redistance_step(
+    sdf: wp.array3d[wp.float32],
+    sdf_out: wp.array3d[wp.float32],
+    inv_dx: float,
+):
+    """One step of the fast-sweeping Eikonal redistancing.
+
+    Enforces |∇d| = 1 by shifting each node toward the signed distance
+    implied by its upwind neighbors, using Godunov's scheme.
+    """
+    i, j, k = wp.tid()
+    nx = sdf.shape[0]
+    ny = sdf.shape[1]
+    nz = sdf.shape[2]
+
+    d = sdf[i, j, k]
+    s = wp.sign(d)
+
+    # Upwind finite differences (Godunov)
+    dx_m = sdf[wp.max(i - 1, 0), j, k]
+    dx_p = sdf[wp.min(i + 1, nx - 1), j, k]
+    dy_m = sdf[i, wp.max(j - 1, 0), k]
+    dy_p = sdf[i, wp.min(j + 1, ny - 1), k]
+    dz_m = sdf[i, j, wp.max(k - 1, 0)]
+    dz_p = sdf[i, j, wp.min(k + 1, nz - 1)]
+
+    # Godunov upwind: pick the derivative that "looks" toward the interface
+    ax = wp.max(wp.max(s * (d - dx_m), 0.0), wp.max(-s * (dx_p - d), 0.0)) * inv_dx
+    ay = wp.max(wp.max(s * (d - dy_m), 0.0), wp.max(-s * (dy_p - d), 0.0)) * inv_dx
+    az = wp.max(wp.max(s * (d - dz_m), 0.0), wp.max(-s * (dz_p - d), 0.0)) * inv_dx
+
+    grad_mag = wp.sqrt(ax * ax + ay * ay + az * az)
+
+    # PDE: d_t + sign(d0) * (|∇d| - 1) = 0
+    # Explicit Euler with CFL-limited dt = 0.5 * dx
+    dt = 0.5 / inv_dx
+    sdf_out[i, j, k] = d - dt * s * (grad_mag - 1.0)
+
+
+# ---------------------------------------------------------------------------
 # ParticleSurface context
 # ---------------------------------------------------------------------------
 
@@ -394,6 +449,10 @@ class ParticleSurface:
             applied to the scalar field before marching cubes.  Smooths
             the transition zone to reduce MC staircase artifacts.
         field_smooth_radius: Half-width of the Gaussian blur in voxels.
+        redistance_iterations: Number of Eikonal redistancing iterations
+            applied after converting the density field to a signed
+            distance field.  Improves SDF quality (|∇d| ≈ 1) away from
+            the surface.  Set to 0 to skip.
         mesh_smooth_iterations: Number of Laplacian smoothing passes
             applied to the extracted mesh.  Set to 0 to disable.
         mesh_smooth_lambda: Laplacian step size [0, 1].
@@ -414,6 +473,7 @@ class ParticleSurface:
         padding: int = 2,
         field_smooth_iterations: int = 1,
         field_smooth_radius: int = 2,
+        redistance_iterations: int = 0,
         mesh_smooth_iterations: int = 0,
         mesh_smooth_lambda: float = 1.0,
         device: wp.DeviceLike = None,
@@ -430,6 +490,7 @@ class ParticleSurface:
         self.padding = padding
         self.field_smooth_iterations = field_smooth_iterations
         self.field_smooth_radius = field_smooth_radius
+        self.redistance_iterations = redistance_iterations
         self.mesh_smooth_iterations = mesh_smooth_iterations
         self.mesh_smooth_lambda = mesh_smooth_lambda
 
@@ -504,19 +565,21 @@ class ParticleSurface:
         return self._det_G
 
     def fem_field(self) -> fem.DiscreteField:
-        """Return the scalar field as a :class:`warp.fem.DiscreteField`.
+        """Return the signed distance field as a :class:`warp.fem.DiscreteField`.
 
-        The field lives on a Q1 (trilinear) function space over a
-        :class:`warp.fem.Grid3D` matching the extraction grid.  It can be
-        used directly with :func:`warp.fem.interpolate` or
+        The field is a signed distance function (negative inside, positive
+        outside, zero at the surface) living on a Q1 (trilinear) function
+        space over a :class:`warp.fem.Grid3D` matching the extraction grid.
+
+        It can be used with :func:`warp.fem.interpolate` or
         :func:`warp.fem.integrate` to evaluate smooth values, gradients,
-        and curvature at arbitrary positions — e.g. at particle locations
-        via :class:`warp.fem.PicQuadrature`.
+        and curvature at arbitrary positions.
 
         Must be called after :meth:`extract`.
 
         Returns:
-            A :class:`warp.fem.DiscreteField` with scalar ``float`` DOFs.
+            A :class:`warp.fem.DiscreteField` with scalar ``float`` DOFs
+            representing signed distance values.
         """
         nx, ny, nz = self._grid_dims
         grid = fem.Grid3D(
@@ -638,25 +701,32 @@ class ParticleSurface:
             device=device,
         )
 
-        # Step 5b: Gaussian blur on scalar field
+        # Step 5b: Gaussian blur on density field
         if self.field_smooth_iterations > 0 and self.field_smooth_radius > 0:
             self._apply_field_blur(nx, ny, nz, device)
 
-        # Step 6: Marching cubes.
-        # Compensate for Laplacian shrinkage by lowering the threshold.
-        effective_threshold = self.threshold
+        # Step 5c: Convert density → SDF (negative inside, positive outside)
+        wp.launch(
+            _density_to_sdf_3d, dim=(nx, ny, nz),
+            inputs=[self._field, self.threshold], device=device,
+        )
+
+        # Step 5d: Redistancing (enforce |∇d| ≈ 1)
+        if self.redistance_iterations > 0:
+            self._apply_redistancing(nx, ny, nz, device)
+
+        # Step 6: Marching cubes on the SDF (surface at d = 0).
+        effective_threshold = 0.0
         if self.mesh_smooth_iterations > 0:
             shrink = 0.15 * math.sqrt(float(self.mesh_smooth_iterations)) * self.mesh_smooth_lambda * self.voxel_size
-            effective_threshold = max(self.threshold - shrink / self.kernel_radius, 0.01)
+            effective_threshold = -shrink / self.kernel_radius
 
         self._mc.surface(self._field, effective_threshold)
         verts = self._mc.verts
         indices = self._mc.indices
 
-        # Flip triangle winding: MC orients normals from low→high field
-        # values (inward for our convention).
-        if indices is not None and indices.shape[0] > 0:
-            wp.launch(_flip_winding, dim=indices.shape[0] // 3, inputs=[indices], device=device)
+        # MC orients normals from low→high. For SDF (low = inside),
+        # that means normals point outward — correct convention, no flip needed.
 
         if verts is None or verts.shape[0] == 0:
             self._verts = self._indices = self._normals = None
@@ -744,6 +814,20 @@ class ParticleSurface:
             wp.launch(_blur_axis_x, dim=(nx, ny, nz), inputs=[src, dst, w, hw], device=device)
             wp.launch(_blur_axis_y, dim=(nx, ny, nz), inputs=[dst, src, w, hw], device=device)
             wp.launch(_blur_axis_z, dim=(nx, ny, nz), inputs=[src, dst, w, hw], device=device)
+            src, dst = dst, src
+        if src is not self._field:
+            self._field, self._blur_temp = src, dst
+
+    def _apply_redistancing(self, nx: int, ny: int, nz: int, device: wp.DeviceLike):
+        """Iterative Eikonal redistancing to enforce |∇d| ≈ 1."""
+        if self._blur_temp is None or self._blur_temp.shape != self._field.shape:
+            self._blur_temp = wp.empty((nx, ny, nz), dtype=wp.float32, device=device)
+
+        inv_dx = 1.0 / self.voxel_size
+        src = self._field
+        dst = self._blur_temp
+        for _ in range(self.redistance_iterations):
+            wp.launch(_redistance_step, dim=(nx, ny, nz), inputs=[src, dst, inv_dx], device=device)
             src, dst = dst, src
         if src is not self._field:
             self._field, self._blur_temp = src, dst
