@@ -51,9 +51,12 @@ from .implicit_mpm_solver_kernels import (
     integrate_collider_fraction,
     integrate_collider_fraction_apic,
     integrate_csf_force,
+    integrate_csf_force_contact_angle,
+    union_particle_collider_sdf,
     integrate_elastic_parameters,
     integrate_fraction,
     _sdf_to_indicator,
+    apply_contact_angle_bc,
     integrate_sdf_indicator,
     integrate_mass,
     integrate_particle_stress,
@@ -704,6 +707,12 @@ class SolverImplicitMPM(SolverBase):
         """Numerical drag for the background air."""
 
         # experimental
+        contact_angle_mode: Literal["force", "sdf", "union"] = "union"
+        """Contact angle enforcement mode. ``'union'`` unions the particle and
+        collider SDFs then redistances, combined with force-level angle filtering.
+        ``'force'`` only filters the CSF force by angle without SDF modification.
+        ``'sdf'`` extrapolates the fluid SDF into the solid via ghost-fluid
+        reflection (experimental)."""
         collider_normal_from_sdf_gradient: bool = False
         """Compute collider normals from sdf gradient rather than closest point"""
         collider_basis: _MPMColliderBasisName = "S2"
@@ -968,6 +977,7 @@ class SolverImplicitMPM(SolverBase):
 
         self.collider_normal_from_sdf_gradient = config.collider_normal_from_sdf_gradient
         self.collider_basis = config.collider_basis
+        self._options = config
 
         # Map deprecated aliases to canonical values
         if config.collider_velocity_mode == "finite_difference":
@@ -1029,6 +1039,7 @@ class SolverImplicitMPM(SolverBase):
         collider_friction: list[float] | None = None,
         collider_adhesion: list[float] | None = None,
         collider_projection_threshold: list[float] | None = None,
+        collider_contact_angle: list[float] | None = None,
         model: newton.Model | None = None,
         body_com: wp.array | None = None,
         body_mass: wp.array | None = None,
@@ -1048,6 +1059,8 @@ class SolverImplicitMPM(SolverBase):
             collider_friction: Per-mesh Coulomb friction coefficients.
             collider_adhesion: Per-mesh adhesion (Pa).
             collider_projection_threshold: Per-mesh projection threshold (m).
+            collider_contact_angle: Per-mesh contact angle for surface tension wetting [rad].
+                Default pi/2 (90 degrees, neutral wetting).
             model: The model to read collider properties from. Default to solver's model.
             body_com: For dynamic colliders, per-body center of mass.
             body_mass: For dynamic colliders, per-body mass. Pass zeros for kinematic bodies.
@@ -1061,6 +1074,7 @@ class SolverImplicitMPM(SolverBase):
             collider_friction=collider_friction,
             collider_adhesion=collider_adhesion,
             collider_projection_threshold=collider_projection_threshold,
+            collider_contact_angle=collider_contact_angle,
             model=model,
             body_com=body_com,
             body_mass=body_mass,
@@ -1728,7 +1742,7 @@ class SolverImplicitMPM(SolverBase):
                 )
 
             if self._mpm_model.has_surface_tension:
-                self._apply_surface_tension_force(dt, pic, scratch, velocity_int, inv_cell_volume)
+                self._apply_surface_tension_force(state_in, dt, pic, scratch, velocity_int, inv_cell_volume)
 
             node_particle_mass = fem.integrate(
                 integrate_mass,
@@ -2390,17 +2404,32 @@ class SolverImplicitMPM(SolverBase):
             # Step 1: Compute density field from particles
             if not hasattr(self, "_st_surface"):
                 sdf_voxel_size = 0.5 * mpm_model.voxel_size
+                # Extra padding when union mode needs collider SDF coverage
+                padding = 8 if self._options.contact_angle_mode == "union" else 4
                 self._st_surface = ParticleSurface(
                     voxel_size=sdf_voxel_size,
                     kernel_radius=3.0 * mpm_model.voxel_size,
-                    field_smooth_radius=3,
+                    threshold=0.15,
+                    padding=padding,
+                    field_smooth_radius=1,
                     field_smooth_iterations=2,
+                    redistance_iterations=10,
                 )
             self._st_surface.extract(
                 state_in.particle_q,
                 radii=mpm_model.particle_radius,
                 compute_normals=False,
             )
+
+            # Step 1.5: (optional) contact angle SDF modifications
+            if mpm_model.has_contact_angle:
+                ca_mode = self._options.contact_angle_mode
+                if ca_mode == "sdf":
+                    self._apply_contact_angle_bc(state_in)
+                    self._st_surface.resurface()
+                elif ca_mode == "union":
+                    self._union_collider_sdf(state_in)
+                    self._st_surface.resurface()
 
             # Step 2: Get SDF fem field (already converted from density in ParticleSurface)
             sdf_field = self._st_surface.fem_field()
@@ -2458,9 +2487,12 @@ class SolverImplicitMPM(SolverBase):
                 inputs=[divergence_int, sdf_node_volume, sdf_curvature.dof_values],
             )
 
-            # Step 4: Wrap SDF-grid curvature as NonconformingField on MPM domain
+            # Step 4: Wrap SDF-grid fields as NonconformingField on MPM domain
             scratch._st_curvature_field = fem.NonconformingField(
                 domain=pic.domain, field=sdf_curvature, background=0.0
+            )
+            scratch._st_normal_field = fem.NonconformingField(
+                domain=pic.domain, field=sdf_normal, background=wp.vec3(0.0)
             )
 
             # Step 5: Sharp indicator on MPM velocity grid from SDF
@@ -2474,8 +2506,92 @@ class SolverImplicitMPM(SolverBase):
                 inputs=[scratch.fraction_field.dof_values, mpm_model.voxel_size],
             )
 
+
+    def _apply_contact_angle_bc(self, state_in: newton.State):
+        """Modify fluid SDF inside collider regions to enforce contact angle.
+
+        Reflects the fluid SDF across the collider surface and shifts by
+        ``2 * d_collider * cos(θ)``, imposing ``dφ/dn = cos(θ)`` at the wall
+        while preserving the tangential SDF variation.
+        """
+        surface = self._st_surface
+        nx, ny, nz = surface.grid_dims
+        collider = self._mpm_model.collider
+
+        # Snapshot the unmodified SDF so mirror-point lookups read original values
+        if not hasattr(self, "_st_field_orig") or self._st_field_orig.shape != surface.field.shape:
+            self._st_field_orig = wp.empty_like(surface.field)
+        wp.copy(self._st_field_orig, surface.field)
+
+        # Temporarily widen query range to cover SDF nodes inside solids
+        prev_query_dist = collider.query_max_dist
+        collider.query_max_dist = max(prev_query_dist, surface.kernel_radius)
+
+        wp.launch(
+            apply_contact_angle_bc,
+            dim=(nx, ny, nz),
+            inputs=[
+                surface.field,
+                self._st_field_orig,
+                surface.grid_origin,
+                surface.voxel_size,
+                8.0 * surface.voxel_size,  # max_depth
+                collider,
+                state_in.body_q,
+                None,  # body_qd — velocity not needed for contact angle
+                None,  # body_q_prev
+            ],
+        )
+
+        collider.query_max_dist = prev_query_dist
+
+    def _union_collider_sdf(self, state_in: newton.State):
+        """Extend the particle SDF into collider regions via reflection.
+
+        Starting 0.5 sim voxels above the collider surface, the particle SDF
+        is replaced by a reflected value that imposes the prescribed contact
+        angle.  A redistancing pass restores ``|∇d| ≈ 1`` afterwards.
+        """
+        surface = self._st_surface
+        nx, ny, nz = surface.grid_dims
+        collider = self._mpm_model.collider
+        mpm_voxel = self._mpm_model.voxel_size
+
+        # Snapshot the unmodified SDF for mirror-point lookups
+        if not hasattr(self, "_st_field_orig") or self._st_field_orig.shape != surface.field.shape:
+            self._st_field_orig = wp.empty_like(surface.field)
+        wp.copy(self._st_field_orig, surface.field)
+
+        prev_query_dist = collider.query_max_dist
+        collider.query_max_dist = max(prev_query_dist, surface.kernel_radius + surface.padding * surface.voxel_size)
+
+        wp.launch(
+            union_particle_collider_sdf,
+            dim=(nx, ny, nz),
+            inputs=[
+                surface.field,
+                self._st_field_orig,
+                surface.grid_origin,
+                surface.voxel_size,
+                0.0 * mpm_voxel,              # onset: start 0.5 sim voxels above wall
+                8.0 * surface.voxel_size,      # max_depth
+                collider,
+                state_in.body_q,
+                None,
+                None,
+            ],
+        )
+
+        collider.query_max_dist = prev_query_dist
+
+        # Smooth the junction between original and reflected SDF, then redistance
+        surface._apply_redistancing(nx, ny, nz, surface._device)
+        surface._apply_field_blur(nx, ny, nz, surface._device)
+        surface._apply_redistancing(nx, ny, nz, surface._device)
+
     def _apply_surface_tension_force(
         self,
+        state_in: newton.State,
         dt: float,
         pic: fem.PicQuadrature,
         scratch: ImplicitMPMScratchpad,
@@ -2485,30 +2601,70 @@ class SolverImplicitMPM(SolverBase):
         """Apply CSF surface tension force to the velocity RHS."""
 
         with self._timer("Surface tension"):
+            mpm_model = self._mpm_model
             surface_tension_coeff = float(
-                np.max(self._mpm_model.material_parameters.surface_tension.numpy())
+                np.max(mpm_model.material_parameters.surface_tension.numpy())
             )
             if surface_tension_coeff <= 0.0:
                 return
 
-            # CSF body force via PIC quadrature (all fields Q1, momentum-consistent)
-            fem.integrate(
-                integrate_csf_force,
-                quadrature=pic,
-                fields={
-                    "u": scratch.velocity_test,
-                    "curvature": scratch._st_curvature_field,
-                    "indicator": scratch.fraction_field,
-                },
-                values={
-                    "dt": dt,
-                    "inv_cell_volume": inv_cell_volume,
-                    "surface_tension_coefficient": surface_tension_coeff,
-                },
-                output=velocity_int,
-                add=True,
-                temporary_store=self.temporary_store,
+            use_contact_angle = (
+                mpm_model.has_contact_angle
+                and self._options.contact_angle_mode in ("force", "union")
             )
+
+            if use_contact_angle:
+                # Retrieve the contact angle from the first non-default material
+                ca = mpm_model.collider.material_contact_angle.numpy()
+                import math
+
+                non_default = [v for v in ca if abs(v - math.pi / 2.0) > 1e-6]
+                contact_angle = float(non_default[0]) if non_default else math.pi / 2.0
+
+                fem.integrate(
+                    integrate_csf_force_contact_angle,
+                    quadrature=pic,
+                    fields={
+                        "u": scratch.velocity_test,
+                        "curvature": scratch._st_curvature_field,
+                        "indicator": scratch.fraction_field,
+                        "sdf_normal": scratch._st_normal_field,
+                    },
+                    values={
+                        "particle_q": state_in.particle_q,
+                        "collider": mpm_model.collider,
+                        "body_q": state_in.body_q,
+                        "body_qd": None,
+                        "body_q_prev": None,
+                        "dt": dt,
+                        "inv_cell_volume": inv_cell_volume,
+                        "surface_tension_coefficient": surface_tension_coeff,
+                        "cos_contact_angle": math.cos(contact_angle),
+                        "activation_dist": 1.5 * mpm_model.voxel_size,
+                        "falloff": 0.2,
+                    },
+                    output=velocity_int,
+                    add=True,
+                    temporary_store=self.temporary_store,
+                )
+            else:
+                fem.integrate(
+                    integrate_csf_force,
+                    quadrature=pic,
+                    fields={
+                        "u": scratch.velocity_test,
+                        "curvature": scratch._st_curvature_field,
+                        "indicator": scratch.fraction_field,
+                    },
+                    values={
+                        "dt": dt,
+                        "inv_cell_volume": inv_cell_volume,
+                        "surface_tension_coefficient": surface_tension_coeff,
+                    },
+                    output=velocity_int,
+                    add=True,
+                    temporary_store=self.temporary_store,
+                )
 
     def gather_surface_tension_fields(self) -> dict[str, wp.array]:
         """Gather surface tension indicator and curvature at particle positions.

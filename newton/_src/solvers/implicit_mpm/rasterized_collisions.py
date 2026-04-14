@@ -66,6 +66,9 @@ class Collider:
     material_projection_threshold: wp.array[float]
     """Projection threshold for each collider material. Shape (material_count,)"""
 
+    material_contact_angle: wp.array[float]
+    """Contact angle per collider material [rad]. Shape (material_count,). Default pi/2 (neutral)."""
+
     body_com: wp.array[wp.vec3]
     """Body center of mass of each collider. Shape (body_count,)"""
 

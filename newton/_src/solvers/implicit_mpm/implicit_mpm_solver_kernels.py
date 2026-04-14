@@ -11,6 +11,7 @@ from warp.types import type_size
 import newton
 
 from .implicit_mpm_model import MaterialParameters
+from .rasterized_collisions import Collider, collision_sdf
 from .rheology_solver_kernels import YieldParamVec, project_stress
 
 wp.set_module_options({"enable_backward": False})
@@ -157,6 +158,204 @@ def _sdf_to_indicator(sdf: wp.array[float], interface_width: float):
 
 
 @wp.kernel
+def union_particle_collider_sdf(
+    field: wp.array3d[wp.float32],
+    field_orig: wp.array3d[wp.float32],
+    grid_origin: wp.vec3,
+    voxel_size: float,
+    onset: float,
+    max_depth: float,
+    collider: Collider,
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_q_prev: wp.array[wp.transform],
+):
+    """Extend the particle SDF into collider regions via reflection.
+
+    Starting at ``onset`` distance above the collider surface (on the fluid
+    side) and extending ``max_depth`` into the solid, the particle SDF is
+    replaced by a reflected value that imposes the prescribed contact angle.
+    Starting the extrapolation above the surface avoids the crease at the
+    exact wall boundary.
+    """
+    i, j, k = wp.tid()
+    x = grid_origin + voxel_size * wp.vec3(float(i), float(j), float(k))
+
+    d_coll, n_coll, _vel, _coll_id, material_id = collision_sdf(
+        x, collider, body_q, body_qd, body_q_prev, 0.0
+    )
+
+    # d_coll -= 2.0*onset
+
+    # d_part = field_orig[i, j, k]
+    # d_part_ori = field_orig[i, j, k]
+
+    # # Start extrapolation at `onset` above the wall (d_coll = onset)
+    # # and extend into the solid (d_coll < 0).
+    # if d_coll >= 0.0 or d_part > max_depth:
+    #     field[i, j, k] = d_part
+    #     return  # far from wall — keep particle SDF
+    
+    # theta = collider.material_contact_angle[material_id]
+    # sin_theta = wp.sin(theta)
+    # cos_theta = wp.cos(theta)
+
+    # if d_coll < -d_part:
+    #     d_part = d_coll
+    # else:
+    #     d_horizontal = wp.sqrt(d_part * d_part - d_coll * d_coll)
+    #     d_part = wp.sin(theta) * d_horizontal + wp.cos(theta) * d_coll
+        
+    # # d_part = wp.min(d_part, d_coll * wp.sqrt(cos_theta*cos_theta + 1.0))
+    
+
+
+    # field[i, j, k] = d_part #wp.min(d_part, d_part_ori)
+    # # phi_mirror = _sample_sdf_trilinear(field_orig, grid_origin, 1.0 / voxel_size, x_mirror)
+
+
+    # Effective penetration depth measured from the onset line
+    depth = onset - d_coll  # always positive in the active zone
+    if depth > max_depth or depth < 0.0:
+        return  # keep original particle SDF
+
+    theta = collider.material_contact_angle[material_id]
+    sin_theta = wp.sin(theta)
+    cos_theta = wp.cos(theta)
+
+    # Mirror point: reflect across the onset line (not the wall itself).
+    # The onset line is at d_coll = onset; mirror maps d_coll to 2*onset - d_coll.
+    x_mirror = x + 2.0 * (onset - d_coll) * n_coll
+    phi_mirror = _sample_sdf_trilinear(field_orig, grid_origin, 1.0 / voxel_size, x_mirror)
+
+    # Reflection formula shifted by onset: imposes dφ/dn = cos(θ) at the onset line.
+    phi_reflected = phi_mirror * sin_theta + 2.0 * (d_coll - onset) * cos_theta
+
+    # Pure reflection near onset, blend to original deeper
+    blend_start = 0.5 * max_depth
+    if depth <= blend_start:
+        field[i, j, k] = phi_reflected
+    else:
+        t = (depth - blend_start) / (max_depth - blend_start)
+        blend = t * t * (3.0 - 2.0 * t)
+        field[i, j, k] = (1.0 - blend) * phi_reflected + blend * field_orig[i, j, k]
+
+
+@wp.kernel
+def _blend_near_wall(
+    blurred: wp.array3d[wp.float32],
+    pre_blur: wp.array3d[wp.float32],
+    grid_origin: wp.vec3,
+    voxel_size: float,
+    band: float,
+    collider: Collider,
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_q_prev: wp.array[wp.transform],
+):
+    """Keep blurred values near the wall (|d_coll| < band), restore pre-blur elsewhere."""
+    i, j, k = wp.tid()
+    x = grid_origin + voxel_size * wp.vec3(float(i), float(j), float(k))
+
+    d_coll, _n, _v, _cid, _mid = collision_sdf(x, collider, body_q, body_qd, body_q_prev, 0.0)
+
+    abs_d = wp.abs(d_coll)
+    if abs_d >= band:
+        blurred[i, j, k] = pre_blur[i, j, k]
+    else:
+        t = abs_d / band
+        alpha = t * t * (3.0 - 2.0 * t)  # 0 at wall, 1 at band
+        blurred[i, j, k] = (1.0 - alpha) * blurred[i, j, k] + alpha * pre_blur[i, j, k]
+
+
+@wp.func
+def _sample_sdf_trilinear(
+    field: wp.array3d[wp.float32],
+    grid_origin: wp.vec3,
+    inv_voxel_size: float,
+    pos: wp.vec3,
+):
+    """Trilinear interpolation of a 3D scalar field at an arbitrary position."""
+    p = (pos - grid_origin) * inv_voxel_size
+    i0 = int(wp.floor(p[0]))
+    j0 = int(wp.floor(p[1]))
+    k0 = int(wp.floor(p[2]))
+
+    fx = p[0] - float(i0)
+    fy = p[1] - float(j0)
+    fz = p[2] - float(k0)
+
+    i0 = wp.clamp(i0, 0, field.shape[0] - 2)
+    j0 = wp.clamp(j0, 0, field.shape[1] - 2)
+    k0 = wp.clamp(k0, 0, field.shape[2] - 2)
+
+    c00 = field[i0, j0, k0] * (1.0 - fx) + field[i0 + 1, j0, k0] * fx
+    c10 = field[i0, j0 + 1, k0] * (1.0 - fx) + field[i0 + 1, j0 + 1, k0] * fx
+    c01 = field[i0, j0, k0 + 1] * (1.0 - fx) + field[i0 + 1, j0, k0 + 1] * fx
+    c11 = field[i0, j0 + 1, k0 + 1] * (1.0 - fx) + field[i0 + 1, j0 + 1, k0 + 1] * fx
+
+    c0 = c00 * (1.0 - fy) + c10 * fy
+    c1 = c01 * (1.0 - fy) + c11 * fy
+
+    return c0 * (1.0 - fz) + c1 * fz
+
+
+@wp.kernel
+def apply_contact_angle_bc(
+    field: wp.array3d[wp.float32],
+    field_orig: wp.array3d[wp.float32],
+    grid_origin: wp.vec3,
+    voxel_size: float,
+    max_depth: float,
+    collider: Collider,
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_q_prev: wp.array[wp.transform],
+):
+    """Impose contact angle by reflecting the fluid SDF across the collider surface.
+
+    For each grid node inside a collider (within ``max_depth``), mirrors the
+    node across the solid surface, samples the original fluid SDF at the mirror
+    point, and shifts by ``2 * d_collider * cos(contact_angle)``.  This imposes
+    ``dφ/dn = cos(θ)`` at the wall while preserving the tangential SDF
+    variation, so the curvature computation enforces the prescribed angle.
+    """
+    i, j, k = wp.tid()
+    x = grid_origin + voxel_size * wp.vec3(float(i), float(j), float(k))
+
+    d_coll, n_coll, _vel, _coll_id, material_id = collision_sdf(
+        x, collider, body_q, body_qd, body_q_prev, 0.0
+    )
+
+    # collision_sdf convention: d_coll > 0 on the particle/fluid side,
+    # d_coll < 0 inside the solid.  We modify the solid side only.
+    if d_coll >= 0.0:
+        return
+
+    depth = -d_coll
+    if depth > max_depth:
+        return
+
+    cos_theta = wp.cos(collider.material_contact_angle[material_id])
+
+    # Mirror point: reflect x across the collider surface into the fluid domain.
+    x_mirror = x - 2.0 * d_coll * n_coll
+    phi_mirror = _sample_sdf_trilinear(field_orig, grid_origin, 1.0 / voxel_size, x_mirror)
+
+    # Reflection formula: imposes dφ/d(n_coll) = cos(θ) at the surface.
+    phi_reflected = phi_mirror + 2.0 * d_coll * cos_theta
+
+    # Pure reflection near wall, blend to original deeper
+    blend_start = 0.5 * max_depth
+    if depth <= blend_start:
+        field[i, j, k] = phi_reflected
+    else:
+        t = (depth - blend_start) / (max_depth - blend_start)
+        blend = t * t * (3.0 - 2.0 * t)
+        field[i, j, k] = (1.0 - blend) * phi_reflected + blend * field_orig[i, j, k]
+
+
+@wp.kernel
 def symmetrize_indicator(values: wp.array[float], interface_half_width: float):
     """Symmetrize the indicator profile around the 0.5 iso-level.
 
@@ -271,6 +470,57 @@ def integrate_csf_force(
     kappa = curvature(s)
     grad_c = fem.grad(indicator, s)
     f_st = surface_tension_coefficient * kappa * grad_c
+    return wp.dot(u(s), dt * f_st) * inv_cell_volume
+
+
+@fem.integrand
+def integrate_csf_force_contact_angle(
+    s: fem.Sample,
+    domain: fem.Domain,
+    u: fem.Field,
+    curvature: fem.Field,
+    indicator: fem.Field,
+    sdf_normal: fem.Field,
+    particle_q: wp.array[wp.vec3],
+    collider: Collider,
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_q_prev: wp.array[wp.transform],
+    dt: float,
+    inv_cell_volume: float,
+    surface_tension_coefficient: float,
+    cos_contact_angle: float,
+    activation_dist: float,
+    falloff: float,
+):
+    """CSF body force with contact angle clamping near walls.
+
+    Same as :func:`integrate_csf_force`, but for particles within
+    ``activation_dist`` of a collider the force is smoothly attenuated
+    when the angle between the fluid SDF normal and the collider normal
+    exceeds the prescribed contact angle.
+    """
+    kappa = curvature(s)
+    grad_c = fem.grad(indicator, s)
+    f_st = surface_tension_coefficient * kappa * grad_c
+
+    x = particle_q[s.qp_index]
+    d_coll, n_coll, _vel, _coll_id, _mid = collision_sdf(
+        x, collider, body_q, body_qd, body_q_prev, 0.0
+    )
+
+    if d_coll < activation_dist:
+        n_fluid = sdf_normal(s)
+        cos_angle = wp.dot(n_fluid, n_coll)
+        # n_fluid points outward from fluid (toward air).
+        # n_coll  points outward from solid (into fluid domain).
+        # dot > 0: fluid normal points away from solid → air interface → keep force
+        # dot < 0: fluid normal points toward solid → no air there → block force
+        # cos(θ) sets the threshold: higher θ → more permissive (hydrophobic).
+        t = wp.clamp((cos_angle - cos_contact_angle) / falloff + 0.5, 0.0, 1.0)
+        mask = t * t * (3.0 - 2.0 * t)
+        f_st = mask * f_st
+
     return wp.dot(u(s), dt * f_st) * inv_cell_volume
 
 

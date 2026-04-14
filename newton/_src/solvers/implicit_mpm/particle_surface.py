@@ -765,6 +765,51 @@ class ParticleSurface:
         self._normals = normals
         return verts, indices, normals
 
+    def resurface(self):
+        """Re-run marching cubes on the current :attr:`field`.
+
+        Use after externally modifying the SDF (e.g. contact angle boundary
+        conditions) so that :attr:`verts`/:attr:`indices`/:attr:`normals`
+        reflect the updated field.
+        """
+        if self._mc is None or self._field is None:
+            return
+
+        effective_threshold = 0.0
+        if self.mesh_smooth_iterations > 0:
+            shrink = 0.15 * math.sqrt(float(self.mesh_smooth_iterations)) * self.mesh_smooth_lambda * self.voxel_size
+            effective_threshold = -shrink / self.kernel_radius
+
+        self._mc.surface(self._field, effective_threshold)
+        verts = self._mc.verts
+        indices = self._mc.indices
+
+        if verts is None or verts.shape[0] == 0:
+            self._verts = self._indices = self._normals = None
+            return
+
+        device = self._device
+
+        if self.mesh_smooth_iterations > 0 and indices.shape[0] > 0:
+            num_verts = verts.shape[0]
+            num_tri_verts = indices.shape[0]
+            smoothed = wp.empty(num_verts, dtype=wp.vec3, device=device)
+            neighbor_sum = wp.zeros(num_verts, dtype=wp.vec3, device=device)
+            valence = wp.zeros(num_verts, dtype=wp.int32, device=device)
+
+            for _ in range(self.mesh_smooth_iterations):
+                neighbor_sum.zero_()
+                valence.zero_()
+                wp.launch(_laplacian_scatter, dim=num_tri_verts, inputs=[indices, verts, neighbor_sum, valence], device=device)
+                wp.launch(_laplacian_apply, dim=num_verts, inputs=[verts, neighbor_sum, valence, smoothed, self.mesh_smooth_lambda], device=device)
+                verts, smoothed = smoothed, verts
+
+        normals = compute_vertex_normals(verts, indices)
+
+        self._verts = verts
+        self._indices = indices
+        self._normals = normals
+
     # -- Internal helpers --
 
     def _ensure_resources(

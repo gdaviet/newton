@@ -3,11 +3,17 @@
 
 """Surface tension on a fluid cube using MPM.
 
-A cube of fluid particles is initialized in zero gravity with surface tension
-enabled. The CSF force pulls corners inward, causing the cube to evolve
-toward a spherical shape. The reconstructed surface mesh can be displayed
-alongside the particles.
+A cube of fluid particles is initialized with surface tension enabled.
+Without a ground plane (default), the CSF force pulls corners inward in zero
+gravity, causing the cube to evolve toward a spherical shape.
+
+With ``--ground-plane``, the cube rests on a solid surface under gravity and
+a contact angle can be prescribed via ``--contact-angle`` (degrees). The
+contact angle controls wetting: 90 is neutral, smaller values are hydrophilic,
+larger values are hydrophobic.
 """
+
+import math
 
 import numpy as np
 import warp as wp
@@ -41,8 +47,19 @@ class Example:
         mass = cell_volume * options.density
         radius = spacing * 0.5
 
+        # Position the cube depending on the scene mode
+        if options.corner:
+            # Resting in a ground + wall corner
+            origin = wp.vec3(radius, -half, radius)
+        elif options.ground_plane:
+            # Resting on a ground plane
+            origin = wp.vec3(-half, -half, radius)
+        else:
+            # Floating in zero gravity
+            origin = wp.vec3(-half, -half, -half)
+
         builder.add_particle_grid(
-            pos=wp.vec3(-half, -half, -half),
+            pos=origin,
             rot=wp.quat_identity(),
             vel=wp.vec3(0.0),
             dim_x=n,
@@ -56,8 +73,19 @@ class Example:
             radius_mean=radius,
         )
 
+        builder.default_shape_cfg.mu = options.collider_friction
+
+        if options.ground_plane or options.corner:
+            builder.add_shape_plane()  # z=0 ground, normal +Z
+        if options.corner:
+            builder.add_shape_plane(plane=[1.0, 0.0, 0.0, 0.0])  # x=0 wall, normal +X
+
         self.model = builder.finalize()
-        self.model.set_gravity(options.gravity)
+
+        if options.ground_plane or options.corner:
+            self.model.set_gravity(options.gravity)
+        else:
+            self.model.set_gravity((0.0, 0.0, 0.0))
 
         # Fluid material: no shear resistance, allows tension, viscous damping
         self.model.mpm.tensile_yield_ratio.fill_(1.0)
@@ -70,17 +98,18 @@ class Example:
         mpm_options.tolerance = options.tolerance
         mpm_options.max_iterations = options.max_iterations
         mpm_options.grid_type = "sparse"
+        mpm_options.collider_basis = "pic"
 
         self.solver = SolverImplicitMPM(self.model, mpm_options)
+
+        if options.ground_plane or options.corner:
+            contact_angle_rad = math.radians(options.contact_angle)
+            self.solver.setup_collider(collider_contact_angle=[contact_angle_rad])
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
 
-        # Surface extraction for visualization
-        self.surface_ctx = self.solver.create_particle_surface(
-            voxel_size=0.5 * options.voxel_size,
-            mesh_smooth_iterations=0,
-        )
+        self.ground_plane = options.ground_plane or options.corner
         self.show_surface = options.show_surface
 
         self.color_mode = options.color_mode
@@ -91,7 +120,10 @@ class Example:
         self.viewer.show_particles = options.show_particles
         self.viewer.set_model(self.model)
         if hasattr(self.viewer, "camera"):
-            self.viewer.set_camera(pos=wp.vec3(0.15, -0.15, 0.0), pitch=0.0, yaw=150.0)
+            if options.corner:
+                self.viewer.set_camera(pos=wp.vec3(0.15, -0.15, half), pitch=0.0, yaw=120.0)
+            else:
+                self.viewer.set_camera(pos=wp.vec3(0.15, -0.15, 0.1), pitch=0.0, yaw=150.0)
 
         if isinstance(self.viewer, newton.viewer.ViewerGL):
             self.viewer.register_ui_callback(self.render_ui, position="side")
@@ -107,11 +139,16 @@ class Example:
 
     def test_final(self):
         positions = self.state_0.particle_q.numpy()
-        center = positions.mean(axis=0)
-        dists = np.linalg.norm(positions - center, axis=1)
-        cv = np.std(dists) / np.mean(dists)
-        if cv > 0.3:
-            raise ValueError(f"Particles not becoming spherical (CV={cv:.3f})")
+        if self.ground_plane:
+            # With ground plane: just check particles haven't fallen through
+            if np.any(positions[:, 2] < -0.01):
+                raise ValueError("Particles fell through the ground plane")
+        else:
+            center = positions.mean(axis=0)
+            dists = np.linalg.norm(positions - center, axis=1)
+            cv = np.std(dists) / np.mean(dists)
+            if cv > 0.3:
+                raise ValueError(f"Particles not becoming spherical (CV={cv:.3f})")
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -136,13 +173,16 @@ class Example:
                 colors=self.particle_colors,
             )
 
-        # Reconstructed surface mesh
-        verts, indices, normals = self.solver.extract_particle_surface(
-            self.state_0, self.surface_ctx
-        )
-        if verts is not None and verts.shape[0] > 0:
+        # Reconstructed surface mesh (from the solver's internal SDF)
+        surface = getattr(self.solver, "_st_surface", None)
+        if surface is not None and surface.verts is not None and surface.verts.shape[0] > 0:
+            normals = surface.normals
+            if normals is None:
+                from newton._src.utils.mesh import compute_vertex_normals
+
+                normals = compute_vertex_normals(surface.verts, surface.indices)
             self.viewer.log_mesh(
-                "/model/particle_surface", verts, indices, normals,
+                "/model/particle_surface", surface.verts, surface.indices, normals,
                 dynamic=True, hidden=not self.show_surface,
             )
 
@@ -185,7 +225,11 @@ class Example:
         # Scene
         parser.add_argument("--cube-size", type=float, default=0.05, help="Side length of the initial cube [m]")
         parser.add_argument("--particles-per-cell-axis", type=int, default=2, help="Particles per voxel per axis")
-        parser.add_argument("--gravity", type=float, nargs=3, default=[0, 0, 0])
+        parser.add_argument("--gravity", type=float, nargs=3, default=[0, 0, -9.81])
+        parser.add_argument("--ground-plane", action="store_true", default=False, help="Add a ground plane collider")
+        parser.add_argument("--corner", action="store_true", default=False, help="Add ground + wall corner colliders")
+        parser.add_argument("--contact-angle", type=float, default=90.0, help="Contact angle [degrees] (with --ground-plane or --corner)")
+        parser.add_argument("--collider-friction", type=float, default=0.01, help="Collider friction coefficient")
         parser.add_argument("--fps", type=float, default=120.0)
         parser.add_argument("--substeps", type=int, default=4)
 

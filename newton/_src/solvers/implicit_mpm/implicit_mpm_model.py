@@ -33,6 +33,8 @@ _DEFAULT_FRICTION = 0.5
 """Default friction coefficient for colliders"""
 _DEFAULT_ADHESION = 0.0
 """Default adhesion coefficient for colliders (Pa)"""
+_DEFAULT_CONTACT_ANGLE = math.pi / 2.0
+"""Default contact angle for colliders [rad]. pi/2 = 90 degrees = neutral wetting."""
 
 
 def _reuse_or_allocate(arr: wp.array | None, num_particles: int, dtype=float) -> wp.array:
@@ -386,6 +388,9 @@ class ImplicitMPMModel:
         self.collider.query_max_dist = self.voxel_size * math.sqrt(3.0)
         self.collider_body_count = int(np.max(body_ids + 1, initial=0))
 
+        ca = self.collider.material_contact_angle.numpy()
+        self._has_contact_angle = bool(np.any(np.abs(ca - math.pi / 2.0) > 1e-6))
+
     def setup_collider(
         self,
         collider_meshes: list[wp.Mesh] | None = None,
@@ -394,6 +399,7 @@ class ImplicitMPMModel:
         collider_friction: list[float] | None = None,
         collider_adhesion: list[float] | None = None,
         collider_projection_threshold: list[float] | None = None,
+        collider_contact_angle: list[float] | None = None,
         model: newton.Model | None = None,
         body_com: wp.array | None = None,
         body_mass: wp.array | None = None,
@@ -421,6 +427,8 @@ class ImplicitMPMModel:
             collider_adhesion: Per-mesh adhesion (Pa).
             collider_projection_threshold: Per-mesh projection threshold, i.e. how far below the surface the
               particle may be before it is projected out. (m)
+            collider_contact_angle: Per-mesh contact angle for surface tension wetting [rad].
+              Default pi/2 (90 degrees, neutral wetting).
             model: The model to read collider properties from. Default to self.model.
             body_com: For dynamic colliders, per-body center of mass. Default to model.body_com.
             body_mass: For dynamic colliders, per-body mass. Default to model.body_mass.
@@ -464,11 +472,14 @@ class ImplicitMPMModel:
             collider_friction = [None] * collider_count
         if collider_adhesion is None:
             collider_adhesion = [None] * collider_count
+        if collider_contact_angle is None:
+            collider_contact_angle = [None] * collider_count
 
         assert len(collider_body_ids) == len(collider_thicknesses)
         assert len(collider_body_ids) == len(collider_projection_threshold)
         assert len(collider_body_ids) == len(collider_friction)
         assert len(collider_body_ids) == len(collider_adhesion)
+        assert len(collider_body_ids) == len(collider_contact_angle)
 
         if body_com is None:
             body_com = model.body_com
@@ -501,6 +512,7 @@ class ImplicitMPMModel:
         material_friction = [_DEFAULT_FRICTION] * material_count
         material_adhesion = [_DEFAULT_ADHESION] * material_count
         material_projection_threshold = [_DEFAULT_PROJECTION_THRESHOLD * self.voxel_size] * material_count
+        material_contact_angle = [_DEFAULT_CONTACT_ANGLE] * material_count
 
         def assign_material(
             material_id: int,
@@ -508,6 +520,7 @@ class ImplicitMPMModel:
             friction: float | None = None,
             adhesion: float | None = None,
             projection_threshold: float | None = None,
+            contact_angle: float | None = None,
         ):
             if thickness is not None:
                 material_thickness[material_id] = thickness
@@ -517,6 +530,8 @@ class ImplicitMPMModel:
                 material_adhesion[material_id] = adhesion
             if projection_threshold is not None:
                 material_projection_threshold[material_id] = projection_threshold
+            if contact_angle is not None:
+                material_contact_angle[material_id] = contact_angle
 
         def assign_collider_material(material_id: int, collider_id: int):
             assign_material(
@@ -525,6 +540,7 @@ class ImplicitMPMModel:
                 collider_friction[collider_id],
                 collider_adhesion[collider_id],
                 collider_projection_threshold[collider_id],
+                collider_contact_angle[collider_id],
             )
 
         for collider_id, body_id in enumerate(collider_body_ids):
@@ -580,6 +596,7 @@ class ImplicitMPMModel:
             self.collider.material_friction = wp.array(material_friction, dtype=float)
             self.collider.material_adhesion = wp.array(material_adhesion, dtype=float)
             self.collider.material_projection_threshold = wp.array(material_projection_threshold, dtype=float)
+            self.collider.material_contact_angle = wp.array(material_contact_angle, dtype=float)
 
         self.collider.body_com = body_com
         self.collider_body_mass = body_mass
@@ -600,6 +617,10 @@ class ImplicitMPMModel:
     @property
     def has_surface_tension(self):
         return self._has_surface_tension
+
+    @property
+    def has_contact_angle(self):
+        return self._has_contact_angle
 
     @property
     def has_compliant_colliders(self):
