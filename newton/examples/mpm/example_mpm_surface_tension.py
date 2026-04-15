@@ -99,6 +99,7 @@ class Example:
         mpm_options.max_iterations = options.max_iterations
         mpm_options.grid_type = "sparse"
         mpm_options.collider_basis = "pic"
+        mpm_options.contact_angle_mode = options.contact_angle_mode
 
         self.solver = SolverImplicitMPM(self.model, mpm_options)
 
@@ -224,12 +225,15 @@ class Example:
 
         # Scene
         parser.add_argument("--cube-size", type=float, default=0.05, help="Side length of the initial cube [m]")
-        parser.add_argument("--particles-per-cell-axis", type=int, default=2, help="Particles per voxel per axis")
+        parser.add_argument("--particles-per-cell-axis", type=int, default=3, help="Particles per voxel per axis")
         parser.add_argument("--gravity", type=float, nargs=3, default=[0, 0, -9.81])
         parser.add_argument("--ground-plane", action="store_true", default=False, help="Add a ground plane collider")
         parser.add_argument("--corner", action="store_true", default=False, help="Add ground + wall corner colliders")
         parser.add_argument("--contact-angle", type=float, default=90.0, help="Contact angle [degrees] (with --ground-plane or --corner)")
-        parser.add_argument("--collider-friction", type=float, default=0.01, help="Collider friction coefficient")
+        parser.add_argument("--collider-friction", type=float, default=0.5, help="Collider friction coefficient")
+        parser.add_argument("--contact-angle-mode", type=str, default="union",
+                            choices=["force", "sdf", "union", "virtual"],
+                            help="Contact angle enforcement mode")
         parser.add_argument("--fps", type=float, default=120.0)
         parser.add_argument("--substeps", type=int, default=4)
 

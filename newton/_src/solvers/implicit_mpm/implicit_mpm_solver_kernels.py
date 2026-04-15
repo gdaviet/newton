@@ -242,6 +242,61 @@ def union_particle_collider_sdf(
 
 
 @wp.kernel
+def apply_virtual_surface_bc(
+    field: wp.array3d[wp.float32],
+    field_orig: wp.array3d[wp.float32],
+    grid_origin: wp.vec3,
+    voxel_size: float,
+    max_depth: float,
+    collider: Collider,
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_q_prev: wp.array[wp.transform],
+):
+    """Construct a virtual surface inside collider regions (Wang et al. 2005).
+
+    Projects each solid-interior node onto the collider wall, samples the
+    original particle SDF there, and extends linearly at the contact-angle
+    slope: ``φ_virtual = φ_wall - d_coll * cos(θ)``.
+
+    Continuous at the wall (``φ_virtual = φ_wall`` when ``d_coll = 0``),
+    with wall-normal gradient ``cos(θ)`` — no gradient discontinuity.
+    """
+    i, j, k = wp.tid()
+    x = grid_origin + voxel_size * wp.vec3(float(i), float(j), float(k))
+
+    d_coll, n_coll, _vel, _coll_id, material_id = collision_sdf(
+        x, collider, body_q, body_qd, body_q_prev, 0.0
+    )
+
+    # Only modify nodes inside the solid
+    if d_coll >= 0.0:
+        return
+    depth = -d_coll
+    if depth > max_depth:
+        return
+
+    cos_theta = wp.cos(collider.material_contact_angle[material_id])
+
+    # Project onto wall, sample original particle SDF there
+    x_wall = x - d_coll * n_coll
+    phi_wall = _sample_sdf_trilinear(field_orig, grid_origin, 1.0 / voxel_size, x_wall)
+
+    # Virtual surface: linear extension at contact angle slope
+    # d_coll < 0, so -d_coll * cos_theta > 0 for θ < 90° → slopes toward air
+    phi_virtual = phi_wall - d_coll * cos_theta
+
+    # Pure virtual near wall, blend to original deeper
+    blend_start = 0.5 * max_depth
+    if depth <= blend_start:
+        field[i, j, k] = phi_virtual
+    else:
+        t = (depth - blend_start) / (max_depth - blend_start)
+        blend = t * t * (3.0 - 2.0 * t)
+        field[i, j, k] = (1.0 - blend) * phi_virtual + blend * field_orig[i, j, k]
+
+
+@wp.kernel
 def _blend_near_wall(
     blurred: wp.array3d[wp.float32],
     pre_blur: wp.array3d[wp.float32],

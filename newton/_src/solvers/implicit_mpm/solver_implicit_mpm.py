@@ -53,6 +53,7 @@ from .implicit_mpm_solver_kernels import (
     integrate_csf_force,
     integrate_csf_force_contact_angle,
     union_particle_collider_sdf,
+    apply_virtual_surface_bc,
     integrate_elastic_parameters,
     integrate_fraction,
     _sdf_to_indicator,
@@ -707,12 +708,13 @@ class SolverImplicitMPM(SolverBase):
         """Numerical drag for the background air."""
 
         # experimental
-        contact_angle_mode: Literal["force", "sdf", "union"] = "union"
-        """Contact angle enforcement mode. ``'union'`` unions the particle and
-        collider SDFs then redistances, combined with force-level angle filtering.
-        ``'force'`` only filters the CSF force by angle without SDF modification.
-        ``'sdf'`` extrapolates the fluid SDF into the solid via ghost-fluid
-        reflection (experimental)."""
+        contact_angle_mode: Literal["force", "sdf", "union", "virtual"] = "virtual"
+        """Contact angle enforcement mode. ``'virtual'`` constructs a virtual
+        surface inside the solid (Wang et al. 2005) by projecting the particle
+        SDF onto the wall and extending at the contact angle slope, combined
+        with force-level angle filtering. ``'union'`` uses reflection-based
+        SDF extension. ``'force'`` only filters the CSF force by angle without
+        SDF modification. ``'sdf'`` uses ghost-fluid reflection (experimental)."""
         collider_normal_from_sdf_gradient: bool = False
         """Compute collider normals from sdf gradient rather than closest point"""
         collider_basis: _MPMColliderBasisName = "S2"
@@ -2404,11 +2406,11 @@ class SolverImplicitMPM(SolverBase):
             # Step 1: Compute density field from particles
             if not hasattr(self, "_st_surface"):
                 sdf_voxel_size = 0.5 * mpm_model.voxel_size
-                # Extra padding when union mode needs collider SDF coverage
-                padding = 8 if self._options.contact_angle_mode == "union" else 4
+                # Extra padding when SDF-modifying modes need collider SDF coverage
+                padding = 8 if self._options.contact_angle_mode in ("union", "virtual") else 4
                 self._st_surface = ParticleSurface(
                     voxel_size=sdf_voxel_size,
-                    kernel_radius=3.0 * mpm_model.voxel_size,
+                    kernel_radius=1.5 * mpm_model.voxel_size,
                     threshold=0.15,
                     padding=padding,
                     field_smooth_radius=1,
@@ -2429,6 +2431,9 @@ class SolverImplicitMPM(SolverBase):
                     self._st_surface.resurface()
                 elif ca_mode == "union":
                     self._union_collider_sdf(state_in)
+                    self._st_surface.resurface()
+                elif ca_mode == "virtual":
+                    self._apply_virtual_surface_bc(state_in)
                     self._st_surface.resurface()
 
             # Step 2: Get SDF fem field (already converted from density in ParticleSurface)
@@ -2589,6 +2594,46 @@ class SolverImplicitMPM(SolverBase):
         surface._apply_field_blur(nx, ny, nz, surface._device)
         surface._apply_redistancing(nx, ny, nz, surface._device)
 
+    def _apply_virtual_surface_bc(self, state_in: newton.State):
+        """Construct a virtual surface inside collider regions (Wang et al. 2005).
+
+        Projects each solid-interior node onto the wall, samples the particle
+        SDF there, and extends at the contact angle slope. Redistances afterwards.
+        """
+        surface = self._st_surface
+        nx, ny, nz = surface.grid_dims
+        collider = self._mpm_model.collider
+
+        # Snapshot the unmodified SDF for wall-projection lookups
+        if not hasattr(self, "_st_field_orig") or self._st_field_orig.shape != surface.field.shape:
+            self._st_field_orig = wp.empty_like(surface.field)
+        wp.copy(self._st_field_orig, surface.field)
+
+        prev_query_dist = collider.query_max_dist
+        collider.query_max_dist = max(prev_query_dist, surface.kernel_radius + surface.padding * surface.voxel_size)
+
+        wp.launch(
+            apply_virtual_surface_bc,
+            dim=(nx, ny, nz),
+            inputs=[
+                surface.field,
+                self._st_field_orig,
+                surface.grid_origin,
+                surface.voxel_size,
+                8.0 * surface.voxel_size,  # max_depth
+                collider,
+                state_in.body_q,
+                None,
+                None,
+            ],
+        )
+
+        collider.query_max_dist = prev_query_dist
+
+        # Redistance only — projection is continuous at the wall, no blur needed
+        if surface.redistance_iterations > 0:
+            surface._apply_redistancing(nx, ny, nz, surface._device)
+
     def _apply_surface_tension_force(
         self,
         state_in: newton.State,
@@ -2610,7 +2655,7 @@ class SolverImplicitMPM(SolverBase):
 
             use_contact_angle = (
                 mpm_model.has_contact_angle
-                and self._options.contact_angle_mode in ("force", "union")
+                and self._options.contact_angle_mode in ("force", "union", "virtual")
             )
 
             if use_contact_angle:
