@@ -407,6 +407,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             solver.render_mujoco_viewer()
     """
 
+    coupling_unsupported = frozenset(
+        {
+            CouplingInterface.Hook.BODY_PROXY_HARVEST,
+            CouplingInterface.Hook.PARTICLE_PROXY_HARVEST,
+        }
+    )
+
     class CtrlSource(IntEnum):
         """Control source for MuJoCo actuators.
 
