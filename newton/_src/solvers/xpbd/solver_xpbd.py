@@ -5,6 +5,7 @@ import warp as wp
 
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelFlags, State
+from ..coupling import CouplingInterface
 from ..solver import SolverBase
 from .kernels import (
     accumulate_weighted_contact_impulse,
@@ -29,7 +30,7 @@ from .kernels import (
 )
 
 
-class SolverXPBD(SolverBase):
+class SolverXPBD(SolverBase, CouplingInterface):
     """An implicit integrator using eXtended Position-Based Dynamics (XPBD) for rigid and soft body simulation.
 
     References:
