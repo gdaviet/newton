@@ -19,7 +19,7 @@ import newton
 
 from ...core.types import override
 from ...sim import ModelFlags
-from ..coupling import CouplingInputStateFlags, CouplingInterface
+from ..coupled.interface import CouplingInputStateFlags, CouplingInterface
 from ..solver import SolverBase
 from .implicit_mpm_model import ImplicitMPMModel
 from .rasterized_collisions import (

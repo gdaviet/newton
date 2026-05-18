@@ -25,7 +25,7 @@ from ...sim import (
     State,
     StateFlags,
 )
-from ..coupling import CouplingInterface
+from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
 
 if TYPE_CHECKING:

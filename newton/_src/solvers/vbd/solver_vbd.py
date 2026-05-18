@@ -20,7 +20,7 @@ from ...sim import (
     ModelFlags,
     State,
 )
-from ..coupling import CouplingInputStateFlags, CouplingInterface
+from ..coupled.interface import CouplingInputStateFlags, CouplingInterface
 from ..solver import SolverBase
 from ..xpbd.kernels import apply_joint_forces
 from .particle_vbd_kernels import (

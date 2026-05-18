@@ -34,7 +34,7 @@ from ...sim.graph_coloring import color_graph, plot_graph
 from ...utils import topological_sort
 from ...utils.benchmark import event_scope
 from ...utils.import_utils import string_to_warp
-from ..coupling import CouplingEndpointKind, CouplingInterface
+from ..coupled.interface import CouplingEndpointKind, CouplingInterface
 from ..solver import SolverBase
 from .constants import (
     DEFAULT_LIMIT_GAIN_RTOL,

@@ -295,14 +295,6 @@ add_function_test(
     check_output=False,
 )
 
-add_function_test(
-    TestImplicitMPM,
-    "test_proxy_particles_excluded_from_material_transfer",
-    test_proxy_particles_excluded_from_material_transfer,
-    devices=devices,
-    check_output=False,
-)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)

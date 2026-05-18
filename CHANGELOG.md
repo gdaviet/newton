@@ -147,7 +147,7 @@
 - Add per-mesh `roughness` and `metallic` PBR overrides to `ViewerBase.log_mesh()`
 - Support negative (mirrored) scale on mesh, convex hull, and SDF shapes, so a single `Mesh` instance can be shared across shapes with different signed scales without re-baking
 - Add an experimental coupled solver framework:
-  - Introduce `SolverCoupled`, `SolverProxyCoupled`, `SolverAdmmCoupled`, and `ModelView` for multi-solver ownership, state mapping, and view-local model overrides.
+  - Introduce `newton.solvers.coupled_experimental` with `SolverCoupled`, `SolverProxyCoupled`, `SolverAdmmCoupled`, and `ModelView` for multi-solver ownership, state mapping, and view-local model overrides.
   - Support body and particle proxy coupling with virtual inertia, solver hooks, MPM collider/transfer proxies, and convergence diagnostics.
   - Support ADMM coupling from model-derived joints, body-particle attachments, and collision-detected rigid/particle contacts with Coulomb friction.
   - Add standalone multiphysics examples and regression coverage for MuJoCo/Kamino, VBD, XPBD, MPM, ADMM contacts, and the cable robot proxy path.

@@ -169,14 +169,17 @@ def write_module_page(mod_name: str, api_toctree_modules: set[str] | None = None
         api_toctree_modules = set(api_modules())
 
     is_solver_submodule = mod_name.startswith("newton.solvers.") and mod_name != "newton.solvers"
-    if is_solver_submodule:
+    is_public_solver_submodule = mod_name == "newton.solvers.coupled_experimental"
+    if is_public_solver_submodule:
+        module = importlib.import_module("newton.solvers").coupled_experimental
+    elif is_solver_submodule:
         sub_name = mod_name.split(".", 2)[2]
         module = importlib.import_module(f"newton._src.solvers.{sub_name}")
     else:
         module = importlib.import_module(mod_name)
 
     symbols = public_symbols(module)
-    if is_solver_submodule:
+    if is_solver_submodule and not is_public_solver_submodule:
         # Keep solver classes centralized in newton.solvers.
         symbols = [name for name in symbols if not name.startswith("Solver")]
 
