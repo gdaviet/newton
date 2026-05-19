@@ -150,7 +150,7 @@
   - Introduce `newton.solvers.coupled_experimental` with `SolverCoupled`, `SolverProxyCoupled`, `SolverAdmmCoupled`, and `ModelView` for multi-solver ownership, state mapping, and view-local model overrides.
   - Support body and particle proxy coupling with virtual inertia, solver hooks, MPM collider/transfer proxies, and convergence diagnostics.
   - Support ADMM coupling from model-derived joints, body-particle attachments, and collision-detected rigid/particle contacts with Coulomb friction.
-  - Add standalone multiphysics examples and regression coverage for MuJoCo/Kamino, VBD, XPBD, MPM, ADMM contacts, and the cable robot proxy path.
+  - Add standalone multiphysics examples and regression coverage for MuJoCo/Kamino, VBD, XPBD, MPM, and ADMM contacts.
 
 ### Changed
 
