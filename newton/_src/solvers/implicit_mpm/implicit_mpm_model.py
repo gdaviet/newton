@@ -591,7 +591,7 @@ class ImplicitMPMModel:
             for collider_id in range(collider_count)
         ]
         collider_particle_offsets = [0]
-        flat_collider_particle_ids = []
+        collider_particle_id_chunks = []
         for collider_id, particle_ids in enumerate(collider_particle_ids):
             if particle_ids is None:
                 collider_particle_offsets.append(collider_particle_offsets[-1])
@@ -618,8 +618,15 @@ class ImplicitMPMModel:
             ):
                 raise ValueError(f"collider_particle_ids[{collider_id}] contains particle ids outside the model")
 
-            flat_collider_particle_ids.extend(int(i) for i in particle_ids_np)
+            collider_particle_id_chunks.append(particle_ids_np)
             collider_particle_offsets.append(collider_particle_offsets[-1] + particle_ids_np.shape[0])
+
+        if not collider_particle_id_chunks:
+            flat_collider_particle_ids = np.empty(0, dtype=int)
+        elif len(collider_particle_id_chunks) == 1:
+            flat_collider_particle_ids = collider_particle_id_chunks[0]
+        else:
+            flat_collider_particle_ids = np.concatenate(collider_particle_id_chunks)
 
         # Create device arrays
         with wp.ScopedDevice(self.model.device):
