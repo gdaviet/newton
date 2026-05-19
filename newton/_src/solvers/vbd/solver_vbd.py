@@ -10,6 +10,7 @@ import numpy as np
 import warp as wp
 
 from ...core.types import override
+from ...math import quat_velocity
 from ...sim import (
     BodyFlags,
     Contacts,
@@ -443,13 +444,14 @@ class SolverVBD(SolverBase, CouplingInterface):
         # Defaults to True and is reset to True when consumed by step().
         self._update_rigid_history = True
 
+        self._coupling_has_rigid_avbd_state = not self.integrate_with_external_rigid_solver and model.body_count > 0
+
         # Conditional coupling hooks: the notify and body-proxy harvest hooks
         # only have meaningful implementations when VBD owns rigid-body AVBD
         # state. Hide them on this instance otherwise so the coupled wrapper
         # falls back to its generic logic.
-        if not hasattr(self, "body_q_prev"):
+        if not self._coupling_has_rigid_avbd_state:
             self.coupling_notify_input_state_update = None
-        if not (hasattr(self, "body_forces") and hasattr(self, "body_torques")):
             self.coupling_harvest_proxy_wrenches = None
 
     def _init_particle_system(
@@ -811,14 +813,12 @@ class SolverVBD(SolverBase, CouplingInterface):
             or not (flags & CouplingInputStateFlags.BODY_QD)
             or state.body_q is None
             or state.body_qd is None
-            or not hasattr(self, "body_q_prev")
+            or not self._coupling_has_rigid_avbd_state
         ):
             return
 
         iteration_restart = int(bool(restart))
-        has_proxy_body_q_prev = hasattr(self, "_coupling_proxy_body_q_prev")
-        if has_proxy_body_q_prev:
-            wp.copy(self._coupling_proxy_body_q_prev, self.body_q_prev)
+        wp.copy(self._coupling_proxy_body_q_prev, self.body_q_prev)
 
         wp.launch(
             _update_vbd_body_input_state_kernel,
@@ -835,7 +835,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             ],
             device=self.device,
         )
-        if iteration_restart != 0 and has_proxy_body_q_prev:
+        if iteration_restart != 0:
             wp.copy(self._coupling_proxy_body_q_prev, self.body_q_prev)
 
     def coupling_prepare_proxy_contacts(
@@ -879,7 +879,7 @@ class SolverVBD(SolverBase, CouplingInterface):
     ) -> None:
         """Harvest contact-only proxy-body wrenches."""
         del state
-        if not hasattr(self, "body_q_prev") or not hasattr(self, "_coupling_proxy_body_q_prev"):
+        if not self._coupling_has_rigid_avbd_state:
             raise NotImplementedError("VBD proxy contact harvest requires rigid-body AVBD state")
 
         if contacts is None or state_out is None:
@@ -3025,17 +3025,6 @@ class SolverVBD(SolverBase, CouplingInterface):
             self.trimesh_collision_detector.rebuild(state.particle_q)
 
 
-@wp.func
-def _vbd_proxy_quat_velocity(q_now: wp.quat, q_prev: wp.quat, dt: float) -> wp.vec3:
-    q1 = wp.normalize(q_now)
-    q0 = wp.normalize(q_prev)
-    if wp.dot(q1, q0) < 0.0:
-        q0 = wp.quat(-q0[0], -q0[1], -q0[2], -q0[3])
-    dq = wp.normalize(wp.mul(q1, wp.quat_inverse(q0)))
-    axis, angle = wp.quat_to_axis_angle(dq)
-    return axis * (angle / dt)
-
-
 @wp.kernel(enable_backward=False)
 def _update_vbd_body_input_state_kernel(
     dt: float,
@@ -3067,7 +3056,7 @@ def _update_vbd_body_input_state_kernel(
 
     r_teleported = wp.transform_get_rotation(q_teleported)
     r_prev = wp.transform_get_rotation(q_prev)
-    dw = _vbd_proxy_quat_velocity(r_teleported, r_prev, dt)
+    dw = quat_velocity(r_teleported, r_prev, dt)
 
     body_qd[local_body] = body_qd[local_body] + wp.spatial_vector(dv, dw)
     body_q[local_body] = q_prev

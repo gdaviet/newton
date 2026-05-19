@@ -513,9 +513,12 @@ def fill_collider_coupling_matrices(
         local_k = indices[3 * face + 2]
 
         offset = collider.collider_particle_offsets[collider_id]
-        particle_i = collider.collider_particle_ids[offset + local_i]
-        particle_j = collider.collider_particle_ids[offset + local_j]
-        particle_k = collider.collider_particle_ids[offset + local_k]
+        flat_i = offset + local_i
+        flat_j = offset + local_j
+        flat_k = offset + local_k
+        particle_i = collider.collider_particle_ids[flat_i]
+        particle_j = collider.collider_particle_ids[flat_j]
+        particle_k = collider.collider_particle_ids[flat_k]
 
         w_j = query.u
         w_k = query.v
@@ -526,21 +529,21 @@ def fill_collider_coupling_matrices(
         m_i = particle_mass[particle_i]
         if m_i > 0.0 and w_i > 0.0:
             J_rows[slot + 0] = i
-            J_cols[slot + 0] = particle_block_offset + particle_i
+            J_cols[slot + 0] = particle_block_offset + flat_i
             J_values[slot + 0] = w_i * Id
             IJtm_values[slot + 0] = (cell_volume * w_i / m_i) * Id
 
         m_j = particle_mass[particle_j]
         if m_j > 0.0 and w_j > 0.0:
             J_rows[slot + 1] = i
-            J_cols[slot + 1] = particle_block_offset + particle_j
+            J_cols[slot + 1] = particle_block_offset + flat_j
             J_values[slot + 1] = w_j * Id
             IJtm_values[slot + 1] = (cell_volume * w_j / m_j) * Id
 
         m_k = particle_mass[particle_k]
         if m_k > 0.0 and w_k > 0.0:
             J_rows[slot + 2] = i
-            J_cols[slot + 2] = particle_block_offset + particle_k
+            J_cols[slot + 2] = particle_block_offset + flat_k
             J_values[slot + 2] = w_k * Id
             IJtm_values[slot + 2] = (cell_volume * w_k / m_k) * Id
 
@@ -728,8 +731,9 @@ def build_rigidity_operator(
     """Build the collider operator that couples collider impulses to finite-mass DOFs.
 
     Builds block-sparse maps between active collider nodes and finite-mass
-    collider DOFs. Only nodes with a valid collider id and only finite-mass
-    colliders produce non-zero blocks.
+    collider DOFs. Rigid-body DOFs occupy the first ``2 * body_count`` block
+    columns; deformable collider vertices use a compact block range after that
+    rather than their global model particle ids.
 
     Internally constructs:
       - J: kinematic Jacobian blocks per node relating collider DOF velocity to nodal velocity.
@@ -754,7 +758,7 @@ def build_rigidity_operator(
 
     vel_node_count = node_volumes.shape[0]
     body_count = body_q.shape[0]
-    particle_count = particle_mass.shape[0]
+    deformable_vertex_count = collider.collider_particle_ids.shape[0]
     particle_block_offset = 2 * body_count
 
     max_blocks_per_node = 3
@@ -785,7 +789,7 @@ def build_rigidity_operator(
 
     J = wps.bsr_from_triplets(
         rows_of_blocks=vel_node_count,
-        cols_of_blocks=particle_block_offset + particle_count,
+        cols_of_blocks=particle_block_offset + deformable_vertex_count,
         rows=J_rows,
         columns=J_cols,
         values=J_values,
@@ -793,7 +797,7 @@ def build_rigidity_operator(
 
     IJtm = wps.bsr_from_triplets(
         cols_of_blocks=vel_node_count,
-        rows_of_blocks=particle_block_offset + particle_count,
+        rows_of_blocks=particle_block_offset + deformable_vertex_count,
         columns=J_rows,
         rows=J_cols,
         values=IJtm_values,

@@ -19,22 +19,7 @@ from __future__ import annotations
 
 import warp as wp
 
-# ------------------------------------------------------------------
-# Helper: angular velocity from two quaternions
-# ------------------------------------------------------------------
-
-
-@wp.func
-def _quat_velocity(q_now: wp.quat, q_prev: wp.quat, dt: float) -> wp.vec3:
-    """Angular velocity (world frame) from successive quaternions."""
-    q1 = wp.normalize(q_now)
-    q0 = wp.normalize(q_prev)
-    if wp.dot(q1, q0) < 0.0:
-        q0 = wp.quat(-q0[0], -q0[1], -q0[2], -q0[3])
-    dq = wp.normalize(wp.mul(q1, wp.quat_inverse(q0)))
-    axis, angle = wp.quat_to_axis_angle(dq)
-    return axis * (angle / dt)
-
+from ...math import quat_velocity
 
 # ------------------------------------------------------------------
 # 1. Sync proxy states
@@ -133,7 +118,7 @@ def smooth_proxy_teleportation_kernel(
     # Rotational correction
     r_teleported = wp.transform_get_rotation(q_teleported)
     r_prev = wp.transform_get_rotation(q_prev)
-    dw = _quat_velocity(r_teleported, r_prev, dt)
+    dw = quat_velocity(r_teleported, r_prev, dt)
 
     # Add correction to the synced velocity
     qd = dst_body_qd[b]
