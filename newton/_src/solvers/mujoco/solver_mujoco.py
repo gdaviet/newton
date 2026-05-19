@@ -3283,8 +3283,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # --- New unified mappings: MuJoCo[world, entity] -> Newton[entity] ---
         self.mjc_body_to_newton: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, body] to Newton body index. Shape [nworld, nbody], dtype int32."""
-        self.newton_body_to_mjc_body: wp.array[wp.int32] | None = None
-        """Mapping from Newton body index to MuJoCo body index. Shape [body_count], dtype int32."""
         self.mjc_geom_to_newton_shape: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, geom] to Newton shape index. Shape [nworld, ngeom], dtype int32."""
         self.mjc_jnt_to_newton_jnt: wp.array2d[wp.int32] | None = None
@@ -3583,7 +3581,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         """Evaluate MuJoCo articulated effective masses for coupling endpoints."""
         if (
             self.mjw_model is None
-            or self.newton_body_to_mjc_body is None
+            or self.mjc_body_to_newton is None
             or self.model.body_world is None
             or self.model.body_mass is None
             or self.model.particle_mass is None
@@ -3603,7 +3601,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.model.body_mass,
                 self.model.particle_mass,
                 self.model.body_world,
-                self.newton_body_to_mjc_body,
+                self.mjc_body_to_newton,
                 self.mjw_model.body_invweight0,
             ],
             outputs=[out],
@@ -3626,7 +3624,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
         if (
             self.mjw_model is None
-            or self.newton_body_to_mjc_body is None
+            or self.mjc_body_to_newton is None
             or self.model.body_world is None
             or self.model.body_mass is None
             or self.model.body_inertia is None
@@ -3649,7 +3647,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.model.body_inertia,
                 self.model.particle_mass,
                 self.model.body_world,
-                self.newton_body_to_mjc_body,
+                self.mjc_body_to_newton,
                 self.mjw_model.body_invweight0,
             ],
             outputs=[out_mass, out_inertia],
@@ -6153,13 +6151,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     for w in range(nworld):
                         mjc_body_to_newton_np[w, mjc_body] = w * bodies_per_world + newton_body_in_world
             self.mjc_body_to_newton = wp.array(mjc_body_to_newton_np, dtype=wp.int32)
-            newton_body_to_mjc_body_np = np.full(model.body_count, -1, dtype=np.int32)
-            for world in range(nworld):
-                for mjc_body in range(nbody):
-                    newton_body = mjc_body_to_newton_np[world, mjc_body]
-                    if newton_body >= 0:
-                        newton_body_to_mjc_body_np[newton_body] = mjc_body
-            self.newton_body_to_mjc_body = wp.array(newton_body_to_mjc_body_np, dtype=wp.int32, device=model.device)
 
             # Common variables for mapping creation
             njnt = self.mj_model.njnt

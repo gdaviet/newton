@@ -224,6 +224,20 @@ def quat_xyzw_to_wxyz(q: wp.quat) -> wp.quat:
 
 
 # Coupling kernels
+@wp.func
+def find_mujoco_body_from_newton_body(
+    world: int,
+    newton_body: int,
+    mjc_body_to_newton: wp.array2d[wp.int32],
+) -> int:
+    mjc_body = int(-1)
+    if world >= 0 and world < mjc_body_to_newton.shape[0]:
+        for candidate in range(mjc_body_to_newton.shape[1]):
+            if mjc_body_to_newton[world, candidate] == newton_body:
+                mjc_body = candidate
+    return mjc_body
+
+
 @wp.kernel
 def eval_mujoco_coupling_effective_mass_kernel(
     endpoint_kind: wp.array[int],
@@ -234,7 +248,7 @@ def eval_mujoco_coupling_effective_mass_kernel(
     body_mass: wp.array[float],
     particle_mass: wp.array[float],
     body_world: wp.array[int],
-    newton_body_to_mjc_body: wp.array[int],
+    mjc_body_to_newton: wp.array2d[wp.int32],
     body_invweight0: wp.array2d[wp.vec2],
     out: wp.array[float],
 ):
@@ -247,14 +261,14 @@ def eval_mujoco_coupling_effective_mass_kernel(
         if index >= 0 and index < body_mass.shape[0]:
             value = body_mass[index]
 
-        if index >= 0 and index < newton_body_to_mjc_body.shape[0]:
+        if index >= 0:
             world = int(0)
             if body_invweight0.shape[0] > 1:
                 if index < body_world.shape[0]:
                     world = body_world[index]
                 else:
                     world = int(-1)
-            mjc_body = newton_body_to_mjc_body[index]
+            mjc_body = find_mujoco_body_from_newton_body(world, index, mjc_body_to_newton)
             if (
                 world >= 0
                 and world < body_invweight0.shape[0]
@@ -286,7 +300,7 @@ def eval_mujoco_coupling_effective_mass_block_kernel(
     body_inertia: wp.array[wp.mat33],
     particle_mass: wp.array[float],
     body_world: wp.array[int],
-    newton_body_to_mjc_body: wp.array[int],
+    mjc_body_to_newton: wp.array2d[wp.int32],
     body_invweight0: wp.array2d[wp.vec2],
     out_mass: wp.array[float],
     out_inertia: wp.array[wp.mat33],
@@ -303,14 +317,14 @@ def eval_mujoco_coupling_effective_mass_block_kernel(
         if index >= 0 and index < body_inertia.shape[0]:
             inertia = body_inertia[index]
 
-        if index >= 0 and index < newton_body_to_mjc_body.shape[0]:
+        if index >= 0:
             world = int(0)
             if body_invweight0.shape[0] > 1:
                 if index < body_world.shape[0]:
                     world = body_world[index]
                 else:
                     world = int(-1)
-            mjc_body = newton_body_to_mjc_body[index]
+            mjc_body = find_mujoco_body_from_newton_body(world, index, mjc_body_to_newton)
             if (
                 world >= 0
                 and world < body_invweight0.shape[0]
