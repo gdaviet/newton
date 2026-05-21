@@ -65,22 +65,21 @@ one sub-solver:
 
    entry = SolverCoupled.Entry(
        name="soft",
-       solver=SolverVBD,
+       solver=lambda view: SolverVBD(model=view, iterations=20),
        bodies=soft_body_ids,
        particles=cloth_particle_ids,
        shapes=cloth_shape_ids,
-       solver_kwargs={"iterations": 20},
        substeps=2,
    )
 
 The entry lists the objects the sub-solver owns. During construction,
 ``SolverCoupled`` creates a model view for every entry, deactivates non-owned
-dynamic endpoints where appropriate, constructs the sub-solver with
-``solver(model=view, **solver_kwargs)``, and keeps per-entry input and output
-states. After a top-level step, only owned outputs are reconciled back into the
-caller's shared ``state_out``. This prevents two sub-solvers from overwriting
-the same body or particle unless an explicit coupling algorithm is responsible
-for arbitration.
+dynamic endpoints where appropriate, constructs the sub-solver by calling the
+entry's ``solver(view)`` factory, and keeps per-entry input and output states.
+Bind any extra solver constructor arguments in the factory itself. After a
+top-level step, only owned outputs are reconciled back into the caller's shared
+``state_out``. This prevents two sub-solvers from overwriting the same body or
+particle unless an explicit coupling algorithm is responsible for arbitration.
 
 The shared base also manages:
 
@@ -92,12 +91,12 @@ The shared base also manages:
 - input-state notifications for solvers with private history buffers;
 - fallback effective-mass estimates from public model mass and inertia arrays.
 
-``ModelView`` mutator methods use copy-on-write semantics. Methods such as
-``zero_body_mass()``, ``scale_body_mass()``, ``mark_proxy_bodies()``,
-``mark_proxy_particles()``, ``zero_particle_mass()``, and
-``scale_particle_mass()`` clone and override arrays in the view without changing
-the parent model. Direct writes through a returned Warp array are not
-intercepted, so view-local edits should use the explicit mutators.
+``ModelView`` applies view-local changes with copy-on-write semantics so the
+coupler can hide, immobilize, or rescale endpoints without changing the parent
+model. Parent-derived view masks are refreshed when relevant model-change
+notifications arrive. Direct writes through returned Warp arrays are not
+intercepted, so view-local edits should go through the coupled-solver API that
+owns the view.
 
 Coupling Hooks
 --------------
