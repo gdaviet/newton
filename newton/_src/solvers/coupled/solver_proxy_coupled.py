@@ -14,6 +14,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import BodyFlags
+from ..flags import SolverNotifyFlags
 from .interface import (
     CouplingEndpointKind,
     CouplingHook,
@@ -457,8 +458,32 @@ class SolverProxyCoupled(SolverCoupled):
             mapping.coupling_forces = wp.zeros(model.particle_count, dtype=wp.vec3, device=device)
             mapping.proxy_qd_before = wp.zeros(model.particle_count, dtype=wp.vec3, device=device)
 
+    def _entry_has_body_proxy_overrides(self, name: str) -> bool:
+        for proxy in self._proxy_mappings:
+            if (
+                proxy.dst_name == name
+                and proxy.proxy_body_ids_local is not None
+                and proxy.proxy_body_ids_local.shape[0] > 0
+            ):
+                return True
+        return False
+
+    def _refresh_body_inertial_view_overrides(self, entry) -> None:
+        if not self._entry_has_body_proxy_overrides(entry.name):
+            super()._refresh_body_inertial_view_overrides(entry)
+            return
+
+        entry.view._refresh_body_inertial_properties(entry.body_local_to_global)
+        if entry.body_dynamics_disabled_indices.shape[0] > 0:
+            entry.view.disable_body_dynamics(entry.body_dynamics_disabled_indices)
+
     def _apply_proxy_effective_masses(self) -> None:
         """Install virtual proxy masses from source solver effective masses."""
+        self._apply_proxy_body_effective_masses()
+        self._apply_proxy_particle_effective_masses()
+
+    def _apply_proxy_body_effective_masses(self) -> None:
+        """Install virtual proxy body inertia from source solver effective masses."""
         device = self.model.device
 
         for proxy in self._proxy_mappings:
@@ -482,6 +507,10 @@ class SolverProxyCoupled(SolverCoupled):
             )
             self._apply_body_inertia_override(dst, proxy.proxy_body_ids_local, proxy_masses, proxy_inertias)
 
+    def _apply_proxy_particle_effective_masses(self) -> None:
+        """Install virtual proxy particle masses from source solver effective masses."""
+        device = self.model.device
+
         for proxy in self._proxy_particle_mappings:
             if proxy.src_particle_ids is None or proxy.src_particle_ids.shape[0] == 0:
                 continue
@@ -500,6 +529,12 @@ class SolverProxyCoupled(SolverCoupled):
                 device=device,
             )
             self._apply_particle_mass_override(dst, proxy.proxy_particle_ids_local, proxy_masses)
+
+    def notify_model_changed(self, flags: int) -> None:
+        """Refresh proxy inertia after source solvers consume model updates."""
+        super().notify_model_changed(flags)
+        if int(flags) & int(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES):
+            self._apply_proxy_body_effective_masses()
 
     def _step_coupled(
         self,

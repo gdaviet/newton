@@ -618,6 +618,18 @@ class SolverAdmmCoupled(SolverCoupled):
             view.scale_body_mass(body_indices, scale)
         view.scale_particle_mass(scale)
 
+    def _refresh_body_inertial_view_overrides(self, entry: SolverEntry) -> None:
+        gamma = float(self._coupling.gamma)
+        if gamma <= 0.0:
+            super()._refresh_body_inertial_view_overrides(entry)
+            return
+
+        entry.view._refresh_body_inertial_properties(entry.body_local_to_global)
+        if entry.body_indices.shape[0] > 0:
+            entry.view.scale_body_mass(entry.body_indices, 1.0 + gamma)
+        if entry.body_dynamics_disabled_indices.shape[0] > 0:
+            entry.view.disable_body_dynamics(entry.body_dynamics_disabled_indices)
+
     def _setup_admm(self, coupling: SolverAdmmCoupled.Config) -> None:
         for entry in self._entries.values():
             buf = _AdmmBuffers()

@@ -812,6 +812,56 @@ class TestSolverCoupledBasic(unittest.TestCase):
         self.assertEqual(view_b.body_flags.numpy()[0] & int(newton.BodyFlags.KINEMATIC), 0)
         self.assertNotEqual(view_b.body_flags.numpy()[0] & int(newton.BodyFlags.DYNAMIC), 0)
 
+    def test_notify_model_changed_refreshes_view_inertial_masks(self):
+        """Runtime parent inertial edits should refresh derived view masks."""
+        coupled = SolverCoupled(
+            model=self.model,
+            entries=[
+                SolverCoupled.Entry(name="A", solver=_StepCountingCopySolver, bodies=[0]),
+                SolverCoupled.Entry(name="B", solver=_StepCountingCopySolver, bodies=[1]),
+            ],
+        )
+
+        self.model.body_inv_mass.assign(np.array([0.25, 0.125], dtype=np.float32))
+        coupled.notify_model_changed(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES)
+
+        view_a_inv_mass = coupled.view("A").body_inv_mass.numpy()
+        view_b_inv_mass = coupled.view("B").body_inv_mass.numpy()
+        np.testing.assert_allclose(view_a_inv_mass, [0.25])
+        np.testing.assert_allclose(view_b_inv_mass, [0.0, 0.125])
+
+    def test_admm_notify_model_changed_reapplies_proximal_body_scaling(self):
+        """ADMM proximal body mass scaling should refresh from parent inertia."""
+        gamma = 0.5
+        coupled = SolverAdmmCoupled(
+            model=self.model,
+            entries=[
+                SolverCoupled.Entry(name="A", solver=_StepCountingCopySolver, bodies=[0]),
+                SolverCoupled.Entry(name="B", solver=_StepCountingCopySolver, bodies=[1]),
+            ],
+            coupling=SolverAdmmCoupled.Config(iterations=1, gamma=gamma),
+        )
+
+        parent_mass = np.array([4.0, 8.0], dtype=np.float32)
+        parent_inertia = np.array([np.eye(3, dtype=np.float32) * 6.0, np.eye(3, dtype=np.float32) * 10.0])
+        self.model.body_mass.assign(parent_mass)
+        self.model.body_inv_mass.assign(1.0 / parent_mass)
+        self.model.body_inertia.assign(parent_inertia)
+        self.model.body_inv_inertia.assign(np.linalg.inv(parent_inertia))
+
+        coupled.notify_model_changed(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES)
+
+        scale = 1.0 + gamma
+        view_a = coupled.view("A")
+        view_b = coupled.view("B")
+        np.testing.assert_allclose(view_a.body_mass.numpy()[0], parent_mass[0] * scale)
+        np.testing.assert_allclose(view_a.body_inv_mass.numpy()[0], 1.0 / (parent_mass[0] * scale), rtol=1.0e-6)
+        np.testing.assert_allclose(view_a.body_inertia.numpy()[0], parent_inertia[0] * scale)
+        np.testing.assert_allclose(view_b.body_mass.numpy()[1], parent_mass[1] * scale)
+        np.testing.assert_allclose(view_b.body_inv_mass.numpy()[1], 1.0 / (parent_mass[1] * scale), rtol=1.0e-6)
+        np.testing.assert_allclose(view_b.body_inertia.numpy()[1], parent_inertia[1] * scale)
+        np.testing.assert_allclose(view_b.body_inv_mass.numpy()[0], 0.0)
+
     def test_entry_shapes_filter_shape_contact_pairs(self):
         """Entry shape masks should prune explicit contact pairs in each view."""
         self.assertEqual(self.model.shape_contact_pair_count, 1)
@@ -1411,6 +1461,55 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
         self.assertTrue(
             any(flags & int(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES) for flags in dst_solver.model_notify_flags)
         )
+
+    def test_notify_model_changed_reapplies_proxy_body_effective_inertia(self):
+        _StepCountingCopySolver.instances.clear()
+        builder = newton.ModelBuilder(gravity=0.0)
+        builder.add_body(mass=2.0, inertia=wp.mat33(np.eye(3) * 4.0))
+        builder.add_body(mass=3.0, inertia=wp.mat33(np.eye(3) * 5.0))
+        builder.add_body(mass=10.0, inertia=wp.mat33(np.eye(3) * 100.0))
+        model = builder.finalize(device="cpu")
+
+        coupled = SolverProxyCoupled(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0]),
+                SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver, bodies=[1]),
+            ],
+            coupling=SolverProxyCoupled.Config(
+                proxies=[
+                    SolverProxyCoupled.Proxy(
+                        source="src",
+                        destination="dst",
+                        bodies=[0],
+                        proxy_bodies=[2],
+                        mass_scale=0.5,
+                    ),
+                ],
+            ),
+        )
+
+        parent_mass = np.array([8.0, 7.0, 10.0], dtype=np.float32)
+        parent_inertia = np.array(
+            [
+                np.eye(3, dtype=np.float32) * 12.0,
+                np.eye(3, dtype=np.float32) * 9.0,
+                np.eye(3, dtype=np.float32) * 100.0,
+            ]
+        )
+        model.body_mass.assign(parent_mass)
+        model.body_inv_mass.assign(1.0 / parent_mass)
+        model.body_inertia.assign(parent_inertia)
+        model.body_inv_inertia.assign(np.linalg.inv(parent_inertia))
+
+        coupled.notify_model_changed(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES)
+
+        dst_view = coupled.view("dst")
+        np.testing.assert_allclose(dst_view.body_mass.numpy()[1], parent_mass[1])
+        np.testing.assert_allclose(dst_view.body_inertia.numpy()[1], parent_inertia[1])
+        np.testing.assert_allclose(dst_view.body_mass.numpy()[2], 0.5 * parent_mass[0])
+        np.testing.assert_allclose(dst_view.body_inertia.numpy()[2], 0.5 * parent_inertia[0])
+        np.testing.assert_allclose(dst_view.body_inv_mass.numpy()[0], 0.0)
 
     def test_body_proxy_maps_proxy_indexed_feedback_to_source(self):
         _BodyForceRecordingSolver.instances.clear()

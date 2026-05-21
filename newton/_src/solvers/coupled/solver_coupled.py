@@ -121,6 +121,7 @@ class SolverEntry:
     body_indices: wp.array
     particle_indices: wp.array
     joint_indices: wp.array
+    body_dynamics_disabled_indices: wp.array
     joint_q_indices: wp.array
     joint_qd_indices: wp.array
     shape_indices: wp.array
@@ -247,12 +248,14 @@ class SolverCoupled(SolverBase, CouplingInterface):
             view = ModelView(model, cfg.name)
             proxy_body_keep: set[int] = set()
             proxy_particle_keep: set[int] = set()
+            body_dynamics_disabled_indices = wp.zeros(0, dtype=int, device=device)
 
             if any_body_owner:
                 proxy_body_keep = self._entry_proxy_body_keep_indices(cfg.name)
                 to_zero = [i for i, owner in enumerate(self._body_owner) if owner != idx and i not in proxy_body_keep]
                 if to_zero:
-                    view.disable_body_dynamics(wp.array(to_zero, dtype=int, device=device))
+                    body_dynamics_disabled_indices = wp.array(to_zero, dtype=int, device=device)
+                    view.disable_body_dynamics(body_dynamics_disabled_indices)
                 if proxy_body_keep:
                     view.mark_proxy_bodies(wp.array(sorted(proxy_body_keep), dtype=int, device=device))
 
@@ -294,6 +297,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 body_indices=body_indices,
                 particle_indices=particle_indices,
                 joint_indices=joint_indices,
+                body_dynamics_disabled_indices=body_dynamics_disabled_indices,
                 joint_q_indices=joint_q_indices,
                 joint_qd_indices=joint_qd_indices,
                 shape_indices=shape_indices,
@@ -909,8 +913,21 @@ class SolverCoupled(SolverBase, CouplingInterface):
             entry.solver.step(state_in, state_out, control, contacts, substep_dt)
             state_in = state_out
 
+    def _refresh_model_view_overrides(self, flags: int) -> None:
+        """Refresh parent-derived view overrides before solver notification."""
+        if not int(flags) & int(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES):
+            return
+        for entry in self._entries.values():
+            self._refresh_body_inertial_view_overrides(entry)
+
+    def _refresh_body_inertial_view_overrides(self, entry: SolverEntry) -> None:
+        """Refresh base ownership masks derived from parent body inertia."""
+        if entry.body_dynamics_disabled_indices.shape[0] > 0:
+            entry.view._refresh_body_inverse_dynamics(entry.body_indices, entry.body_dynamics_disabled_indices)
+
     def notify_model_changed(self, flags: int) -> None:
         """Forward model change notifications to all sub-solvers."""
+        self._refresh_model_view_overrides(flags)
         for entry in self._entries.values():
             entry.solver.notify_model_changed(flags)
 

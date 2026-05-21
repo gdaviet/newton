@@ -355,6 +355,62 @@ class ModelView:
             overrides[name] = array
         return array
 
+    def _refresh_body_inertial_properties(self, body_indices: wp.array[int]) -> None:
+        """Refresh view-local body inertial properties copied from the parent model."""
+        if body_indices.shape[0] == 0:
+            return
+
+        parent = object.__getattribute__(self, "_parent")
+        mass = self._cow_array("body_mass")
+        inertia = self._cow_array("body_inertia")
+        inv_mass = self._cow_array("body_inv_mass")
+        inv_inertia = self._cow_array("body_inv_inertia")
+
+        wp.launch(
+            _copy_body_inertial_properties_kernel,
+            dim=body_indices.shape[0],
+            inputs=[
+                body_indices,
+                parent.body_mass,
+                parent.body_inertia,
+                parent.body_inv_mass,
+                parent.body_inv_inertia,
+                mass,
+                inertia,
+                inv_mass,
+                inv_inertia,
+            ],
+            device=parent.device,
+        )
+
+    def _refresh_body_inverse_dynamics(
+        self,
+        body_indices: wp.array[int],
+        disabled_body_indices: wp.array[int],
+    ) -> None:
+        """Refresh view-local inverse dynamics copied from the parent model."""
+        if body_indices.shape[0] == 0 and disabled_body_indices.shape[0] == 0:
+            return
+
+        parent = object.__getattribute__(self, "_parent")
+        inv_mass = self._cow_array("body_inv_mass")
+        inv_inertia = self._cow_array("body_inv_inertia")
+
+        if body_indices.shape[0] > 0:
+            wp.launch(
+                _copy_body_inverse_dynamics_kernel,
+                dim=body_indices.shape[0],
+                inputs=[body_indices, parent.body_inv_mass, parent.body_inv_inertia, inv_mass, inv_inertia],
+                device=parent.device,
+            )
+        if disabled_body_indices.shape[0] > 0:
+            wp.launch(
+                _zero_body_inverse_dynamics_kernel,
+                dim=disabled_body_indices.shape[0],
+                inputs=[disabled_body_indices, inv_mass, inv_inertia],
+                device=parent.device,
+            )
+
     def disable_body_dynamics(self, body_indices: wp.array[int]) -> None:
         """Disable dynamics for the given body indices in this view.
 
@@ -716,6 +772,40 @@ def _zero_body_inverse_dynamics_kernel(
     idx = indices[i]
     inv_mass[idx] = 0.0
     inv_inertia[idx] = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
+@wp.kernel(enable_backward=False)
+def _copy_body_inertial_properties_kernel(
+    indices: wp.array[int],
+    parent_mass: wp.array[float],
+    parent_inertia: wp.array[wp.mat33],
+    parent_inv_mass: wp.array[float],
+    parent_inv_inertia: wp.array[wp.mat33],
+    mass: wp.array[float],
+    inertia: wp.array[wp.mat33],
+    inv_mass: wp.array[float],
+    inv_inertia: wp.array[wp.mat33],
+):
+    i = wp.tid()
+    idx = indices[i]
+    mass[idx] = parent_mass[idx]
+    inertia[idx] = parent_inertia[idx]
+    inv_mass[idx] = parent_inv_mass[idx]
+    inv_inertia[idx] = parent_inv_inertia[idx]
+
+
+@wp.kernel(enable_backward=False)
+def _copy_body_inverse_dynamics_kernel(
+    indices: wp.array[int],
+    parent_inv_mass: wp.array[float],
+    parent_inv_inertia: wp.array[wp.mat33],
+    inv_mass: wp.array[float],
+    inv_inertia: wp.array[wp.mat33],
+):
+    i = wp.tid()
+    idx = indices[i]
+    inv_mass[idx] = parent_inv_mass[idx]
+    inv_inertia[idx] = parent_inv_inertia[idx]
 
 
 @wp.kernel(enable_backward=False)
