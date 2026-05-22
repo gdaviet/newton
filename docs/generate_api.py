@@ -160,13 +160,20 @@ def solver_submodule_pages() -> list[str]:
         public_name = f"newton.solvers.{info.name}"
         modules.append(public_name)
 
+    def add_public_module_tree(mod_name: str, module: ModuleType) -> None:
+        if mod_name not in modules:
+            modules.append(mod_name)
+        for child_name in public_symbols(module):
+            child = getattr(module, child_name)
+            if not inspect.ismodule(child):
+                continue
+            add_public_module_tree(f"{mod_name}.{child_name}", child)
+
     for name in public_symbols(public_solvers):
         attr = getattr(public_solvers, name)
         if not inspect.ismodule(attr):
             continue
-        public_name = f"newton.solvers.{name}"
-        if public_name not in modules:
-            modules.append(public_name)
+        add_public_module_tree(f"newton.solvers.{name}", attr)
 
     return modules
 
@@ -269,6 +276,8 @@ def write_module_page(mod_name: str, api_toctree_modules: set[str] | None = None
     else:
         lines.extend([f".. py:module:: {mod_name}", f".. currentmodule:: {mod_name}", ""])
 
+    # Render a simple bullet list of submodules (no autosummary/toctree) to
+    # avoid generating stub pages that can cause duplicate descriptions.
     if modules and not is_solver_submodule:
         modules.sort()
         nested_modules = [sub for sub in modules if f"{mod_name}.{sub}" not in api_toctree_modules]

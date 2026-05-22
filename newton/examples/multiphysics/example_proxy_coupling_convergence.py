@@ -5,7 +5,7 @@
 # Example Proxy Coupling Convergence
 #
 # A synthetic one-dimensional virtual-inertia problem that exercises
-# SolverProxyCoupled.Config.iterations in lagged mode. The source solver owns
+# SolverCoupledProxy.Config.iterations in lagged mode. The source solver owns
 # one interface particle and maps the previous feedback force to an end
 # velocity. The destination solver sees that particle as a proxy with scaled
 # virtual inertia, lets the generic lagged prepare step subtract the previously
@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import warp as wp
-from newton.solvers.coupled_experimental import CouplingInterface, SolverProxyCoupled
+from newton.solvers.experimental.coupled import CouplingInterface, SolverCoupledProxy
 
 import newton
 import newton.examples
@@ -274,10 +274,10 @@ class Example:
         )
 
     def _run_case(self, iterations: int, mass_scale: float) -> float:
-        solver = SolverProxyCoupled(
+        solver = SolverCoupledProxy(
             model=self.model,
             entries=[
-                SolverProxyCoupled.Entry(
+                SolverCoupledProxy.Entry(
                     name="source",
                     solver=lambda v: _SourceVelocitySolver(
                         model=v,
@@ -289,7 +289,7 @@ class Example:
                     ),
                     particles=[self.source_particle],
                 ),
-                SolverProxyCoupled.Entry(
+                SolverCoupledProxy.Entry(
                     name="response",
                     solver=lambda v: _KktResponseSolver(
                         model=v,
@@ -302,9 +302,9 @@ class Example:
                     particles=[self.response_particle],
                 ),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="source",
                         destination="response",
                         particles=[self.source_particle],

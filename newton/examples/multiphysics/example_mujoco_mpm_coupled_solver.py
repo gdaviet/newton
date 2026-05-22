@@ -18,7 +18,7 @@ from collections.abc import Callable
 
 import numpy as np
 import warp as wp
-from newton.solvers.coupled_experimental import SolverProxyCoupled
+from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 import newton
 import newton.examples
@@ -130,10 +130,10 @@ class Example:
             dtype=int,
             device=self.model.device,
         )
-        self.solver = SolverProxyCoupled(
+        self.solver = SolverCoupledProxy(
             model=self.model,
             entries=[
-                SolverProxyCoupled.Entry(
+                SolverCoupledProxy.Entry(
                     name=rigid_name,
                     solver=lambda v: rigid_solver(model=v, **rigid_kwargs),
                     bodies=[int(i) for i in rigid_body_indices.numpy()],
@@ -141,16 +141,16 @@ class Example:
                     configure_view=rigid_configure_view,
                     substeps=args.rigid_substeps,
                 ),
-                SolverProxyCoupled.Entry(
+                SolverCoupledProxy.Entry(
                     name="mpm",
                     solver=lambda v: SolverImplicitMPM(model=v, config=mpm_config),
                     particles=list(range(self.model.particle_count)),
                     in_place=True,
                 ),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source=rigid_name,
                         destination="mpm",
                         bodies=[int(i) for i in rigid_body_indices.numpy()],

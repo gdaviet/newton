@@ -9,7 +9,7 @@ Coupled Solvers
 .. warning::
 
    Coupled solvers are experimental. The public API currently lives under
-   :mod:`newton.solvers.coupled_experimental`, and both the API shape and the
+   :mod:`newton.solvers.experimental.coupled`, and both the API shape and the
    numerical defaults may change while the feature is refined.
 
 Newton's coupled-solver framework lets one simulation step be split across
@@ -27,24 +27,24 @@ that namespace:
 .. code-block:: python
 
    from newton.solvers import SolverMuJoCo, SolverVBD
-   from newton.solvers.coupled_experimental import (
-       SolverAdmmCoupled,
+   from newton.solvers.experimental.coupled import (
+       SolverCoupledAdmm,
        SolverCoupled,
-       SolverProxyCoupled,
+       SolverCoupledProxy,
    )
 
 The main public types are:
 
-- :class:`newton.solvers.coupled_experimental.ModelView`: a view-local overlay
+- :class:`newton.solvers.experimental.coupled.ModelView`: a view-local overlay
   on a shared :class:`Model`.
-- :class:`newton.solvers.coupled_experimental.CouplingInterface`: the hook
+- :class:`newton.solvers.experimental.coupled.CouplingInterface`: the hook
   protocol implemented by solvers that need custom coupled behavior.
-- :class:`newton.solvers.coupled_experimental.SolverCoupled`: the shared base
+- :class:`newton.solvers.experimental.coupled.SolverCoupled`: the shared base
   for partitioning models, distributing state, stepping entries, and
   reconciling results.
-- :class:`newton.solvers.coupled_experimental.SolverProxyCoupled`: a lagged or
+- :class:`newton.solvers.experimental.coupled.SolverCoupledProxy`: a lagged or
   staggered proxy coupling wrapper.
-- :class:`newton.solvers.coupled_experimental.SolverAdmmCoupled`: a fixed
+- :class:`newton.solvers.experimental.coupled.SolverCoupledAdmm`: a fixed
   iteration ADMM coupling wrapper for model-derived joints, attachments, and
   contacts.
 
@@ -52,13 +52,13 @@ Shared Model, Entry Views, and Ownership
 ----------------------------------------
 
 Coupled simulations start from a single :class:`Model`. Each sub-solver receives
-a :class:`~newton.solvers.coupled_experimental.ModelView` rather than the raw
+a :class:`~newton.solvers.experimental.coupled.ModelView` rather than the raw
 model. A view delegates reads to the parent model until the coupler or user
 applies a view-local override. The important idea is that sub-solvers can see
 the same model topology while owning only the bodies, particles, joints, or
 shapes assigned to their entry.
 
-A :class:`~newton.solvers.coupled_experimental.SolverCoupled.Entry` describes
+A :class:`~newton.solvers.experimental.coupled.SolverCoupled.Entry` describes
 one sub-solver:
 
 .. code-block:: python
@@ -104,7 +104,7 @@ Coupling Hooks
 Some solvers keep important state outside the public :class:`State` arrays or
 can report interface forces more accurately than a generic momentum fallback.
 Those solvers implement
-:class:`newton.solvers.coupled_experimental.CouplingInterface` hooks. The
+:class:`newton.solvers.experimental.coupled.CouplingInterface` hooks. The
 coupler detects hook methods by name. Missing hooks use generic fallbacks, while
 hooks listed in ``coupling_unsupported`` make the coupler raise
 :class:`NotImplementedError` instead of silently using an invalid path.
@@ -146,16 +146,16 @@ driving MPM transfer particles, or VBD reporting contact forces back to a rigid
 source body.
 
 A proxy pair is declared with
-:class:`newton.solvers.coupled_experimental.SolverProxyCoupled.Proxy`:
+:class:`newton.solvers.experimental.coupled.SolverCoupledProxy.Proxy`:
 
 .. code-block:: python
 
-   solver = SolverProxyCoupled(
+   solver = SolverCoupledProxy(
        model,
        entries=[rigid_entry, soft_entry],
-       coupling=SolverProxyCoupled.Config(
+       coupling=SolverCoupledProxy.Config(
            proxies=[
-               SolverProxyCoupled.Proxy(
+               SolverCoupledProxy.Proxy(
                    source="rigid",
                    destination="soft",
                    bodies=robot_body_ids,
@@ -216,9 +216,17 @@ velocity target when configured, lets sub-solvers advance, solves local
 interface rows, updates dual variables, and splats equal and opposite coupling
 forces back to endpoint force buffers.
 
+Compared with proxy coupling, ADMM is less invasive for sub-solvers: entries do
+not need to represent proxy bodies or particles, filter proxy contacts, or
+harvest proxy-native feedback. The tradeoff is that the coupler must implement
+each supported interface row explicitly, so every cross-solver joint, attachment,
+and contact type needs ADMM row support. Transient contacts and stiff
+attachments also generally need several coupling iterations per step, while the
+proxy path is often useful with a single lagged or staggered pass.
+
 The implemented ADMM wrapper discovers constraint rows from the shared model and
 enables contact rows through explicit
-:class:`newton.solvers.coupled_experimental.SolverAdmmCoupled.ContactPair`
+:class:`newton.solvers.experimental.coupled.SolverCoupledAdmm.ContactPair`
 objects. It does not currently accept arbitrary user-authored endpoint records
 as public API. Supported row sources are:
 
@@ -238,16 +246,16 @@ the experimental API.
 
 Body-particle attachments cover interfaces that cannot be represented by a
 model joint because one endpoint is a particle. The helper
-``SolverAdmmCoupled.add_body_particle_attachment()`` registers and fills custom
+``SolverCoupledAdmm.add_body_particle_attachment()`` registers and fills custom
 attributes under ``coupling:body_particle_attachment`` with body id, particle id,
 body-local point, stiffness, damping, and enabled state. Importers can author the
 same custom attributes directly. Rows whose endpoints are unowned or owned by
 the same entry are ignored; only cross-solver attachments are coupled by ADMM.
 
 Contact coupling is enabled by adding one or more ``ContactPair`` values to
-``SolverAdmmCoupled.Config.contact_pairs``. A contact pair names two entries and
+``SolverCoupledAdmm.Config.contact_pairs``. A contact pair names two entries and
 optionally overrides ``contact_distance`` and ``detection_margin`` for that
-interface. ``SolverAdmmCoupled.auto_detect_contact_pairs(entries, ...)`` can
+interface. ``SolverCoupledAdmm.auto_detect_contact_pairs(entries, ...)`` can
 build the complete pair list for every distinct entry combination.
 
 For enabled contact pairs, the coupler owns private detection data and builds

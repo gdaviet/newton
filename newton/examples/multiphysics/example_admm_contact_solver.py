@@ -5,7 +5,7 @@
 # Example ADMM Contact Coupled Solver
 #
 # An XPBD particle pad falls under gravity into a ball-jointed rigid drawer.
-# SolverAdmmCoupled runs particle-shape collision detection internally and
+# SolverCoupledAdmm runs particle-shape collision detection internally and
 # supplies the drawer response through frictionless ADMM contacts.
 #
 # Pass ``--solver free`` to disable the ADMM contacts and compare against the
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import numpy as np
 import warp as wp
-from newton.solvers.coupled_experimental import SolverAdmmCoupled, SolverCoupled
+from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledAdmm
 
 import newton
 import newton.examples
@@ -68,7 +68,7 @@ class Example:
         self.model.soft_contact_kf = 0.0
         self.model.soft_contact_mu = 0.0
 
-        self.solver = SolverAdmmCoupled(
+        self.solver = SolverCoupledAdmm(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(
@@ -91,26 +91,26 @@ class Example:
                     joints=[self.tray_joint],
                 ),
             ],
-            coupling=SolverAdmmCoupled.Config(
+            coupling=SolverCoupledAdmm.Config(
                 iterations=args.admm_iterations,
                 rho=args.rho,
                 gamma=args.gamma,
                 baumgarte=args.baumgarte,
                 contact_pairs=(
                     [
-                        SolverAdmmCoupled.ContactPair(
+                        SolverCoupledAdmm.ContactPair(
                             source="drop_a",
                             destination="tray",
                             contact_distance=args.contact_distance,
                             detection_margin=args.contact_detection_margin,
                         ),
-                        SolverAdmmCoupled.ContactPair(
+                        SolverCoupledAdmm.ContactPair(
                             source="drop_b",
                             destination="tray",
                             contact_distance=args.contact_distance,
                             detection_margin=args.contact_detection_margin,
                         ),
-                        SolverAdmmCoupled.ContactPair(
+                        SolverCoupledAdmm.ContactPair(
                             source="drop_a",
                             destination="drop_b",
                             contact_distance=args.contact_distance,

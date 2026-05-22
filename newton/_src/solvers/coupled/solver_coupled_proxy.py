@@ -100,7 +100,7 @@ class _ProxyMode(IntEnum):
 _PROXY_MODE_BY_NAME = {"lagged": _ProxyMode.LAGGED, "staggered": _ProxyMode.STAGGERED}
 
 
-class SolverProxyCoupled(SolverCoupled):
+class SolverCoupledProxy(SolverCoupled):
     """Couple two solvers with lagged-impulse virtual proxy bodies or particles."""
 
     @dataclass(frozen=True)
@@ -126,7 +126,7 @@ class SolverProxyCoupled(SolverCoupled):
                 ``particles``.
             collision_pipeline: Optional factory called as
                 ``collision_pipeline(destination_model_view)``. When supplied,
-                ``SolverProxyCoupled`` uses the returned pipeline to detect
+                ``SolverCoupledProxy`` uses the returned pipeline to detect
                 destination proxy contacts before each destination solve. If
                 the factory returns ``None``, the destination solve receives
                 the outer-level contacts passed to :meth:`step`.
@@ -150,14 +150,14 @@ class SolverProxyCoupled(SolverCoupled):
     class Config:
         """Lagged-impulse proxy coupling configuration."""
 
-        proxies: Sequence[SolverProxyCoupled.Proxy]
+        proxies: Sequence[SolverCoupledProxy.Proxy]
         iterations: int = 1
 
     def __init__(
         self,
         model: Model,
         entries: Sequence[SolverCoupled.Entry],
-        coupling: SolverProxyCoupled.Config,
+        coupling: SolverCoupledProxy.Config,
     ) -> None:
         if len(entries) > 2:
             raise ValueError("Proxy coupling currently supports at most two solver entries")
@@ -195,7 +195,7 @@ class SolverProxyCoupled(SolverCoupled):
     def _build_proxy_mappings(
         self,
         model: Model,
-        coupling: SolverProxyCoupled.Config,
+        coupling: SolverCoupledProxy.Config,
     ) -> list[_ProxyBodyMapping]:
         mappings = []
         device = model.device
@@ -243,7 +243,7 @@ class SolverProxyCoupled(SolverCoupled):
 
     def _build_proxy_collision_configs(
         self,
-        coupling: SolverProxyCoupled.Config,
+        coupling: SolverCoupledProxy.Config,
     ) -> dict[tuple[str, str], _ProxyCollisionConfig]:
         configs: dict[tuple[str, str], _ProxyCollisionConfig] = {}
         for proxy in coupling.proxies:
@@ -276,7 +276,7 @@ class SolverProxyCoupled(SolverCoupled):
     def _build_proxy_particle_mappings(
         self,
         model: Model,
-        coupling: SolverProxyCoupled.Config,
+        coupling: SolverCoupledProxy.Config,
     ) -> list[_ProxyParticleMapping]:
         mappings = []
         device = model.device

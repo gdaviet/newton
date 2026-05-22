@@ -67,7 +67,7 @@ Supported hook signatures are:
 
 from __future__ import annotations
 
-from enum import IntEnum, IntFlag
+from enum import Enum, IntEnum, IntFlag, auto
 from typing import ClassVar
 
 __all__ = ["CouplingInterface"]
@@ -91,17 +91,17 @@ class CouplingInterface:
     the public coupling namespace compact.
     """
 
-    class Hook(IntFlag):
+    class Hook(Enum):
         """Coupling dispatch points exposed by coupled solvers."""
 
-        BODY_PROXY_REWIND_VELOCITY = 1 << 0
-        PARTICLE_PROXY_REWIND_VELOCITY = 1 << 1
-        BODY_PROXY_HARVEST = 1 << 2
-        PARTICLE_PROXY_HARVEST = 1 << 3
-        EFFECTIVE_MASS_DIAGONAL = 1 << 4
-        EFFECTIVE_MASS_BLOCK = 1 << 5
-        NOTIFY_INPUT_STATE_UPDATE = 1 << 6
-        PROXY_CONTACT_PREPARE = 1 << 7
+        BODY_PROXY_REWIND_VELOCITY = auto()
+        PARTICLE_PROXY_REWIND_VELOCITY = auto()
+        BODY_PROXY_HARVEST = auto()
+        PARTICLE_PROXY_HARVEST = auto()
+        EFFECTIVE_MASS_DIAGONAL = auto()
+        EFFECTIVE_MASS_BLOCK = auto()
+        NOTIFY_INPUT_STATE_UPDATE = auto()
+        PROXY_CONTACT_PREPARE = auto()
 
     class EndpointKind(IntEnum):
         """Kinds of model endpoints addressed by coupling hooks."""

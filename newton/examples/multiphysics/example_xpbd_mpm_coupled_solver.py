@@ -5,7 +5,7 @@
 # Example XPBD-MPM Coupled Solver
 #
 # XPBD point particles fall into an implicit-MPM granular cube through
-# SolverProxyCoupled's particle proxy path.  The MPM view treats XPBD particles
+# SolverCoupledProxy's particle proxy path.  The MPM view treats XPBD particles
 # as transfer-active proxy particles: they participate in P2G/G2P momentum
 # exchange, but they do not contribute material stress.
 #
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import numpy as np
 import warp as wp
-from newton.solvers.coupled_experimental import SolverCoupled, SolverProxyCoupled
+from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy
 
 import newton
 import newton.examples
@@ -70,7 +70,7 @@ class Example:
         mpm_config.critical_fraction = 0.0
         mpm_config.strain_basis = "P0"
 
-        self.solver = SolverProxyCoupled(
+        self.solver = SolverCoupledProxy(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(
@@ -88,10 +88,10 @@ class Example:
                     in_place=True,
                 ),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 iterations=args.proxy_iterations,
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="xpbd",
                         destination="mpm",
                         particles=self.xpbd_particles,

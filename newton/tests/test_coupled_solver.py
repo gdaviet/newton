@@ -3,7 +3,6 @@
 
 """Smoke tests for the coupled solver prototype."""
 
-import importlib
 import unittest
 from typing import ClassVar
 
@@ -34,32 +33,13 @@ from newton.solvers import (
     SolverSemiImplicit,
     SolverVBD,
     SolverXPBD,
-    coupled_experimental,
 )
-from newton.solvers.coupled_experimental import (
+from newton.solvers.experimental.coupled import (
     ModelView,
-    SolverAdmmCoupled,
     SolverCoupled,
-    SolverProxyCoupled,
+    SolverCoupledAdmm,
+    SolverCoupledProxy,
 )
-
-
-class TestCoupledExperimentalPublicApi(unittest.TestCase):
-    def test_direct_namespace_import(self):
-        self.assertIs(importlib.import_module("newton.solvers.coupled_experimental"), coupled_experimental)
-
-    def test_exports_coupling_symbols_under_experimental_namespace(self):
-        self.assertIs(coupled_experimental.CouplingInterface, CouplingInterface)
-        self.assertIs(coupled_experimental.ModelView, ModelView)
-        self.assertIs(coupled_experimental.SolverCoupled, SolverCoupled)
-        self.assertIs(coupled_experimental.SolverProxyCoupled, SolverProxyCoupled)
-        self.assertIs(coupled_experimental.SolverAdmmCoupled, SolverAdmmCoupled)
-
-    def test_flat_coupling_symbols_are_not_exported(self):
-        for name in ("ModelView", "SolverCoupled", "SolverProxyCoupled", "SolverAdmmCoupled", "CouplingInterface"):
-            with self.subTest(name=name):
-                self.assertNotIn(name, newton.solvers.__all__)
-                self.assertFalse(hasattr(newton.solvers, name))
 
 
 @wp.kernel(enable_backward=False)
@@ -833,13 +813,13 @@ class TestSolverCoupledBasic(unittest.TestCase):
     def test_admm_notify_model_changed_reapplies_proximal_body_scaling(self):
         """ADMM proximal body mass scaling should refresh from parent inertia."""
         gamma = 0.5
-        coupled = SolverAdmmCoupled(
+        coupled = SolverCoupledAdmm(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(name="A", solver=_StepCountingCopySolver, bodies=[0]),
                 SolverCoupled.Entry(name="B", solver=_StepCountingCopySolver, bodies=[1]),
             ],
-            coupling=SolverAdmmCoupled.Config(iterations=1, gamma=gamma),
+            coupling=SolverCoupledAdmm.Config(iterations=1, gamma=gamma),
         )
 
         parent_mass = np.array([4.0, 8.0], dtype=np.float32)
@@ -890,15 +870,15 @@ class TestSolverCoupledBasic(unittest.TestCase):
 
     def test_proxy_shape_visibility_keeps_proxy_contact_pairs(self):
         """Proxy destination views should keep shape pairs touching proxy bodies."""
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(name="A", solver=SolverSemiImplicit, bodies=[0], shapes=[0]),
                 SolverCoupled.Entry(name="B", solver=SolverSemiImplicit, bodies=[1], shapes=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(source="A", destination="B", bodies=[0]),
+                    SolverCoupledProxy.Proxy(source="A", destination="B", bodies=[0]),
                 ],
             ),
         )
@@ -1051,15 +1031,15 @@ class TestSolverCoupledBasic(unittest.TestCase):
 
     def test_proxy_destination_view_marks_proxy_flags(self):
         """Proxy destination views should expose proxy bodies through body_flags."""
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(name="A", solver=SolverSemiImplicit, bodies=[0]),
                 SolverCoupled.Entry(name="B", solver=SolverSemiImplicit, bodies=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(source="A", destination="B", bodies=[0]),
+                    SolverCoupledProxy.Proxy(source="A", destination="B", bodies=[0]),
                 ],
             ),
         )
@@ -1082,16 +1062,16 @@ class TestSolverCoupledBasic(unittest.TestCase):
         model = builder.finalize(device="cpu")
 
         with self.assertRaisesRegex(ValueError, "at most two solver entries"):
-            SolverProxyCoupled(
+            SolverCoupledProxy(
                 model=model,
                 entries=[
                     SolverCoupled.Entry(name="a", solver=SolverSemiImplicit, bodies=[0]),
                     SolverCoupled.Entry(name="b", solver=SolverSemiImplicit, bodies=[1]),
                     SolverCoupled.Entry(name="c", solver=SolverSemiImplicit, bodies=[2]),
                 ],
-                coupling=SolverProxyCoupled.Config(
+                coupling=SolverCoupledProxy.Config(
                     proxies=[
-                        SolverProxyCoupled.Proxy(source="a", destination="b", bodies=[0]),
+                        SolverCoupledProxy.Proxy(source="a", destination="b", bodies=[0]),
                     ],
                 ),
             )
@@ -1103,12 +1083,12 @@ class TestSolverCoupledBasic(unittest.TestCase):
         builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
         model = builder.finalize(device="cpu")
 
-        coupled = SolverAdmmCoupled(
+        coupled = SolverCoupledAdmm(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="A", solver=_InputMutatingSolver, bodies=[0]),
             ],
-            coupling=SolverAdmmCoupled.Config(iterations=2, gamma=0.0),
+            coupling=SolverCoupledAdmm.Config(iterations=2, gamma=0.0),
         )
 
         state_0 = model.state()
@@ -1168,7 +1148,7 @@ class TestSolverCoupledMuJoCoVBDMultiEnv(unittest.TestCase):
         self.assertEqual(mjc_bodies, [0, 2])
         self.assertEqual(vbd_bodies, [1, 3])
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(
@@ -1186,9 +1166,9 @@ class TestSolverCoupledMuJoCoVBDMultiEnv(unittest.TestCase):
                     shapes=vbd_shapes,
                 ),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(source="mjc", destination="vbd", bodies=mjc_bodies),
+                    SolverCoupledProxy.Proxy(source="mjc", destination="vbd", bodies=mjc_bodies),
                 ],
             ),
         )
@@ -1389,15 +1369,15 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
         model = builder.finalize(device="cpu")
 
         with self.assertRaisesRegex(ValueError, "Duplicate source body"):
-            SolverProxyCoupled(
+            SolverCoupledProxy(
                 model=model,
                 entries=[
                     SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0, 1]),
                     SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver),
                 ],
-                coupling=SolverProxyCoupled.Config(
+                coupling=SolverCoupledProxy.Config(
                     proxies=[
-                        SolverProxyCoupled.Proxy(
+                        SolverCoupledProxy.Proxy(
                             source="src",
                             destination="dst",
                             bodies=[0, 0],
@@ -1408,15 +1388,15 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
             )
 
         with self.assertRaisesRegex(ValueError, "Duplicate proxy body"):
-            SolverProxyCoupled(
+            SolverCoupledProxy(
                 model=model,
                 entries=[
                     SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0, 1]),
                     SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver),
                 ],
-                coupling=SolverProxyCoupled.Config(
+                coupling=SolverCoupledProxy.Config(
                     proxies=[
-                        SolverProxyCoupled.Proxy(
+                        SolverCoupledProxy.Proxy(
                             source="src",
                             destination="dst",
                             bodies=[0, 1],
@@ -1433,15 +1413,15 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
         builder.add_body(mass=10.0, inertia=wp.mat33(np.eye(3) * 100.0))
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0]),
                 SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="src",
                         destination="dst",
                         bodies=[0],
@@ -1470,15 +1450,15 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
         builder.add_body(mass=10.0, inertia=wp.mat33(np.eye(3) * 100.0))
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0]),
                 SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver, bodies=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="src",
                         destination="dst",
                         bodies=[0],
@@ -1521,15 +1501,15 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
         builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_BodyForceRecordingSolver, bodies=[0]),
                 SolverCoupled.Entry(name="dst", solver=_ProxyBodyHookSolver, bodies=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="src",
                         destination="dst",
                         bodies=[0],
@@ -1558,7 +1538,7 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
         builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(
@@ -1568,9 +1548,9 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
                 ),
                 SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="src",
                         destination="dst",
                         bodies=[0],
@@ -1597,15 +1577,15 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
         builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_CustomEffectiveBodyInertiaSolver, bodies=[0]),
                 SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="src",
                         destination="dst",
                         bodies=[0],
@@ -1637,15 +1617,15 @@ class TestSolverCoupledProxyContactHooks(unittest.TestCase):
         builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
         builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
         model = builder.finalize(device="cpu")
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0]),
                 SolverCoupled.Entry(name="dst", solver=dst_solver, bodies=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="src",
                         destination="dst",
                         bodies=[0],
@@ -1688,15 +1668,15 @@ class TestSolverCoupledProxyContactHooks(unittest.TestCase):
             pipeline_holder.append(pipeline)
             return pipeline
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0]),
                 SolverCoupled.Entry(name="dst", solver=_CustomProxyContactRecordingSolver, bodies=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="src",
                         destination="dst",
                         bodies=[0],
@@ -1737,15 +1717,15 @@ class TestSolverCoupledProxyContactHooks(unittest.TestCase):
             factory_models.append(view)
             return None
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0]),
                 SolverCoupled.Entry(name="dst", solver=_CustomProxyContactRecordingSolver, bodies=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="src",
                         destination="dst",
                         bodies=[0],
@@ -1772,15 +1752,15 @@ class TestSolverCoupledProxyContactHooks(unittest.TestCase):
         model = builder.finalize(device="cpu")
 
         with self.assertRaises(ValueError):
-            SolverProxyCoupled(
+            SolverCoupledProxy(
                 model=model,
                 entries=[
                     SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0]),
                     SolverCoupled.Entry(name="dst", solver=_CustomProxyContactRecordingSolver, bodies=[1]),
                 ],
-                coupling=SolverProxyCoupled.Config(
+                coupling=SolverCoupledProxy.Config(
                     proxies=[
-                        SolverProxyCoupled.Proxy(
+                        SolverCoupledProxy.Proxy(
                             source="src",
                             destination="dst",
                             bodies=[0],
@@ -1797,15 +1777,15 @@ class TestSolverCoupledProxyContactHooks(unittest.TestCase):
         model = builder.finalize(device="cpu")
 
         with self.assertRaisesRegex(ValueError, "in_place=True"):
-            SolverProxyCoupled(
+            SolverCoupledProxy(
                 model=model,
                 entries=[
                     SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0], in_place=True),
                     SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver, bodies=[1]),
                 ],
-                coupling=SolverProxyCoupled.Config(
+                coupling=SolverCoupledProxy.Config(
                     proxies=[
-                        SolverProxyCoupled.Proxy(
+                        SolverCoupledProxy.Proxy(
                             source="src",
                             destination="dst",
                             bodies=[0],
@@ -1831,15 +1811,15 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
         self.model = builder.finalize(device="cpu")
 
     def _make_coupled(self, dst_solver=_ProxyParticleKickSolver):
-        return SolverProxyCoupled(
+        return SolverCoupledProxy(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_ParticleForceRecordingSolver, particles=[0]),
                 SolverCoupled.Entry(name="dst", solver=dst_solver, particles=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="src",
                         destination="dst",
                         particles=[0],
@@ -1856,15 +1836,15 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
         model = builder.finalize(device="cpu")
 
         with self.assertRaisesRegex(ValueError, "Duplicate source particle"):
-            SolverProxyCoupled(
+            SolverCoupledProxy(
                 model=model,
                 entries=[
                     SolverCoupled.Entry(name="src", solver=_ParticleForceRecordingSolver, particles=[0, 1]),
                     SolverCoupled.Entry(name="dst", solver=_ProxyParticleKickSolver, particles=[2]),
                 ],
-                coupling=SolverProxyCoupled.Config(
+                coupling=SolverCoupledProxy.Config(
                     proxies=[
-                        SolverProxyCoupled.Proxy(
+                        SolverCoupledProxy.Proxy(
                             source="src",
                             destination="dst",
                             particles=[0, 0],
@@ -1875,15 +1855,15 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
             )
 
         with self.assertRaisesRegex(ValueError, "Duplicate proxy particle"):
-            SolverProxyCoupled(
+            SolverCoupledProxy(
                 model=model,
                 entries=[
                     SolverCoupled.Entry(name="src", solver=_ParticleForceRecordingSolver, particles=[0, 1]),
                     SolverCoupled.Entry(name="dst", solver=_ProxyParticleKickSolver, particles=[2]),
                 ],
-                coupling=SolverProxyCoupled.Config(
+                coupling=SolverCoupledProxy.Config(
                     proxies=[
-                        SolverProxyCoupled.Proxy(
+                        SolverCoupledProxy.Proxy(
                             source="src",
                             destination="dst",
                             particles=[0, 1],
@@ -1908,15 +1888,15 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
 
     def test_proxy_particle_mass_override_notifies_model_changed(self):
         _StepCountingCopySolver.instances.clear()
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_ParticleForceRecordingSolver, particles=[0]),
                 SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver, particles=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="src",
                         destination="dst",
                         particles=[0],
@@ -1933,7 +1913,7 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
 
     def test_proxy_mass_uses_source_effective_mass_hook(self):
         _CustomEffectiveMassParticleSolver.instances.clear()
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(
@@ -1943,9 +1923,9 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
                 ),
                 SolverCoupled.Entry(name="dst", solver=_ProxyParticleKickSolver, particles=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="src",
                         destination="dst",
                         particles=[0],
@@ -1979,15 +1959,15 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
 
     def test_particle_proxy_uses_default_force_input_and_notifies(self):
         _ParticleForceNotifySolver.instances.clear()
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_ParticleForceNotifySolver, particles=[0]),
                 SolverCoupled.Entry(name="dst", solver=_ProxyParticleKickSolver, particles=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="src",
                         destination="dst",
                         particles=[0],
@@ -2040,15 +2020,15 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
         builder.add_particle(pos=(0.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0), mass=2.0, radius=0.0)
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, particles=[0]),
                 SolverCoupled.Entry(name="dst", solver=_ParticleHarvestStateRecordingSolver, particles=[]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(source="src", destination="dst", particles=[0]),
+                    SolverCoupledProxy.Proxy(source="src", destination="dst", particles=[0]),
                 ],
             ),
         )
@@ -2070,15 +2050,15 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
         builder.add_particle(pos=(2.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0), mass=2.0, radius=0.0)
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_ParticleForceRecordingSolver, particles=[0]),
                 SolverCoupled.Entry(name="dst", solver=_ProxyParticleHookSolver, particles=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="src",
                         destination="dst",
                         particles=[0],
@@ -2187,15 +2167,15 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
         builder.add_particle(pos=(1.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.0)
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0], particles=[0]),
                 SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver, bodies=[1], particles=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(source="src", destination="dst", bodies=[0], particles=[0]),
+                    SolverCoupledProxy.Proxy(source="src", destination="dst", bodies=[0], particles=[0]),
                 ],
             ),
         )
@@ -2214,15 +2194,15 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
         builder.add_particle(pos=(1.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.0)
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, particles=[0]),
                 SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver, particles=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(source="src", destination="dst", particles=[0]),
+                    SolverCoupledProxy.Proxy(source="src", destination="dst", particles=[0]),
                 ],
                 iterations=3,
             ),
@@ -2282,15 +2262,15 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
         builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0], substeps=4),
                 SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver, bodies=[1], substeps=2),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(source="src", destination="dst", bodies=[0]),
+                    SolverCoupledProxy.Proxy(source="src", destination="dst", bodies=[0]),
                 ],
                 iterations=3,
             ),
@@ -2315,15 +2295,15 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
         builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0]),
                 SolverCoupled.Entry(name="dst", solver=_BodyHarvestStateRecordingSolver, bodies=[]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(source="src", destination="dst", bodies=[0]),
+                    SolverCoupledProxy.Proxy(source="src", destination="dst", bodies=[0]),
                 ],
             ),
         )
@@ -2345,15 +2325,15 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
         builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0]),
                 SolverCoupled.Entry(name="dst", solver=_BodyInputMutatingCopySolver, bodies=[1]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(source="src", destination="dst", bodies=[0]),
+                    SolverCoupledProxy.Proxy(source="src", destination="dst", bodies=[0]),
                 ],
                 iterations=2,
             ),
@@ -2382,15 +2362,15 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
         builder.add_shape_sphere(body=body, radius=0.1)
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[body]),
                 SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver, bodies=[]),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 proxies=[
-                    SolverProxyCoupled.Proxy(source="src", destination="dst", bodies=[body]),
+                    SolverCoupledProxy.Proxy(source="src", destination="dst", bodies=[body]),
                 ],
                 iterations=2,
             ),

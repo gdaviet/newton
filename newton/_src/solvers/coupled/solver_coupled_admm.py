@@ -342,7 +342,7 @@ class _AdmmParticleParticleContactSpec:
     detection_margin: float | None = None
 
 
-class SolverAdmmCoupled(SolverCoupled):
+class SolverCoupledAdmm(SolverCoupled):
     """Couple multiple solvers with linearized ADMM over model-derived constraints."""
 
     BODY_PARTICLE_ATTACHMENT_FREQUENCY = "coupling:body_particle_attachment"
@@ -359,7 +359,7 @@ class SolverAdmmCoupled(SolverCoupled):
 
         The registered ``coupling:body_particle_attachment`` custom frequency
         stores model-level rigid-body-to-particle attachment annotations. During
-        construction, :class:`SolverAdmmCoupled` converts rows whose body and
+        construction, :class:`SolverCoupledAdmm` converts rows whose body and
         particle endpoints are owned by different solver entries into ADMM
         attachment constraints.
 
@@ -528,7 +528,7 @@ class SolverAdmmCoupled(SolverCoupled):
                 joints [N*m*s/rad].
             contact_pairs: Per-interface contact pairs to enable. Empty list
                 disables ADMM-managed contacts. Use
-                :meth:`SolverAdmmCoupled.auto_detect_contact_pairs` to build the
+                :meth:`SolverCoupledAdmm.auto_detect_contact_pairs` to build the
                 old auto-discovery list.
         """
 
@@ -540,13 +540,13 @@ class SolverAdmmCoupled(SolverCoupled):
         joint_damping: float = 0.0
         joint_angular_stiffness: float = 1.0e4
         joint_angular_damping: float = 0.0
-        contact_pairs: Sequence[SolverAdmmCoupled.ContactPair] = ()
+        contact_pairs: Sequence[SolverCoupledAdmm.ContactPair] = ()
 
     def __init__(
         self,
         model: Model,
         entries: Sequence[SolverCoupled.Entry],
-        coupling: SolverAdmmCoupled.Config,
+        coupling: SolverCoupledAdmm.Config,
     ) -> None:
         self._admm_buffers: dict[str, _AdmmBuffers] = {}
         self._admm_rr_groups: list[_AdmmRigidRigidAttachmentGroup] = []
@@ -630,7 +630,7 @@ class SolverAdmmCoupled(SolverCoupled):
         if entry.body_dynamics_disabled_indices.shape[0] > 0:
             entry.view.disable_body_dynamics(entry.body_dynamics_disabled_indices)
 
-    def _setup_admm(self, coupling: SolverAdmmCoupled.Config) -> None:
+    def _setup_admm(self, coupling: SolverCoupledAdmm.Config) -> None:
         for entry in self._entries.values():
             buf = _AdmmBuffers()
             s0 = entry.state_0
@@ -777,7 +777,7 @@ class SolverAdmmCoupled(SolverCoupled):
             return ((m_a * m_b) / (m_a + m_b)) ** 0.5
         return 1.0
 
-    def _setup_admm_contact_specs(self, coupling: SolverAdmmCoupled.Config) -> None:
+    def _setup_admm_contact_specs(self, coupling: SolverCoupledAdmm.Config) -> None:
         """Populate dynamic ADMM contact specs from configured contact pairs."""
         if not coupling.contact_pairs:
             return
@@ -786,7 +786,7 @@ class SolverAdmmCoupled(SolverCoupled):
         # /particle-particle entry per cross-owner combination), then keep only those
         # whose owner pair appears in the user's ContactPair list. ContactPair fields
         # override per-pair friction/contact_distance.
-        pair_by_owners: dict[frozenset[str], SolverAdmmCoupled.ContactPair] = {}
+        pair_by_owners: dict[frozenset[str], SolverCoupledAdmm.ContactPair] = {}
         for pair in coupling.contact_pairs:
             if pair.source == pair.destination:
                 raise ValueError(f"ADMM ContactPair requires distinct source and destination, got {pair.source!r}")
@@ -846,7 +846,7 @@ class SolverAdmmCoupled(SolverCoupled):
         *,
         contact_distance: float | None = None,
         detection_margin: float | None = None,
-    ) -> list[SolverAdmmCoupled.ContactPair]:
+    ) -> list[SolverCoupledAdmm.ContactPair]:
         """Return ContactPair entries for every cross-owner interface.
 
         Mirrors the prior auto-detection behavior: a pair is emitted for every
@@ -857,12 +857,12 @@ class SolverAdmmCoupled(SolverCoupled):
 
         Args:
             entries: Sub-solver entries that will be passed to
-                :class:`SolverAdmmCoupled`.
+                :class:`SolverCoupledAdmm`.
             contact_distance: Default minimum contact gap [m].
             detection_margin: Default detection margin [m].
         """
         names = [e.name for e in entries]
-        pairs: list[SolverAdmmCoupled.ContactPair] = []
+        pairs: list[SolverCoupledAdmm.ContactPair] = []
         for i, a in enumerate(names):
             for b in names[i + 1 :]:
                 pairs.append(
@@ -1166,7 +1166,7 @@ class SolverAdmmCoupled(SolverCoupled):
         if self._joint_owner[joint] >= 0:
             raise ValueError(
                 f"ADMM cross-solver joint {joint} must not be owned by a sub-solver entry; "
-                "leave it to SolverAdmmCoupled so the constraint is not applied twice"
+                "leave it to SolverCoupledAdmm so the constraint is not applied twice"
             )
         return child_entry, parent_entry
 
@@ -1185,7 +1185,7 @@ class SolverAdmmCoupled(SolverCoupled):
         inertia_b = self._inertia_scalar(props_b[1][0])
         return self._interface_weight(inertia_a, inertia_b)
 
-    def _build_admm_joint_groups(self, coupling: SolverAdmmCoupled.Config) -> None:
+    def _build_admm_joint_groups(self, coupling: SolverCoupledAdmm.Config) -> None:
         """Build quadratic ADMM attachments from cross-solver model joints."""
         if (
             coupling.joint_stiffness < 0.0
@@ -1467,7 +1467,7 @@ class SolverAdmmCoupled(SolverCoupled):
         )
         if coupling_ns is None or any(not hasattr(coupling_ns, attr) for attr in required_attrs):
             raise ValueError(
-                "ADMM body-particle attachments require SolverAdmmCoupled.register_custom_attributes(builder) "
+                "ADMM body-particle attachments require SolverCoupledAdmm.register_custom_attributes(builder) "
                 "before finalizing the model"
             )
 

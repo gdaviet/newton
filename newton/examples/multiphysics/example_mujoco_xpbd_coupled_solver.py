@@ -6,7 +6,7 @@
 #
 # Rigid boxes and an articulated pendulum chain (driven by MuJoCo or Kamino)
 # interact with a cloth sheet (simulated by XPBD). Contact forces from the
-# deformable side are fed back to the rigid bodies through SolverProxyCoupled's
+# deformable side are fed back to the rigid bodies through SolverCoupledProxy's
 # proxy-body coupling path with momentum-based force harvesting.
 #
 # Pass ``--solver xpbd`` to run the same scene with a single XPBD solver
@@ -23,7 +23,7 @@ from collections.abc import Callable
 
 import numpy as np
 import warp as wp
-from newton.solvers.coupled_experimental import SolverProxyCoupled
+from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 import newton
 import newton.examples
@@ -142,26 +142,26 @@ class Example:
                 dtype=int,
             )
 
-            self.solver = SolverProxyCoupled(
+            self.solver = SolverCoupledProxy(
                 model=self.model,
                 entries=[
-                    SolverProxyCoupled.Entry(
+                    SolverCoupledProxy.Entry(
                         name=rigid_name,
                         solver=lambda v: rigid_solver(model=v, **rigid_kwargs),
                         bodies=[int(i) for i in rigid_body_indices.numpy()],
                         joints=list(range(self.model.joint_count)),
                         configure_view=rigid_configure_view,
                     ),
-                    SolverProxyCoupled.Entry(
+                    SolverCoupledProxy.Entry(
                         name="xpbd",
                         solver=lambda v: SolverXPBD(model=v, **xpbd_kwargs),
                         bodies=[int(i) for i in xpbd_body_indices.numpy()],
                         particles=list(range(self.model.particle_count)),
                     ),
                 ],
-                coupling=SolverProxyCoupled.Config(
+                coupling=SolverCoupledProxy.Config(
                     proxies=[
-                        SolverProxyCoupled.Proxy(
+                        SolverCoupledProxy.Proxy(
                             source=rigid_name,
                             destination="xpbd",
                             bodies=[int(i) for i in rigid_body_indices.numpy()],

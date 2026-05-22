@@ -401,6 +401,7 @@ See the `DiffSim examples on GitHub`_ for the current reference workflows.
 
 # solver types
 import sys
+from types import ModuleType
 
 from ._src.solvers import (
     SolverBase,
@@ -414,12 +415,19 @@ from ._src.solvers import (
     SolverXPBD,
     style3d,
 )
-from ._src.solvers import coupled as coupled_experimental
+from ._src.solvers import coupled as _coupled
 
 # solver flags
 from ._src.solvers.flags import SolverNotifyFlags
 
-sys.modules[f"{__name__}.coupled_experimental"] = coupled_experimental
+experimental = ModuleType(f"{__name__}.experimental")
+experimental.__doc__ = "Experimental solver namespaces."
+experimental.__all__ = ["coupled"]
+experimental.__path__ = []
+experimental.coupled = _coupled
+
+sys.modules[f"{__name__}.experimental"] = experimental
+sys.modules[f"{__name__}.experimental.coupled"] = _coupled
 
 __all__ = [
     "SolverBase",
@@ -432,6 +440,6 @@ __all__ = [
     "SolverStyle3D",
     "SolverVBD",
     "SolverXPBD",
-    "coupled_experimental",
+    "experimental",
     "style3d",
 ]

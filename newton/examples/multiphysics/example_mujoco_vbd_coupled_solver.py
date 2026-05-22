@@ -10,7 +10,7 @@
 # rigid bodies, causing them to bounce and settle realistically.
 #
 # This example builds rigid/VBD proxy coupling directly through
-# ``SolverProxyCoupled`` so the generic proxy path exercises the default API.
+# ``SolverCoupledProxy`` so the generic proxy path exercises the default API.
 #
 # Pass ``--solver vbd`` to run the same scene with a single VBD solver
 # (no coupling) as a reference baseline.
@@ -26,7 +26,7 @@ from collections.abc import Callable
 
 import numpy as np
 import warp as wp
-from newton.solvers.coupled_experimental import SolverProxyCoupled
+from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 import newton
 import newton.examples
@@ -173,26 +173,26 @@ class Example:
                 dtype=int,
             )
 
-            self.solver = SolverProxyCoupled(
+            self.solver = SolverCoupledProxy(
                 model=self.model,
                 entries=[
-                    SolverProxyCoupled.Entry(
+                    SolverCoupledProxy.Entry(
                         name=rigid_name,
                         solver=lambda v: rigid_solver(model=v, **rigid_kwargs),
                         bodies=[int(i) for i in rigid_body_indices.numpy()],
                         joints=list(range(self.model.joint_count)),
                         configure_view=rigid_configure_view,
                     ),
-                    SolverProxyCoupled.Entry(
+                    SolverCoupledProxy.Entry(
                         name="vbd",
                         solver=lambda v: SolverVBD(model=v, **vbd_kwargs),
                         bodies=[int(i) for i in vbd_body_indices.numpy()],
                         particles=list(range(self.model.particle_count)),
                     ),
                 ],
-                coupling=SolverProxyCoupled.Config(
+                coupling=SolverCoupledProxy.Config(
                     proxies=[
-                        SolverProxyCoupled.Proxy(
+                        SolverCoupledProxy.Proxy(
                             source=rigid_name,
                             destination="vbd",
                             bodies=[int(i) for i in rigid_body_indices.numpy()],

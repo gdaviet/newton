@@ -146,8 +146,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
     ``Model``, ``ModelView`` and ``State``: per-solver views, ownership masks,
     state distribution/reconciliation, per-entry substeps, and shared coupling
     hook dispatch helpers. Algorithm-specific couplers such as
-    :class:`~newton.solvers.coupled_experimental.SolverAdmmCoupled` and
-    :class:`~newton.solvers.coupled_experimental.SolverProxyCoupled` derive from this base class.
+    :class:`~newton.solvers.experimental.coupled.SolverCoupledAdmm` and
+    :class:`~newton.solvers.experimental.coupled.SolverCoupledProxy` derive from this base class.
 
     Args:
         model: Shared model.

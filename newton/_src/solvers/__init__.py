@@ -4,9 +4,9 @@
 from .coupled import (
     CouplingInterface,
     ModelView,
-    SolverAdmmCoupled,
     SolverCoupled,
-    SolverProxyCoupled,
+    SolverCoupledAdmm,
+    SolverCoupledProxy,
 )
 from .featherstone import SolverFeatherstone
 from .flags import SolverNotifyFlags
@@ -22,15 +22,15 @@ from .xpbd import SolverXPBD
 __all__ = [
     "CouplingInterface",
     "ModelView",
-    "SolverAdmmCoupled",
     "SolverBase",
     "SolverCoupled",
+    "SolverCoupledAdmm",
+    "SolverCoupledProxy",
     "SolverFeatherstone",
     "SolverImplicitMPM",
     "SolverKamino",
     "SolverMuJoCo",
     "SolverNotifyFlags",
-    "SolverProxyCoupled",
     "SolverSemiImplicit",
     "SolverStyle3D",
     "SolverVBD",

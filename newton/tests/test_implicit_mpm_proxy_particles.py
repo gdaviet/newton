@@ -10,7 +10,7 @@ import warp as wp
 
 import newton
 from newton.solvers import SolverImplicitMPM, SolverXPBD
-from newton.solvers.coupled_experimental import SolverCoupled, SolverProxyCoupled
+from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy
 
 
 class TestImplicitMPMProxyParticles(unittest.TestCase):
@@ -36,7 +36,7 @@ class TestImplicitMPMProxyParticles(unittest.TestCase):
         builder.add_particle(pos=(1.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.05)
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="xpbd", solver=SolverXPBD, particles=[0]),
@@ -46,8 +46,8 @@ class TestImplicitMPMProxyParticles(unittest.TestCase):
                     particles=[1],
                 ),
             ],
-            coupling=SolverProxyCoupled.Config(
-                proxies=[SolverProxyCoupled.Proxy(source="xpbd", destination="mpm", particles=[0])]
+            coupling=SolverCoupledProxy.Config(
+                proxies=[SolverCoupledProxy.Proxy(source="xpbd", destination="mpm", particles=[0])]
             ),
         )
 
@@ -77,7 +77,7 @@ class TestImplicitMPMProxyParticles(unittest.TestCase):
             builder.add_particle(pos=pos, vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.05)
         model = builder.finalize(device="cpu")
 
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="xpbd", solver=SolverXPBD, particles=[0, 1, 2]),
@@ -87,8 +87,8 @@ class TestImplicitMPMProxyParticles(unittest.TestCase):
                     particles=[3],
                 ),
             ],
-            coupling=SolverProxyCoupled.Config(
-                proxies=[SolverProxyCoupled.Proxy(source="xpbd", destination="mpm", particles=[0, 1, 2])]
+            coupling=SolverCoupledProxy.Config(
+                proxies=[SolverCoupledProxy.Proxy(source="xpbd", destination="mpm", particles=[0, 1, 2])]
             ),
         )
 
@@ -130,7 +130,7 @@ class TestImplicitMPMProxyParticles(unittest.TestCase):
         config = self._mpm_config()
         config.voxel_size = 0.2
         config.grid_padding = 2
-        coupled = SolverProxyCoupled(
+        coupled = SolverCoupledProxy(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="xpbd", solver=lambda v: SolverXPBD(model=v, iterations=1), particles=[0]),
@@ -141,8 +141,8 @@ class TestImplicitMPMProxyParticles(unittest.TestCase):
                     in_place=True,
                 ),
             ],
-            coupling=SolverProxyCoupled.Config(
-                proxies=[SolverProxyCoupled.Proxy(source="xpbd", destination="mpm", particles=[0])]
+            coupling=SolverCoupledProxy.Config(
+                proxies=[SolverCoupledProxy.Proxy(source="xpbd", destination="mpm", particles=[0])]
             ),
         )
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 import warp as wp
-from newton.solvers.coupled_experimental import SolverProxyCoupled
+from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 import newton
 import newton.examples
@@ -33,7 +33,7 @@ def _gather_particles(
     out_q[i] = particle_q[particle_ids[i]]
 
 
-class _VBDMPMProxyCoupled(SolverProxyCoupled):
+class _VBDMPMProxyCoupled(SolverCoupledProxy):
     """Example-local VBD source / MPM prescribed-collider proxy coupling."""
 
     def __init__(
@@ -58,7 +58,7 @@ class _VBDMPMProxyCoupled(SolverProxyCoupled):
         super().__init__(
             model=model,
             entries=[
-                SolverProxyCoupled.Entry(
+                SolverCoupledProxy.Entry(
                     name="vbd",
                     solver=lambda v: SolverVBD(
                         model=v,
@@ -70,16 +70,16 @@ class _VBDMPMProxyCoupled(SolverProxyCoupled):
                     ),
                     particles=soft_particles,
                 ),
-                SolverProxyCoupled.Entry(
+                SolverCoupledProxy.Entry(
                     name="mpm",
                     solver=lambda v: SolverImplicitMPM(model=v, config=mpm_config),
                     particles=mpm_particles,
                 ),
             ],
-            coupling=SolverProxyCoupled.Config(
+            coupling=SolverCoupledProxy.Config(
                 iterations=max(1, int(proxy_iterations)),
                 proxies=[
-                    SolverProxyCoupled.Proxy(
+                    SolverCoupledProxy.Proxy(
                         source="vbd",
                         destination="mpm",
                         particles=soft_particles,

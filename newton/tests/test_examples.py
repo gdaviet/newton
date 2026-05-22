@@ -824,6 +824,20 @@ add_example_test(
     test_options={"num-frames": 120},
     use_viewer=True,
 )
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_admm_rigid_contact_solver",
+    devices=test_devices,
+    test_options={"num-frames": 90, "tilt-time": 1.0},
+    use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_xpbd_vbd_coupled_solver",
+    devices=test_devices,
+    test_options={"num-frames": 5, "xpbd-iterations": 4, "vbd-iterations": 2},
+    use_viewer=True,
+)
 
 
 class TestSoftbodyExamples(unittest.TestCase):

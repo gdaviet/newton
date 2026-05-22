@@ -4,7 +4,7 @@
 ###########################################################################
 # Example XPBD-VBD Coupled Solver
 #
-# A VBD cloth patch pushes into an XPBD particle bed through SolverProxyCoupled's
+# A VBD cloth patch pushes into an XPBD particle bed through SolverCoupledProxy's
 # proxy-particle path. XPBD resolves particle-particle contact against the VBD
 # proxy particles, and the harvested proxy impulse is applied back to the VBD
 # particles on the next coupled step.
@@ -22,14 +22,14 @@ from __future__ import annotations
 
 import numpy as np
 import warp as wp
-from newton.solvers.coupled_experimental import ModelView, SolverProxyCoupled
+from newton.solvers.experimental.coupled import ModelView, SolverCoupledProxy
 
 import newton
 import newton.examples
 from newton.solvers import SolverVBD, SolverXPBD
 
 
-class _VBDXPBDParticleProxyCoupled(SolverProxyCoupled):
+class _VBDXPBDParticleProxyCoupled(SolverCoupledProxy):
     """Coupled solver for the example's VBD-source / XPBD-contact split."""
 
     def _customize_view(self, name: str, view: ModelView, body_indices: wp.array[int]) -> None:
@@ -87,7 +87,7 @@ class Example:
                 entries=[
                     # VBD is the primary/source solver. It owns the cloth and
                     # receives only the harvested XPBD particle response.
-                    SolverProxyCoupled.Entry(
+                    SolverCoupledProxy.Entry(
                         name="vbd",
                         solver=lambda v: SolverVBD(model=v, **vbd_kwargs),
                         particles=self.vbd_particles,
@@ -95,15 +95,15 @@ class Example:
                     # XPBD is the secondary/destination solver. It sees the
                     # VBD particles as proxies, handles particle-particle
                     # collision, and exposes the proxy momentum change.
-                    SolverProxyCoupled.Entry(
+                    SolverCoupledProxy.Entry(
                         name="xpbd",
                         solver=lambda v: SolverXPBD(model=v, **xpbd_kwargs),
                         particles=self.xpbd_particles,
                     ),
                 ],
-                coupling=SolverProxyCoupled.Config(
+                coupling=SolverCoupledProxy.Config(
                     proxies=[
-                        SolverProxyCoupled.Proxy(
+                        SolverCoupledProxy.Proxy(
                             source="vbd",
                             destination="xpbd",
                             particles=self.vbd_particles,

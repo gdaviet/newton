@@ -6,7 +6,7 @@
 #
 # A dynamic rigid box rests on a kinematic rigid plane whose angle progressively
 # increases. The two bodies are owned by separate solvers and interact through
-# collision-detected rigid-rigid Coulomb contacts in SolverAdmmCoupled.
+# collision-detected rigid-rigid Coulomb contacts in SolverCoupledAdmm.
 #
 # Pass ``--solver free`` to disable the ADMM contacts and compare against the
 # uncoupled baseline.
@@ -22,7 +22,7 @@ import math
 
 import numpy as np
 import warp as wp
-from newton.solvers.coupled_experimental import CouplingInterface, SolverAdmmCoupled, SolverCoupled
+from newton.solvers.experimental.coupled import CouplingInterface, SolverCoupled, SolverCoupledAdmm
 
 import newton
 import newton.examples
@@ -88,7 +88,7 @@ class Example:
         self.model = builder.finalize()
         self.angle_buffer = wp.array([self.current_angle], dtype=float, device=self.model.device)
 
-        self.solver = SolverAdmmCoupled(
+        self.solver = SolverCoupledAdmm(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(
@@ -102,13 +102,13 @@ class Example:
                     bodies=[self.box_body],
                 ),
             ],
-            coupling=SolverAdmmCoupled.Config(
+            coupling=SolverCoupledAdmm.Config(
                 iterations=args.admm_iterations,
                 rho=args.rho,
                 gamma=args.gamma,
                 baumgarte=args.baumgarte,
                 contact_pairs=(
-                    [SolverAdmmCoupled.ContactPair(source="plane", destination="box")]
+                    [SolverCoupledAdmm.ContactPair(source="plane", destination="box")]
                     if self.solver_type == "admm"
                     else []
                 ),

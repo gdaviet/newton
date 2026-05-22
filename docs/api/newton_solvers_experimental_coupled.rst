@@ -1,11 +1,11 @@
 .. SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 .. SPDX-License-Identifier: CC-BY-4.0
 
-newton.solvers.coupled_experimental
+newton.solvers.experimental.coupled
 ===================================
 
-.. py:module:: newton.solvers.coupled_experimental
-.. currentmodule:: newton.solvers.coupled_experimental
+.. py:module:: newton.solvers.experimental.coupled
+.. currentmodule:: newton.solvers.experimental.coupled
 
 .. rubric:: Classes
 
@@ -13,9 +13,9 @@ newton.solvers.coupled_experimental
 
 .. autoclass:: ModelView
 
-.. autoclass:: SolverAdmmCoupled
-
 .. autoclass:: SolverCoupled
 
-.. autoclass:: SolverProxyCoupled
+.. autoclass:: SolverCoupledAdmm
+
+.. autoclass:: SolverCoupledProxy
 
