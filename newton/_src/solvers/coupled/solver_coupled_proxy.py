@@ -192,6 +192,22 @@ class SolverCoupledProxy(SolverCoupled):
         if len(ids) != len(set(ids)):
             raise ValueError(f"Duplicate {label} ids in proxy mapping")
 
+    @staticmethod
+    def _validate_proxy_body_worlds(model: Model, source_ids: Sequence[int], proxy_ids: Sequence[int]) -> None:
+        if model.body_world is None:
+            return
+
+        body_world = model.body_world.numpy()
+        for source_id, proxy_id in zip(source_ids, proxy_ids, strict=True):
+            source_world = int(body_world[source_id])
+            proxy_world = int(body_world[proxy_id])
+            if source_world != proxy_world:
+                raise ValueError(
+                    "Proxy source body and destination proxy body must live in the same world: "
+                    f"source body {source_id} is in world {source_world}, "
+                    f"proxy body {proxy_id} is in world {proxy_world}"
+                )
+
     def _build_proxy_mappings(
         self,
         model: Model,
@@ -210,6 +226,7 @@ class SolverCoupledProxy(SolverCoupled):
             self._validate_proxy_ids("Proxy destination body", proxy_local_ids, model.body_count)
             self._validate_unique_proxy_ids("source body", src_ids)
             self._validate_unique_proxy_ids("proxy body", proxy_local_ids)
+            self._validate_proxy_body_worlds(model, src_ids, proxy_local_ids)
             # ModelView currently preserves parent-model indexing, so the
             # configured proxy ids are both local ids in the destination view
             # and global ids in the parent model. Keep both names explicit so

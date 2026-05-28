@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 
 from ...geometry import ParticleFlags
-from ...sim import BodyFlags, Model
+from ...sim import BodyFlags, JointType, Model
 
 if TYPE_CHECKING:
     from ...sim import State
@@ -623,8 +623,8 @@ class ModelView:
     def disable_joints(self, joint_indices: wp.array[int]) -> None:
         """Disable the given joints in this view.
 
-        Creates a view-local copy of ``joint_enabled`` on first write. The
-        parent model is never mutated.
+        Creates view-local copies of ``joint_enabled`` and ``joint_type`` on
+        first write. The parent model is never mutated.
 
         Args:
             joint_indices: 1-D int array of joint indices to disable.
@@ -638,6 +638,13 @@ class ModelView:
             _disable_joints_kernel,
             dim=joint_indices.shape[0],
             inputs=[joint_indices, joint_enabled],
+            device=parent.device,
+        )
+        joint_type = self._cow_array("joint_type")
+        wp.launch(
+            _replace_joint_type_kernel,
+            dim=joint_indices.shape[0],
+            inputs=[joint_indices, joint_type, int(JointType.CABLE), int(JointType.D6)],
             device=parent.device,
         )
 
@@ -861,6 +868,19 @@ def _disable_joints_kernel(
     i = wp.tid()
     idx = indices[i]
     joint_enabled[idx] = False
+
+
+@wp.kernel(enable_backward=False)
+def _replace_joint_type_kernel(
+    indices: wp.array[int],
+    joint_type: wp.array[int],
+    from_type: int,
+    to_type: int,
+):
+    i = wp.tid()
+    idx = indices[i]
+    if joint_type[idx] == from_type:
+        joint_type[idx] = to_type
 
 
 @wp.kernel(enable_backward=False)

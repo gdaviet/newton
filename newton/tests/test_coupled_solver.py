@@ -597,6 +597,27 @@ class TestModelView(unittest.TestCase):
         self.assertNotEqual(parent_flags[1] & dynamic, 0)
         self.assertEqual(parent_flags[1] & kinematic, 0)
 
+    def test_disable_joints_rewrites_cable_type_in_view(self):
+        """disable_joints should expose disabled cable joints as D6 in the view."""
+        builder = newton.ModelBuilder(gravity=0.0)
+        parent = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        child = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        joint = builder.add_joint_cable(
+            parent=parent,
+            child=child,
+            parent_xform=wp.transform(wp.vec3(0.5, 0.0, 0.0), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(-0.5, 0.0, 0.0), wp.quat_identity()),
+        )
+        model = builder.finalize(device="cpu")
+        view = ModelView(model, "test")
+
+        view.disable_joints(wp.array([joint], dtype=int, device="cpu"))
+
+        self.assertFalse(bool(view.joint_enabled.numpy()[joint]))
+        self.assertEqual(int(view.joint_type.numpy()[joint]), int(newton.JointType.D6))
+        self.assertEqual(int(model.joint_type.numpy()[joint]), int(newton.JointType.CABLE))
+        np.testing.assert_array_equal(view.joint_dof_dim.numpy()[joint], model.joint_dof_dim.numpy()[joint])
+
     def test_zero_particle_mass(self):
         """zero_particle_mass should zero forward and inverse mass arrays."""
         builder = newton.ModelBuilder()
@@ -1401,6 +1422,35 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
                             destination="dst",
                             bodies=[0, 1],
                             proxy_bodies=[2, 2],
+                        ),
+                    ],
+                ),
+            )
+
+    def test_cross_world_body_proxy_mapping_is_rejected(self):
+        builder = newton.ModelBuilder(gravity=0.0)
+        builder.begin_world()
+        source_body = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.end_world()
+        builder.begin_world()
+        proxy_body = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.end_world()
+        model = builder.finalize(device="cpu")
+
+        with self.assertRaisesRegex(ValueError, "same world"):
+            SolverCoupledProxy(
+                model=model,
+                entries=[
+                    SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[source_body]),
+                    SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver, bodies=[proxy_body]),
+                ],
+                coupling=SolverCoupledProxy.Config(
+                    proxies=[
+                        SolverCoupledProxy.Proxy(
+                            source="src",
+                            destination="dst",
+                            bodies=[source_body],
+                            proxy_bodies=[proxy_body],
                         ),
                     ],
                 ),
