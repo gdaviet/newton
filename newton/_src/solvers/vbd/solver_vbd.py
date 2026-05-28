@@ -845,25 +845,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         *,
         contacts_freshly_detected: bool = False,
     ) -> Contacts | None:
-        """Filter freshly detected proxy contacts and update rigid history cadence."""
+        """Update rigid history cadence for proxy contacts."""
         del state
-        if contacts_freshly_detected and contacts is not None and contacts.rigid_contact_count is not None:
-            wp.launch(
-                _filter_vbd_proxy_rigid_contacts_kernel,
-                dim=contacts.rigid_contact_shape0.shape[0],
-                inputs=[
-                    contacts.rigid_contact_count,
-                    contacts.rigid_contact_shape0,
-                    contacts.rigid_contact_shape1,
-                    self.model.shape_body,
-                    self.model.body_flags,
-                    self.model.body_inv_mass,
-                    int(BodyFlags.PROXY),
-                    int(BodyFlags.KINEMATIC),
-                ],
-                device=self.device,
-            )
-
         self.set_rigid_history_update(bool(contacts_freshly_detected))
         return contacts
 
@@ -3060,59 +3043,3 @@ def _update_vbd_body_input_state_kernel(
 
     body_qd[local_body] = body_qd[local_body] + wp.spatial_vector(dv, dw)
     body_q[local_body] = q_prev
-
-
-@wp.kernel(enable_backward=False)
-def _filter_vbd_proxy_rigid_contacts_kernel(
-    rigid_contact_count: wp.array[int],
-    rigid_contact_shape0: wp.array[wp.int32],
-    rigid_contact_shape1: wp.array[wp.int32],
-    shape_body: wp.array[wp.int32],
-    body_flags: wp.array[wp.int32],
-    body_inv_mass: wp.array[float],
-    proxy_flag: int,
-    kinematic_flag: int,
-):
-    contact_id = wp.tid()
-    if contact_id >= rigid_contact_count[0]:
-        return
-
-    s0 = rigid_contact_shape0[contact_id]
-    s1 = rigid_contact_shape1[contact_id]
-    body0 = shape_body[s0] if s0 >= 0 and s0 < shape_body.shape[0] else -1
-    body1 = shape_body[s1] if s1 >= 0 and s1 < shape_body.shape[0] else -1
-
-    is_proxy0 = 0
-    if body0 >= 0 and body0 < body_flags.shape[0] and (body_flags[body0] & proxy_flag) != 0:
-        is_proxy0 = 1
-    is_proxy1 = 0
-    if body1 >= 0 and body1 < body_flags.shape[0] and (body_flags[body1] & proxy_flag) != 0:
-        is_proxy1 = 1
-
-    is_static0 = 0
-    if body0 < 0:
-        is_static0 = 1
-    elif body0 < body_flags.shape[0] and (body_flags[body0] & kinematic_flag) != 0:
-        is_static0 = 1
-    elif body0 < body_inv_mass.shape[0] and body_inv_mass[body0] == 0.0:
-        is_static0 = 1
-
-    is_static1 = 0
-    if body1 < 0:
-        is_static1 = 1
-    elif body1 < body_flags.shape[0] and (body_flags[body1] & kinematic_flag) != 0:
-        is_static1 = 1
-    elif body1 < body_inv_mass.shape[0] and body_inv_mass[body1] == 0.0:
-        is_static1 = 1
-
-    discard = 0
-    if is_proxy0 == 1 and is_proxy1 == 1:
-        discard = 1
-    if is_proxy0 == 1 and is_static1 == 1:
-        discard = 1
-    if is_proxy1 == 1 and is_static0 == 1:
-        discard = 1
-
-    if discard == 1:
-        rigid_contact_shape0[contact_id] = -1
-        rigid_contact_shape1[contact_id] = -1

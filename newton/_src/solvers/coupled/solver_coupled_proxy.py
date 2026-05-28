@@ -737,6 +737,9 @@ class SolverCoupledProxy(SolverCoupled):
                     collision_config, dst.state_0, iteration_restart=iteration_restart
                 )
 
+            use_body_momentum_harvest = body_proxies and not self._uses_custom_coupling_hook(
+                dst, CouplingHook.BODY_PROXY_HARVEST
+            )
             restore_filtered_contacts = False
             try:
                 if body_proxies:
@@ -747,14 +750,18 @@ class SolverCoupledProxy(SolverCoupled):
                             contacts_freshly_detected=contacts_freshly_detected,
                         )
 
-                    if dst_contacts is contacts and contacts is not None and contacts.rigid_contact_count is not None:
+                    if (
+                        use_body_momentum_harvest
+                        and dst_contacts is not None
+                        and dst_contacts.rigid_contact_count is not None
+                    ):
                         wp.launch(
                             _filter_proxy_rigid_contacts_kernel,
-                            dim=contacts.rigid_contact_shape0.shape[0],
+                            dim=dst_contacts.rigid_contact_shape0.shape[0],
                             inputs=[
-                                contacts.rigid_contact_count,
-                                contacts.rigid_contact_shape0,
-                                contacts.rigid_contact_shape1,
+                                dst_contacts.rigid_contact_count,
+                                dst_contacts.rigid_contact_shape0,
+                                dst_contacts.rigid_contact_shape1,
                                 self.model.shape_body,
                                 dst.view.body_flags,
                                 dst.view.body_inv_mass,
@@ -774,11 +781,11 @@ class SolverCoupledProxy(SolverCoupled):
                 if restore_filtered_contacts:
                     wp.launch(
                         _restore_filtered_proxy_rigid_contacts_kernel,
-                        dim=contacts.rigid_contact_shape0.shape[0],
+                        dim=dst_contacts.rigid_contact_shape0.shape[0],
                         inputs=[
-                            contacts.rigid_contact_count,
-                            contacts.rigid_contact_shape0,
-                            contacts.rigid_contact_shape1,
+                            dst_contacts.rigid_contact_count,
+                            dst_contacts.rigid_contact_shape0,
+                            dst_contacts.rigid_contact_shape1,
                         ],
                         device=self.model.device,
                     )

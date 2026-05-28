@@ -467,6 +467,35 @@ class _StepCountingCopySolver(SolverBase, CouplingInterface):
             wp.copy(state_out.particle_qd, state_in.particle_qd)
 
 
+class _ContactRecordingCopySolver(_StepCountingCopySolver):
+    """Copy solver that records rigid contact shape ids seen by step()."""
+
+    instances: ClassVar[dict[str, "_ContactRecordingCopySolver"]] = {}
+
+    def __init__(self, model):
+        super().__init__(model)
+        self.rigid_shape0_steps = []
+        self.rigid_shape1_steps = []
+
+    def step(self, state_in, state_out, control, contacts, dt):
+        if contacts is not None and contacts.rigid_contact_count is not None:
+            contact_count = int(contacts.rigid_contact_count.numpy()[0])
+            self.rigid_shape0_steps.append(contacts.rigid_contact_shape0.numpy()[:contact_count].copy())
+            self.rigid_shape1_steps.append(contacts.rigid_contact_shape1.numpy()[:contact_count].copy())
+        super().step(state_in, state_out, control, contacts, dt)
+
+
+class _ContactRecordingBodyHarvestSolver(_ContactRecordingCopySolver):
+    """Contact-recording solver with a custom body proxy harvest hook."""
+
+    instances: ClassVar[dict[str, "_ContactRecordingBodyHarvestSolver"]] = {}
+
+    def coupling_harvest_proxy_wrenches(
+        self, body_local_to_proxy_global, out_body_f, *, state=None, state_out=None, contacts=None, dt=0.0
+    ):
+        del body_local_to_proxy_global, out_body_f, state, state_out, contacts, dt
+
+
 class _ProxyContactRecordingSolver(_StepCountingCopySolver):
     """Base stub that tracks would-be prepare-contact metadata.
 
@@ -2397,6 +2426,101 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
         self.assertEqual(len(dst_solver.input_body_qd), 2)
         np.testing.assert_allclose(dst_solver.input_body_qd[0][1], np.zeros(6), atol=1.0e-6)
         np.testing.assert_allclose(dst_solver.input_body_qd[1][1], np.zeros(6), atol=1.0e-6)
+
+    def test_momentum_harvest_filters_proxy_proxy_contacts_during_destination_solve(self):
+        """Momentum fallback should not feed proxy-proxy contact impulses back to sources."""
+        _StepCountingCopySolver.instances.clear()
+        _ContactRecordingCopySolver.instances.clear()
+
+        builder = newton.ModelBuilder(gravity=0.0)
+        body0 = builder.add_body(
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+            xform=wp.transform(p=wp.vec3(-0.04, 0.0, 0.0), q=wp.quat_identity()),
+        )
+        body1 = builder.add_body(
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+            xform=wp.transform(p=wp.vec3(0.04, 0.0, 0.0), q=wp.quat_identity()),
+        )
+        builder.add_shape_sphere(body=body0, radius=0.1)
+        builder.add_shape_sphere(body=body1, radius=0.1)
+        model = builder.finalize(device="cpu")
+
+        coupled = SolverCoupledProxy(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[body0, body1]),
+                SolverCoupled.Entry(name="dst", solver=_ContactRecordingCopySolver, bodies=[]),
+            ],
+            coupling=SolverCoupledProxy.Config(
+                proxies=[
+                    SolverCoupledProxy.Proxy(source="src", destination="dst", bodies=[body0, body1]),
+                ],
+            ),
+        )
+
+        state_0 = model.state()
+        state_1 = model.state()
+        contacts = model.collide(state_0)
+        contact_count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertGreater(contact_count, 0)
+        shape0_before = contacts.rigid_contact_shape0.numpy()[:contact_count].copy()
+        shape1_before = contacts.rigid_contact_shape1.numpy()[:contact_count].copy()
+
+        coupled.step(state_0, state_1, control=None, contacts=contacts, dt=1.0 / 60.0)
+
+        dst_solver = _ContactRecordingCopySolver.instances["dst"]
+        self.assertTrue(np.any(dst_solver.rigid_shape0_steps[0] < -1) or np.any(dst_solver.rigid_shape1_steps[0] < -1))
+        np.testing.assert_array_equal(contacts.rigid_contact_shape0.numpy()[:contact_count], shape0_before)
+        np.testing.assert_array_equal(contacts.rigid_contact_shape1.numpy()[:contact_count], shape1_before)
+
+    def test_custom_body_harvest_keeps_proxy_proxy_contacts_during_destination_solve(self):
+        """Contact-specific harvesters should decide what proxy contacts become feedback."""
+        _StepCountingCopySolver.instances.clear()
+        _ContactRecordingBodyHarvestSolver.instances.clear()
+
+        builder = newton.ModelBuilder(gravity=0.0)
+        body0 = builder.add_body(
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+            xform=wp.transform(p=wp.vec3(-0.04, 0.0, 0.0), q=wp.quat_identity()),
+        )
+        body1 = builder.add_body(
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+            xform=wp.transform(p=wp.vec3(0.04, 0.0, 0.0), q=wp.quat_identity()),
+        )
+        builder.add_shape_sphere(body=body0, radius=0.1)
+        builder.add_shape_sphere(body=body1, radius=0.1)
+        model = builder.finalize(device="cpu")
+
+        coupled = SolverCoupledProxy(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[body0, body1]),
+                SolverCoupled.Entry(name="dst", solver=_ContactRecordingBodyHarvestSolver, bodies=[]),
+            ],
+            coupling=SolverCoupledProxy.Config(
+                proxies=[
+                    SolverCoupledProxy.Proxy(source="src", destination="dst", bodies=[body0, body1]),
+                ],
+            ),
+        )
+
+        state_0 = model.state()
+        state_1 = model.state()
+        contacts = model.collide(state_0)
+        contact_count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertGreater(contact_count, 0)
+        shape0_before = contacts.rigid_contact_shape0.numpy()[:contact_count].copy()
+        shape1_before = contacts.rigid_contact_shape1.numpy()[:contact_count].copy()
+
+        coupled.step(state_0, state_1, control=None, contacts=contacts, dt=1.0 / 60.0)
+
+        dst_solver = _ContactRecordingBodyHarvestSolver.instances["dst"]
+        np.testing.assert_array_equal(dst_solver.rigid_shape0_steps[0], shape0_before)
+        np.testing.assert_array_equal(dst_solver.rigid_shape1_steps[0], shape1_before)
 
     def test_proxy_contact_filter_restores_shared_contacts(self):
         """Destination proxy filtering should not leak into later source solves."""
