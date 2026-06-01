@@ -227,6 +227,56 @@ def contact_lambda_update_kernel(
     lambda_inout[i] = lambda_inout[i] + rho * W[i] * (u[i] - Jv[i])
 
 
+@wp.kernel(enable_backward=False)
+def contact_u_update_active_kernel(
+    active_count: wp.array[int],
+    u_min: wp.array[float],
+    W: wp.array[float],
+    rho: float,
+    friction: wp.array[float],
+    normal: wp.array[wp.vec3],
+    lambda_k: wp.array[wp.vec3],
+    Jv: wp.array[wp.vec3],
+    u_out: wp.array[wp.vec3],
+):
+    """Local contact solve for compact active contact rows."""
+    i = wp.tid()
+    if i >= active_count[0]:
+        return
+
+    W_i = W[i]
+    p = Jv[i]
+    denom = rho * W_i
+    if denom > 0.0:
+        p = p - lambda_k[i] / denom
+
+    u_min_i = u_min[i]
+    if u_min_i < -1.0e7:
+        u_out[i] = p
+        return
+
+    n = normal[i]
+    mu = wp.max(0.0, friction[i])
+    shifted = p - u_min_i * n
+    u_out[i] = solve_coulomb_isotropic(mu, n, shifted) + u_min_i * n
+
+
+@wp.kernel(enable_backward=False)
+def contact_lambda_update_active_kernel(
+    active_count: wp.array[int],
+    rho: float,
+    W: wp.array[float],
+    u: wp.array[wp.vec3],
+    Jv: wp.array[wp.vec3],
+    lambda_inout: wp.array[wp.vec3],
+):
+    """Dual update for compact active contact rows."""
+    i = wp.tid()
+    if i >= active_count[0]:
+        return
+    lambda_inout[i] = lambda_inout[i] + rho * W[i] * (u[i] - Jv[i])
+
+
 # ----------------------------------------------------------------------
 # Rigid-particle attachment kernels
 # ----------------------------------------------------------------------
@@ -616,7 +666,114 @@ def contact_rr_accumulate_forces_kernel(
 
 
 @wp.kernel(enable_backward=False)
+def contact_rr_compute_Jv_active_kernel(
+    active_count: wp.array[int],
+    body_a: wp.array[int],
+    point_a_local: wp.array[wp.vec3],
+    body_b: wp.array[int],
+    point_b_local: wp.array[wp.vec3],
+    body_q_a: wp.array[wp.transform],
+    body_com_a: wp.array[wp.vec3],
+    body_qd_a: wp.array[wp.spatial_vector],
+    body_q_b: wp.array[wp.transform],
+    body_com_b: wp.array[wp.vec3],
+    body_qd_b: wp.array[wp.spatial_vector],
+    Jv: wp.array[wp.vec3],
+):
+    """Compute relative point velocity for compact active rigid contacts."""
+    i = wp.tid()
+    if i >= active_count[0]:
+        return
+    ba = body_a[i]
+    bb = body_b[i]
+
+    xform_a = body_q_a[ba]
+    point_a = wp.transform_point(xform_a, point_a_local[i])
+    arm_a = point_a - wp.transform_point(xform_a, body_com_a[ba])
+    vel_a = velocity_at_point(body_qd_a[ba], arm_a)
+
+    xform_b = body_q_b[bb]
+    point_b = wp.transform_point(xform_b, point_b_local[i])
+    arm_b = point_b - wp.transform_point(xform_b, body_com_b[bb])
+    vel_b = velocity_at_point(body_qd_b[bb], arm_b)
+
+    Jv[i] = vel_a - vel_b
+
+
+@wp.kernel(enable_backward=False)
+def contact_rr_compute_u_min_active_kernel(
+    active_count: wp.array[int],
+    body_a: wp.array[int],
+    point_a_local: wp.array[wp.vec3],
+    body_b: wp.array[int],
+    point_b_local: wp.array[wp.vec3],
+    normal: wp.array[wp.vec3],
+    contact_distance: wp.array[float],
+    body_q_a: wp.array[wp.transform],
+    body_q_b: wp.array[wp.transform],
+    baumgarte: float,
+    dt: float,
+    u_min: wp.array[float],
+):
+    """Compute minimum normal velocity for compact active rigid contacts."""
+    i = wp.tid()
+    if i >= active_count[0]:
+        return
+    ba = body_a[i]
+    bb = body_b[i]
+    point_a = wp.transform_point(body_q_a[ba], point_a_local[i])
+    point_b = wp.transform_point(body_q_b[bb], point_b_local[i])
+    gap = wp.dot(normal[i], point_a - point_b)
+    violation = contact_distance[i] - gap
+    if violation > 0.0 and dt > 0.0:
+        u_min[i] = baumgarte * violation / dt
+    else:
+        u_min[i] = -1.0e8
+
+
+@wp.kernel(enable_backward=False)
+def contact_rr_accumulate_forces_active_kernel(
+    active_count: wp.array[int],
+    body_a: wp.array[int],
+    point_a_local: wp.array[wp.vec3],
+    body_b: wp.array[int],
+    point_b_local: wp.array[wp.vec3],
+    body_q_a: wp.array[wp.transform],
+    body_com_a: wp.array[wp.vec3],
+    body_q_b: wp.array[wp.transform],
+    body_com_b: wp.array[wp.vec3],
+    rho: float,
+    W: wp.array[float],
+    lambda_k: wp.array[wp.vec3],
+    u_k: wp.array[wp.vec3],
+    Jv_k: wp.array[wp.vec3],
+    body_f_a: wp.array[wp.spatial_vector],
+    body_f_b: wp.array[wp.spatial_vector],
+):
+    """Splat contact wrenches for compact active rigid contacts."""
+    i = wp.tid()
+    if i >= active_count[0]:
+        return
+    ba = body_a[i]
+    bb = body_b[i]
+    W_i = W[i]
+    force_a = W_i * (lambda_k[i] + rho * W_i * (u_k[i] - Jv_k[i]))
+
+    xform_a = body_q_a[ba]
+    point_a = wp.transform_point(xform_a, point_a_local[i])
+    arm_a = point_a - wp.transform_point(xform_a, body_com_a[ba])
+    wp.atomic_add(body_f_a, ba, wp.spatial_vector(force_a, wp.cross(arm_a, force_a)))
+
+    force_b = -force_a
+    xform_b = body_q_b[bb]
+    point_b = wp.transform_point(xform_b, point_b_local[i])
+    arm_b = point_b - wp.transform_point(xform_b, body_com_b[bb])
+    wp.atomic_add(body_f_b, bb, wp.spatial_vector(force_b, wp.cross(arm_b, force_b)))
+
+
+@wp.kernel(enable_backward=False)
 def contact_rr_snapshot_kernel(
+    active_count: wp.array[int],
     body_a: wp.array[int],
     body_b: wp.array[int],
     shape_a: wp.array[int],
@@ -630,12 +787,18 @@ def contact_rr_snapshot_kernel(
     prev_shape_a: wp.array[int],
     prev_shape_b: wp.array[int],
     prev_point_id: wp.array[int],
+    prev_active_count: wp.array[int],
     prev_active: wp.array[int],
     prev_u: wp.array[wp.vec3],
     prev_lambda: wp.array[wp.vec3],
 ):
     """Snapshot dynamic rigid-rigid contacts for key-based warm starting."""
     i = wp.tid()
+    if i == 0:
+        prev_active_count[0] = active_count[0]
+    if i >= active_count[0]:
+        prev_active[i] = 0
+        return
     prev_body_a[i] = body_a[i]
     prev_body_b[i] = body_b[i]
     prev_shape_a[i] = shape_a[i]
@@ -718,6 +881,7 @@ def contact_rr_fill_from_rigid_contacts_kernel(
     prev_shape_a: wp.array[int],
     prev_shape_b: wp.array[int],
     prev_point_id: wp.array[int],
+    prev_active_count: wp.array[int],
     prev_active: wp.array[int],
     prev_u: wp.array[wp.vec3],
     prev_lambda: wp.array[wp.vec3],
@@ -816,7 +980,8 @@ def contact_rr_fill_from_rigid_contacts_kernel(
 
     u_out = wp.vec3(0.0, 0.0, 0.0)
     lambda_out = wp.vec3(0.0, 0.0, 0.0)
-    for j in range(capacity):
+    prev_count = wp.min(prev_active_count[0], capacity)
+    for j in range(prev_count):
         if prev_active[j] != 0 and prev_shape_a[j] == sa and prev_shape_b[j] == sb and prev_point_id[j] == pid:
             u_out = prev_u[j]
             lambda_out = prev_lambda[j]

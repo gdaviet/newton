@@ -834,10 +834,11 @@ class TestSolverCoupledBasic(unittest.TestCase):
         self.assertEqual(view_a.body_count, 1)
         self.assertEqual(view_a.body_inv_mass.shape[0], 1)
         self.assertGreater(view_a.body_inv_mass.numpy()[0], 0.0)
-        # Solver B is not a prefix, so the generic zero-mass mask is used.
-        self.assertEqual(view_b.body_count, 2)
-        self.assertEqual(view_b.body_inv_mass.numpy()[0], 0.0)
-        self.assertGreater(view_b.body_inv_mass.numpy()[1], 0.0)
+        # Solver B is also compact even though it is not a parent-model prefix.
+        self.assertEqual(view_b.body_count, 1)
+        self.assertEqual(coupled._entries["B"].body_global_to_local.numpy()[0], -1)
+        self.assertEqual(coupled._entries["B"].body_global_to_local.numpy()[1], 0)
+        self.assertGreater(view_b.body_inv_mass.numpy()[0], 0.0)
         self.assertGreater(view_b.body_mass.numpy()[0], 0.0)
         self.assertEqual(view_b.body_flags.numpy()[0] & int(newton.BodyFlags.KINEMATIC), 0)
         self.assertNotEqual(view_b.body_flags.numpy()[0] & int(newton.BodyFlags.DYNAMIC), 0)
@@ -858,7 +859,7 @@ class TestSolverCoupledBasic(unittest.TestCase):
         view_a_inv_mass = coupled.view("A").body_inv_mass.numpy()
         view_b_inv_mass = coupled.view("B").body_inv_mass.numpy()
         np.testing.assert_allclose(view_a_inv_mass, [0.25])
-        np.testing.assert_allclose(view_b_inv_mass, [0.0, 0.125])
+        np.testing.assert_allclose(view_b_inv_mass, [0.125])
 
     def test_admm_notify_model_changed_reapplies_proximal_body_scaling(self):
         """ADMM proximal body mass scaling should refresh from parent inertia."""
@@ -887,10 +888,10 @@ class TestSolverCoupledBasic(unittest.TestCase):
         np.testing.assert_allclose(view_a.body_mass.numpy()[0], parent_mass[0] * scale)
         np.testing.assert_allclose(view_a.body_inv_mass.numpy()[0], 1.0 / (parent_mass[0] * scale), rtol=1.0e-6)
         np.testing.assert_allclose(view_a.body_inertia.numpy()[0], parent_inertia[0] * scale)
-        np.testing.assert_allclose(view_b.body_mass.numpy()[1], parent_mass[1] * scale)
-        np.testing.assert_allclose(view_b.body_inv_mass.numpy()[1], 1.0 / (parent_mass[1] * scale), rtol=1.0e-6)
-        np.testing.assert_allclose(view_b.body_inertia.numpy()[1], parent_inertia[1] * scale)
-        np.testing.assert_allclose(view_b.body_inv_mass.numpy()[0], 0.0)
+        np.testing.assert_allclose(view_b.body_mass.numpy()[0], parent_mass[1] * scale)
+        np.testing.assert_allclose(view_b.body_inv_mass.numpy()[0], 1.0 / (parent_mass[1] * scale), rtol=1.0e-6)
+        np.testing.assert_allclose(view_b.body_inertia.numpy()[0], parent_inertia[1] * scale)
+        self.assertEqual(coupled._entries["B"].body_global_to_local.numpy()[0], -1)
 
     def test_entry_shapes_filter_shape_contact_pairs(self):
         """Entry shape masks should prune explicit contact pairs in each view."""
@@ -912,8 +913,8 @@ class TestSolverCoupledBasic(unittest.TestCase):
         self.assertEqual(view_a.shape_flags.shape[0], 1)
         self.assertEqual(view_a.shape_contact_pair_count, 0)
 
-        self.assertEqual(int(view_b.shape_flags.numpy()[0]) & collide, 0)
-        self.assertNotEqual(int(view_b.shape_flags.numpy()[1]) & collide, 0)
+        self.assertNotEqual(int(view_b.shape_flags.numpy()[0]) & collide, 0)
+        self.assertEqual(view_b.shape_flags.shape[0], 1)
         self.assertEqual(view_b.shape_contact_pair_count, 0)
 
         self.assertEqual(self.model.shape_contact_pair_count, 1)
@@ -1233,14 +1234,85 @@ class TestSolverCoupledMuJoCoVBDMultiEnv(unittest.TestCase):
         mjc_flags = mjc_view.body_flags.numpy()
         mjc_inv_mass = mjc_view.body_inv_mass.numpy()
         for body in vbd_bodies:
-            self.assertEqual(mjc_inv_mass[body], 0.0)
-            self.assertEqual(mjc_flags[body] & int(newton.BodyFlags.KINEMATIC), 0)
+            self.assertEqual(coupled._entries["mjc"].body_global_to_local.numpy()[body], -1)
+        for local_body in range(mjc_view.body_count):
+            self.assertGreater(mjc_inv_mass[local_body], 0.0)
+            self.assertEqual(mjc_flags[local_body] & int(newton.BodyFlags.KINEMATIC), 0)
 
         vbd_flags = vbd_view.body_flags.numpy()
         vbd_inv_mass = vbd_view.body_inv_mass.numpy()
         for body in mjc_bodies:
             self.assertGreater(vbd_inv_mass[body], 0.0)
             self.assertNotEqual(vbd_flags[body] & proxy, 0)
+
+    def test_mujoco_view_omits_disabled_multi_world_cable_joints(self):
+        try:
+            SolverMuJoCo.import_mujoco()
+        except ImportError as exc:
+            self.skipTest(str(exc))
+
+        world_count = 2
+        template = newton.ModelBuilder(gravity=0.0)
+        SolverMuJoCo.register_custom_attributes(template)
+        SolverVBD.register_custom_attributes(template, dahl_defaults_enabled=False)
+
+        mjc_body = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)), label="mjc_body")
+        mjc_joint = template.add_joint_free(child=mjc_body, label="mjc_free")
+        template.add_articulation([mjc_joint])
+        template.add_shape_box(body=mjc_body, hx=0.05, hy=0.05, hz=0.05)
+
+        cable_shape_start = template.shape_count
+        cable_bodies, cable_joints = template.add_rod(
+            positions=[
+                wp.vec3(0.25, 0.0, 0.0),
+                wp.vec3(0.35, 0.0, 0.0),
+                wp.vec3(0.45, 0.0, 0.0),
+            ],
+            radius=0.01,
+            bend_stiffness=0.01,
+            label="vbd_cable",
+        )
+        cable_shapes = list(range(cable_shape_start, template.shape_count))
+
+        builder = newton.ModelBuilder(gravity=0.0)
+        builder.replicate(template, world_count=world_count)
+        builder.color()
+        model = builder.finalize(device="cpu")
+
+        bodies_per_world = template.body_count
+        joints_per_world = template.joint_count
+        shapes_per_world = template.shape_count
+
+        def expand(ids: list[int], stride: int) -> list[int]:
+            return [world * stride + id_ for world in range(world_count) for id_ in ids]
+
+        coupled = SolverCoupled(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="mjc",
+                    solver=lambda view: SolverMuJoCo(model=view, iterations=1, disable_contacts=True),
+                    bodies=expand([mjc_body], bodies_per_world),
+                    joints=expand([mjc_joint], joints_per_world),
+                    shapes=expand([0], shapes_per_world),
+                ),
+                SolverCoupled.Entry(
+                    name="vbd",
+                    solver=lambda view: SolverVBD(model=view, iterations=1),
+                    bodies=expand(cable_bodies, bodies_per_world),
+                    joints=expand(cable_joints, joints_per_world),
+                    shapes=expand(cable_shapes, shapes_per_world),
+                ),
+            ],
+        )
+
+        self.assertIsInstance(coupled.solver("mjc"), SolverMuJoCo)
+        mjc_view = coupled.view("mjc")
+        mjc_entry = coupled._entries["mjc"]
+        self.assertEqual(mjc_view.joint_count, world_count)
+        self.assertEqual(mjc_view.body_count, world_count)
+        self.assertEqual(mjc_entry.body_global_to_local.numpy()[expand(cable_bodies, bodies_per_world)[0]], -1)
+        self.assertNotIn(int(newton.JointType.CABLE), {int(t) for t in mjc_view.joint_type.numpy()})
 
 
 class TestSolverAdmmContactKernels(unittest.TestCase):
@@ -1303,6 +1375,7 @@ class TestSolverAdmmContactKernels(unittest.TestCase):
                 wp.full(capacity, -1, dtype=int, device=device),
                 wp.full(capacity, -1, dtype=int, device=device),
                 wp.full(capacity, -1, dtype=int, device=device),
+                wp.zeros(1, dtype=int, device=device),
                 wp.zeros(capacity, dtype=int, device=device),
                 wp.zeros(capacity, dtype=wp.vec3, device=device),
                 wp.zeros(capacity, dtype=wp.vec3, device=device),
@@ -1412,6 +1485,10 @@ class TestSolverAdmmContactKernels(unittest.TestCase):
 class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
     """Body proxy mappings install full proxy inertia tensors."""
 
+    @staticmethod
+    def _entry_body_local(coupled: SolverCoupledProxy, entry_name: str, body_id: int) -> int:
+        return int(coupled._entries[entry_name].body_global_to_local.numpy()[body_id])
+
     def test_duplicate_body_proxy_mapping_ids_are_rejected(self):
         builder = newton.ModelBuilder(gravity=0.0)
         for _ in range(3):
@@ -1512,10 +1589,15 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
         )
 
         dst_view = coupled.view("dst")
+        proxy_local = self._entry_body_local(coupled, "dst", 1)
         expected_inertia = np.array([[2.5, 0.05, 0.0], [0.05, 3.0, 0.1], [0.0, 0.1, 3.5]])
-        np.testing.assert_allclose(dst_view.body_mass.numpy()[1], 1.0)
-        np.testing.assert_allclose(dst_view.body_inertia.numpy()[1], expected_inertia)
-        np.testing.assert_allclose(dst_view.body_inv_inertia.numpy()[1], np.linalg.inv(expected_inertia), rtol=1.0e-6)
+        np.testing.assert_allclose(dst_view.body_mass.numpy()[proxy_local], 1.0)
+        np.testing.assert_allclose(dst_view.body_inertia.numpy()[proxy_local], expected_inertia)
+        np.testing.assert_allclose(
+            dst_view.body_inv_inertia.numpy()[proxy_local],
+            np.linalg.inv(expected_inertia),
+            rtol=1.0e-6,
+        )
         dst_solver = _StepCountingCopySolver.instances["dst"]
         self.assertTrue(
             any(flags & int(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES) for flags in dst_solver.model_notify_flags)
@@ -1564,11 +1646,13 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
         coupled.notify_model_changed(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES)
 
         dst_view = coupled.view("dst")
-        np.testing.assert_allclose(dst_view.body_mass.numpy()[1], parent_mass[1])
-        np.testing.assert_allclose(dst_view.body_inertia.numpy()[1], parent_inertia[1])
-        np.testing.assert_allclose(dst_view.body_mass.numpy()[2], 0.5 * parent_mass[0])
-        np.testing.assert_allclose(dst_view.body_inertia.numpy()[2], 0.5 * parent_inertia[0])
-        np.testing.assert_allclose(dst_view.body_inv_mass.numpy()[0], 0.0)
+        owned_local = self._entry_body_local(coupled, "dst", 1)
+        proxy_local = self._entry_body_local(coupled, "dst", 2)
+        self.assertEqual(self._entry_body_local(coupled, "dst", 0), -1)
+        np.testing.assert_allclose(dst_view.body_mass.numpy()[owned_local], parent_mass[1])
+        np.testing.assert_allclose(dst_view.body_inertia.numpy()[owned_local], parent_inertia[1])
+        np.testing.assert_allclose(dst_view.body_mass.numpy()[proxy_local], 0.5 * parent_mass[0])
+        np.testing.assert_allclose(dst_view.body_inertia.numpy()[proxy_local], 0.5 * parent_inertia[0])
 
     def test_body_proxy_maps_proxy_indexed_feedback_to_source(self):
         _BodyForceRecordingSolver.instances.clear()
@@ -1642,12 +1726,17 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
 
         solver = _CustomEffectiveMassBodySolver.instances[-1]
         dst_view = coupled.view("dst")
+        proxy_local = self._entry_body_local(coupled, "dst", 1)
         expected_inertia = np.array([[8.0, 0.2, 0.0], [0.2, 12.0, 0.4], [0.0, 0.4, 16.0]])
 
         self.assertEqual(len(solver.queried_endpoints), 1)
-        np.testing.assert_allclose(dst_view.body_mass.numpy()[1], 4.0)
-        np.testing.assert_allclose(dst_view.body_inertia.numpy()[1], expected_inertia)
-        np.testing.assert_allclose(dst_view.body_inv_inertia.numpy()[1], np.linalg.inv(expected_inertia), rtol=1.0e-6)
+        np.testing.assert_allclose(dst_view.body_mass.numpy()[proxy_local], 4.0)
+        np.testing.assert_allclose(dst_view.body_inertia.numpy()[proxy_local], expected_inertia)
+        np.testing.assert_allclose(
+            dst_view.body_inv_inertia.numpy()[proxy_local],
+            np.linalg.inv(expected_inertia),
+            rtol=1.0e-6,
+        )
 
     def test_proxy_body_can_use_custom_effective_mass_block(self):
         _CustomEffectiveBodyInertiaSolver.instances.clear()
@@ -1677,14 +1766,19 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
 
         solver = _CustomEffectiveBodyInertiaSolver.instances[-1]
         dst_view = coupled.view("dst")
+        proxy_local = self._entry_body_local(coupled, "dst", 1)
         expected_inertia = np.array([[1.0, 0.25, 0.0], [0.25, 1.5, 0.125], [0.0, 0.125, 2.5]])
 
         self.assertTrue(solver.received_inertia_buffer)
         self.assertEqual(len(solver.queried_endpoints), 1)
         self.assertEqual(solver.queried_endpoints[0], 0)
-        np.testing.assert_allclose(dst_view.body_mass.numpy()[1], 3.0)
-        np.testing.assert_allclose(dst_view.body_inertia.numpy()[1], expected_inertia)
-        np.testing.assert_allclose(dst_view.body_inv_inertia.numpy()[1], np.linalg.inv(expected_inertia), rtol=1.0e-6)
+        np.testing.assert_allclose(dst_view.body_mass.numpy()[proxy_local], 3.0)
+        np.testing.assert_allclose(dst_view.body_inertia.numpy()[proxy_local], expected_inertia)
+        np.testing.assert_allclose(
+            dst_view.body_inv_inertia.numpy()[proxy_local],
+            np.linalg.inv(expected_inertia),
+            rtol=1.0e-6,
+        )
 
 
 class TestSolverCoupledProxyContactHooks(unittest.TestCase):

@@ -355,9 +355,9 @@ class ModelView:
             overrides[name] = array
         return array
 
-    def _refresh_body_inertial_properties(self, body_indices: wp.array[int]) -> None:
+    def _refresh_body_inertial_properties(self, body_local_to_global: wp.array[int]) -> None:
         """Refresh view-local body inertial properties copied from the parent model."""
-        if body_indices.shape[0] == 0:
+        if body_local_to_global.shape[0] == 0:
             return
 
         parent = object.__getattribute__(self, "_parent")
@@ -368,9 +368,9 @@ class ModelView:
 
         wp.launch(
             _copy_body_inertial_properties_kernel,
-            dim=body_indices.shape[0],
+            dim=body_local_to_global.shape[0],
             inputs=[
-                body_indices,
+                body_local_to_global,
                 parent.body_mass,
                 parent.body_inertia,
                 parent.body_inv_mass,
@@ -385,29 +385,36 @@ class ModelView:
 
     def _refresh_body_inverse_dynamics(
         self,
-        body_indices: wp.array[int],
+        body_local_to_global: wp.array[int],
         disabled_body_indices: wp.array[int],
     ) -> None:
         """Refresh view-local inverse dynamics copied from the parent model."""
-        if body_indices.shape[0] == 0 and disabled_body_indices.shape[0] == 0:
+        if body_local_to_global.shape[0] == 0 and disabled_body_indices.shape[0] == 0:
             return
 
         parent = object.__getattribute__(self, "_parent")
         inv_mass = self._cow_array("body_inv_mass")
         inv_inertia = self._cow_array("body_inv_inertia")
 
-        if body_indices.shape[0] > 0:
+        if body_local_to_global.shape[0] > 0:
             wp.launch(
                 _copy_body_inverse_dynamics_kernel,
-                dim=body_indices.shape[0],
-                inputs=[body_indices, parent.body_inv_mass, parent.body_inv_inertia, inv_mass, inv_inertia],
+                dim=body_local_to_global.shape[0],
+                inputs=[body_local_to_global, parent.body_inv_mass, parent.body_inv_inertia, inv_mass, inv_inertia],
                 device=parent.device,
             )
         if disabled_body_indices.shape[0] > 0:
+            local_to_global = [int(index) for index in body_local_to_global.numpy()]
+            global_to_local = {global_id: local_id for local_id, global_id in enumerate(local_to_global)}
+            disabled_local = [
+                global_to_local[int(index)] for index in disabled_body_indices.numpy() if int(index) in global_to_local
+            ]
+            if not disabled_local:
+                return
             wp.launch(
                 _zero_body_inverse_dynamics_kernel,
-                dim=disabled_body_indices.shape[0],
-                inputs=[disabled_body_indices, inv_mass, inv_inertia],
+                dim=len(disabled_local),
+                inputs=[wp.array(disabled_local, dtype=int, device=parent.device), inv_mass, inv_inertia],
                 device=parent.device,
             )
 
@@ -783,7 +790,7 @@ def _zero_body_inverse_dynamics_kernel(
 
 @wp.kernel(enable_backward=False)
 def _copy_body_inertial_properties_kernel(
-    indices: wp.array[int],
+    local_to_global: wp.array[int],
     parent_mass: wp.array[float],
     parent_inertia: wp.array[wp.mat33],
     parent_inv_mass: wp.array[float],
@@ -793,26 +800,26 @@ def _copy_body_inertial_properties_kernel(
     inv_mass: wp.array[float],
     inv_inertia: wp.array[wp.mat33],
 ):
-    i = wp.tid()
-    idx = indices[i]
-    mass[idx] = parent_mass[idx]
-    inertia[idx] = parent_inertia[idx]
-    inv_mass[idx] = parent_inv_mass[idx]
-    inv_inertia[idx] = parent_inv_inertia[idx]
+    local_id = wp.tid()
+    global_id = local_to_global[local_id]
+    mass[local_id] = parent_mass[global_id]
+    inertia[local_id] = parent_inertia[global_id]
+    inv_mass[local_id] = parent_inv_mass[global_id]
+    inv_inertia[local_id] = parent_inv_inertia[global_id]
 
 
 @wp.kernel(enable_backward=False)
 def _copy_body_inverse_dynamics_kernel(
-    indices: wp.array[int],
+    local_to_global: wp.array[int],
     parent_inv_mass: wp.array[float],
     parent_inv_inertia: wp.array[wp.mat33],
     inv_mass: wp.array[float],
     inv_inertia: wp.array[wp.mat33],
 ):
-    i = wp.tid()
-    idx = indices[i]
-    inv_mass[idx] = parent_inv_mass[idx]
-    inv_inertia[idx] = parent_inv_inertia[idx]
+    local_id = wp.tid()
+    global_id = local_to_global[local_id]
+    inv_mass[local_id] = parent_inv_mass[global_id]
+    inv_inertia[local_id] = parent_inv_inertia[global_id]
 
 
 @wp.kernel(enable_backward=False)

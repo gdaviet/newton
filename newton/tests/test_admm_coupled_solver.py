@@ -1479,6 +1479,145 @@ class TestAdmmModelJointInterface(unittest.TestCase):
         self.assertEqual(len(solver._admm_rr_angular_groups), 0)
         self.assertEqual(len(solver._admm_rr_revolute_angular_groups), 1)
 
+    def test_joint_attachment_weights_use_local_ids_and_scaled_inertia(self):
+        builder = newton.ModelBuilder(gravity=0.0)
+        parent_mass = 2.0
+        child_mass = 5.0
+        parent_inertia = 0.2
+        child_inertia = 0.5
+        parent = builder.add_body(
+            xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0), q=wp.quat_identity()),
+            mass=parent_mass,
+            inertia=wp.mat33(np.eye(3) * parent_inertia),
+        )
+        child = builder.add_body(
+            xform=wp.transform(p=wp.vec3(0.3, 0.0, 0.0), q=wp.quat_identity()),
+            mass=child_mass,
+            inertia=wp.mat33(np.eye(3) * child_inertia),
+        )
+        shape_cfg = newton.ModelBuilder.ShapeConfig(density=0.0)
+        builder.add_shape_sphere(parent, radius=0.05, cfg=shape_cfg)
+        builder.add_shape_sphere(child, radius=0.05, cfg=shape_cfg)
+        builder.add_joint_revolute(parent=parent, child=child, friction=0.25, collision_filter_parent=False)
+        model = builder.finalize(device="cpu")
+
+        gamma = 2.0
+        solver = SolverCoupledAdmm(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="child",
+                    solver=lambda v: _CustomAdmmParticleCopySolver(model=v),
+                    bodies=[child],
+                ),
+                SolverCoupled.Entry(
+                    name="parent",
+                    solver=lambda v: _CustomAdmmParticleCopySolver(model=v),
+                    bodies=[parent],
+                ),
+            ],
+            coupling=SolverCoupledAdmm.Config(gamma=gamma),
+        )
+
+        linear_group = solver._admm_rr_groups[0]
+        angular_group = solver._admm_rr_revolute_angular_groups[0]
+        friction_group = solver._admm_rr_angular_friction_groups[0]
+        child_entry = solver._entries["child"]
+        parent_entry = solver._entries["parent"]
+        np.testing.assert_array_equal(child_entry.body_local_to_global.numpy(), [parent, child])
+        np.testing.assert_array_equal(parent_entry.body_local_to_global.numpy(), [parent, child])
+        child_local = int(child_entry.body_global_to_local.numpy()[child])
+        parent_local = int(parent_entry.body_global_to_local.numpy()[parent])
+        child_parent_proxy_local = int(child_entry.body_global_to_local.numpy()[parent])
+        parent_child_proxy_local = int(parent_entry.body_global_to_local.numpy()[child])
+        proxy_flag = int(newton.BodyFlags.PROXY)
+        self.assertEqual(int(child_entry.view.body_flags.numpy()[child_local]) & proxy_flag, 0)
+        self.assertEqual(int(parent_entry.view.body_flags.numpy()[parent_local]) & proxy_flag, 0)
+        self.assertNotEqual(int(child_entry.view.body_flags.numpy()[child_parent_proxy_local]) & proxy_flag, 0)
+        self.assertNotEqual(int(parent_entry.view.body_flags.numpy()[parent_child_proxy_local]) & proxy_flag, 0)
+
+        collision_mask = int(
+            newton.ShapeFlags.COLLIDE_SHAPES | newton.ShapeFlags.COLLIDE_PARTICLES | newton.ShapeFlags.HYDROELASTIC
+        )
+        for shape_body, shape_flags in zip(
+            child_entry.view.shape_body.numpy(),
+            child_entry.view.shape_flags.numpy(),
+            strict=True,
+        ):
+            if int(shape_body) == child_parent_proxy_local:
+                self.assertEqual(int(shape_flags) & collision_mask, 0)
+            elif int(shape_body) == child_local:
+                self.assertNotEqual(int(shape_flags) & int(newton.ShapeFlags.COLLIDE_SHAPES), 0)
+        for shape_body, shape_flags in zip(
+            parent_entry.view.shape_body.numpy(),
+            parent_entry.view.shape_flags.numpy(),
+            strict=True,
+        ):
+            if int(shape_body) == parent_child_proxy_local:
+                self.assertEqual(int(shape_flags) & collision_mask, 0)
+            elif int(shape_body) == parent_local:
+                self.assertNotEqual(int(shape_flags) & int(newton.ShapeFlags.COLLIDE_SHAPES), 0)
+
+        np.testing.assert_array_equal(linear_group.body_ids_a.numpy(), [child_local])
+        np.testing.assert_array_equal(linear_group.body_ids_b.numpy(), [parent_local])
+        np.testing.assert_array_equal(angular_group.body_ids_a.numpy(), [child_local])
+        np.testing.assert_array_equal(angular_group.body_ids_b.numpy(), [parent_local])
+        np.testing.assert_array_equal(friction_group.body_ids_a.numpy(), [child_local])
+        np.testing.assert_array_equal(friction_group.body_ids_b.numpy(), [parent_local])
+
+        scale = 1.0 + gamma
+        child_view_mass = child_entry.view.body_mass.numpy()
+        parent_view_mass = parent_entry.view.body_mass.numpy()
+        np.testing.assert_allclose(child_view_mass[child_local], child_mass * scale, atol=1.0e-6)
+        np.testing.assert_allclose(
+            child_view_mass[int(child_entry.body_global_to_local.numpy()[parent])], parent_mass * scale, atol=1.0e-6
+        )
+        np.testing.assert_allclose(parent_view_mass[parent_local], parent_mass * scale, atol=1.0e-6)
+        np.testing.assert_allclose(
+            parent_view_mass[int(parent_entry.body_global_to_local.numpy()[child])], child_mass * scale, atol=1.0e-6
+        )
+        expected_linear = math.sqrt((child_mass * scale * parent_mass * scale) / ((child_mass + parent_mass) * scale))
+        child_angular_weight = child_inertia * scale / 3.0
+        parent_angular_weight = parent_inertia * scale / 3.0
+        expected_angular = math.sqrt(
+            (child_angular_weight * parent_angular_weight) / (child_angular_weight + parent_angular_weight)
+        )
+        np.testing.assert_allclose(linear_group.W.numpy(), [expected_linear], atol=1.0e-6)
+        np.testing.assert_allclose(angular_group.W.numpy(), [expected_angular], atol=1.0e-6)
+        np.testing.assert_allclose(friction_group.W.numpy(), [expected_angular], atol=1.0e-6)
+
+    def test_joint_proximal_destination_filter_adds_proxy_to_one_side(self):
+        model, parent, child, _ = self._build_two_body_joint_scene("ball")
+        solver = SolverCoupledAdmm(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="child",
+                    solver=lambda v: _CustomAdmmParticleCopySolver(model=v),
+                    bodies=[child],
+                ),
+                SolverCoupled.Entry(
+                    name="parent",
+                    solver=lambda v: _CustomAdmmParticleCopySolver(model=v),
+                    bodies=[parent],
+                ),
+            ],
+            coupling=SolverCoupledAdmm.Config(joint_proximal_destination_entries=("parent",)),
+        )
+
+        child_entry = solver._entries["child"]
+        parent_entry = solver._entries["parent"]
+        proxy_flag = int(newton.BodyFlags.PROXY)
+
+        self.assertEqual(int(child_entry.body_global_to_local.numpy()[parent]), -1)
+        self.assertGreaterEqual(int(parent_entry.body_global_to_local.numpy()[child]), 0)
+        self.assertEqual(int(child_entry.view.body_flags.numpy()[0]) & proxy_flag, 0)
+
+        parent_child_proxy_local = int(parent_entry.body_global_to_local.numpy()[child])
+        self.assertNotEqual(int(parent_entry.view.body_flags.numpy()[parent_child_proxy_local]) & proxy_flag, 0)
+        self.assertEqual(len(solver._admm_joint_proxy_mappings), 1)
+        self.assertEqual(solver._admm_joint_proxy_mappings[0].dst_name, "parent")
+
     def test_revolute_joint_friction_builds_hinge_friction_row(self):
         model, parent, child, _ = self._build_two_body_joint_scene("revolute", friction=2.5)
         solver = self._make_two_body_joint_solver(model, parent, child)
@@ -1600,6 +1739,88 @@ class TestAdmmExternalForces(unittest.TestCase):
 
 class TestAdmmCollisionDetection(unittest.TestCase):
     """Collision-detected ADMM contact constraints."""
+
+    def test_rigid_contact_detection_uses_exact_admm_pairs(self):
+        builder = newton.ModelBuilder()
+        builder.default_shape_cfg.density = 1000.0
+
+        body_a0 = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()))
+        shape_a0 = builder.add_shape_box(body=body_a0, hx=0.05, hy=0.05, hz=0.05)
+        body_a1 = builder.add_body(xform=wp.transform(wp.vec3(2.0, 0.0, 0.0), wp.quat_identity()))
+        shape_a1 = builder.add_shape_box(body=body_a1, hx=0.05, hy=0.05, hz=0.05)
+        body_b0 = builder.add_body(xform=wp.transform(wp.vec3(0.08, 0.0, 0.0), wp.quat_identity()))
+        shape_b0 = builder.add_shape_box(body=body_b0, hx=0.05, hy=0.05, hz=0.05)
+        body_b1 = builder.add_body(xform=wp.transform(wp.vec3(2.08, 0.0, 0.0), wp.quat_identity()))
+        shape_b1 = builder.add_shape_box(body=body_b1, hx=0.05, hy=0.05, hz=0.05)
+
+        builder.add_shape_collision_filter_pair(shape_a0, shape_b1)
+        builder.add_shape_collision_filter_pair(shape_a1, shape_b0)
+        model = builder.finalize(device="cpu")
+
+        solver = SolverCoupledAdmm(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="a",
+                    solver=lambda v: SolverSemiImplicit(model=v, enable_tri_contact=False),
+                    bodies=[body_a0, body_a1],
+                ),
+                SolverCoupled.Entry(
+                    name="b",
+                    solver=lambda v: SolverSemiImplicit(model=v, enable_tri_contact=False),
+                    bodies=[body_b0, body_b1],
+                ),
+            ],
+            coupling=SolverCoupledAdmm.Config(
+                contact_pairs=[SolverCoupledAdmm.ContactPair(source="a", destination="b")],
+            ),
+        )
+
+        group = solver._admm_dynamic_rr_contact_groups[0]
+        expected_pairs = {(shape_a0, shape_b0), (shape_a1, shape_b1)}
+        actual_pairs = {tuple(pair) for pair in solver._admm_collision_pipeline.shape_pairs_filtered.numpy()}
+
+        self.assertEqual(actual_pairs, expected_pairs)
+        self.assertEqual(group.count, 8 * len(expected_pairs))
+        self.assertEqual(solver._admm_internal_contacts.rigid_contact_max, 8 * len(expected_pairs))
+
+    def test_rigid_contact_detection_rejects_cross_world_pairs(self):
+        builder = newton.ModelBuilder()
+        builder.default_shape_cfg.density = 1000.0
+
+        builder.begin_world()
+        body_a = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()))
+        shape_a = builder.add_shape_box(body=body_a, hx=0.05, hy=0.05, hz=0.05)
+        builder.end_world()
+
+        builder.begin_world()
+        body_b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()))
+        shape_b = builder.add_shape_box(body=body_b, hx=0.05, hy=0.05, hz=0.05)
+        builder.end_world()
+
+        model = builder.finalize(device="cpu")
+        model.shape_contact_pairs = wp.array(np.asarray([(shape_a, shape_b)], dtype=np.int32), dtype=wp.vec2i)
+        model.shape_contact_pair_count = 1
+
+        with self.assertRaisesRegex(ValueError, "same world"):
+            SolverCoupledAdmm(
+                model=model,
+                entries=[
+                    SolverCoupled.Entry(
+                        name="a",
+                        solver=lambda v: SolverSemiImplicit(model=v, enable_tri_contact=False),
+                        bodies=[body_a],
+                    ),
+                    SolverCoupled.Entry(
+                        name="b",
+                        solver=lambda v: SolverSemiImplicit(model=v, enable_tri_contact=False),
+                        bodies=[body_b],
+                    ),
+                ],
+                coupling=SolverCoupledAdmm.Config(
+                    contact_pairs=[SolverCoupledAdmm.ContactPair(source="a", destination="b")],
+                ),
+            )
 
     def test_collision_particle_particle_contacts_are_refreshed_in_solver(self):
         model = _build_two_particle_contact_scene(gap=-0.08)

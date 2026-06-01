@@ -819,6 +819,23 @@ add_example_test(
 )
 add_example_test(
     TestMultiphysicsExamples,
+    name="multiphysics.example_mujoco_franka_vbd_cable_admm_solver",
+    devices=["cpu"],
+    test_options={
+        "num-frames": 0,
+        "world-count": 2,
+        "cable-segments": 4,
+        "substeps": 1,
+        "admm-iterations": 1,
+        "vbd-iterations": 1,
+        "mujoco-iterations": 8,
+        "mujoco-ls-iterations": 10,
+        "graph-capture": False,
+    },
+    use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
     name="multiphysics.example_admm_contact_solver",
     devices=test_devices,
     test_options={"num-frames": 120},
@@ -829,6 +846,13 @@ add_example_test(
     name="multiphysics.example_admm_rigid_contact_solver",
     devices=test_devices,
     test_options={"num-frames": 90, "tilt-time": 1.0},
+    use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_kamino_mujoco_admm_solver",
+    devices=["cpu"],
+    test_options={"num-frames": 30, "world-count": 4, "graph-capture": False},
     use_viewer=True,
 )
 add_example_test(

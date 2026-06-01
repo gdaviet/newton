@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Callable
 
 import numpy as np
@@ -222,6 +223,8 @@ class Example:
                 rho=50,
                 gamma=0.1,
                 baumgarte=0.01,
+                joint_proximal_bodies=args.joint_proximal_bodies,
+                joint_proximal_destination_entries=(rigid_name,),
             ),
         )
 
@@ -283,6 +286,12 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         _add_rigid_solver_arg(parser)
+        parser.add_argument(
+            "--joint-proximal-bodies",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Keep cross-solver joint neighbor bodies as inertial ADMM proxies.",
+        )
         return parser
 
 

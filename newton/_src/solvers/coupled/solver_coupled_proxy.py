@@ -45,6 +45,7 @@ class _ProxyBodyMapping:
     src_name: str
     dst_name: str
     src_body_ids: wp.array = field(default=None)
+    proxy_body_ids_global: wp.array = field(default=None)
     proxy_body_ids_local: wp.array = field(default=None)
     source_local_to_proxy_local: wp.array = field(default=None)
     source_local_to_proxy_global: wp.array = field(default=None)
@@ -67,6 +68,7 @@ class _ProxyParticleMapping:
     src_name: str
     dst_name: str
     src_particle_ids: wp.array = field(default=None)
+    proxy_particle_ids_global: wp.array = field(default=None)
     proxy_particle_ids_local: wp.array = field(default=None)
     source_local_to_proxy_local: wp.array = field(default=None)
     source_local_to_proxy_global: wp.array = field(default=None)
@@ -227,10 +229,6 @@ class SolverCoupledProxy(SolverCoupled):
             self._validate_unique_proxy_ids("source body", src_ids)
             self._validate_unique_proxy_ids("proxy body", proxy_local_ids)
             self._validate_proxy_body_worlds(model, src_ids, proxy_local_ids)
-            # ModelView currently preserves parent-model indexing, so the
-            # configured proxy ids are both local ids in the destination view
-            # and global ids in the parent model. Keep both names explicit so
-            # hook indexing remains unambiguous if views become compact later.
             proxy_global_ids = proxy_local_ids
 
             source_local_to_proxy_local = [-1] * model.body_count
@@ -246,6 +244,7 @@ class SolverCoupledProxy(SolverCoupled):
                     src_name=proxy.source,
                     dst_name=proxy.destination,
                     src_body_ids=wp.array(src_ids, dtype=int, device=device),
+                    proxy_body_ids_global=wp.array(proxy_global_ids, dtype=int, device=device),
                     proxy_body_ids_local=wp.array(proxy_local_ids, dtype=int, device=device),
                     source_local_to_proxy_local=wp.array(source_local_to_proxy_local, dtype=int, device=device),
                     source_local_to_proxy_global=wp.array(source_local_to_proxy_global, dtype=int, device=device),
@@ -310,8 +309,6 @@ class SolverCoupledProxy(SolverCoupled):
             self._validate_proxy_ids("Proxy destination particle", proxy_local_ids, model.particle_count)
             self._validate_unique_proxy_ids("source particle", src_ids)
             self._validate_unique_proxy_ids("proxy particle", proxy_local_ids)
-            # ModelView currently preserves parent-model indexing; see the
-            # body-proxy construction above for the local/global convention.
             proxy_global_ids = proxy_local_ids
 
             source_local_to_proxy_local = [-1] * model.particle_count
@@ -327,6 +324,7 @@ class SolverCoupledProxy(SolverCoupled):
                     src_name=proxy.source,
                     dst_name=proxy.destination,
                     src_particle_ids=wp.array(src_ids, dtype=int, device=device),
+                    proxy_particle_ids_global=wp.array(proxy_global_ids, dtype=int, device=device),
                     proxy_particle_ids_local=wp.array(proxy_local_ids, dtype=int, device=device),
                     source_local_to_proxy_local=wp.array(source_local_to_proxy_local, dtype=int, device=device),
                     source_local_to_proxy_global=wp.array(source_local_to_proxy_global, dtype=int, device=device),
@@ -342,15 +340,15 @@ class SolverCoupledProxy(SolverCoupled):
     def _entry_proxy_body_keep_indices(self, name: str) -> set[int]:
         proxy_keep: set[int] = set()
         for mapping in self._proxy_mappings:
-            if mapping.dst_name == name and mapping.proxy_body_ids_local is not None:
-                proxy_keep.update(int(i) for i in mapping.proxy_body_ids_local.numpy())
+            if mapping.dst_name == name and mapping.proxy_body_ids_global is not None:
+                proxy_keep.update(int(i) for i in mapping.proxy_body_ids_global.numpy())
         return proxy_keep
 
     def _entry_proxy_particle_keep_indices(self, name: str) -> set[int]:
         proxy_keep: set[int] = set()
         for mapping in self._proxy_particle_mappings:
-            if mapping.dst_name == name and mapping.proxy_particle_ids_local is not None:
-                proxy_keep.update(int(i) for i in mapping.proxy_particle_ids_local.numpy())
+            if mapping.dst_name == name and mapping.proxy_particle_ids_global is not None:
+                proxy_keep.update(int(i) for i in mapping.proxy_particle_ids_global.numpy())
         return proxy_keep
 
     def _after_entries_constructed(self) -> None:
@@ -360,45 +358,99 @@ class SolverCoupledProxy(SolverCoupled):
         self._init_proxy_collision_pipelines()
 
     def _refresh_proxy_view_maps(self) -> None:
-        """Resize dense proxy maps to the source/destination view counts."""
+        """Remap dense proxy maps to the source/destination view layouts."""
         device = self.model.device
         for mapping in self._proxy_mappings:
-            src_count = int(self._entries[mapping.src_name].view.body_count)
-            dst_count = int(self._entries[mapping.dst_name].view.body_count)
-            mapping.source_local_to_proxy_local = wp.array(
-                mapping.source_local_to_proxy_local.numpy()[:src_count],
-                dtype=int,
-                device=device,
+            src = self._entries[mapping.src_name]
+            dst = self._entries[mapping.dst_name]
+            src_count = int(src.view.body_count)
+            dst_count = int(dst.view.body_count)
+            src_globals = [int(i) for i in mapping.src_body_ids.numpy()]
+            proxy_globals = [int(i) for i in mapping.proxy_body_ids_global.numpy()]
+            src_locals = self._local_ids_from_global(
+                src.body_global_to_local,
+                src_globals,
+                mapping.src_name,
+                "body",
             )
-            mapping.source_local_to_proxy_global = wp.array(
-                mapping.source_local_to_proxy_global.numpy()[:src_count],
-                dtype=int,
-                device=device,
+            proxy_locals = self._local_ids_from_global(
+                dst.body_global_to_local,
+                proxy_globals,
+                mapping.dst_name,
+                "proxy body",
             )
+
+            source_local_to_proxy_local = [-1] * src_count
+            source_local_to_proxy_global = [-1] * src_count
+            destination_local_to_proxy_global = [-1] * dst_count
+            for source_local, proxy_local, proxy_global in zip(src_locals, proxy_locals, proxy_globals, strict=True):
+                source_local_to_proxy_local[source_local] = proxy_local
+                source_local_to_proxy_global[source_local] = proxy_global
+                destination_local_to_proxy_global[proxy_local] = proxy_global
+
+            mapping.proxy_body_ids_local = wp.array(proxy_locals, dtype=int, device=device)
+            mapping.source_local_to_proxy_local = wp.array(source_local_to_proxy_local, dtype=int, device=device)
+            mapping.source_local_to_proxy_global = wp.array(source_local_to_proxy_global, dtype=int, device=device)
             mapping.destination_local_to_proxy_global = wp.array(
-                mapping.destination_local_to_proxy_global.numpy()[:dst_count],
+                destination_local_to_proxy_global,
                 dtype=int,
                 device=device,
             )
 
         for mapping in self._proxy_particle_mappings:
-            src_count = int(self._entries[mapping.src_name].view.particle_count)
-            dst_count = int(self._entries[mapping.dst_name].view.particle_count)
-            mapping.source_local_to_proxy_local = wp.array(
-                mapping.source_local_to_proxy_local.numpy()[:src_count],
-                dtype=int,
-                device=device,
+            src = self._entries[mapping.src_name]
+            dst = self._entries[mapping.dst_name]
+            src_count = int(src.view.particle_count)
+            dst_count = int(dst.view.particle_count)
+            src_globals = [int(i) for i in mapping.src_particle_ids.numpy()]
+            proxy_globals = [int(i) for i in mapping.proxy_particle_ids_global.numpy()]
+            src_locals = self._local_ids_from_global(
+                src.particle_global_to_local,
+                src_globals,
+                mapping.src_name,
+                "particle",
             )
-            mapping.source_local_to_proxy_global = wp.array(
-                mapping.source_local_to_proxy_global.numpy()[:src_count],
-                dtype=int,
-                device=device,
+            proxy_locals = self._local_ids_from_global(
+                dst.particle_global_to_local,
+                proxy_globals,
+                mapping.dst_name,
+                "proxy particle",
             )
+
+            source_local_to_proxy_local = [-1] * src_count
+            source_local_to_proxy_global = [-1] * src_count
+            destination_local_to_proxy_global = [-1] * dst_count
+            for source_local, proxy_local, proxy_global in zip(src_locals, proxy_locals, proxy_globals, strict=True):
+                source_local_to_proxy_local[source_local] = proxy_local
+                source_local_to_proxy_global[source_local] = proxy_global
+                destination_local_to_proxy_global[proxy_local] = proxy_global
+
+            mapping.proxy_particle_ids_local = wp.array(proxy_locals, dtype=int, device=device)
+            mapping.source_local_to_proxy_local = wp.array(source_local_to_proxy_local, dtype=int, device=device)
+            mapping.source_local_to_proxy_global = wp.array(source_local_to_proxy_global, dtype=int, device=device)
             mapping.destination_local_to_proxy_global = wp.array(
-                mapping.destination_local_to_proxy_global.numpy()[:dst_count],
+                destination_local_to_proxy_global,
                 dtype=int,
                 device=device,
             )
+
+    @staticmethod
+    def _local_ids_from_global(
+        global_to_local: wp.array,
+        global_ids: Sequence[int],
+        entry_name: str,
+        label: str,
+    ) -> list[int]:
+        mapping = global_to_local.numpy()
+        locals_: list[int] = []
+        for global_id in global_ids:
+            local_id = int(mapping[global_id]) if 0 <= global_id < len(mapping) else -1
+            if local_id < 0:
+                raise ValueError(
+                    f"{label.capitalize()} {global_id} is not visible in coupled solver entry {entry_name!r}"
+                )
+            locals_.append(local_id)
+        return locals_
 
     def _validate_in_place_proxy_entries(self) -> None:
         for proxy in [*self._proxy_mappings, *self._proxy_particle_mappings]:
@@ -492,7 +544,9 @@ class SolverCoupledProxy(SolverCoupled):
 
         entry.view._refresh_body_inertial_properties(entry.body_local_to_global)
         if entry.body_dynamics_disabled_indices.shape[0] > 0:
-            entry.view.disable_body_dynamics(entry.body_dynamics_disabled_indices)
+            entry.view.disable_body_dynamics(
+                self._body_indices_to_local_array(entry, entry.body_dynamics_disabled_indices)
+            )
 
     def _apply_proxy_effective_masses(self) -> None:
         """Install virtual proxy masses from source solver effective masses."""
@@ -762,7 +816,7 @@ class SolverCoupledProxy(SolverCoupled):
                                 dst_contacts.rigid_contact_count,
                                 dst_contacts.rigid_contact_shape0,
                                 dst_contacts.rigid_contact_shape1,
-                                self.model.shape_body,
+                                dst.view.shape_body,
                                 dst.view.body_flags,
                                 dst.view.body_inv_mass,
                                 int(BodyFlags.PROXY),
