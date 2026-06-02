@@ -908,16 +908,150 @@ class TestSolverCoupledBasic(unittest.TestCase):
         collide = int(newton.ShapeFlags.COLLIDE_SHAPES)
         view_a = coupled.view("A")
         view_b = coupled.view("B")
+        flags_a = view_a.shape_flags.numpy()
+        flags_b = view_b.shape_flags.numpy()
 
-        self.assertNotEqual(int(view_a.shape_flags.numpy()[0]) & collide, 0)
-        self.assertEqual(view_a.shape_flags.shape[0], 1)
+        self.assertEqual(view_a.shape_flags.shape[0], self.model.shape_count)
+        self.assertNotEqual(int(flags_a[0]) & collide, 0)
+        self.assertEqual(int(flags_a[1]) & collide, 0)
+        np.testing.assert_array_equal(view_a.shape_body.numpy(), np.array([0, -1], dtype=np.int32))
         self.assertEqual(view_a.shape_contact_pair_count, 0)
 
-        self.assertNotEqual(int(view_b.shape_flags.numpy()[0]) & collide, 0)
-        self.assertEqual(view_b.shape_flags.shape[0], 1)
+        self.assertEqual(view_b.shape_flags.shape[0], self.model.shape_count)
+        self.assertEqual(int(flags_b[0]) & collide, 0)
+        self.assertNotEqual(int(flags_b[1]) & collide, 0)
+        np.testing.assert_array_equal(view_b.shape_body.numpy(), np.array([-1, 0], dtype=np.int32))
         self.assertEqual(view_b.shape_contact_pair_count, 0)
 
         self.assertEqual(self.model.shape_contact_pair_count, 1)
+
+    def test_entries_preserve_global_shape_ids_by_default(self):
+        """Entry shape views should keep global shape arrays with hidden dummies."""
+        coupled = SolverCoupled(
+            model=self.model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="A",
+                    solver=SolverSemiImplicit,
+                    bodies=[0],
+                    shapes=[0],
+                ),
+                SolverCoupled.Entry(name="B", solver=SolverSemiImplicit, bodies=[1], shapes=[1]),
+            ],
+        )
+
+        view_a = coupled.view("A")
+        flags = view_a.shape_flags.numpy()
+        collide = int(newton.ShapeFlags.COLLIDE_SHAPES)
+
+        self.assertEqual(view_a.body_count, 1)
+        self.assertEqual(view_a.shape_count, self.model.shape_count)
+        self.assertEqual(view_a.shape_flags.shape[0], self.model.shape_count)
+        np.testing.assert_array_equal(view_a.shape_body.numpy(), np.array([0, -1], dtype=np.int32))
+        self.assertEqual(view_a.body_shapes, {-1: [], 0: [0]})
+        self.assertNotEqual(int(flags[0]) & collide, 0)
+        self.assertEqual(int(flags[1]) & collide, 0)
+        self.assertEqual(view_a.shape_contact_pair_count, 0)
+
+    def test_entry_can_compact_shape_ids_when_requested(self):
+        """Entry views should still support compact local shape ids by opt-out."""
+        coupled = SolverCoupled(
+            model=self.model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="A",
+                    solver=SolverSemiImplicit,
+                    bodies=[0],
+                    shapes=[0],
+                    preserve_shape_ids=False,
+                ),
+                SolverCoupled.Entry(
+                    name="B",
+                    solver=SolverSemiImplicit,
+                    bodies=[1],
+                    shapes=[1],
+                    preserve_shape_ids=False,
+                ),
+            ],
+        )
+
+        view_a = coupled.view("A")
+        view_b = coupled.view("B")
+
+        self.assertEqual(view_a.shape_count, 1)
+        self.assertEqual(view_a.shape_flags.shape[0], 1)
+        np.testing.assert_array_equal(view_a.shape_body.numpy(), np.array([0], dtype=np.int32))
+        self.assertEqual(view_b.shape_count, 1)
+        self.assertEqual(view_b.shape_flags.shape[0], 1)
+        np.testing.assert_array_equal(view_b.shape_body.numpy(), np.array([0], dtype=np.int32))
+
+    def test_preserved_global_shape_ids_remap_hidden_shapes_in_prefix_views(self):
+        """Preserved shape ids should not leave hidden shapes attached to omitted bodies."""
+        builder = newton.ModelBuilder()
+        builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_shape_sphere(body=0, radius=0.1)
+        builder.add_shape_sphere(body=1, radius=0.1)
+        builder.add_particle(pos=(0.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0)
+        model = builder.finalize(device="cpu")
+
+        coupled = SolverCoupled(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="A",
+                    solver=SolverSemiImplicit,
+                    bodies=[0],
+                    particles=[0],
+                    shapes=[0],
+                ),
+                SolverCoupled.Entry(name="B", solver=SolverSemiImplicit, bodies=[1], shapes=[1]),
+            ],
+        )
+
+        view_a = coupled.view("A")
+
+        self.assertEqual(view_a.body_count, 1)
+        self.assertEqual(view_a.particle_count, 1)
+        self.assertEqual(view_a.shape_count, model.shape_count)
+        np.testing.assert_array_equal(view_a.shape_body.numpy(), np.array([0, -1], dtype=np.int32))
+        self.assertEqual(view_a.body_shapes, {-1: [], 0: [0]})
+
+    def test_preserved_global_shape_contacts_are_filtered_without_reindexing(self):
+        """Entry contact filtering should keep only visible global shape ids."""
+        builder = newton.ModelBuilder()
+        ground_shape = builder.add_ground_plane()
+        body_b = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        shape_b = builder.add_shape_sphere(body=body_b, radius=0.1)
+        body_a = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        shape_a = builder.add_shape_sphere(body=body_a, radius=0.1)
+        model = builder.finalize(device="cpu")
+
+        coupled = SolverCoupled(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="A",
+                    solver=SolverSemiImplicit,
+                    bodies=[body_a],
+                    shapes=[ground_shape, shape_a],
+                ),
+                SolverCoupled.Entry(name="B", solver=SolverSemiImplicit, bodies=[body_b], shapes=[shape_b]),
+            ],
+        )
+
+        contacts = newton.Contacts(3, 0, device=model.device)
+        contacts.rigid_contact_count.assign(np.array([3], dtype=np.int32))
+        contacts.rigid_contact_shape0.assign(np.array([ground_shape, ground_shape, shape_a], dtype=np.int32))
+        contacts.rigid_contact_shape1.assign(np.array([shape_a, shape_b, shape_b], dtype=np.int32))
+
+        filtered = coupled._contacts_for_entry(coupled._entries["A"], contacts)
+
+        self.assertIsNot(filtered, contacts)
+        self.assertEqual(int(filtered.rigid_contact_count.numpy()[0]), 1)
+        np.testing.assert_array_equal(filtered.rigid_contact_shape0.numpy()[:1], np.array([ground_shape]))
+        np.testing.assert_array_equal(filtered.rigid_contact_shape1.numpy()[:1], np.array([shape_a]))
+        self.assertGreater(shape_a, 1)
 
     def test_proxy_shape_visibility_keeps_proxy_contact_pairs(self):
         """Proxy destination views should keep shape pairs touching proxy bodies."""
@@ -2565,7 +2699,8 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
         coupled.step(state_0, state_1, control=None, contacts=contacts, dt=1.0 / 60.0)
 
         dst_solver = _ContactRecordingCopySolver.instances["dst"]
-        self.assertTrue(np.any(dst_solver.rigid_shape0_steps[0] < -1) or np.any(dst_solver.rigid_shape1_steps[0] < -1))
+        self.assertEqual(dst_solver.rigid_shape0_steps[0].shape[0], 0)
+        self.assertEqual(dst_solver.rigid_shape1_steps[0].shape[0], 0)
         np.testing.assert_array_equal(contacts.rigid_contact_shape0.numpy()[:contact_count], shape0_before)
         np.testing.assert_array_equal(contacts.rigid_contact_shape1.numpy()[:contact_count], shape1_before)
 
