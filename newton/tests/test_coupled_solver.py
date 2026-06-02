@@ -173,6 +173,31 @@ class _ParticleForceRecordingSolver(SolverBase, CouplingInterface):
         wp.copy(state_out.particle_qd, state_in.particle_qd)
 
 
+class _ControlRecordingSolver(SolverBase, CouplingInterface):
+    """Test solver that records entry-local control arrays."""
+
+    instances: ClassVar[list] = []
+
+    def __init__(self, model):
+        super().__init__(model)
+        self.joint_f = []
+        self.joint_target_pos = []
+        self.instances.append(self)
+
+    def step(self, state_in, state_out, control, contacts, dt):
+        del contacts, dt
+        self.joint_f.append(None if control is None or control.joint_f is None else control.joint_f.numpy().copy())
+        self.joint_target_pos.append(
+            None if control is None or control.joint_target_pos is None else control.joint_target_pos.numpy().copy()
+        )
+        if state_in.body_q is not None and state_out.body_q is not None:
+            wp.copy(state_out.body_q, state_in.body_q)
+            wp.copy(state_out.body_qd, state_in.body_qd)
+        if state_in.joint_q is not None and state_out.joint_q is not None:
+            wp.copy(state_out.joint_q, state_in.joint_q)
+            wp.copy(state_out.joint_qd, state_in.joint_qd)
+
+
 class _InPlaceRecordingParticleSolver(SolverBase, CouplingInterface):
     """Test solver that records whether it was stepped in-place."""
 
@@ -842,6 +867,37 @@ class TestSolverCoupledBasic(unittest.TestCase):
         self.assertGreater(view_b.body_mass.numpy()[0], 0.0)
         self.assertEqual(view_b.body_flags.numpy()[0] & int(newton.BodyFlags.KINEMATIC), 0)
         self.assertNotEqual(view_b.body_flags.numpy()[0] & int(newton.BodyFlags.DYNAMIC), 0)
+
+    def test_entry_control_arrays_are_mapped_to_local_dofs(self):
+        """Entry solvers should receive control arrays in their local DOF namespace."""
+        _ControlRecordingSolver.instances.clear()
+        builder = newton.ModelBuilder()
+        body_a = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        body_b = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        joint_a = builder.add_joint_revolute(parent=-1, child=body_a, axis=(0.0, 0.0, 1.0))
+        joint_b = builder.add_joint_revolute(parent=-1, child=body_b, axis=(0.0, 0.0, 1.0))
+        builder.add_articulation([joint_a])
+        builder.add_articulation([joint_b])
+        model = builder.finalize(device="cpu")
+
+        coupled = SolverCoupled(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(name="A", solver=_ControlRecordingSolver, bodies=[body_a], joints=[joint_a]),
+                SolverCoupled.Entry(name="B", solver=_ControlRecordingSolver, bodies=[body_b], joints=[joint_b]),
+            ],
+        )
+        control = model.control()
+        control.joint_f.assign(np.array([3.0, 7.0], dtype=np.float32))
+        control.joint_target_pos.assign(np.array([11.0, 13.0], dtype=np.float32))
+
+        coupled.step(model.state(), model.state(), control, contacts=None, dt=1.0 / 60.0)
+
+        solver_a, solver_b = _ControlRecordingSolver.instances
+        np.testing.assert_array_equal(solver_a.joint_f[0], np.array([3.0], dtype=np.float32))
+        np.testing.assert_array_equal(solver_b.joint_f[0], np.array([7.0], dtype=np.float32))
+        np.testing.assert_array_equal(solver_a.joint_target_pos[0], np.array([11.0], dtype=np.float32))
+        np.testing.assert_array_equal(solver_b.joint_target_pos[0], np.array([13.0], dtype=np.float32))
 
     def test_notify_model_changed_refreshes_view_inertial_masks(self):
         """Runtime parent inertial edits should refresh derived view masks."""

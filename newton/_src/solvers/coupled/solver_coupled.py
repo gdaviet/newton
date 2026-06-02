@@ -163,6 +163,7 @@ class SolverEntry:
     state_1: State | None = None
     state_tmp: State | None = None
     state_tmp_1: State | None = None
+    control: Control | None = None
     body_force_input: wp.array = field(default=None)
     particle_force_input: wp.array = field(default=None)
     hook_methods: dict = field(default_factory=dict)
@@ -366,6 +367,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
         for entry in self._entries.values():
             entry.state_0 = entry.view.state()
             entry.state_1 = entry.state_0 if entry.in_place else entry.view.state()
+            entry.control = _entry_control(entry.view)
             if model.body_count:
                 entry.body_force_input = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=device)
             if model.particle_count:
@@ -2006,6 +2008,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
     ) -> None:
         """Step one sub-solver entry, honoring its local substep count."""
         contacts = self._contacts_for_entry(entry, contacts)
+        control = _copy_control_to_entry(control, entry)
         if entry.in_place:
             entry.solver.step(entry.state_0, entry.state_0, control, contacts, dt)
             return
@@ -2220,6 +2223,62 @@ class SolverCoupled(SolverBase, CouplingInterface):
         self._refresh_model_view_overrides(flags)
         for entry in self._entries.values():
             entry.solver.notify_model_changed(flags)
+
+
+def _entry_control(view: ModelView) -> Control:
+    """Allocate standard entry-local control arrays for a model view."""
+    from ...sim import Control  # noqa: PLC0415
+
+    control = Control()
+    dof_count = int(view.joint_dof_count)
+    if dof_count:
+        requires_grad = bool(getattr(view.parent, "requires_grad", False))
+        device = view.parent.device
+        control.joint_target_pos = wp.zeros(dof_count, dtype=float, device=device, requires_grad=requires_grad)
+        control.joint_target_vel = wp.zeros(dof_count, dtype=float, device=device, requires_grad=requires_grad)
+        control.joint_act = wp.zeros(dof_count, dtype=float, device=device, requires_grad=requires_grad)
+        control.joint_f = wp.zeros(dof_count, dtype=float, device=device, requires_grad=requires_grad)
+    return control
+
+
+def _copy_control_to_entry(src: Control | None, entry: SolverEntry) -> Control | None:
+    """Copy full-model DOF controls into an entry-local control object."""
+    if src is None:
+        return None
+    dst = entry.control
+    if dst is None:
+        return src
+
+    device = entry.view.parent.device
+    dof_map = entry.joint_dof_local_to_global
+    for name in ("joint_f", "joint_target_pos", "joint_target_vel", "joint_act"):
+        _copy_control_dof_array(src, dst, name, dof_map, device)
+    return dst
+
+
+def _copy_control_dof_array(
+    src_control: Control,
+    dst_control: Control,
+    name: str,
+    local_to_global: wp.array,
+    device,
+) -> None:
+    src = getattr(src_control, name, None)
+    dst = getattr(dst_control, name, None)
+    if dst is None:
+        return
+    if src is None:
+        dst.zero_()
+        return
+    if int(src.shape[0]) == int(dst.shape[0]):
+        wp.copy(dst, src)
+        return
+    wp.launch(
+        _copy_mapped_float,
+        dim=local_to_global.shape[0],
+        inputs=[local_to_global, src, dst],
+        device=device,
+    )
 
 
 def _copy_state_to_entry(src: State, dst: State, entry: SolverEntry) -> None:

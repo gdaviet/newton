@@ -143,6 +143,7 @@ class Example:
                 rho=float(args.rho),
                 gamma=float(args.gamma),
                 baumgarte=float(args.baumgarte),
+                rigid_contact_matching=str(args.rigid_contact_matching),
                 contact_pairs=[
                     SolverCoupledAdmm.ContactPair(
                         source="mjc",
@@ -444,6 +445,12 @@ class Example:
         parser.add_argument("--rho", type=float, default=200.0, help="ADMM penalty parameter.")
         parser.add_argument("--gamma", type=float, default=0.1, help="ADMM proximal mass scaling.")
         parser.add_argument("--baumgarte", type=float, default=0.02, help="Position error correction fraction.")
+        parser.add_argument(
+            "--rigid-contact-matching",
+            choices=["disabled", "latest", "sticky"],
+            default="disabled",
+            help="ADMM Franka-payload rigid contact matching mode.",
+        )
         parser.add_argument(
             "--payload-kind",
             choices=["xpbd-chain", "vbd-cable"],
