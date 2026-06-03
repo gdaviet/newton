@@ -241,6 +241,11 @@ class SolverCoupled(SolverBase, CouplingInterface):
         self._entries: dict[str, SolverEntry] = {}
         self._solver_order: list[str] = []
         self._entry_contact_buffers: dict[str, Contacts] = {}
+        self._entry_contact_sources: dict[str, Contacts] = {}
+        self._entry_rigid_contact_generation: dict[str, wp.array] = {}
+        self._entry_soft_contact_generation: dict[str, wp.array] = {}
+        self._entry_rigid_contact_update: dict[str, wp.array] = {}
+        self._entry_soft_contact_update: dict[str, wp.array] = {}
         self._entry_rigid_contact_src_to_dst: dict[str, wp.array] = {}
         self._entry_soft_contact_src_to_dst: dict[str, wp.array] = {}
 
@@ -2018,17 +2023,20 @@ class SolverCoupled(SolverBase, CouplingInterface):
         control: Control | None,
         contacts: Contacts | None,
         dt: float,
-    ) -> None:
+        *,
+        filter_contacts: bool = True,
+    ) -> Contacts | None:
         """Step one sub-solver entry, honoring its local substep count."""
-        contacts = self._contacts_for_entry(entry, contacts)
+        if filter_contacts:
+            contacts = self._contacts_for_entry(entry, contacts)
         control = _copy_control_to_entry(control, entry)
         if entry.in_place:
             entry.solver.step(entry.state_0, entry.state_0, control, contacts, dt)
-            return
+            return contacts
 
         if entry.substeps == 1:
             entry.solver.step(entry.state_0, entry.state_1, control, contacts, dt)
-            return
+            return contacts
 
         substep_dt = dt / float(entry.substeps)
         if entry.state_tmp is None or entry.state_tmp_1 is None:
@@ -2047,6 +2055,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 _copy_forces(entry.state_0, state_in)
             entry.solver.step(state_in, state_out, control, contacts, substep_dt)
             state_in = state_out
+        return contacts
 
     def _contacts_for_entry(self, entry: SolverEntry, contacts: Contacts | None) -> Contacts | None:
         if contacts is None or not entry.preserve_shape_ids:
@@ -2055,19 +2064,46 @@ class SolverCoupled(SolverBase, CouplingInterface):
             return contacts
 
         filtered = self._ensure_entry_contact_buffer(entry, contacts)
-        filtered.clear()
+        force_contact_update = int(self._entry_contact_sources.get(entry.name) is not contacts)
+        if force_contact_update:
+            self._entry_contact_sources[entry.name] = contacts
+
         if filtered.rigid_contact_force is not None:
             filtered.rigid_contact_force.zero_()
         if filtered.force is not None:
             filtered.force.zero_()
 
+        contact_update_dim = max(
+            contacts.rigid_contact_max, contacts.soft_contact_max, filtered.contact_counters.shape[0]
+        )
+        if contact_update_dim > 0:
+            wp.launch(
+                _prepare_filtered_contact_update_kernel,
+                dim=contact_update_dim,
+                inputs=[
+                    contacts.contact_generation,
+                    self._entry_rigid_contact_generation[entry.name],
+                    self._entry_soft_contact_generation[entry.name],
+                    self._entry_rigid_contact_update[entry.name],
+                    self._entry_soft_contact_update[entry.name],
+                    filtered.contact_counters,
+                    filtered.contact_counters.shape[0],
+                    self._entry_rigid_contact_src_to_dst[entry.name],
+                    contacts.rigid_contact_max,
+                    self._entry_soft_contact_src_to_dst[entry.name],
+                    contacts.soft_contact_max,
+                    force_contact_update,
+                ],
+                device=self.model.device,
+            )
+
         if contacts.rigid_contact_max > 0:
             rigid_src_to_dst = self._entry_rigid_contact_src_to_dst[entry.name]
-            rigid_src_to_dst.fill_(-1)
             wp.launch(
                 _filter_rigid_contacts_global_shape_ids_kernel,
                 dim=contacts.rigid_contact_max,
                 inputs=[
+                    self._entry_rigid_contact_update[entry.name],
                     contacts.rigid_contact_count,
                     contacts.rigid_contact_shape0,
                     contacts.rigid_contact_shape1,
@@ -2103,6 +2139,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                     _copy_filtered_rigid_contact_properties_kernel,
                     dim=contacts.rigid_contact_max,
                     inputs=[
+                        self._entry_rigid_contact_update[entry.name],
                         rigid_src_to_dst,
                         contacts.rigid_contact_stiffness,
                         contacts.rigid_contact_damping,
@@ -2118,6 +2155,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                     _copy_filtered_rigid_contact_match_index_kernel,
                     dim=contacts.rigid_contact_max,
                     inputs=[
+                        self._entry_rigid_contact_update[entry.name],
                         rigid_src_to_dst,
                         contacts.rigid_contact_match_index,
                         filtered.rigid_contact_match_index,
@@ -2129,6 +2167,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                     _copy_filtered_rigid_contact_diff_kernel,
                     dim=contacts.rigid_contact_max,
                     inputs=[
+                        self._entry_rigid_contact_update[entry.name],
                         rigid_src_to_dst,
                         contacts.rigid_contact_diff_distance,
                         contacts.rigid_contact_diff_normal,
@@ -2144,11 +2183,11 @@ class SolverCoupled(SolverBase, CouplingInterface):
 
         if contacts.soft_contact_max > 0 and int(entry.view.particle_count) > 0:
             soft_src_to_dst = self._entry_soft_contact_src_to_dst[entry.name]
-            soft_src_to_dst.fill_(-1)
             wp.launch(
                 _filter_soft_contacts_global_shape_ids_kernel,
                 dim=contacts.soft_contact_max,
                 inputs=[
+                    self._entry_soft_contact_update[entry.name],
                     contacts.soft_contact_count,
                     contacts.soft_contact_particle,
                     contacts.soft_contact_shape,
@@ -2190,6 +2229,29 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 contact_matching=contacts.rigid_contact_match_index is not None,
             )
             self._entry_contact_buffers[entry.name] = filtered
+            self._entry_contact_sources[entry.name] = contacts
+            self._entry_rigid_contact_generation[entry.name] = wp.full(
+                1,
+                -1,
+                dtype=wp.int32,
+                device=contacts.device,
+            )
+            self._entry_soft_contact_generation[entry.name] = wp.full(
+                1,
+                -1,
+                dtype=wp.int32,
+                device=contacts.device,
+            )
+            self._entry_rigid_contact_update[entry.name] = wp.zeros(
+                1,
+                dtype=wp.int32,
+                device=contacts.device,
+            )
+            self._entry_soft_contact_update[entry.name] = wp.zeros(
+                1,
+                dtype=wp.int32,
+                device=contacts.device,
+            )
             self._entry_rigid_contact_src_to_dst[entry.name] = wp.full(
                 contacts.rigid_contact_max,
                 -1,
@@ -2595,7 +2657,47 @@ def _add_mapped_particle_forces_kernel(
 
 
 @wp.kernel(enable_backward=False)
+def _prepare_filtered_contact_update_kernel(
+    src_generation: wp.array[wp.int32],
+    rigid_generation: wp.array[wp.int32],
+    soft_generation: wp.array[wp.int32],
+    rigid_update_out: wp.array[wp.int32],
+    soft_update_out: wp.array[wp.int32],
+    dst_counters: wp.array[wp.int32],
+    counter_count: int,
+    rigid_src_to_dst: wp.array[wp.int32],
+    rigid_contact_max: int,
+    soft_src_to_dst: wp.array[wp.int32],
+    soft_contact_max: int,
+    force_update: int,
+):
+    tid = wp.tid()
+    rigid_update = wp.int32(0)
+    if force_update != 0 or src_generation[0] != rigid_generation[0]:
+        rigid_update = wp.int32(1)
+    soft_update = wp.int32(0)
+    if force_update != 0 or src_generation[0] != soft_generation[0]:
+        soft_update = wp.int32(1)
+    if tid == 0:
+        rigid_update_out[0] = rigid_update
+        soft_update_out[0] = soft_update
+        if rigid_update != 0:
+            rigid_generation[0] = src_generation[0]
+        if soft_update != 0:
+            soft_generation[0] = src_generation[0]
+        if rigid_update != 0 and counter_count > 0:
+            dst_counters[0] = 0
+        if soft_update != 0 and counter_count > 1:
+            dst_counters[1] = 0
+    if rigid_update != 0 and tid < rigid_contact_max:
+        rigid_src_to_dst[tid] = -1
+    if soft_update != 0 and tid < soft_contact_max:
+        soft_src_to_dst[tid] = -1
+
+
+@wp.kernel(enable_backward=False)
 def _filter_rigid_contacts_global_shape_ids_kernel(
+    update_filter: wp.array[wp.int32],
     src_count: wp.array[wp.int32],
     src_shape0: wp.array[wp.int32],
     src_shape1: wp.array[wp.int32],
@@ -2624,6 +2726,9 @@ def _filter_rigid_contacts_global_shape_ids_kernel(
     dst_tids: wp.array[wp.int32],
     src_to_dst: wp.array[wp.int32],
 ):
+    if update_filter[0] == 0:
+        return
+
     contact_id = wp.tid()
     if contact_id >= src_count[0]:
         return
@@ -2655,6 +2760,7 @@ def _filter_rigid_contacts_global_shape_ids_kernel(
 
 @wp.kernel(enable_backward=False)
 def _copy_filtered_rigid_contact_properties_kernel(
+    update_filter: wp.array[wp.int32],
     src_to_dst: wp.array[wp.int32],
     src_stiffness: wp.array[wp.float32],
     src_damping: wp.array[wp.float32],
@@ -2663,6 +2769,9 @@ def _copy_filtered_rigid_contact_properties_kernel(
     dst_damping: wp.array[wp.float32],
     dst_friction: wp.array[wp.float32],
 ):
+    if update_filter[0] == 0:
+        return
+
     src_id = wp.tid()
     dst_id = src_to_dst[src_id]
     if dst_id < 0:
@@ -2675,20 +2784,29 @@ def _copy_filtered_rigid_contact_properties_kernel(
 
 @wp.kernel(enable_backward=False)
 def _copy_filtered_rigid_contact_match_index_kernel(
+    update_filter: wp.array[wp.int32],
     src_to_dst: wp.array[wp.int32],
     src_match_index: wp.array[wp.int32],
     dst_match_index: wp.array[wp.int32],
 ):
+    if update_filter[0] == 0:
+        return
+
     src_id = wp.tid()
     dst_id = src_to_dst[src_id]
     if dst_id < 0:
         return
 
-    dst_match_index[dst_id] = src_match_index[src_id]
+    match_id = src_match_index[src_id]
+    if match_id < 0:
+        dst_match_index[dst_id] = match_id
+    else:
+        dst_match_index[dst_id] = -1
 
 
 @wp.kernel(enable_backward=False)
 def _copy_filtered_rigid_contact_diff_kernel(
+    update_filter: wp.array[wp.int32],
     src_to_dst: wp.array[wp.int32],
     src_distance: wp.array[wp.float32],
     src_normal: wp.array[wp.vec3],
@@ -2699,6 +2817,9 @@ def _copy_filtered_rigid_contact_diff_kernel(
     dst_point0_world: wp.array[wp.vec3],
     dst_point1_world: wp.array[wp.vec3],
 ):
+    if update_filter[0] == 0:
+        return
+
     src_id = wp.tid()
     dst_id = src_to_dst[src_id]
     if dst_id < 0:
@@ -2712,6 +2833,7 @@ def _copy_filtered_rigid_contact_diff_kernel(
 
 @wp.kernel(enable_backward=False)
 def _filter_soft_contacts_global_shape_ids_kernel(
+    update_filter: wp.array[wp.int32],
     src_count: wp.array[wp.int32],
     src_particle: wp.array[int],
     src_shape: wp.array[int],
@@ -2732,6 +2854,9 @@ def _filter_soft_contacts_global_shape_ids_kernel(
     dst_tids: wp.array[int],
     src_to_dst: wp.array[wp.int32],
 ):
+    if update_filter[0] == 0:
+        return
+
     contact_id = wp.tid()
     if contact_id >= src_count[0]:
         return

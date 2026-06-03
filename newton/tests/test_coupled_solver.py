@@ -501,8 +501,10 @@ class _ContactRecordingCopySolver(_StepCountingCopySolver):
         super().__init__(model)
         self.rigid_shape0_steps = []
         self.rigid_shape1_steps = []
+        self.step_contacts = []
 
     def step(self, state_in, state_out, control, contacts, dt):
+        self.step_contacts.append(contacts)
         if contacts is not None and contacts.rigid_contact_count is not None:
             contact_count = int(contacts.rigid_contact_count.numpy()[0])
             self.rigid_shape0_steps.append(contacts.rigid_contact_shape0.numpy()[:contact_count].copy())
@@ -515,10 +517,15 @@ class _ContactRecordingBodyHarvestSolver(_ContactRecordingCopySolver):
 
     instances: ClassVar[dict[str, "_ContactRecordingBodyHarvestSolver"]] = {}
 
+    def __init__(self, model):
+        super().__init__(model)
+        self.harvest_contacts = []
+
     def coupling_harvest_proxy_wrenches(
         self, body_local_to_proxy_global, out_body_f, *, state=None, state_out=None, contacts=None, dt=0.0
     ):
-        del body_local_to_proxy_global, out_body_f, state, state_out, contacts, dt
+        del body_local_to_proxy_global, out_body_f, state, state_out, dt
+        self.harvest_contacts.append(contacts)
 
 
 class _ProxyContactRecordingSolver(_StepCountingCopySolver):
@@ -556,8 +563,8 @@ class _UnsupportedProxyContactRecordingSolver(_ProxyContactRecordingSolver):
 class _FakeProxyCollisionPipeline:
     """Minimal collision pipeline used to test proxy-coupler scheduling."""
 
-    def __init__(self, device):
-        self.contacts_obj = newton.Contacts(0, 0, device=device)
+    def __init__(self, device, contacts=None):
+        self.contacts_obj = contacts if contacts is not None else newton.Contacts(0, 0, device=device)
         self.contacts_calls = 0
         self.collide_calls = 0
 
@@ -1109,6 +1116,77 @@ class TestSolverCoupledBasic(unittest.TestCase):
         np.testing.assert_array_equal(filtered.rigid_contact_shape1.numpy()[:1], np.array([shape_a]))
         self.assertGreater(shape_a, 1)
 
+    def test_preserved_global_shape_contact_filter_reuses_same_generation_rows(self):
+        """Entry contact filtering should not recompact unchanged contact generations."""
+        builder = newton.ModelBuilder()
+        ground_shape = builder.add_ground_plane()
+        body_b = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        shape_b = builder.add_shape_sphere(body=body_b, radius=0.1)
+        body_a = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        shape_a = builder.add_shape_sphere(body=body_a, radius=0.1)
+        model = builder.finalize(device="cpu")
+
+        coupled = SolverCoupled(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="A",
+                    solver=SolverSemiImplicit,
+                    bodies=[body_a],
+                    shapes=[ground_shape, shape_a],
+                ),
+                SolverCoupled.Entry(name="B", solver=SolverSemiImplicit, bodies=[body_b], shapes=[shape_b]),
+            ],
+        )
+
+        contacts = newton.Contacts(4, 0, device=model.device, contact_matching=True)
+        contacts.rigid_contact_count.assign(np.array([4], dtype=np.int32))
+        contacts.rigid_contact_shape0.assign(
+            np.array([ground_shape, ground_shape, shape_a, ground_shape], dtype=np.int32)
+        )
+        contacts.rigid_contact_shape1.assign(np.array([shape_a, shape_b, ground_shape, shape_b], dtype=np.int32))
+
+        filtered = coupled._contacts_for_entry(coupled._entries["A"], contacts)
+        self.assertEqual(int(filtered.rigid_contact_count.numpy()[0]), 2)
+        np.testing.assert_array_equal(
+            coupled._entry_rigid_contact_src_to_dst["A"].numpy(),
+            np.array([0, -1, 1, -1], dtype=np.int32),
+        )
+
+        contacts.clear()
+        contacts.rigid_contact_count.assign(np.array([3], dtype=np.int32))
+        contacts.rigid_contact_shape0.assign(np.array([ground_shape, shape_a, ground_shape, -1], dtype=np.int32))
+        contacts.rigid_contact_shape1.assign(np.array([shape_a, ground_shape, shape_b, -1], dtype=np.int32))
+        contacts.rigid_contact_match_index.assign(np.array([2, 1, -1, -1], dtype=np.int32))
+
+        filtered = coupled._contacts_for_entry(coupled._entries["A"], contacts)
+
+        self.assertEqual(int(filtered.rigid_contact_count.numpy()[0]), 2)
+        np.testing.assert_array_equal(
+            filtered.rigid_contact_match_index.numpy()[:2],
+            np.array([-1, -1], dtype=np.int32),
+        )
+
+        contacts.rigid_contact_shape0.assign(np.array([ground_shape, ground_shape, ground_shape, -1], dtype=np.int32))
+        contacts.rigid_contact_shape1.assign(np.array([shape_b, shape_b, shape_b, -1], dtype=np.int32))
+        contacts.rigid_contact_match_index.assign(np.array([-2, -2, -2, -2], dtype=np.int32))
+
+        filtered = coupled._contacts_for_entry(coupled._entries["A"], contacts)
+
+        self.assertEqual(int(filtered.rigid_contact_count.numpy()[0]), 2)
+        np.testing.assert_array_equal(
+            filtered.rigid_contact_shape0.numpy()[:2],
+            np.array([ground_shape, shape_a], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            filtered.rigid_contact_shape1.numpy()[:2],
+            np.array([shape_a, ground_shape], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            filtered.rigid_contact_match_index.numpy()[:2],
+            np.array([-1, -1], dtype=np.int32),
+        )
+
     def test_proxy_shape_visibility_keeps_proxy_contact_pairs(self):
         """Proxy destination views should keep shape pairs touching proxy bodies."""
         coupled = SolverCoupledProxy(
@@ -1133,6 +1211,107 @@ class TestSolverCoupledBasic(unittest.TestCase):
         self.assertNotEqual(int(view_b.shape_flags.numpy()[1]) & collide, 0)
         self.assertEqual(view_b.shape_contact_pair_count, 1)
         np.testing.assert_array_equal(view_b.shape_contact_pairs.numpy(), np.array([[0, 1]], dtype=np.int32))
+
+    def test_proxy_harvest_uses_filtered_preserved_shape_contacts(self):
+        """Custom proxy harvest should receive the contacts used by the step."""
+        _StepCountingCopySolver.instances.clear()
+        _ContactRecordingBodyHarvestSolver.instances.clear()
+
+        builder = newton.ModelBuilder(gravity=0.0)
+        ground_shape = builder.add_ground_plane()
+        src_body = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        src_shape = builder.add_shape_sphere(body=src_body, radius=0.1)
+        dst_body = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        dst_shape = builder.add_shape_sphere(body=dst_body, radius=0.1)
+        hidden_body = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        hidden_shape = builder.add_shape_sphere(body=hidden_body, radius=0.1)
+        model = builder.finalize(device="cpu")
+
+        coupled = SolverCoupledProxy(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[src_body], shapes=[src_shape]),
+                SolverCoupled.Entry(
+                    name="dst",
+                    solver=_ContactRecordingBodyHarvestSolver,
+                    bodies=[dst_body],
+                    shapes=[ground_shape, dst_shape],
+                ),
+            ],
+            coupling=SolverCoupledProxy.Config(
+                proxies=[
+                    SolverCoupledProxy.Proxy(source="src", destination="dst", bodies=[src_body]),
+                ],
+            ),
+        )
+
+        contacts = newton.Contacts(2, 0, device=model.device)
+        contacts.rigid_contact_count.assign(np.array([2], dtype=np.int32))
+        contacts.rigid_contact_shape0.assign(np.array([ground_shape, ground_shape], dtype=np.int32))
+        contacts.rigid_contact_shape1.assign(np.array([dst_shape, hidden_shape], dtype=np.int32))
+
+        coupled.step(model.state(), model.state(), control=None, contacts=contacts, dt=1.0 / 60.0)
+
+        dst_solver = _ContactRecordingBodyHarvestSolver.instances["dst"]
+        self.assertEqual(len(dst_solver.step_contacts), 1)
+        self.assertEqual(len(dst_solver.harvest_contacts), 1)
+        self.assertIs(dst_solver.harvest_contacts[0], dst_solver.step_contacts[0])
+        self.assertIsNot(dst_solver.step_contacts[0], contacts)
+        self.assertEqual(int(dst_solver.step_contacts[0].rigid_contact_count.numpy()[0]), 1)
+        np.testing.assert_array_equal(dst_solver.rigid_shape1_steps[0], np.array([dst_shape], dtype=np.int32))
+
+    def test_proxy_collision_contacts_bypass_preserved_shape_filter(self):
+        """Proxy-local contacts are already generated in the destination view."""
+        _StepCountingCopySolver.instances.clear()
+        _ContactRecordingBodyHarvestSolver.instances.clear()
+
+        builder = newton.ModelBuilder(gravity=0.0)
+        ground_shape = builder.add_ground_plane()
+        src_body = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        src_shape = builder.add_shape_sphere(body=src_body, radius=0.1)
+        dst_body = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        dst_shape = builder.add_shape_sphere(body=dst_body, radius=0.1)
+        model = builder.finalize(device="cpu")
+
+        proxy_contacts = newton.Contacts(1, 0, device=model.device)
+        proxy_contacts.rigid_contact_count.assign(np.array([1], dtype=np.int32))
+        proxy_contacts.rigid_contact_shape0.assign(np.array([ground_shape], dtype=np.int32))
+        proxy_contacts.rigid_contact_shape1.assign(np.array([dst_shape], dtype=np.int32))
+
+        def make_pipeline(view):
+            del view
+            return _FakeProxyCollisionPipeline(model.device, contacts=proxy_contacts)
+
+        coupled = SolverCoupledProxy(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[src_body], shapes=[src_shape]),
+                SolverCoupled.Entry(
+                    name="dst",
+                    solver=_ContactRecordingBodyHarvestSolver,
+                    bodies=[dst_body],
+                    shapes=[ground_shape, dst_shape],
+                ),
+            ],
+            coupling=SolverCoupledProxy.Config(
+                proxies=[
+                    SolverCoupledProxy.Proxy(
+                        source="src",
+                        destination="dst",
+                        bodies=[src_body],
+                        collision_pipeline=make_pipeline,
+                    ),
+                ],
+            ),
+        )
+
+        coupled.step(model.state(), model.state(), control=None, contacts=None, dt=1.0 / 60.0)
+
+        dst_solver = _ContactRecordingBodyHarvestSolver.instances["dst"]
+        self.assertEqual(len(dst_solver.step_contacts), 1)
+        self.assertEqual(len(dst_solver.harvest_contacts), 1)
+        self.assertIs(dst_solver.step_contacts[0], proxy_contacts)
+        self.assertIs(dst_solver.harvest_contacts[0], proxy_contacts)
 
     def test_duplicate_shape_ownership_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "owned by more than one"):

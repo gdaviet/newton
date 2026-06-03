@@ -821,16 +821,19 @@ class SolverCoupledProxy(SolverCoupled):
 
             dst_contacts = contacts
             contacts_freshly_detected = False
+            filter_dst_contacts = True
             collision_config = self._proxy_collision_configs.get((src_name, dst_name))
             if collision_config is not None:
                 dst_contacts, contacts_freshly_detected = self._proxy_collision_contacts(
                     collision_config, dst.state_0, iteration_restart=iteration_restart
                 )
+                filter_dst_contacts = False
 
             use_body_momentum_harvest = body_proxies and not self._uses_custom_coupling_hook(
                 dst, CouplingHook.BODY_PROXY_HARVEST
             )
             restore_filtered_contacts = False
+            dst_contacts_used = dst_contacts
             try:
                 if body_proxies:
                     if self._uses_custom_coupling_hook(dst, CouplingHook.PROXY_CONTACT_PREPARE):
@@ -866,7 +869,9 @@ class SolverCoupledProxy(SolverCoupled):
                 for proxy in particle_proxies:
                     wp.copy(proxy.proxy_qd_before, dst.state_0.particle_qd)
 
-                self._step_entry(dst, control, dst_contacts, dt)
+                dst_contacts_used = self._step_entry(
+                    dst, control, dst_contacts, dt, filter_contacts=filter_dst_contacts
+                )
             finally:
                 if restore_filtered_contacts:
                     wp.launch(
@@ -888,7 +893,7 @@ class SolverCoupledProxy(SolverCoupled):
                         proxy.coupling_forces,
                         state=dst.state_0,
                         state_out=dst.state_1,
-                        contacts=dst_contacts,
+                        contacts=dst_contacts_used,
                         dt=dt,
                     )
                 else:
@@ -918,7 +923,7 @@ class SolverCoupledProxy(SolverCoupled):
                         proxy.coupling_forces,
                         state=dst.state_0,
                         state_out=dst.state_1,
-                        contacts=dst_contacts,
+                        contacts=dst_contacts_used,
                         dt=dt,
                     )
                 else:
