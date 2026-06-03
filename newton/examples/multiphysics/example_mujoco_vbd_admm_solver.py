@@ -7,10 +7,10 @@
 # A rigid ball is attached to the centre of a pinned VBD cloth sheet
 # through a model-level body-particle attachment annotation, while a separate
 # rigid pendulum link carries a VBD rigid payload through a normal model ball
-# joint. SolverCoupledAdmm converts both cross-solver couplings into ADMM
+# joint. SolverCoupledADMM converts both cross-solver couplings into ADMM
 # attachment constraints.
 #
-# This example demonstrates ``SolverCoupledAdmm``, an
+# This example demonstrates ``SolverCoupledADMM``, an
 # alternative to proxy-body coupling based on linearised ADMM over model
 # joints, model attachment annotations, and collision-detected contacts rather
 # than proxy bodies. See ``docs/plans/2026-04-23-admm-coupling.tex`` for the
@@ -27,7 +27,7 @@ from collections.abc import Callable
 
 import numpy as np
 import warp as wp
-from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledAdmm
+from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM
 
 import newton
 import newton.examples
@@ -145,7 +145,7 @@ class Example:
         )
         self.ball_joint = builder.joint_count - 1
         builder.add_shape_sphere(self.ball_body, radius=ball_radius)
-        SolverCoupledAdmm.add_body_particle_attachment(
+        SolverCoupledADMM.add_body_particle_attachment(
             builder,
             self.ball_body,
             self.center_particle,
@@ -200,7 +200,7 @@ class Example:
             self.rigid_solver,
             mujoco_kwargs={"use_mujoco_contacts": False, "njmax": 32},
         )
-        self.solver = SolverCoupledAdmm(
+        self.solver = SolverCoupledADMM(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(
@@ -218,7 +218,7 @@ class Example:
                     particles=list(range(self.model.particle_count)),
                 ),
             ],
-            coupling=SolverCoupledAdmm.Config(
+            coupling=SolverCoupledADMM.Config(
                 iterations=2,
                 rho=50,
                 gamma=0.1,

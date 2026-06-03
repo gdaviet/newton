@@ -5,7 +5,7 @@
 # Example Kamino-MuJoCo ADMM Coupled Solver
 #
 # A closed four-bar linkage is split across two rigid solvers: two links are
-# owned by Kamino and two links are owned by MuJoCo. SolverCoupledAdmm detects
+# owned by Kamino and two links are owned by MuJoCo. SolverCoupledADMM detects
 # the model revolute joints that connect bodies owned by different solvers and
 # turns them into ADMM attachments.
 #
@@ -19,7 +19,7 @@ from collections.abc import Callable
 
 import numpy as np
 import warp as wp
-from newton.solvers.experimental.coupled import ModelView, SolverCoupled, SolverCoupledAdmm
+from newton.solvers.experimental.coupled import ModelView, SolverCoupled, SolverCoupledADMM
 
 import newton
 import newton.examples
@@ -137,7 +137,7 @@ class Example:
         kamino_config = _make_kamino_config()
         kamino_config.padmm.max_iterations = args.kamino_iterations
 
-        self.solver = SolverCoupledAdmm(
+        self.solver = SolverCoupledADMM(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(
@@ -157,7 +157,7 @@ class Example:
                     joints=self.mujoco_joints,
                 ),
             ],
-            coupling=SolverCoupledAdmm.Config(
+            coupling=SolverCoupledADMM.Config(
                 iterations=args.admm_iterations,
                 rho=args.rho,
                 gamma=args.gamma,

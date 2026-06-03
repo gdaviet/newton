@@ -17,6 +17,7 @@ from ...geometry import ParticleFlags
 from ...math.spatial import velocity_at_point
 
 _PARTICLE_FLAG_ACTIVE = wp.constant(int(ParticleFlags.ACTIVE))
+_INACTIVE_U_MIN = wp.constant(-1.0e8)
 
 
 @wp.kernel(enable_backward=False)
@@ -246,7 +247,7 @@ def contact_u_update_kernel(
         p = p - lambda_k[i] / denom
 
     u_min_i = u_min[i]
-    if u_min_i < -1.0e7:
+    if u_min_i <= _INACTIVE_U_MIN:
         u_out[i] = p
         return
 
@@ -293,7 +294,7 @@ def contact_u_update_active_kernel(
         p = p - lambda_k[i] / denom
 
     u_min_i = u_min[i]
-    if u_min_i < -1.0e7:
+    if u_min_i <= _INACTIVE_U_MIN:
         u_out[i] = p
         return
 
@@ -667,7 +668,7 @@ def contact_rr_compute_u_min_kernel(
     if violation > 0.0 and dt > 0.0:
         u_min[i] = baumgarte * violation / dt
     else:
-        u_min[i] = -1.0e8
+        u_min[i] = _INACTIVE_U_MIN
 
 
 @wp.kernel(enable_backward=False)
@@ -770,7 +771,7 @@ def contact_rr_compute_u_min_active_kernel(
     if violation > 0.0 and dt > 0.0:
         u_min[i] = baumgarte * violation / dt
     else:
-        u_min[i] = -1.0e8
+        u_min[i] = _INACTIVE_U_MIN
 
 
 @wp.kernel(enable_backward=False)
@@ -888,7 +889,7 @@ def contact_rr_reset_kernel(
     u[i] = wp.vec3(0.0, 0.0, 0.0)
     lambda_[i] = wp.vec3(0.0, 0.0, 0.0)
     Jv[i] = wp.vec3(0.0, 0.0, 0.0)
-    u_min[i] = -1.0e8
+    u_min[i] = _INACTIVE_U_MIN
 
 
 @wp.kernel(enable_backward=False)
@@ -1091,7 +1092,7 @@ def contact_rp_compute_u_min_kernel(
     if violation > 0.0 and dt > 0.0:
         u_min[i] = baumgarte * violation / dt
     else:
-        u_min[i] = -1.0e8
+        u_min[i] = _INACTIVE_U_MIN
 
 
 @wp.kernel(enable_backward=False)
@@ -1186,7 +1187,7 @@ def contact_rp_reset_kernel(
     u[i] = wp.vec3(0.0, 0.0, 0.0)
     lambda_[i] = wp.vec3(0.0, 0.0, 0.0)
     Jv[i] = wp.vec3(0.0, 0.0, 0.0)
-    u_min[i] = -1.0e8
+    u_min[i] = _INACTIVE_U_MIN
 
 
 @wp.kernel(enable_backward=False)
@@ -1336,7 +1337,7 @@ def contact_pp_compute_u_min_kernel(
     if violation > 0.0 and dt > 0.0:
         u_min[i] = baumgarte * violation / dt
     else:
-        u_min[i] = -1.0e8
+        u_min[i] = _INACTIVE_U_MIN
 
 
 @wp.kernel(enable_backward=False)
@@ -1413,7 +1414,7 @@ def contact_pp_reset_kernel(
     u[i] = wp.vec3(0.0, 0.0, 0.0)
     lambda_[i] = wp.vec3(0.0, 0.0, 0.0)
     Jv[i] = wp.vec3(0.0, 0.0, 0.0)
-    u_min[i] = -1.0e8
+    u_min[i] = _INACTIVE_U_MIN
 
 
 @wp.kernel(enable_backward=False)

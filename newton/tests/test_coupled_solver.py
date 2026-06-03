@@ -37,7 +37,7 @@ from newton.solvers import (
 from newton.solvers.experimental.coupled import (
     ModelView,
     SolverCoupled,
-    SolverCoupledAdmm,
+    SolverCoupledADMM,
     SolverCoupledProxy,
 )
 
@@ -713,8 +713,8 @@ class TestModelView(unittest.TestCase):
         self.assertNotEqual(view_flags[1] & int(newton.BodyFlags.PROXY), 0)
         self.assertEqual(parent_flags[1] & int(newton.BodyFlags.PROXY), 0)
 
-    def test_deactivate_particles(self):
-        """deactivate_particles should clear only view-local active flags."""
+    def test_disable_particles(self):
+        """disable_particles should clear only view-local active flags."""
         builder = newton.ModelBuilder()
         builder.add_particle(pos=(0.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0)
         builder.add_particle(pos=(0.1, 0.0, 0.0), vel=(0.0, 0.0, 0.0), mass=1.0)
@@ -722,7 +722,7 @@ class TestModelView(unittest.TestCase):
 
         view = ModelView(model, "test")
         indices = wp.array([1], dtype=int, device="cpu")
-        view.deactivate_particles(indices)
+        view.disable_particles(indices)
 
         active = int(newton.ParticleFlags.ACTIVE)
         view_flags = view.particle_flags.numpy()
@@ -920,13 +920,13 @@ class TestSolverCoupledBasic(unittest.TestCase):
     def test_admm_notify_model_changed_reapplies_proximal_body_scaling(self):
         """ADMM proximal body mass scaling should refresh from parent inertia."""
         gamma = 0.5
-        coupled = SolverCoupledAdmm(
+        coupled = SolverCoupledADMM(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(name="A", solver=_StepCountingCopySolver, bodies=[0]),
                 SolverCoupled.Entry(name="B", solver=_StepCountingCopySolver, bodies=[1]),
             ],
-            coupling=SolverCoupledAdmm.Config(iterations=1, gamma=gamma),
+            coupling=SolverCoupledADMM.Config(iterations=1, gamma=gamma),
         )
 
         parent_mass = np.array([4.0, 8.0], dtype=np.float32)
@@ -1317,6 +1317,66 @@ class TestSolverCoupledBasic(unittest.TestCase):
                 ),
             )
 
+    def test_proxy_coupling_rejects_destination_owned_proxy_body(self):
+        """Proxy body ids must not alias bodies owned by the destination."""
+        builder = newton.ModelBuilder(gravity=0.0)
+        body0 = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        body1 = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        model = builder.finalize(device="cpu")
+
+        with self.assertRaisesRegex(ValueError, "owned by destination entry"):
+            SolverCoupledProxy(
+                model=model,
+                entries=[
+                    SolverCoupled.Entry(name="src", solver=SolverSemiImplicit, bodies=[body0]),
+                    SolverCoupled.Entry(name="dst", solver=SolverSemiImplicit, bodies=[body1]),
+                ],
+                coupling=SolverCoupledProxy.Config(
+                    proxies=[
+                        SolverCoupledProxy.Proxy(
+                            source="src",
+                            destination="dst",
+                            bodies=[body0],
+                            proxy_bodies=[body1],
+                        ),
+                    ],
+                ),
+            )
+
+    def test_proxy_coupling_rejects_destination_owned_proxy_particle(self):
+        """Proxy particle ids must not alias particles owned by the destination."""
+        builder = newton.ModelBuilder(gravity=0.0)
+        particle0 = builder.add_particle(
+            pos=(0.0, 0.0, 0.0),
+            vel=(0.0, 0.0, 0.0),
+            mass=1.0,
+        )
+        particle1 = builder.add_particle(
+            pos=(1.0, 0.0, 0.0),
+            vel=(0.0, 0.0, 0.0),
+            mass=1.0,
+        )
+        model = builder.finalize(device="cpu")
+
+        with self.assertRaisesRegex(ValueError, "owned by destination entry"):
+            SolverCoupledProxy(
+                model=model,
+                entries=[
+                    SolverCoupled.Entry(name="src", solver=SolverSemiImplicit, particles=[particle0]),
+                    SolverCoupled.Entry(name="dst", solver=SolverSemiImplicit, particles=[particle1]),
+                ],
+                coupling=SolverCoupledProxy.Config(
+                    proxies=[
+                        SolverCoupledProxy.Proxy(
+                            source="src",
+                            destination="dst",
+                            particles=[particle0],
+                            proxy_particles=[particle1],
+                        ),
+                    ],
+                ),
+            )
+
     def test_admm_gamma_zero_restores_mutated_input_velocities(self):
         """ADMM iterations should restore input velocities even without a proximal term."""
         _InputMutatingSolver.instances.clear()
@@ -1324,12 +1384,12 @@ class TestSolverCoupledBasic(unittest.TestCase):
         builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
         model = builder.finalize(device="cpu")
 
-        coupled = SolverCoupledAdmm(
+        coupled = SolverCoupledADMM(
             model=model,
             entries=[
                 SolverCoupled.Entry(name="A", solver=_InputMutatingSolver, bodies=[0]),
             ],
-            coupling=SolverCoupledAdmm.Config(iterations=2, gamma=0.0),
+            coupling=SolverCoupledADMM.Config(iterations=2, gamma=0.0),
         )
 
         state_0 = model.state()

@@ -6,7 +6,7 @@
 #
 # A fixed-base Franka arm is simulated by MuJoCo while a short rigid payload
 # chain is simulated by XPBD by default. The original VBD cable payload is kept
-# as an alternate mode for A/B testing. SolverCoupledAdmm detects rigid-rigid
+# as an alternate mode for A/B testing. SolverCoupledADMM detects rigid-rigid
 # contacts between the robot and the payload from the model collision pairs,
 # and the same template is replicated across many worlds to exercise ADMM
 # contact scaling.
@@ -21,7 +21,7 @@ from collections.abc import Callable
 
 import numpy as np
 import warp as wp
-from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledAdmm
+from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM
 
 import newton
 import newton.examples
@@ -111,7 +111,7 @@ class Example:
         mujoco_contact_budget = max(64, 16 * self.world_count)
         payload_name = "vbd" if self.payload_kind == "vbd-cable" else "xpbd"
         payload_solver = self._make_payload_solver(args)
-        self.solver = SolverCoupledAdmm(
+        self.solver = SolverCoupledADMM(
             model=self.model,
             entries=[
                 SolverCoupled.Entry(
@@ -138,14 +138,14 @@ class Example:
                     shapes=self.payload_shapes + self.ground_shapes,
                 ),
             ],
-            coupling=SolverCoupledAdmm.Config(
+            coupling=SolverCoupledADMM.Config(
                 iterations=int(args.admm_iterations),
                 rho=float(args.rho),
                 gamma=float(args.gamma),
                 baumgarte=float(args.baumgarte),
                 rigid_contact_matching=str(args.rigid_contact_matching),
                 contact_pairs=[
-                    SolverCoupledAdmm.ContactPair(
+                    SolverCoupledADMM.ContactPair(
                         source="mjc",
                         destination=payload_name,
                         contact_distance=None,

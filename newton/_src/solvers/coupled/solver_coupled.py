@@ -176,7 +176,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
     ``Model``, ``ModelView`` and ``State``: per-solver views, ownership masks,
     state distribution/reconciliation, per-entry substeps, and shared coupling
     hook dispatch helpers. Algorithm-specific couplers such as
-    :class:`~newton.solvers.experimental.coupled.SolverCoupledAdmm` and
+    :class:`~newton.solvers.experimental.coupled.SolverCoupledADMM` and
     :class:`~newton.solvers.experimental.coupled.SolverCoupledProxy` derive from this base class.
 
     Args:
@@ -202,6 +202,19 @@ class SolverCoupled(SolverBase, CouplingInterface):
         ids remain in the parent model namespace by default; set
         ``preserve_shape_ids=False`` to expose a compact entry-local shape
         namespace instead.
+
+        Args:
+            name: Unique entry name used by coupling configuration.
+            solver: Factory called with this entry's :class:`ModelView`.
+            bodies: Global body ids owned by this entry.
+            particles: Global particle ids owned by this entry.
+            joints: Global joint ids owned by this entry.
+            shapes: Global shape ids owned by this entry.
+            configure_view: Optional callback for entry-local view overrides.
+            substeps: Number of substeps to run per coupled step.
+            in_place: Whether the sub-solver may step in-place.
+            preserve_shape_ids: Whether shape ids remain in the parent model
+                namespace instead of being compacted.
         """
 
         name: str
@@ -305,7 +318,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 if to_zero:
                     to_zero_array = wp.array(to_zero, dtype=int, device=device)
                     view.zero_particle_mass(to_zero_array)
-                    view.deactivate_particles(to_zero_array)
+                    view.disable_particles(to_zero_array)
                 if proxy_particle_keep:
                     view.mark_proxy_particles(wp.array(sorted(proxy_particle_keep), dtype=int, device=device))
 

@@ -9,7 +9,7 @@
 - Warn from `SolverMuJoCo` when a `JointType.FREE` joint has a non-world parent; MuJoCo requires free joints to attach directly to the world.
 - Document loop closure in the articulations concept page, covering the omit-from-`add_articulation` pattern and USD `excludeFromArticulation` with per-solver caveats
 - Add an experimental coupled solver framework:
-  - Introduce `newton.solvers.experimental.coupled` with `SolverCoupled`, `SolverCoupledProxy`, `SolverCoupledAdmm`, and `ModelView` for multi-solver ownership, state mapping, and view-local model overrides.
+  - Introduce `newton.solvers.experimental.coupled` with `SolverCoupled`, `SolverCoupledProxy`, `SolverCoupledADMM`, and `ModelView` for multi-solver ownership, state mapping, and view-local model overrides.
   - Support body and particle proxy coupling with virtual inertia, solver hooks, MPM collider/transfer proxies, and convergence diagnostics.
   - Support ADMM coupling from model-derived joints, body-particle attachments, and collision-detected rigid/particle contacts with Coulomb friction.
   - Add standalone multiphysics examples and regression coverage for MuJoCo/Kamino, VBD, XPBD, MPM, and ADMM contacts.
@@ -29,6 +29,7 @@
 - Add USD parsing for `NewtonSiteAPI` to mark shapes as sites.
 - Add `joint_damping` model attribute and `JointDofConfig.damping` for velocity-proportional damping that is always active
 - Add `SolverCoupledAdmm.Config.rigid_contact_matching` to select `"disabled"`, `"latest"`, or `"sticky"` matching for collision-detected rigid ADMM contacts.
+- Add `SolverCoupledADMM.Config.rigid_contact_matching` to select `"disabled"`, `"latest"`, or `"sticky"` matching for collision-detected rigid ADMM contacts.
 - Add `ViewerRTX`, a real-time ray-traced viewer powered by NVIDIA OVRTX.
 - Add `SolverBase.reset()` method for in-place solver state resets with optional `world_mask` and `StateFlags`; default implementation is a no-op
 - Add `StateFlags` enum to control which state attributes are reset
@@ -89,6 +90,7 @@
 - Fix coupled `SolverMuJoCo` views with multi-world VBD cable joints owned by another sub-solver.
 - Fix coupled solver entries receiving parent-layout DOF controls instead of entry-local control arrays.
 - Fix collision-detected rigid ADMM contacts reusing primal warm-start state across contact rebuilds.
+- Fix `SolverSemiImplicit` particle-particle contact forces accumulating into `particle_f` instead of overwriting existing forces.
 - Fix `SolverXPBD` `body_parent_f` reporting to include `Control.joint_f` contributions and accumulate multiple inbound joint contributions, matching the `SolverMuJoCo` and `SolverFeatherstone` convention.
 - Fix MJCF `xyaxes` parsing to treat the second vector as Y and derive Z from X cross Y.
 - Fix `ViewerFile` playback dropping namespaced custom attributes (e.g. `model.mujoco.geom_solimp`) when restoring into a fresh `Model`.
@@ -156,11 +158,6 @@
 - Add per-mesh `color` override to `ViewerBase.log_mesh()` for tinting individual meshes without authoring per-vertex colors
 - Add per-mesh `roughness` and `metallic` PBR overrides to `ViewerBase.log_mesh()`
 - Support negative (mirrored) scale on mesh, convex hull, and SDF shapes, so a single `Mesh` instance can be shared across shapes with different signed scales without re-baking
-- Add an experimental coupled solver framework:
-  - Introduce `newton.solvers.coupled_experimental` with `SolverCoupled`, `SolverProxyCoupled`, `SolverAdmmCoupled`, and `ModelView` for multi-solver ownership, state mapping, and view-local model overrides.
-  - Support body and particle proxy coupling with virtual inertia, solver hooks, MPM collider/transfer proxies, and convergence diagnostics.
-  - Support ADMM coupling from model-derived joints, body-particle attachments, and collision-detected rigid/particle contacts with Coulomb friction.
-  - Add standalone multiphysics examples and regression coverage for MuJoCo/Kamino, VBD, XPBD, MPM, and ADMM contacts.
 
 ### Changed
 
