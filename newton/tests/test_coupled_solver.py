@@ -1016,6 +1016,35 @@ class TestSolverCoupledBasic(unittest.TestCase):
         self.assertEqual(int(flags[1]) & collide, 0)
         self.assertEqual(view_a.shape_contact_pair_count, 0)
 
+    def test_particle_entry_without_shapes_keeps_global_static_shapes(self):
+        """Particle-only entries should inherit global static shapes by default."""
+        builder = newton.ModelBuilder()
+        ground_shape = builder.add_ground_plane()
+        body = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        dynamic_shape = builder.add_shape_sphere(body=body, radius=0.1)
+        particle = builder.add_particle(pos=(0.0, 0.0, 0.5), vel=(0.0, 0.0, 0.0), mass=1.0)
+        model = builder.finalize(device="cpu")
+
+        coupled = SolverCoupled(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(name="particles", solver=SolverSemiImplicit, particles=[particle]),
+            ],
+        )
+
+        view = coupled.view("particles")
+        flags = view.shape_flags.numpy()
+        collide_particles = int(newton.ShapeFlags.COLLIDE_PARTICLES)
+
+        self.assertEqual(view.shape_count, model.shape_count)
+        self.assertEqual(view.body_shapes[-1], [ground_shape])
+        self.assertNotIn(dynamic_shape, view.body_shapes[-1])
+        self.assertNotEqual(int(flags[ground_shape]) & collide_particles, 0)
+        self.assertEqual(int(flags[dynamic_shape]) & collide_particles, 0)
+        body_shape_ids = np.array(view.body_shapes[-1], dtype=int)
+        particle_collider_shapes = body_shape_ids[(flags[body_shape_ids] & collide_particles) > 0]
+        np.testing.assert_array_equal(particle_collider_shapes, np.array([ground_shape], dtype=int))
+
     def test_entry_can_compact_shape_ids_when_requested(self):
         """Entry views should still support compact local shape ids by opt-out."""
         coupled = SolverCoupled(

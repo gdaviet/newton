@@ -447,16 +447,10 @@ class SolverCoupled(SolverBase, CouplingInterface):
             if shape_id < 0 or shape_id >= model.shape_count:
                 raise IndexError(f"Shape ownership index {shape_id} out of range for count {model.shape_count}")
 
-        shape_body = getattr(model, "shape_body", None)
         visible_bodies = set(proxy_body_keep)
         if not cfg.shapes:
             visible_bodies.update(int(i) for i in cfg.bodies)
-        if visible_bodies and shape_body is not None:
-            shape_body_np = shape_body.numpy()
-            for shape_id, shape_body_id in enumerate(shape_body_np):
-                body_id = int(shape_body_id)
-                if body_id in visible_bodies or (not cfg.shapes and body_id < 0):
-                    visible.add(shape_id)
+        visible.update(self._entry_visible_shapes(cfg, visible_bodies))
         if not visible:
             return
 
@@ -560,19 +554,11 @@ class SolverCoupled(SolverBase, CouplingInterface):
         view.articulation_count = articulation_prefix
 
     def _apply_shape_prefix_limit(self, view: ModelView, cfg: SolverCoupled.Entry, visible_bodies: set[int]) -> None:
-        model = self.model
-        visible_shapes = {int(i) for i in cfg.shapes}
-        if model.shape_count and model.shape_body is not None and visible_bodies:
-            shape_body = model.shape_body.numpy()
-            visible_shapes.update(
-                int(shape_id)
-                for shape_id, body_id in enumerate(shape_body)
-                if int(body_id) < 0 or int(body_id) in visible_bodies
-            )
+        visible_shapes = self._entry_visible_shapes(cfg, visible_bodies)
         if not visible_shapes:
             return
         shape_prefix = self._prefix_length(visible_shapes)
-        if shape_prefix is not None and shape_prefix < model.shape_count:
+        if shape_prefix is not None and shape_prefix < self.model.shape_count:
             view.shape_count = shape_prefix
 
     def _apply_preserved_shape_metadata_without_compaction(
@@ -680,12 +666,13 @@ class SolverCoupled(SolverBase, CouplingInterface):
     def _entry_visible_shapes(self, cfg: SolverCoupled.Entry, visible_bodies: set[int]) -> set[int]:
         model = self.model
         visible_shapes = {int(i) for i in cfg.shapes}
-        if model.shape_count and model.shape_body is not None and visible_bodies:
+        include_default_static_shapes = not cfg.shapes
+        if model.shape_count and model.shape_body is not None and (visible_bodies or include_default_static_shapes):
             shape_body = model.shape_body.numpy()
             visible_shapes.update(
                 int(shape_id)
                 for shape_id, body_id in enumerate(shape_body)
-                if int(body_id) < 0 or int(body_id) in visible_bodies
+                if (include_default_static_shapes and int(body_id) < 0) or int(body_id) in visible_bodies
             )
         return visible_shapes
 
