@@ -165,7 +165,7 @@ class Example:
         self.solver.prepare_contacts(self.contacts)
         self.control = self.model.control()
 
-        self.viewer.set_model(self.model)
+        newton.examples.configure_coupled_view(self, args)
         self.viewer.set_world_offsets((1.1, 1.1, 0.0))
         if isinstance(self.viewer, newton.viewer.ViewerGL):
             scale = max(1.0, float(np.sqrt(self.world_count)))
@@ -406,7 +406,7 @@ class Example:
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
-            self.viewer.apply_forces(self.state_0)
+            newton.examples.apply_coupled_viewer_forces(self, self.state_0)
             self.model.collide(self.state_0, self.contacts, collision_pipeline=self.collision_pipeline)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             newton.eval_ik(self.model, self.state_1, self.state_1.joint_q, self.state_1.joint_qd)
@@ -431,13 +431,13 @@ class Example:
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
-        self.viewer.log_state(self.state_0)
-        self.viewer.log_contacts(self.contacts, self.state_0)
+        newton.examples.log_coupled_view(self, self.contacts)
         self.viewer.end_frame()
 
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
+        newton.examples.add_coupled_view_args(parser)
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(world_count=8)
         parser.add_argument("--substeps", type=int, default=16, help="Coupled substeps per rendered frame.")

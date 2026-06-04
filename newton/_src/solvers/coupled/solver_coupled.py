@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import warp as wp
@@ -248,6 +248,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
         self._entry_soft_contact_update: dict[str, wp.array] = {}
         self._entry_rigid_contact_src_to_dst: dict[str, wp.array] = {}
         self._entry_soft_contact_src_to_dst: dict[str, wp.array] = {}
+        self._entry_output_state_valid = False
 
         self._validate_entry_names()
         self._body_owner = self._build_owner_map(model.body_count, [e.bodies for e in self._entry_configs])
@@ -1722,6 +1723,74 @@ class SolverCoupled(SolverBase, CouplingInterface):
         """Return the :class:`ModelView` for the sub-solver *name*."""
         return self._entries[name].view
 
+    def entry_names(self) -> tuple[str, ...]:
+        """Return coupled sub-solver entry names in stepping order."""
+        return tuple(self._solver_order)
+
+    def entry_view(self, name: str) -> ModelView:
+        """Return the :class:`ModelView` for coupled sub-solver *name*."""
+        return self.view(name)
+
+    def entry_state(self, name: str, phase: Literal["current", "input", "output"] = "current") -> State:
+        """Return an entry-local state suitable for visualization.
+
+        Args:
+            name: Coupled sub-solver entry name.
+            phase: Which state phase to return. ``"input"`` returns the
+                distributed input state, ``"output"`` returns the last
+                sub-solver output state, and ``"current"`` returns output
+                after the coupled solver has stepped at least once or input
+                before the first step.
+
+        Returns:
+            Entry-local state whose arrays match :meth:`entry_view`.
+        """
+        entry = self._entries[name]
+        if phase == "input":
+            return entry.state_0
+        if phase == "output":
+            return entry.state_1
+        if phase != "current":
+            raise ValueError(f"Unsupported coupled entry state phase {phase!r}")
+        if self._entry_output_state_valid:
+            return entry.state_1
+        return entry.state_0
+
+    def entry_contacts(self, name: str, contacts: Contacts | None) -> Contacts | None:
+        """Return contacts filtered for a coupled entry's view, when possible.
+
+        Args:
+            name: Coupled sub-solver entry name.
+            contacts: Parent-model contacts to filter.
+
+        Returns:
+            Entry-local contacts, or ``None`` when no compatible contact buffer
+            is available.
+        """
+        if contacts is None:
+            return None
+        entry = self._entries[name]
+        if not entry.preserve_shape_ids:
+            return None
+        return self._contacts_for_entry(entry, contacts)
+
+    def entry_output_state_valid(self) -> bool:
+        """Return whether entry output states reflect the last coupled step."""
+        return self._entry_output_state_valid
+
+    def sync_entry_states(self, state_in: State, dt: float = 0.0) -> None:
+        """Synchronize entry input states from a parent-model state.
+
+        This is primarily useful for visualization before the first coupled
+        step has produced entry output states.
+
+        Args:
+            state_in: Parent-model state to distribute into entry-local states.
+            dt: Time step metadata forwarded to coupling input-state hooks.
+        """
+        self._distribute_state(state_in, dt=dt)
+        self._entry_output_state_valid = False
+
     # ------------------------------------------------------------------
     # SolverBase interface
     # ------------------------------------------------------------------
@@ -1745,6 +1814,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
         self._step_coupled(state_in, state_out, control, contacts, dt)
         _copy_state(state_in, state_out)
         self._reconcile_state(state_out)
+        self._entry_output_state_valid = True
 
     def prepare_contacts(self, contacts: Contacts | None) -> None:
         """Preallocate entry-local filtered contact buffers for graph capture."""

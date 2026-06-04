@@ -151,7 +151,7 @@ class Example:
         self.initial_tray_origin = self._tray_origin(self.model.body_q.numpy())
         self.max_tray_origin_error = 0.0
 
-        self.viewer.set_model(self.model)
+        newton.examples.configure_coupled_view(self, args)
         if hasattr(self.viewer, "show_particles"):
             self.viewer.show_particles = False
         camera_target = np.array([0.0, 0.0, 0.06], dtype=np.float32)
@@ -184,7 +184,7 @@ class Example:
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
-            self.viewer.apply_forces(self.state_0)
+            newton.examples.apply_coupled_viewer_forces(self, self.state_0)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
@@ -225,16 +225,17 @@ class Example:
             )
 
     def render(self):
+        render_state = newton.examples.get_coupled_view_state(self)
         wp.launch(
             _gather_particles,
             dim=len(self.falling_particles),
-            inputs=[self.falling_ids, self.state_0.particle_q],
+            inputs=[self.falling_ids, render_state.particle_q],
             outputs=[self.falling_points],
             device=self.model.device,
         )
 
         self.viewer.begin_frame(self.sim_time)
-        self.viewer.log_state(self.state_0)
+        newton.examples.log_coupled_view(self, log_contacts=False)
         self.viewer.log_points(
             "/admm_contact/falling_particles",
             self.falling_points,
@@ -353,6 +354,7 @@ class Example:
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
+        newton.examples.add_coupled_view_args(parser)
         parser.add_argument(
             "--solver",
             "-s",

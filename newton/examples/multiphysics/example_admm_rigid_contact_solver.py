@@ -129,7 +129,7 @@ class Example:
         self.max_precritical_slip = 0.0
         self.final_plane_local_x = self.box_start_x
 
-        self.viewer.set_model(self.model)
+        newton.examples.configure_coupled_view(self, args)
         camera_target = wp.vec3(0.05, 0.0, 0.08)
         self.viewer.set_camera(pos=wp.vec3(1.05, -1.2, 0.72), pitch=-24.0, yaw=140.0)
         if hasattr(self.viewer, "camera") and hasattr(self.viewer.camera, "look_at"):
@@ -148,7 +148,7 @@ class Example:
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
-            self.viewer.apply_forces(self.state_0)
+            newton.examples.apply_coupled_viewer_forces(self, self.state_0)
             self._sync_kinematic_plane(self.state_0)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
@@ -185,7 +185,7 @@ class Example:
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
-        self.viewer.log_state(self.state_0)
+        newton.examples.log_coupled_view(self, log_contacts=False)
         self.viewer.end_frame()
 
     def _emit_scene(self, builder: newton.ModelBuilder, args) -> tuple[int, int]:
@@ -290,6 +290,7 @@ class Example:
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
+        newton.examples.add_coupled_view_args(parser)
         parser.add_argument(
             "--solver",
             "-s",

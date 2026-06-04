@@ -875,6 +875,59 @@ class TestSolverCoupledBasic(unittest.TestCase):
         self.assertEqual(view_b.body_flags.numpy()[0] & int(newton.BodyFlags.KINEMATIC), 0)
         self.assertNotEqual(view_b.body_flags.numpy()[0] & int(newton.BodyFlags.DYNAMIC), 0)
 
+    def test_entry_visualization_accessors(self):
+        """SolverCoupled should expose entry-local views and states for rendering."""
+        coupled = SolverCoupled(
+            model=self.model,
+            entries=[
+                SolverCoupled.Entry(name="A", solver=SolverSemiImplicit, bodies=[0]),
+                SolverCoupled.Entry(name="B", solver=SolverSemiImplicit, bodies=[1]),
+            ],
+        )
+
+        self.assertEqual(coupled.entry_names(), ("A", "B"))
+        self.assertIs(coupled.entry_view("A"), coupled.view("A"))
+        self.assertFalse(coupled.entry_output_state_valid())
+        self.assertIs(coupled.entry_state("A"), coupled._entries["A"].state_0)
+        self.assertIs(coupled.entry_state("A", phase="input"), coupled._entries["A"].state_0)
+        self.assertIs(coupled.entry_state("A", phase="output"), coupled._entries["A"].state_1)
+        self.assertIsNone(coupled.entry_contacts("A", None))
+        with self.assertRaises(ValueError):
+            coupled.entry_state("A", phase="bad")
+
+        state_0 = self.model.state()
+        state_1 = self.model.state()
+        coupled.step(state_0, state_1, control=None, contacts=None, dt=1.0 / 60.0)
+
+        self.assertTrue(coupled.entry_output_state_valid())
+        self.assertIs(coupled.entry_state("A"), coupled._entries["A"].state_1)
+
+        coupled.sync_entry_states(state_1)
+        self.assertFalse(coupled.entry_output_state_valid())
+        self.assertIs(coupled.entry_state("A"), coupled._entries["A"].state_0)
+
+    def test_entry_contacts_unavailable_for_compact_shape_ids(self):
+        """Entry contacts should not be exposed when shape ids were compacted."""
+        coupled = SolverCoupled(
+            model=self.model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="A",
+                    solver=SolverSemiImplicit,
+                    bodies=[0],
+                    preserve_shape_ids=False,
+                ),
+                SolverCoupled.Entry(
+                    name="B",
+                    solver=SolverSemiImplicit,
+                    bodies=[1],
+                    preserve_shape_ids=False,
+                ),
+            ],
+        )
+
+        self.assertIsNone(coupled.entry_contacts("A", self.model.contacts()))
+
     def test_entry_control_arrays_are_mapped_to_local_dofs(self):
         """Entry solvers should receive control arrays in their local DOF namespace."""
         _ControlRecordingSolver.instances.clear()
