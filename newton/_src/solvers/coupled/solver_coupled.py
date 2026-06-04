@@ -2367,9 +2367,9 @@ def _entry_control(view: ModelView) -> Control:
     control._use_coord_layout_targets = use_coord_layout_targets
     target_q_count = int(view.joint_coord_count if use_coord_layout_targets else view.joint_dof_count)
     dof_count = int(view.joint_dof_count)
+    requires_grad = bool(getattr(view.parent, "requires_grad", False))
+    device = view.parent.device
     if target_q_count or dof_count:
-        requires_grad = bool(getattr(view.parent, "requires_grad", False))
-        device = view.parent.device
         if target_q_count:
             control.joint_target_q = wp.zeros(
                 target_q_count,
@@ -2381,6 +2381,12 @@ def _entry_control(view: ModelView) -> Control:
             control.joint_target_qd = wp.zeros(dof_count, dtype=float, device=device, requires_grad=requires_grad)
         control.joint_act = wp.zeros(dof_count, dtype=float, device=device, requires_grad=requires_grad)
         control.joint_f = wp.zeros(dof_count, dtype=float, device=device, requires_grad=requires_grad)
+    if int(view.tri_count):
+        control.tri_activations = wp.clone(view.tri_activations, requires_grad=requires_grad)
+    if int(view.tet_count):
+        control.tet_activations = wp.clone(view.tet_activations, requires_grad=requires_grad)
+    if int(view.muscle_count):
+        control.muscle_activations = wp.clone(view.muscle_activations, requires_grad=requires_grad)
     return control
 
 
@@ -2403,6 +2409,8 @@ def _copy_control_to_entry(src: Control | None, entry: SolverEntry) -> Control |
         ("joint_act", dof_map),
     ):
         _copy_control_float_array(src, dst, name, local_to_global, device)
+    for name in ("tri_activations", "tet_activations", "muscle_activations"):
+        _copy_control_prefix_float_array(src, dst, name)
     return dst
 
 
@@ -2429,6 +2437,17 @@ def _copy_control_float_array(
         inputs=[local_to_global, src, dst],
         device=device,
     )
+
+
+def _copy_control_prefix_float_array(src_control: Control, dst_control: Control, name: str) -> None:
+    dst = getattr(dst_control, name, None)
+    if dst is None:
+        return
+    src = getattr(src_control, name, None)
+    if src is None:
+        dst.zero_()
+        return
+    _copy_prefix(dst, src, name)
 
 
 def _copy_state_to_entry(src: State, dst: State, entry: SolverEntry) -> None:
