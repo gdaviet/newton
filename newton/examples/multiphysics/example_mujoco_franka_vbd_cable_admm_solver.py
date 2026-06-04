@@ -212,7 +212,7 @@ class Example:
             force_show_colliders=False,
         )
         builder.joint_q[: len(FRANKA_Q)] = FRANKA_Q
-        builder.joint_target_pos[: len(FRANKA_Q)] = FRANKA_Q
+        builder.joint_target_q[: len(FRANKA_Q)] = FRANKA_Q
         builder.joint_target_ke[:7] = [900.0] * 7
         builder.joint_target_kd[:7] = [90.0] * 7
         builder.joint_target_ke[7:9] = [1500.0, 1500.0]

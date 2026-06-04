@@ -951,10 +951,11 @@ class SolverCoupled(SolverBase, CouplingInterface):
             "constraint_mimic_joint0",
             "constraint_mimic_joint1",
         }
+        renamed_attrs = {"joint_target_pos", "joint_target_vel"}
         handled_attrs = self._select_compact_attributes_by_frequency(
             view,
             index_orders_by_frequency,
-            exclude=remapped_or_derived_attrs,
+            exclude=remapped_or_derived_attrs | renamed_attrs,
         )
         self._select_compact_prefix_attributes(
             view,
@@ -967,7 +968,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 "equality_constraint_": (equality_order, model.equality_constraint_count),
                 "constraint_mimic_": (mimic_order, model.constraint_mimic_count),
             },
-            exclude=handled_attrs | remapped_or_derived_attrs,
+            exclude=handled_attrs | remapped_or_derived_attrs | renamed_attrs,
         )
 
         joint_parent = self._select_numpy_array(view, "joint_parent", joint_order)
@@ -2362,19 +2363,29 @@ def _entry_control(view: ModelView) -> Control:
     from ...sim import Control  # noqa: PLC0415
 
     control = Control()
+    use_coord_layout_targets = bool(getattr(view.parent, "use_coord_layout_targets", False))
+    control._use_coord_layout_targets = use_coord_layout_targets
+    target_q_count = int(view.joint_coord_count if use_coord_layout_targets else view.joint_dof_count)
     dof_count = int(view.joint_dof_count)
-    if dof_count:
+    if target_q_count or dof_count:
         requires_grad = bool(getattr(view.parent, "requires_grad", False))
         device = view.parent.device
-        control.joint_target_pos = wp.zeros(dof_count, dtype=float, device=device, requires_grad=requires_grad)
-        control.joint_target_vel = wp.zeros(dof_count, dtype=float, device=device, requires_grad=requires_grad)
+        if target_q_count:
+            control.joint_target_q = wp.zeros(
+                target_q_count,
+                dtype=float,
+                device=device,
+                requires_grad=requires_grad,
+            )
+        if dof_count:
+            control.joint_target_qd = wp.zeros(dof_count, dtype=float, device=device, requires_grad=requires_grad)
         control.joint_act = wp.zeros(dof_count, dtype=float, device=device, requires_grad=requires_grad)
         control.joint_f = wp.zeros(dof_count, dtype=float, device=device, requires_grad=requires_grad)
     return control
 
 
 def _copy_control_to_entry(src: Control | None, entry: SolverEntry) -> Control | None:
-    """Copy full-model DOF controls into an entry-local control object."""
+    """Copy full-model controls into an entry-local control object."""
     if src is None:
         return None
     dst = entry.control
@@ -2383,12 +2394,19 @@ def _copy_control_to_entry(src: Control | None, entry: SolverEntry) -> Control |
 
     device = entry.view.parent.device
     dof_map = entry.joint_dof_local_to_global
-    for name in ("joint_f", "joint_target_pos", "joint_target_vel", "joint_act"):
-        _copy_control_dof_array(src, dst, name, dof_map, device)
+    use_coord_layout_targets = bool(getattr(entry.view.parent, "use_coord_layout_targets", False))
+    target_q_map = entry.joint_coord_local_to_global if use_coord_layout_targets else dof_map
+    for name, local_to_global in (
+        ("joint_f", dof_map),
+        ("joint_target_q", target_q_map),
+        ("joint_target_qd", dof_map),
+        ("joint_act", dof_map),
+    ):
+        _copy_control_float_array(src, dst, name, local_to_global, device)
     return dst
 
 
-def _copy_control_dof_array(
+def _copy_control_float_array(
     src_control: Control,
     dst_control: Control,
     name: str,
