@@ -16,9 +16,7 @@ from ...geometry import ParticleFlags, ShapeFlags
 from ..flags import SolverNotifyFlags
 from ..solver import SolverBase
 from .interface import (
-    COUPLING_HOOK_METHOD,
     CouplingEndpointKind,
-    CouplingHook,
     CouplingInputStateFlags,
     CouplingInterface,
 )
@@ -81,57 +79,12 @@ def _coupling_endpoint_arrays(
     )
 
 
-_UNSUPPORTED = object()
-"""Sentinel returned by :func:`_coupling_method_or_fallback` when the solver
-declared the hook unsupported and ``raise_on_unsupported`` is False."""
-
-
-_SENTINEL_UNCACHED = object()
-"""Sentinel marking an entry-level hook lookup that has not been resolved yet."""
-
-
 def _require_supports_coupling(solver: SolverBase) -> None:
     if not isinstance(solver, CouplingInterface):
         raise TypeError(
             f"{type(solver).__name__} cannot participate in a coupled simulation; "
             "inherit CouplingInterface and override the hook methods it needs."
         )
-
-
-def _coupling_method_or_fallback(
-    entry: SolverEntry,
-    hook: CouplingHook,
-    *,
-    raise_on_unsupported: bool = True,
-):
-    """Look up an entry solver's hook method, caching the result on the entry.
-
-    Returns the bound method to call if the solver overrides the hook, ``None``
-    if the solver supports the hook but expects the wrapper fallback, or
-    :data:`_UNSUPPORTED` if the solver declared the hook unsupported and
-    ``raise_on_unsupported`` is False. Raises :class:`NotImplementedError`
-    when the hook is unsupported and ``raise_on_unsupported`` is True, or
-    :class:`TypeError` when the solver does not inherit :class:`CouplingInterface`.
-    """
-    cache = entry.hook_methods
-    cached = cache.get(hook, _SENTINEL_UNCACHED)
-    if cached is _SENTINEL_UNCACHED:
-        solver = entry.solver
-        _require_supports_coupling(solver)
-        if hook in solver.coupling_unsupported:
-            cached = _UNSUPPORTED
-        else:
-            method = getattr(solver, COUPLING_HOOK_METHOD[hook], None)
-            cached = method if callable(method) else None
-        cache[hook] = cached
-
-    if cached is _UNSUPPORTED:
-        if raise_on_unsupported:
-            raise NotImplementedError(
-                f"{type(entry.solver).__name__} declared coupling hook {hook.name} as unsupported"
-            )
-        return _UNSUPPORTED
-    return cached
 
 
 @dataclass
@@ -166,7 +119,6 @@ class SolverEntry:
     control: Control | None = None
     body_force_input: wp.array = field(default=None)
     particle_force_input: wp.array = field(default=None)
-    hook_methods: dict = field(default_factory=dict)
 
 
 class SolverCoupled(SolverBase, CouplingInterface):
@@ -1552,42 +1504,29 @@ class SolverCoupled(SolverBase, CouplingInterface):
         if endpoint_indices.shape[0] == 0:
             return []
 
-        method = _coupling_method_or_fallback(
-            entry,
-            CouplingHook.EFFECTIVE_MASS_DIAGONAL,
-            raise_on_unsupported=raise_on_unsupported,
-        )
-        if method is _UNSUPPORTED:
-            return None
-
         indices = [int(i) for i in endpoint_indices.numpy()]
         local_indices = self._endpoint_indices_to_local(entry, endpoint_kind, indices)
         local_indices_array = wp.array(local_indices, dtype=int, device=self.model.device)
-        if method is not None:
-            endpoint_kind_array, endpoint_index, endpoint_local_pos = _coupling_endpoint_arrays(
-                endpoint_kind,
-                local_indices_array,
-                self.model.device,
-            )
-            out = wp.empty(endpoint_indices.shape[0], dtype=float, device=self.model.device)
-            method(
+        endpoint_kind_array, endpoint_index, endpoint_local_pos = _coupling_endpoint_arrays(
+            endpoint_kind,
+            local_indices_array,
+            self.model.device,
+        )
+        out = wp.empty(endpoint_indices.shape[0], dtype=float, device=self.model.device)
+
+        _require_supports_coupling(entry.solver)
+        try:
+            entry.solver.coupling_eval_effective_mass(
                 endpoint_kind_array,
                 endpoint_index,
                 endpoint_local_pos,
                 out,
             )
-            return [float(value) for value in out.numpy()]
-
-        if int(endpoint_kind) == int(CouplingEndpointKind.BODY):
-            inv_mass = entry.view.body_inv_mass.numpy() if entry.view.body_inv_mass is not None else []
-        elif int(endpoint_kind) == int(CouplingEndpointKind.PARTICLE):
-            inv_mass = entry.view.particle_inv_mass.numpy() if entry.view.particle_inv_mass is not None else []
-        else:
-            raise ValueError(f"Unknown coupling endpoint kind {endpoint_kind}")
-        return [
-            0.0 if len(inv_mass) <= local or float(inv_mass[local]) == 0.0 else 1.0 / float(inv_mass[local])
-            for local in local_indices
-        ]
+        except NotImplementedError:
+            if raise_on_unsupported:
+                raise
+            return None
+        return [float(value) for value in out.numpy()]
 
     def _eval_effective_body_inertial_properties(
         self,
@@ -1603,54 +1542,29 @@ class SolverCoupled(SolverBase, CouplingInterface):
         indices = [int(i) for i in body_indices.numpy()]
         local_indices = self._endpoint_indices_to_local(entry, CouplingEndpointKind.BODY, indices)
         local_indices_array = wp.array(local_indices, dtype=int, device=self.model.device)
-        block_method = _coupling_method_or_fallback(
-            entry,
-            CouplingHook.EFFECTIVE_MASS_BLOCK,
-            raise_on_unsupported=raise_on_unsupported,
+        endpoint_kind_array, endpoint_index, endpoint_local_pos = _coupling_endpoint_arrays(
+            CouplingEndpointKind.BODY,
+            local_indices_array,
+            self.model.device,
         )
-        if block_method is _UNSUPPORTED:
-            return None
+        out_mass = wp.empty(body_indices.shape[0], dtype=float, device=self.model.device)
+        out_inertia = wp.empty(body_indices.shape[0], dtype=wp.mat33, device=self.model.device)
 
-        if block_method is not None:
-            endpoint_kind_array, endpoint_index, endpoint_local_pos = _coupling_endpoint_arrays(
-                CouplingEndpointKind.BODY,
-                local_indices_array,
-                self.model.device,
-            )
-            out_mass = wp.empty(body_indices.shape[0], dtype=float, device=self.model.device)
-            out_inertia = wp.empty(body_indices.shape[0], dtype=wp.mat33, device=self.model.device)
-            block_method(
+        _require_supports_coupling(entry.solver)
+        try:
+            entry.solver.coupling_eval_effective_mass_block(
                 endpoint_kind_array,
                 endpoint_index,
                 endpoint_local_pos,
                 out_mass,
                 out_inertia,
             )
-            masses = [float(value) for value in out_mass.numpy()]
-            inertias = [wp.mat33(np.asarray(value, dtype=np.float32)) for value in out_inertia.numpy()]
-            return masses, inertias
-
-        masses = self._eval_effective_masses(
-            entry,
-            CouplingEndpointKind.BODY,
-            body_indices,
-            raise_on_unsupported=raise_on_unsupported,
-        )
-        if masses is None:
+        except NotImplementedError:
+            if raise_on_unsupported:
+                raise
             return None
-
-        model_mass = entry.view.body_mass.numpy() if entry.view.body_mass is not None else []
-        model_inertia = entry.view.body_inertia.numpy() if entry.view.body_inertia is not None else []
-        inertias = []
-        for local, mass in zip(local_indices, masses, strict=True):
-            if len(model_inertia) <= local:
-                inertias.append(wp.mat33(0.0))
-                continue
-            inertia = np.asarray(model_inertia[local], dtype=np.float32)
-            base_mass = float(model_mass[local]) if len(model_mass) > local else 0.0
-            if base_mass > 0.0:
-                inertia = inertia * (float(mass) / base_mass)
-            inertias.append(wp.mat33(inertia))
+        masses = [float(value) for value in out_mass.numpy()]
+        inertias = [wp.mat33(np.asarray(value, dtype=np.float32)) for value in out_inertia.numpy()]
         return masses, inertias
 
     def _endpoint_indices_to_local(
@@ -1930,10 +1844,6 @@ class SolverCoupled(SolverBase, CouplingInterface):
     # Generic proxy implementation
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _uses_custom_coupling_hook(entry: SolverEntry, hook: CouplingHook) -> bool:
-        return _coupling_method_or_fallback(entry, hook) is not None
-
     def _clear_body_force_input(self, entry: SolverEntry) -> None:
         """Clear an entry's public body force input before mapped additions."""
         if entry.state_0.body_f is not None:
@@ -2072,8 +1982,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
         flags = CouplingInputStateFlags(flags)
         if flags == 0 and not restart:
             return
-        if self._uses_custom_coupling_hook(entry, CouplingHook.NOTIFY_INPUT_STATE_UPDATE):
-            entry.solver.coupling_notify_input_state_update(entry.state_0, flags, restart=restart, dt=dt)
+        _require_supports_coupling(entry.solver)
+        entry.solver.coupling_notify_input_state_update(entry.state_0, flags, restart=restart, dt=dt)
 
     def _step_entry(
         self,

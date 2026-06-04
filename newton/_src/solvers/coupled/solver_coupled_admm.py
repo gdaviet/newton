@@ -71,7 +71,6 @@ from .admm_utils import (
 )
 from .interface import (
     CouplingEndpointKind,
-    CouplingHook,
     CouplingInputStateFlags,
 )
 from .model_view import ModelView
@@ -1039,9 +1038,7 @@ class SolverCoupledADMM(SolverCoupled):
         if (entry_name, int(endpoint_kind)) not in self._admm_effective_mass_unsupported:
             return
         solver = self._entries[entry_name].solver
-        raise NotImplementedError(
-            f"{solver.__class__.__name__} does not support coupling hook {CouplingHook.EFFECTIVE_MASS_DIAGONAL.name}"
-        )
+        raise NotImplementedError(f"{solver.__class__.__name__} does not support coupling_eval_effective_mass()")
 
     @staticmethod
     def _interface_weight(m_a: float, m_b: float) -> float:
