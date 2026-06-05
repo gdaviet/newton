@@ -28,7 +28,6 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import forward_step_rigid_bodies
 from newton.solvers import (
     SolverBase,
     SolverMuJoCo,
-    SolverNotifyFlags,
     SolverSemiImplicit,
     SolverVBD,
     SolverXPBD,
@@ -994,7 +993,7 @@ class TestSolverCoupledBasic(unittest.TestCase):
         )
 
         self.model.body_inv_mass.assign(np.array([0.25, 0.125], dtype=np.float32))
-        coupled.notify_model_changed(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES)
+        coupled.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
 
         view_a_inv_mass = coupled.view("A").body_inv_mass.numpy()
         view_b_inv_mass = coupled.view("B").body_inv_mass.numpy()
@@ -1020,7 +1019,7 @@ class TestSolverCoupledBasic(unittest.TestCase):
         self.model.body_inertia.assign(parent_inertia)
         self.model.body_inv_inertia.assign(np.linalg.inv(parent_inertia))
 
-        coupled.notify_model_changed(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES)
+        coupled.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
 
         scale = 1.0 + gamma
         view_a = coupled.view("A")
@@ -2135,7 +2134,7 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
         )
         dst_solver = _StepCountingCopySolver.instances["dst"]
         self.assertTrue(
-            any(flags & int(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES) for flags in dst_solver.model_notify_flags)
+            any(flags & int(newton.ModelFlags.BODY_INERTIAL_PROPERTIES) for flags in dst_solver.model_notify_flags)
         )
 
     def test_notify_model_changed_reapplies_proxy_body_effective_inertia(self):
@@ -2178,7 +2177,7 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
         model.body_inertia.assign(parent_inertia)
         model.body_inv_inertia.assign(np.linalg.inv(parent_inertia))
 
-        coupled.notify_model_changed(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES)
+        coupled.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
 
         dst_view = coupled.view("dst")
         owned_local = self._entry_body_local(coupled, "dst", 1)
@@ -2617,7 +2616,7 @@ class TestSolverCoupledParticleProxy(unittest.TestCase):
         dst_view = coupled.view("dst")
         np.testing.assert_allclose(dst_view.particle_mass.numpy()[0], 1.0)
         dst_solver = _StepCountingCopySolver.instances["dst"]
-        self.assertTrue(any(flags & int(SolverNotifyFlags.MODEL_PROPERTIES) for flags in dst_solver.model_notify_flags))
+        self.assertTrue(any(flags & int(newton.ModelFlags.MODEL_PROPERTIES) for flags in dst_solver.model_notify_flags))
 
     def test_proxy_mass_uses_source_effective_mass_hook(self):
         _CustomEffectiveMassParticleSolver.instances.clear()

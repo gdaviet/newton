@@ -13,7 +13,7 @@ import numpy as np
 import warp as wp
 
 from ...geometry import ParticleFlags, ShapeFlags
-from ..flags import SolverNotifyFlags
+from ...sim import ModelFlags
 from ..solver import SolverBase
 from .interface import (
     CouplingEndpointKind,
@@ -1614,7 +1614,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
     ) -> None:
         """Apply body mass/inertia to the destination model view."""
         entry.view.set_body_inertial_properties(body_indices, body_mass, body_inertia)
-        entry.solver.notify_model_changed(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES)
+        entry.solver.notify_model_changed(ModelFlags.BODY_INERTIAL_PROPERTIES)
 
     def _apply_particle_mass_override(
         self,
@@ -1624,7 +1624,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
     ) -> None:
         """Apply particle mass to the destination model view."""
         entry.view.set_particle_mass(particle_indices, particle_mass)
-        entry.solver.notify_model_changed(SolverNotifyFlags.MODEL_PROPERTIES)
+        entry.solver.notify_model_changed(ModelFlags.MODEL_PROPERTIES)
 
     # ------------------------------------------------------------------
     # Sub-solver access
@@ -2247,7 +2247,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
 
     def _refresh_model_view_overrides(self, flags: int) -> None:
         """Refresh parent-derived view overrides before solver notification."""
-        if not int(flags) & int(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES):
+        if not int(flags) & int(ModelFlags.BODY_INERTIAL_PROPERTIES):
             return
         for entry in self._entries.values():
             self._refresh_body_inertial_view_overrides(entry)

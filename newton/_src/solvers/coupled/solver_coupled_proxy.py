@@ -13,8 +13,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import warp as wp
 
-from ...sim import BodyFlags
-from ..flags import SolverNotifyFlags
+from ...sim import BodyFlags, ModelFlags
 from .interface import (
     CouplingEndpointKind,
     CouplingInputStateFlags,
@@ -647,7 +646,7 @@ class SolverCoupledProxy(SolverCoupled):
     def notify_model_changed(self, flags: int) -> None:
         """Refresh proxy inertia after source solvers consume model updates."""
         super().notify_model_changed(flags)
-        if int(flags) & int(SolverNotifyFlags.BODY_INERTIAL_PROPERTIES):
+        if int(flags) & int(ModelFlags.BODY_INERTIAL_PROPERTIES):
             self._apply_proxy_body_effective_masses()
 
     def _step_coupled(
