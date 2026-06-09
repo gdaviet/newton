@@ -1883,12 +1883,16 @@ class TestSolverCoupledMuJoCoVBDMultiEnv(unittest.TestCase):
             model=model,
             entries=[
                 SolverCoupled.Entry(
-                    name="rigid", solver=SolverSemiImplicit,
-                    bodies=expand([base, link], bpw), joints=expand([jf, jr], jpw),
+                    name="rigid",
+                    solver=SolverSemiImplicit,
+                    bodies=expand([base, link], bpw),
+                    joints=expand([jf, jr], jpw),
                 ),
                 SolverCoupled.Entry(
-                    name="free", solver=SolverSemiImplicit,
-                    bodies=expand([free_body], bpw), joints=expand([jfree], jpw),
+                    name="free",
+                    solver=SolverSemiImplicit,
+                    bodies=expand([free_body], bpw),
+                    joints=expand([jfree], jpw),
                 ),
             ],
         )
@@ -3662,7 +3666,7 @@ class TestSolverCoupledVBDColoring(unittest.TestCase):
             entries=[
                 SolverCoupled.Entry(
                     name="src",
-                    solver=lambda view: SolverSemiImplicit(view),
+                    solver=SolverSemiImplicit,
                     bodies=[0, 1],
                     joints=[0, 1],
                 ),
