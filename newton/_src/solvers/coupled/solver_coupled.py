@@ -1002,9 +1002,6 @@ class SolverCoupled(SolverBase, CouplingInterface):
 
         articulation_starts = self._compact_articulation_starts(joint_order, articulation_order)
         view.articulation_start = wp.array(articulation_starts, dtype=wp.int32, device=device)
-        # Rebase articulation_end to local joint indices too; the generic prefix
-        # selector only gathers it by value (global indices), which mismatches the
-        # rebased starts and corrupts solver FK (e.g. out-of-bounds joint ranges).
         view.articulation_end = wp.array(articulation_starts[1:], dtype=wp.int32, device=device)
         self._set_compact_articulation_extents(view, articulation_order)
 
