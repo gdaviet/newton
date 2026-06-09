@@ -1001,11 +1001,9 @@ class SolverCoupled(SolverBase, CouplingInterface):
             )
             self._compact_shape_contact_pairs(view, shape_global_to_local)
 
-        view.articulation_start = wp.array(
-            self._compact_articulation_starts(joint_order, articulation_order),
-            dtype=wp.int32,
-            device=device,
-        )
+        articulation_starts = self._compact_articulation_starts(joint_order, articulation_order)
+        view.articulation_start = wp.array(articulation_starts, dtype=wp.int32, device=device)
+        view.articulation_end = wp.array(articulation_starts[1:], dtype=wp.int32, device=device)
         self._set_compact_articulation_extents(view, articulation_order)
 
         self._compact_equality_constraints(
@@ -1387,7 +1385,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 remapped.append(group)
                 continue
             local = [body_global_to_local[g] for g in (int(x) for x in group.numpy()) if g in body_global_to_local]
-            remapped.append(wp.array(local, dtype=group.dtype, device=self.model.device))
+            remapped.append(wp.array(local, dtype=wp.int32, device=self.model.device))
         view.body_color_groups = remapped
 
     def _set_world_start_arrays(self, view: ModelView) -> None:
