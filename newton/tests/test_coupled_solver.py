@@ -1848,6 +1848,60 @@ class TestSolverCoupledMuJoCoVBDMultiEnv(unittest.TestCase):
         self.assertEqual(mjc_entry.body_global_to_local.numpy()[expand(cable_bodies, bodies_per_world)[0]], -1)
         self.assertNotIn(int(newton.JointType.CABLE), {int(t) for t in mjc_view.joint_type.numpy()})
 
+    def test_compacted_multi_world_articulation_end_is_rebased(self):
+        """articulation_end must be rebased to local joint ids, matching articulation_start.
+
+        Regression: compaction rebased articulation_start but left articulation_end as
+        global joint indices, so a non-first-world articulation got an out-of-bounds
+        end (e.g. end=9 in an 8-joint view), corrupting solver FK (fixed base displaced).
+        """
+        world_count = 2
+        template = newton.ModelBuilder(gravity=0.0)
+
+        # Articulation A: fixed base + one revolute link (the "rigid" entry).
+        base = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)), label="base")
+        jf = template.add_joint_fixed(parent=-1, child=base)
+        link = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)), label="link")
+        jr = template.add_joint_revolute(parent=base, child=link, axis=(0.0, 0.0, 1.0))
+        template.add_articulation([jf, jr])
+        # Articulation B: a free body owned by the other entry.
+        free_body = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)), label="free")
+        jfree = template.add_joint_free(child=free_body)
+        template.add_articulation([jfree])
+
+        builder = newton.ModelBuilder(gravity=0.0)
+        builder.replicate(template, world_count=world_count)
+        builder.color()
+        model = builder.finalize(device="cpu")
+
+        bpw, jpw = template.body_count, template.joint_count
+
+        def expand(ids, stride):
+            return [w * stride + i for w in range(world_count) for i in ids]
+
+        coupled = SolverCoupled(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="rigid", solver=SolverSemiImplicit,
+                    bodies=expand([base, link], bpw), joints=expand([jf, jr], jpw),
+                ),
+                SolverCoupled.Entry(
+                    name="free", solver=SolverSemiImplicit,
+                    bodies=expand([free_body], bpw), joints=expand([jfree], jpw),
+                ),
+            ],
+        )
+
+        view = coupled.view("rigid")
+        starts = view.articulation_start.numpy()
+        ends = view.articulation_end.numpy()
+        # Two articulations (one per world), each spanning 2 joints in the 4-joint view.
+        self.assertEqual(starts.tolist(), [0, 2, 4])
+        self.assertEqual(ends.tolist(), [2, 4])
+        # End indices must stay within the compacted joint range (no OOB).
+        self.assertTrue(all(e <= view.joint_count for e in ends))
+
 
 class TestSolverAdmmContactKernels(unittest.TestCase):
     """ADMM contact fill kernels should respect solver-local body ids."""
