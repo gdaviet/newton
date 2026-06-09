@@ -3633,7 +3633,7 @@ class TestSolverCoupledVBDColoring(unittest.TestCase):
 
         # No joint-connected pair may share a color.
         color_of = {body: color for color, group in enumerate(groups) for body in group}
-        for parent, child in zip(parents, children):
+        for parent, child in zip(parents, children, strict=True):
             if 0 <= parent < body_count and 0 <= child < body_count:
                 self.assertNotEqual(
                     color_of.get(parent),
