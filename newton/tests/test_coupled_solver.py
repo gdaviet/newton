@@ -3608,7 +3608,7 @@ class TestSolverCoupledVBDColoring(unittest.TestCase):
             entries=[
                 SolverCoupled.Entry(
                     name="src",
-                    solver=lambda view: SolverSemiImplicit(view),
+                    solver=SolverSemiImplicit,
                     bodies=[0, 1],
                     joints=[0, 1],
                 ),
@@ -3640,6 +3640,44 @@ class TestSolverCoupledVBDColoring(unittest.TestCase):
                     color_of.get(child),
                     f"joint-connected local bodies {parent},{child} share a color: {groups}",
                 )
+
+    def test_compacted_custom_namespace_does_not_mutate_parent(self):
+        """Compacted entry namespaces must be view-local, not parent aliases."""
+        builder = newton.ModelBuilder()
+        SolverVBD.register_custom_attributes(builder, dahl_defaults_enabled=False)
+        for _ in range(5):
+            builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        soft_joint = builder.add_joint_fixed(parent=3, child=4, custom_attributes={"vbd:joint_is_hard": 0})
+        builder.color()
+        model = builder.finalize(device="cpu")
+
+        parent_joint_is_hard = model.vbd.joint_is_hard.numpy().copy()
+        vbd_joint_order = [2, 3, 4, soft_joint]
+
+        coupled = SolverCoupled(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="src",
+                    solver=SolverSemiImplicit,
+                    bodies=[0, 1],
+                    joints=[0, 1],
+                ),
+                SolverCoupled.Entry(
+                    name="dst",
+                    solver=lambda view: SolverVBD(view, iterations=1),
+                    bodies=[2, 3, 4],
+                    joints=vbd_joint_order,
+                ),
+            ],
+        )
+
+        np.testing.assert_array_equal(model.vbd.joint_is_hard.numpy(), parent_joint_is_hard)
+
+        view = coupled.view("dst")
+        self.assertIsNot(view.vbd, model.vbd)
+        self.assertEqual(view.vbd.joint_is_hard.shape[0], view.joint_count)
+        np.testing.assert_array_equal(view.vbd.joint_is_hard.numpy(), parent_joint_is_hard[vbd_joint_order])
 
 
 if __name__ == "__main__":

@@ -1458,7 +1458,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
             value = getattr(parent_ns, attr_name, None)
             if value is None:
                 continue
-            namespace = getattr(view, namespace_name, None)
+            overrides = object.__getattribute__(view, "_overrides")
+            namespace = overrides.get(namespace_name)
             if namespace is None:
                 namespace = type(parent_ns)(namespace_name)
                 setattr(view, namespace_name, namespace)
