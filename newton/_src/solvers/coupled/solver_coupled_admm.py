@@ -13,7 +13,7 @@ import numpy as np
 import warp as wp
 
 from ...geometry.flags import ShapeFlags
-from ...sim import JointType, ModelFlags
+from ...sim import JointType, ModelFlags, StateFlags
 from .admm_contact_stream import (
     AdmmContactStream,
     AdmmContactType,
@@ -983,6 +983,76 @@ class SolverCoupledADMM(SolverCoupled):
             self._admm_dynamic_rr_contact_groups or self._admm_dynamic_rp_contact_groups
         ) and self._admm_internal_contacts is None:
             self._admm_internal_contacts = self._admm_collision_pipeline.contacts()
+
+    def _reset_coupling_state(
+        self,
+        state: State,
+        *,
+        world_mask: wp.array | None = None,
+        flags: StateFlags | int | None = None,
+    ) -> None:
+        """Clear ADMM warm-start and internal contact buffers after reset."""
+        super()._reset_coupling_state(state, world_mask=world_mask, flags=flags)
+        for name, entry in self._entries.items():
+            buf = self._admm_buffers[name]
+            if buf.body_q_n is not None:
+                wp.copy(buf.body_q_n, entry.state_0.body_q)
+                wp.copy(buf.body_qd_n, entry.state_0.body_qd)
+                wp.copy(buf.body_qd_k, entry.state_0.body_qd)
+            if buf.particle_q_n is not None:
+                wp.copy(buf.particle_q_n, entry.state_0.particle_q)
+                wp.copy(buf.particle_qd_n, entry.state_0.particle_qd)
+                wp.copy(buf.particle_qd_k, entry.state_0.particle_qd)
+            if buf.joint_q_n is not None:
+                wp.copy(buf.joint_q_n, entry.state_0.joint_q)
+                wp.copy(buf.joint_qd_n, entry.state_0.joint_qd)
+                wp.copy(buf.joint_qd_k, entry.state_0.joint_qd)
+            self._zero_array(buf.body_f)
+            self._zero_array(buf.particle_f)
+
+        for group in (
+            *self._admm_rr_groups,
+            *self._admm_rr_angular_groups,
+            *self._admm_rr_revolute_angular_groups,
+            *self._admm_rr_angular_friction_groups,
+            *self._admm_rp_groups,
+            *self._admm_rr_contact_groups,
+            *self._admm_rp_contact_groups,
+            *self._admm_pp_contact_groups,
+        ):
+            self._zero_group_reset_arrays(group)
+
+        if self._admm_internal_contacts is not None:
+            self._admm_internal_contacts.clear(bump_generation=True)
+
+    @staticmethod
+    def _zero_array(array) -> None:
+        if array is not None:
+            array.zero_()
+
+    @classmethod
+    def _zero_group_reset_arrays(cls, group) -> None:
+        for attr in (
+            "u",
+            "lambda_",
+            "Jv",
+            "u_target",
+            "u_min",
+            "active",
+            "active_count",
+            "active_count_max",
+            "prev_active",
+            "prev_u",
+            "prev_lambda",
+            "prev_contact_active",
+            "prev_contact_lambda",
+        ):
+            cls._zero_array(getattr(group, attr, None))
+        contact_stream = getattr(group, "contact_stream", None)
+        if contact_stream is None:
+            return
+        for attr in ("count", "count_max", "normal_force", "normal_impulse"):
+            cls._zero_array(getattr(contact_stream, attr, None))
 
     def _setup_admm_effective_mass_buffers(self, entry: SolverEntry, buf: _AdmmBuffers) -> None:
         device = self.model.device

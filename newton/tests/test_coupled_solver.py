@@ -506,6 +506,28 @@ class _StepCountingCopySolver(SolverBase, CouplingInterface):
             wp.copy(state_out.particle_qd, state_in.particle_qd)
 
 
+class _ResetRecordingSolver(_StepCountingCopySolver):
+    """Copy solver that records reset forwarding and clears velocities."""
+
+    instances: ClassVar[dict[str, "_ResetRecordingSolver"]] = {}
+
+    def __init__(self, model):
+        super().__init__(model)
+        self.reset_count = 0
+        self.reset_world_masks = []
+        self.reset_flags = []
+
+    def reset(self, state, world_mask=None, flags=None):
+        self.reset_count += 1
+        self.reset_world_masks.append(world_mask)
+        self.reset_flags.append(flags)
+        flags_value = int(newton.StateFlags.ALL if flags is None else flags)
+        if state.body_qd is not None and flags_value & int(newton.StateFlags.BODY_QD):
+            state.body_qd.zero_()
+        if state.particle_qd is not None and flags_value & int(newton.StateFlags.PARTICLE_QD):
+            state.particle_qd.zero_()
+
+
 class _ContactRecordingCopySolver(_StepCountingCopySolver):
     """Copy solver that records rigid contact shape ids seen by step()."""
 
@@ -930,6 +952,44 @@ class TestSolverCoupledBasic(unittest.TestCase):
         self.assertFalse(coupled.entry_output_state_valid())
         self.assertIs(coupled.entry_state("A"), coupled._entries["A"].state_0)
 
+    def test_reset_forwards_to_entries_and_syncs_persistent_states(self):
+        """SolverCoupled.reset() should reset sub-solvers and persistent entry buffers."""
+        _ResetRecordingSolver.instances.clear()
+        coupled = SolverCoupled(
+            model=self.model,
+            entries=[
+                SolverCoupled.Entry(name="A", solver=_ResetRecordingSolver, bodies=[0], substeps=2),
+                SolverCoupled.Entry(name="B", solver=_ResetRecordingSolver, bodies=[1]),
+            ],
+        )
+        state = self.model.state()
+        state_out = self.model.state()
+        wp.launch(_mutate_body_qd_at_kernel, dim=1, inputs=[state.body_qd, 0], device=self.model.device)
+        wp.launch(_mutate_body_qd_at_kernel, dim=1, inputs=[state.body_qd, 1], device=self.model.device)
+        coupled.step(state, state_out, control=None, contacts=None, dt=1.0 / 60.0)
+        self.assertTrue(coupled.entry_output_state_valid())
+
+        world_mask = wp.array([True], dtype=wp.bool, device=self.model.device)
+        flags = newton.StateFlags.BODY_QD
+        coupled.reset(state, world_mask=world_mask, flags=flags)
+
+        self.assertFalse(coupled.entry_output_state_valid())
+        self.assertIs(coupled.entry_state("A"), coupled._entries["A"].state_0)
+        np.testing.assert_allclose(state.body_qd.numpy(), np.zeros((2, 6)), atol=0.0)
+
+        solver_a = _ResetRecordingSolver.instances["A"]
+        solver_b = _ResetRecordingSolver.instances["B"]
+        self.assertEqual(solver_a.reset_count, 1)
+        self.assertEqual(solver_b.reset_count, 1)
+        self.assertIs(solver_a.reset_world_masks[0], world_mask)
+        self.assertIs(solver_b.reset_world_masks[0], world_mask)
+        self.assertEqual(solver_a.reset_flags[0], flags)
+        self.assertEqual(solver_b.reset_flags[0], flags)
+
+        entry_a = coupled._entries["A"]
+        np.testing.assert_allclose(entry_a.state_0.body_qd.numpy(), np.zeros((1, 6)), atol=0.0)
+        np.testing.assert_allclose(entry_a.state_1.body_qd.numpy(), np.zeros((1, 6)), atol=0.0)
+
     def test_entry_contacts_unavailable_for_compact_shape_ids(self):
         """Entry contacts should not be exposed when shape ids were compacted."""
         coupled = SolverCoupled(
@@ -1032,6 +1092,69 @@ class TestSolverCoupledBasic(unittest.TestCase):
         np.testing.assert_allclose(view_b.body_inv_mass.numpy()[0], 1.0 / (parent_mass[1] * scale), rtol=1.0e-6)
         np.testing.assert_allclose(view_b.body_inertia.numpy()[0], parent_inertia[1] * scale)
         self.assertEqual(coupled._entries["B"].body_global_to_local.numpy()[0], -1)
+
+    def test_proxy_reset_clears_lagged_buffers_and_contacts(self):
+        """SolverCoupledProxy.reset() should clear lagged feedback and contacts."""
+        builder = newton.ModelBuilder()
+        builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        model = builder.finalize(device="cpu")
+        contacts = newton.Contacts(1, 1, device=model.device)
+        contacts.contact_counters.assign(np.array([1, 1], dtype=np.int32))
+        old_generation = int(contacts.contact_generation.numpy()[0])
+        pipeline = _FakeProxyCollisionPipeline(model.device, contacts=contacts)
+
+        coupled = SolverCoupledProxy(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(name="src", solver=_StepCountingCopySolver, bodies=[0]),
+                SolverCoupled.Entry(name="dst", solver=_StepCountingCopySolver, bodies=[1]),
+            ],
+            coupling=SolverCoupledProxy.Config(
+                proxies=[
+                    SolverCoupledProxy.Proxy(
+                        source="src",
+                        destination="dst",
+                        bodies=[0],
+                        proxy_bodies=[2],
+                        collision_pipeline=lambda view: pipeline,
+                    ),
+                ],
+            ),
+        )
+        mapping = coupled._proxy_mappings[0]
+        wp.launch(_mutate_body_qd_at_kernel, dim=1, inputs=[mapping.coupling_forces, 0], device=model.device)
+        wp.launch(_mutate_body_qd_at_kernel, dim=1, inputs=[mapping.proxy_qd_before, 0], device=model.device)
+        config = coupled._proxy_collision_configs[("src", "dst")]
+        config.collide_counter = 5
+
+        coupled.reset(model.state())
+
+        np.testing.assert_allclose(mapping.coupling_forces.numpy(), np.zeros((3, 6)), atol=0.0)
+        np.testing.assert_allclose(mapping.proxy_qd_before.numpy(), np.zeros((3, 6)), atol=0.0)
+        self.assertEqual(config.collide_counter, 0)
+        np.testing.assert_array_equal(contacts.contact_counters.numpy(), np.zeros(2, dtype=np.int32))
+        self.assertEqual(int(contacts.contact_generation.numpy()[0]), old_generation + 1)
+
+    def test_admm_reset_clears_work_buffers(self):
+        """SolverCoupledADMM.reset() should clear ADMM force and velocity work buffers."""
+        coupled = SolverCoupledADMM(
+            model=self.model,
+            entries=[
+                SolverCoupled.Entry(name="A", solver=_StepCountingCopySolver, bodies=[0]),
+                SolverCoupled.Entry(name="B", solver=_StepCountingCopySolver, bodies=[1]),
+            ],
+            coupling=SolverCoupledADMM.Config(iterations=1),
+        )
+        buf_a = coupled._admm_buffers["A"]
+        wp.launch(_mutate_body_qd_kernel, dim=1, inputs=[buf_a.body_f], device=self.model.device)
+        wp.launch(_mutate_body_qd_kernel, dim=1, inputs=[buf_a.body_qd_k], device=self.model.device)
+
+        coupled.reset(self.model.state())
+
+        np.testing.assert_allclose(buf_a.body_f.numpy(), np.zeros((1, 6)), atol=0.0)
+        np.testing.assert_allclose(buf_a.body_qd_k.numpy(), np.zeros((1, 6)), atol=0.0)
 
     def test_entry_shapes_filter_shape_contact_pairs(self):
         """Entry shape masks should prune explicit contact pairs in each view."""

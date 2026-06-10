@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import warp as wp
 
-from ...sim import BodyFlags, ModelFlags
+from ...sim import BodyFlags, ModelFlags, StateFlags
 from .interface import (
     CouplingEndpointKind,
     CouplingInputStateFlags,
@@ -568,6 +568,30 @@ class SolverCoupledProxy(SolverCoupled):
         for mapping in self._proxy_particle_mappings:
             mapping.coupling_forces = wp.zeros(model.particle_count, dtype=wp.vec3, device=device)
             mapping.proxy_qd_before = wp.zeros(model.particle_count, dtype=wp.vec3, device=device)
+
+    def _reset_coupling_state(
+        self,
+        state: State,
+        *,
+        world_mask: wp.array | None = None,
+        flags: StateFlags | int | None = None,
+    ) -> None:
+        """Clear lagged proxy feedback and collision caches after reset."""
+        super()._reset_coupling_state(state, world_mask=world_mask, flags=flags)
+        for mapping in self._proxy_mappings:
+            if mapping.coupling_forces is not None:
+                mapping.coupling_forces.zero_()
+            if mapping.proxy_qd_before is not None:
+                mapping.proxy_qd_before.zero_()
+        for mapping in self._proxy_particle_mappings:
+            if mapping.coupling_forces is not None:
+                mapping.coupling_forces.zero_()
+            if mapping.proxy_qd_before is not None:
+                mapping.proxy_qd_before.zero_()
+        for config in self._proxy_collision_configs.values():
+            config.collide_counter = 0
+            if config.contacts is not None:
+                config.contacts.clear(bump_generation=True)
 
     def _entry_has_body_proxy_overrides(self, name: str) -> bool:
         for proxy in self._proxy_mappings:

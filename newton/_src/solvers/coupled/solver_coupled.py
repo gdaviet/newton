@@ -13,7 +13,7 @@ import numpy as np
 import warp as wp
 
 from ...geometry import ParticleFlags, ShapeFlags
-from ...sim import ModelFlags
+from ...sim import ModelFlags, StateFlags
 from ..solver import SolverBase
 from .interface import (
     CouplingEndpointKind,
@@ -1796,6 +1796,37 @@ class SolverCoupled(SolverBase, CouplingInterface):
         self._distribute_state(state_in, dt=dt)
         self._entry_output_state_valid = False
 
+    def reset(
+        self,
+        state: State,
+        world_mask: wp.array | None = None,
+        flags: StateFlags | int | None = None,
+    ) -> None:
+        """Reset coupled sub-solvers and clear coupled-solver transient state.
+
+        Args:
+            state: Parent-model simulation state to reset (modified in place).
+            world_mask: Optional boolean mask of shape ``(world_count,)``
+                selecting which worlds to reset. If ``None``, all worlds are
+                reset.
+            flags: Optional :class:`~newton.StateFlags` bitmask controlling
+                which state quantities sub-solvers should reset. If ``None``,
+                all state quantities are reset.
+        """
+        if state is None:
+            raise ValueError("'state' argument is required.")
+
+        self._distribute_state(state, restart=True)
+        for entry in self._entries.values():
+            entry.solver.reset(entry.state_0, world_mask=world_mask, flags=flags)
+            self._sync_entry_reset_state(entry)
+
+        self._reconcile_state(state)
+        self._reset_coupling_state(state, world_mask=world_mask, flags=flags)
+        self._clear_entry_contact_buffers()
+        self._rebuild_entry_solver_state_caches()
+        self._entry_output_state_valid = False
+
     # ------------------------------------------------------------------
     # SolverBase interface
     # ------------------------------------------------------------------
@@ -1828,6 +1859,42 @@ class SolverCoupled(SolverBase, CouplingInterface):
         for entry in self._entries.values():
             if entry.preserve_shape_ids:
                 self._ensure_entry_contact_buffer(entry, contacts)
+
+    def _sync_entry_reset_state(self, entry: SolverEntry) -> None:
+        """Mirror a reset entry input state to persistent entry buffers."""
+        if entry.state_1 is not None and entry.state_1 is not entry.state_0:
+            _copy_state(entry.state_0, entry.state_1)
+
+        for entry_state in (entry.state_0, entry.state_1):
+            if entry_state is not None:
+                _clear_transient_state_buffers(entry_state)
+        if entry.body_force_input is not None:
+            entry.body_force_input.zero_()
+        if entry.particle_force_input is not None:
+            entry.particle_force_input.zero_()
+
+    def _reset_coupling_state(
+        self,
+        state: State,
+        *,
+        world_mask: wp.array | None = None,
+        flags: StateFlags | int | None = None,
+    ) -> None:
+        """Hook for subclasses to clear algorithm-specific reset state."""
+        del state, world_mask, flags
+
+    def _clear_entry_contact_buffers(self) -> None:
+        """Invalidate cached entry-local contact buffers after a reset."""
+        for contacts in self._entry_contact_buffers.values():
+            contacts.clear(bump_generation=True)
+        self._entry_contact_sources.clear()
+
+    def _rebuild_entry_solver_state_caches(self) -> None:
+        """Refresh optional sub-solver spatial caches from reset entry states."""
+        for entry in self._entries.values():
+            rebuild_bvh = getattr(entry.solver, "rebuild_bvh", None)
+            if callable(rebuild_bvh):
+                rebuild_bvh(entry.state_0)
 
     def _step_coupled(
         self,
@@ -2547,6 +2614,14 @@ def _copy_forces(src: State, dst: State) -> None:
             _copy_prefix(dst.particle_f, src.particle_f, "particle_f")
         else:
             dst.particle_f.zero_()
+
+
+def _clear_transient_state_buffers(state: State) -> None:
+    """Clear force and acceleration buffers that should not survive reset."""
+    for name in ("body_f", "particle_f", "body_qdd", "body_parent_f"):
+        array = getattr(state, name, None)
+        if array is not None:
+            array.zero_()
 
 
 def _copy_prefix(dst: wp.array, src: wp.array, name: str) -> None:
