@@ -2121,6 +2121,7 @@ class TestSolverAdmmContactKernels(unittest.TestCase):
                 wp.zeros(capacity, dtype=int, device=device),
                 wp.full(capacity, -1, dtype=int, device=device),
                 wp.zeros(capacity, dtype=int, device=device),
+                wp.zeros(capacity, dtype=float, device=device),
                 wp.zeros(capacity, dtype=wp.vec3, device=device),
                 wp.zeros(capacity, dtype=wp.vec3, device=device),
             ],
