@@ -112,15 +112,15 @@ class _AdmmParticleForceNotifySolver(_CustomAdmmParticleCopySolver):
     def __init__(self, model):
         super().__init__(model)
         self.notified_flags = []
-        self.notified_restart = []
+        self.notified_iteration_restart = []
         self.notified_particle_f = []
         self.instances.append(self)
 
-    def coupling_notify_input_state_update(self, state, flags, *, restart=False, dt=0.0):
+    def coupling_notify_input_state_update(self, state, flags, *, iteration_restart=False, dt=0.0):
         del dt
         flags = CouplingInputStateFlags(flags)
         self.notified_flags.append(flags)
-        self.notified_restart.append(bool(restart))
+        self.notified_iteration_restart.append(bool(iteration_restart))
         if flags & CouplingInputStateFlags.PARTICLE_F:
             self.notified_particle_f.append(state.particle_f.numpy().copy())
 
@@ -133,16 +133,16 @@ class _CustomAdmmInputStateUpdateSolver(_CustomAdmmParticleCopySolver):
     def __init__(self, model):
         super().__init__(model)
         self.update_calls = []
-        self.update_restart = []
+        self.update_iteration_restart = []
         self.proximal_shift_calls = 0
         self.input_particle_qd = None
         self.instances.append(self)
 
-    def coupling_notify_input_state_update(self, state, flags, *, restart=False, dt=0.0):
+    def coupling_notify_input_state_update(self, state, flags, *, iteration_restart=False, dt=0.0):
         del dt
         flags = CouplingInputStateFlags(flags)
         self.update_calls.append(flags)
-        self.update_restart.append(bool(restart))
+        self.update_iteration_restart.append(bool(iteration_restart))
         if flags == CouplingInputStateFlags.PARTICLE_QD:
             self.proximal_shift_calls += 1
             self.input_particle_qd = state.particle_qd.numpy().copy()
@@ -1370,8 +1370,10 @@ class TestAdmmCouplingHooks(unittest.TestCase):
         custom_solver = _CustomAdmmInputStateUpdateSolver.instances[-1]
         self.assertTrue(
             any(
-                restart and bool(flags & CouplingInputStateFlags.PARTICLE)
-                for flags, restart in zip(custom_solver.update_calls, custom_solver.update_restart, strict=True)
+                iteration_restart and bool(flags & CouplingInputStateFlags.PARTICLE)
+                for flags, iteration_restart in zip(
+                    custom_solver.update_calls, custom_solver.update_iteration_restart, strict=True
+                )
             )
         )
 

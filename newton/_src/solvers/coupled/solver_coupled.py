@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -115,10 +115,9 @@ class SolverEntry:
     state_0: State | None = None
     state_1: State | None = None
     state_tmp: State | None = None
-    state_tmp_1: State | None = None
     control: Control | None = None
-    body_force_input: wp.array = field(default=None)
-    particle_force_input: wp.array = field(default=None)
+    has_body_force_input: bool = False
+    has_particle_force_input: bool = False
 
 
 class SolverCoupled(SolverBase, CouplingInterface):
@@ -150,8 +149,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
         :class:`SolverBase`. Bind any extra constructor arguments in the
         factory itself (e.g. ``lambda v: SolverVBD(model=v, iterations=10)``).
         Entry names must be unique. In-place stepping is only valid for solvers
-        that explicitly support it and currently requires ``substeps=1``. Shape
-        ids remain in the parent model namespace by default; set
+        that explicitly support it. Shape ids remain in the parent model
+        namespace by default; set
         ``preserve_shape_ids=False`` to expose a compact entry-local shape
         namespace instead.
 
@@ -245,8 +244,6 @@ class SolverCoupled(SolverBase, CouplingInterface):
             substeps = int(cfg.substeps)
             if substeps < 1:
                 raise ValueError(f"SolverCoupled.Entry {cfg.name!r} substeps must be >= 1")
-            if cfg.in_place and substeps != 1:
-                raise ValueError(f"SolverCoupled.Entry {cfg.name!r} in_place requires substeps=1")
 
             body_indices = wp.array([int(i) for i in cfg.bodies], dtype=int, device=device)
             particle_indices = wp.array([int(i) for i in cfg.particles], dtype=int, device=device)
@@ -339,13 +336,10 @@ class SolverCoupled(SolverBase, CouplingInterface):
             entry.state_0 = entry.view.state()
             entry.state_1 = entry.state_0 if entry.in_place else entry.view.state()
             entry.control = _entry_control(entry.view)
-            if model.body_count:
-                entry.body_force_input = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=device)
-            if model.particle_count:
-                entry.particle_force_input = wp.zeros(model.particle_count, dtype=wp.vec3, device=device)
-            if entry.substeps > 1:
+            entry.has_body_force_input = entry.state_0.body_f is not None
+            entry.has_particle_force_input = entry.state_0.particle_f is not None
+            if entry.substeps > 1 and not entry.in_place:
                 entry.state_tmp = entry.view.state()
-                entry.state_tmp_1 = entry.view.state()
 
         self._after_entry_states_created()
 
@@ -1816,7 +1810,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
         if state is None:
             raise ValueError("'state' argument is required.")
 
-        self._distribute_state(state, restart=True)
+        self._distribute_state(state, iteration_restart=True)
         for entry in self._entries.values():
             entry.solver.reset(entry.state_0, world_mask=world_mask, flags=flags)
             self._sync_entry_reset_state(entry)
@@ -1868,10 +1862,6 @@ class SolverCoupled(SolverBase, CouplingInterface):
         for entry_state in (entry.state_0, entry.state_1):
             if entry_state is not None:
                 _clear_transient_state_buffers(entry_state)
-        if entry.body_force_input is not None:
-            entry.body_force_input.zero_()
-        if entry.particle_force_input is not None:
-            entry.particle_force_input.zero_()
 
     def _reset_coupling_state(
         self,
@@ -1919,13 +1909,13 @@ class SolverCoupled(SolverBase, CouplingInterface):
         state_in: State,
         *,
         dt: float = 0.0,
-        restart: bool = False,
+        iteration_restart: bool = False,
     ) -> None:
         """Copy ``state_in`` into each sub-solver's ``state_0``."""
         for entry in self._entries.values():
             flags = self._input_state_copy_flags(state_in, entry.state_0)
             _copy_state_to_entry(state_in, entry.state_0, entry)
-            self._notify_input_state_update(entry, flags, dt=dt, restart=restart)
+            self._notify_input_state_update(entry, flags, dt=dt, iteration_restart=iteration_restart)
 
     def _reconcile_state(self, state_out: State) -> None:
         """Merge owned sub-solver state into ``state_out``."""
@@ -2133,14 +2123,16 @@ class SolverCoupled(SolverBase, CouplingInterface):
         flags: CouplingInputStateFlags | int,
         *,
         dt: float = 0.0,
-        restart: bool = False,
+        iteration_restart: bool = False,
     ) -> None:
         """Notify custom solvers after coupler-produced input state updates."""
         flags = CouplingInputStateFlags(flags)
-        if flags == 0 and not restart:
+        if flags == 0 and not iteration_restart:
             return
         _require_supports_coupling(entry.solver)
-        entry.solver.coupling_notify_input_state_update(entry.state_0, flags, restart=restart, dt=dt)
+        entry.solver.coupling_notify_input_state_update(
+            entry.state_0, flags, iteration_restart=iteration_restart, dt=dt
+        )
 
     def _step_entry(
         self,
@@ -2156,7 +2148,9 @@ class SolverCoupled(SolverBase, CouplingInterface):
             contacts = self._contacts_for_entry(entry, contacts)
         control = _copy_control_to_entry(control, entry)
         if entry.in_place:
-            entry.solver.step(entry.state_0, entry.state_0, control, contacts, dt)
+            substep_dt = dt / float(entry.substeps)
+            for _ in range(entry.substeps):
+                entry.solver.step(entry.state_0, entry.state_0, control, contacts, substep_dt)
             return contacts
 
         if entry.substeps == 1:
@@ -2164,22 +2158,18 @@ class SolverCoupled(SolverBase, CouplingInterface):
             return contacts
 
         substep_dt = dt / float(entry.substeps)
-        if entry.state_tmp is None or entry.state_tmp_1 is None:
-            raise RuntimeError(f"SolverCoupled.Entry {entry.name!r} is missing substep scratch states")
-        _copy_state(entry.state_0, entry.state_tmp)
-        state_in = entry.state_tmp
+        if entry.state_tmp is None:
+            raise RuntimeError(f"SolverCoupled.Entry {entry.name!r} is missing a substep scratch state")
+        _copy_state(entry.state_0, entry.state_1)
+        state_in = entry.state_1
+        state_out = entry.state_tmp
         for substep in range(entry.substeps):
-            remaining = entry.substeps - substep - 1
-            if remaining == 0:
-                state_out = entry.state_1
-            elif state_in is entry.state_tmp:
-                state_out = entry.state_tmp_1
-            else:
-                state_out = entry.state_tmp
             if substep > 0:
                 _copy_forces(entry.state_0, state_in)
             entry.solver.step(state_in, state_out, control, contacts, substep_dt)
-            state_in = state_out
+            state_in, state_out = state_out, state_in
+        if state_in is entry.state_tmp:
+            _copy_state(entry.state_tmp, entry.state_1)
         return contacts
 
     def _contacts_for_entry(self, entry: SolverEntry, contacts: Contacts | None) -> Contacts | None:

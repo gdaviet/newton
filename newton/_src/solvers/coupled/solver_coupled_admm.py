@@ -2736,7 +2736,7 @@ class SolverCoupledADMM(SolverCoupled):
             wp.copy(entry.state_0.joint_qd, buf.joint_qd_n)
             flags |= CouplingInputStateFlags.JOINT
 
-        self._notify_input_state_update(entry, flags, dt=dt, restart=bool(iteration_restart) and bool(flags))
+        self._notify_input_state_update(entry, flags, dt=dt, iteration_restart=bool(iteration_restart) and bool(flags))
 
         if apply_proximal:
             self._apply_admm_velocity_proximal_shift(entry, buf, gamma, dt)

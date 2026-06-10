@@ -38,7 +38,7 @@ Supported hook signatures are:
     ) -> None: ...
 
 
-    def coupling_notify_input_state_update(state, flags, *, restart=False, dt=0.0) -> None: ...
+    def coupling_notify_input_state_update(state, flags, *, iteration_restart=False, dt=0.0) -> None: ...
 
 
     def coupling_rewind_proxy_body_velocity(body_local_to_proxy_global, state, coupling_forces, dt) -> None: ...
@@ -82,7 +82,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 import warp as wp
 
+from ...sim import BodyFlags
 from .proxy_utils import (
+    filter_proxy_rigid_contacts_kernel,
     harvest_proxy_momentum_forces_kernel,
     harvest_proxy_particle_momentum_forces_kernel,
     subtract_proxy_forces_kernel,
@@ -220,11 +222,11 @@ class CouplingInterface:
         state: State,
         flags: InputStateFlags | int,
         *,
-        restart: bool = False,
+        iteration_restart: bool = False,
         dt: float = 0.0,
     ) -> None:
         """React to coupler-produced input state updates."""
-        del state, flags, restart, dt
+        del state, flags, iteration_restart, dt
 
     def coupling_rewind_proxy_body_velocity(
         self,
@@ -233,7 +235,14 @@ class CouplingInterface:
         coupling_forces: wp.array[wp.spatial_vector],
         dt: float,
     ) -> None:
-        """Remove lagged proxy feedback, public forces, and gravity from body velocities."""
+        """Remove velocity-level feedback, public forces, and gravity from proxy velocities.
+
+        The default proxy feedback is harvested from destination momentum
+        change, so ``coupling_forces`` are treated as lagged velocity-level
+        response and rewound before the destination solve. Solvers whose
+        feedback is position-dependent, such as barrier-style contact, should
+        override this hook and leave ``coupling_forces`` in the synced velocity.
+        """
         if body_local_to_proxy_global.shape[0] == 0 or state.body_qd is None:
             return
 
@@ -263,7 +272,14 @@ class CouplingInterface:
         coupling_forces: wp.array[wp.vec3],
         dt: float,
     ) -> None:
-        """Remove lagged proxy feedback, public forces, and gravity from particle velocities."""
+        """Remove velocity-level feedback, public forces, and gravity from proxy velocities.
+
+        The default proxy feedback is harvested from destination momentum
+        change, so ``coupling_forces`` are treated as lagged velocity-level
+        response and rewound before the destination solve. Solvers whose
+        feedback is position-dependent, such as barrier-style contact, should
+        override this hook and leave ``coupling_forces`` in the synced velocity.
+        """
         if particle_local_to_proxy_global.shape[0] == 0 or state.particle_qd is None:
             return
 
@@ -296,7 +312,7 @@ class CouplingInterface:
         dt: float = 0.0,
     ) -> None:
         """Estimate proxy-body feedback from destination momentum change."""
-        del state, contacts
+        del contacts
         if body_local_to_proxy_global.shape[0] == 0:
             return
         if body_qd_before is None or state_out is None or state_out.body_qd is None:
@@ -313,6 +329,7 @@ class CouplingInterface:
                 body_local_to_proxy_global,
                 body_qd_before,
                 state_out.body_qd,
+                state.body_f if state is not None else None,
                 model.body_mass,
                 model.body_inertia,
                 state_out.body_q,
@@ -335,7 +352,7 @@ class CouplingInterface:
         dt: float = 0.0,
     ) -> None:
         """Estimate proxy-particle feedback from destination momentum change."""
-        del state, contacts
+        del contacts
         if particle_local_to_proxy_global.shape[0] == 0:
             return
         if particle_qd_before is None or state_out is None or state_out.particle_qd is None:
@@ -352,6 +369,7 @@ class CouplingInterface:
                 particle_local_to_proxy_global,
                 particle_qd_before,
                 state_out.particle_qd,
+                state.particle_f if state is not None else None,
                 model.particle_mass,
                 model.gravity,
                 model.particle_world,
@@ -367,8 +385,32 @@ class CouplingInterface:
         *,
         contacts_freshly_detected: bool = False,
     ) -> Contacts | None:
-        """Prepare contacts for a proxy destination solve."""
+        """Prepare contacts for a proxy destination solve.
+
+        The generic momentum harvest treats proxy feedback as a destination
+        momentum change. Proxy-static and proxy-proxy rigid contacts therefore
+        must not be passed through as solver contacts because they would feed
+        constraints between virtual objects back to the source.
+        """
         del state, contacts_freshly_detected
+        if contacts is None or contacts.rigid_contact_count is None or contacts.rigid_contact_max == 0:
+            return contacts
+
+        model = self.model
+        wp.launch(
+            filter_proxy_rigid_contacts_kernel,
+            dim=contacts.rigid_contact_shape0.shape[0],
+            inputs=[
+                contacts.rigid_contact_count,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                model.shape_body,
+                model.body_flags,
+                model.body_inv_mass,
+                int(BodyFlags.PROXY),
+            ],
+            device=model.device,
+        )
         return contacts
 
 
