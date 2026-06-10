@@ -890,6 +890,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
             equality_order,
             mimic_order,
         )
+        self._set_compact_custom_frequency_counts(view, index_orders_by_frequency)
         remapped_or_derived_attrs = {
             "joint_parent",
             "joint_child",
@@ -1026,6 +1027,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
             coord_order,
             dof_order,
             shape_order,
+            articulation_order,
             equality_order,
             mimic_order,
         )
@@ -1056,10 +1058,10 @@ class SolverCoupled(SolverBase, CouplingInterface):
         articulation_order: Sequence[int],
         equality_order: Sequence[int],
         mimic_order: Sequence[int],
-    ) -> dict[Model.AttributeFrequency, tuple[Sequence[int], int]]:
+    ) -> dict[Model.AttributeFrequency | str, tuple[Sequence[int], int]]:
         freq = self.model.AttributeFrequency
         model = self.model
-        return {
+        index_orders_by_frequency = {
             freq.BODY: (body_order, model.body_count),
             freq.JOINT: (joint_order, model.joint_count),
             freq.JOINT_COORD: (coord_order, model.joint_coord_count),
@@ -1069,11 +1071,39 @@ class SolverCoupled(SolverBase, CouplingInterface):
             freq.EQUALITY_CONSTRAINT: (equality_order, model.equality_constraint_count),
             freq.CONSTRAINT_MIMIC: (mimic_order, model.constraint_mimic_count),
         }
+        index_orders_by_name = {
+            "body": (body_order, model.body_count),
+            "joint": (joint_order, model.joint_count),
+            "joint_coord": (coord_order, model.joint_coord_count),
+            "joint_dof": (dof_order, model.joint_dof_count),
+            "shape": (shape_order, model.shape_count),
+            "articulation": (articulation_order, model.articulation_count),
+            "equality_constraint": (equality_order, model.equality_constraint_count),
+            "constraint_mimic": (mimic_order, model.constraint_mimic_count),
+        }
+        for frequency in model.custom_frequency_counts:
+            frequency_name = frequency.rsplit(":", 1)[-1]
+            index_order = index_orders_by_name.get(frequency_name)
+            if index_order is not None:
+                index_orders_by_frequency[frequency] = index_order
+        return index_orders_by_frequency
+
+    def _set_compact_custom_frequency_counts(
+        self,
+        view: ModelView,
+        index_orders_by_frequency: dict[Model.AttributeFrequency | str, tuple[Sequence[int], int]],
+    ) -> None:
+        custom_frequency_counts = dict(self.model.custom_frequency_counts)
+        for frequency, (indices, _source_count) in index_orders_by_frequency.items():
+            if isinstance(frequency, str):
+                custom_frequency_counts[frequency] = len(indices)
+        if custom_frequency_counts != self.model.custom_frequency_counts:
+            view.custom_frequency_counts = custom_frequency_counts
 
     def _select_compact_attributes_by_frequency(
         self,
         view: ModelView,
-        indices_by_frequency: dict[Model.AttributeFrequency, tuple[Sequence[int], int]],
+        indices_by_frequency: dict[Model.AttributeFrequency | str, tuple[Sequence[int], int]],
         *,
         exclude: set[str],
     ) -> set[str]:
@@ -1435,18 +1465,23 @@ class SolverCoupled(SolverBase, CouplingInterface):
         coord_order: Sequence[int],
         dof_order: Sequence[int],
         shape_order: Sequence[int],
+        articulation_order: Sequence[int],
         equality_order: Sequence[int],
         mimic_order: Sequence[int],
     ) -> None:
         freq = self.model.AttributeFrequency
+        index_orders_by_frequency = self._compact_index_orders_by_frequency(
+            body_order,
+            joint_order,
+            coord_order,
+            dof_order,
+            shape_order,
+            articulation_order,
+            equality_order,
+            mimic_order,
+        )
         indices_by_frequency = {
-            freq.BODY: body_order,
-            freq.JOINT: joint_order,
-            freq.JOINT_COORD: coord_order,
-            freq.JOINT_DOF: dof_order,
-            freq.SHAPE: shape_order,
-            freq.EQUALITY_CONSTRAINT: equality_order,
-            freq.CONSTRAINT_MIMIC: mimic_order,
+            frequency: indices for frequency, (indices, _source_count) in index_orders_by_frequency.items()
         }
         for full_name, frequency in self.model.attribute_frequency.items():
             if ":" not in full_name:
@@ -1461,7 +1496,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
             overrides = object.__getattribute__(view, "_overrides")
             namespace = overrides.get(namespace_name)
             if namespace is None:
-                namespace = type(parent_ns)(namespace_name)
+                namespace = self._view_attribute_namespace(parent_ns, namespace_name)
                 setattr(view, namespace_name, namespace)
             if frequency in (freq.ONCE, freq.WORLD):
                 setattr(namespace, attr_name, value)
@@ -1469,9 +1504,43 @@ class SolverCoupled(SolverBase, CouplingInterface):
             indices = indices_by_frequency.get(frequency)
             if indices is None:
                 continue
-            selected = self._select_attribute_value(value, indices)
+            selected = self._compact_namespace_attribute_value(view, attr_name, value, indices)
             if selected is not None:
                 setattr(namespace, attr_name, selected)
+        self._sync_custom_frequency_namespace_metadata(view)
+
+    @staticmethod
+    def _view_attribute_namespace(parent_namespace, namespace_name: str):
+        namespace = type(parent_namespace)(namespace_name)
+        for name, value in vars(parent_namespace).items():
+            if not name.startswith("_"):
+                setattr(namespace, name, value)
+        return namespace
+
+    def _compact_namespace_attribute_value(self, view: ModelView, attr_name: str, value, indices: Sequence[int]):
+        overrides = object.__getattribute__(view, "_overrides")
+        override = overrides.get(attr_name)
+        if override is not None and self._is_indexed_compact_value(override, len(indices)):
+            return override
+        return self._select_attribute_value(value, indices)
+
+    def _sync_custom_frequency_namespace_metadata(self, view: ModelView) -> None:
+        overrides = object.__getattribute__(view, "_overrides")
+        for frequency, count in view.custom_frequency_counts.items():
+            if ":" not in frequency:
+                continue
+            namespace_name, frequency_name = frequency.split(":", 1)
+            namespace = overrides.get(namespace_name)
+            if namespace is None:
+                continue
+            count_name = f"{frequency_name}_count"
+            if hasattr(namespace, count_name):
+                setattr(namespace, count_name, int(count))
+            world_start_name = f"{frequency_name}_world_start"
+            if hasattr(namespace, world_start_name):
+                world_start = getattr(view, world_start_name, None)
+                if world_start is not None:
+                    setattr(namespace, world_start_name, world_start)
 
     def _select_attribute_value(self, value, indices: Sequence[int]):
         if isinstance(value, wp.array):

@@ -24,6 +24,7 @@ from newton._src.solvers.coupled.proxy_utils import (
     subtract_proxy_particle_forces_kernel,
     sync_proxy_states_kernel,
 )
+from newton._src.solvers.mujoco.equality import _add_equality_constraint
 from newton._src.solvers.vbd.rigid_vbd_kernels import forward_step_rigid_bodies
 from newton.solvers import (
     SolverBase,
@@ -1845,6 +1846,15 @@ class TestSolverCoupledMuJoCoVBDMultiEnv(unittest.TestCase):
         mjc_entry = coupled._entries["mjc"]
         self.assertEqual(mjc_view.joint_count, world_count)
         self.assertEqual(mjc_view.body_count, world_count)
+        self.assertEqual(
+            mjc_view.custom_frequency_counts["mujoco:equality_constraint"],
+            mjc_view.equality_constraint_count,
+        )
+        self.assertEqual(mjc_view.mujoco.equality_constraint_count, mjc_view.equality_constraint_count)
+        np.testing.assert_array_equal(
+            mjc_view.mujoco.equality_constraint_world_start.numpy(),
+            mjc_view.equality_constraint_world_start.numpy(),
+        )
         self.assertEqual(mjc_entry.body_global_to_local.numpy()[expand(cable_bodies, bodies_per_world)[0]], -1)
         self.assertNotIn(int(newton.JointType.CABLE), {int(t) for t in mjc_view.joint_type.numpy()})
 
@@ -3650,6 +3660,7 @@ class TestSolverCoupledVBDColoring(unittest.TestCase):
         soft_joint = builder.add_joint_fixed(parent=3, child=4, custom_attributes={"vbd:joint_is_hard": 0})
         builder.color()
         model = builder.finalize(device="cpu")
+        model.vbd.namespace_marker = "parent metadata"
 
         parent_joint_is_hard = model.vbd.joint_is_hard.numpy().copy()
         vbd_joint_order = [2, 3, 4, soft_joint]
@@ -3676,8 +3687,37 @@ class TestSolverCoupledVBDColoring(unittest.TestCase):
 
         view = coupled.view("dst")
         self.assertIsNot(view.vbd, model.vbd)
+        self.assertEqual(view.vbd.namespace_marker, model.vbd.namespace_marker)
         self.assertEqual(view.vbd.joint_is_hard.shape[0], view.joint_count)
         np.testing.assert_array_equal(view.vbd.joint_is_hard.numpy(), parent_joint_is_hard[vbd_joint_order])
+
+    def test_compacted_custom_frequency_namespace_metadata_is_generic(self):
+        builder = newton.ModelBuilder()
+        for _ in range(4):
+            builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        _add_equality_constraint(builder, constraint_type=newton.EqType.CONNECT, body1=0, body2=1)
+        _add_equality_constraint(builder, constraint_type=newton.EqType.CONNECT, body1=2, body2=3)
+        model = builder.finalize(device="cpu")
+
+        coupled = SolverCoupled(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(name="src", solver=SolverSemiImplicit, bodies=[0, 1]),
+                SolverCoupled.Entry(name="dst", solver=SolverSemiImplicit, bodies=[2, 3]),
+            ],
+        )
+
+        view = coupled.view("dst")
+        self.assertEqual(view.equality_constraint_count, 1)
+        self.assertEqual(view.custom_frequency_counts["mujoco:equality_constraint"], 1)
+        self.assertEqual(view.mujoco.equality_constraint_count, 1)
+        self.assertEqual(view.mujoco.equality_constraint_type.shape[0], 1)
+        np.testing.assert_array_equal(view.mujoco.equality_constraint_body1.numpy(), np.array([0], dtype=np.int32))
+        np.testing.assert_array_equal(view.mujoco.equality_constraint_body2.numpy(), np.array([1], dtype=np.int32))
+        np.testing.assert_array_equal(
+            view.mujoco.equality_constraint_world_start.numpy(),
+            view.equality_constraint_world_start.numpy(),
+        )
 
 
 if __name__ == "__main__":
