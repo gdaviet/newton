@@ -2338,6 +2338,7 @@ class _APGDPrototypeSolver:
                 self.rheology.strain_node_volume,
                 self.rheology.strain_mat.offsets,
                 self.delassus_operator.delassus_diagonal,
+                self.delassus_operator.delassus_rotation,
                 self.stress_response,
                 self.extrapolated_stress,
                 self.rheology.stress,
@@ -2369,6 +2370,7 @@ class _APGDPrototypeSolver:
                 self.rheology.strain_node_volume,
                 self.rheology.strain_mat.offsets,
                 self.delassus_operator.delassus_diagonal,
+                self.delassus_operator.delassus_rotation,
                 self.stress_response,
                 self.extrapolated_stress,
                 self.rheology.stress,
@@ -2382,6 +2384,8 @@ class _APGDPrototypeSolver:
             dim=self.delassus_operator.size,
             inputs=[
                 self.condition,
+                self.rheology.yield_params,
+                self.rheology.strain_node_volume,
                 self.rheology.strain_mat.offsets,
                 self.delassus_operator.delassus_diagonal,
                 self.previous_extrapolated_stress,
@@ -2941,6 +2945,9 @@ def solve_rheology(
             momentum=momentum,
             rheology=rheology,
             collision=collision,
+            # The viscous block metric is approximate, so keep BB steps within
+            # the globally stable initial bound while retaining APGD inertia.
+            max_step_size=0.25 if rheology.has_viscosity else 0.5,
             residual_tolerance=tolerance,
             normalize_residuals_by_environment=True,
             use_graph=use_graph,

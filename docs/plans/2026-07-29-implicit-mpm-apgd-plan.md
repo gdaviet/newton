@@ -11,7 +11,7 @@ Progress:
   states, implements the Algorithm B.2 inertia/restart, computes the scaled
   BB2 step from raw coupled responses, and checks stress and contact residuals
   independently.
-- Eighteen test functions generate 54 passing cases across CPU, `cuda:0`, and
+- Twenty test functions generate 60 passing cases across CPU, `cuda:0`, and
   `cuda:1`.
 - On the synthetic coupled regression, acceleration reaches a `1e-4`
   two-family residual tolerance in 55 iterations, compared with 884
@@ -38,8 +38,10 @@ Progress:
   nodal snapshot and at a loose subgrid tolerance; APGD wins by 2.32x and
   1.96x over Jacobi on the two test GPUs at the tighter subgrid tolerance.
 - Stress-side de Saxcé/bipotential bias and viscosity are implemented in the
-  same projected fixed-point step. A converged coupled regression agrees with
-  the existing Gauss-Seidel solver for non-associated viscous flow.
+  same projected fixed-point step. The viscosity-preconditioned local
+  resolvent keeps the large-viscosity mapping finite. Converged coupled
+  regressions agree with the existing Gauss-Seidel solver for moderate and
+  large non-associated viscosity.
 - Sparse associated, sparse viscous, and fixed-grid non-associated granular
   examples pass CUDA smoke tests. The fixed-grid test also covers collider
   contact and outer graph capture.
@@ -254,19 +256,29 @@ The correction vanishes for associated flow (\(\theta=1\)). With viscosity
 =\sigma^k+\frac{\eta}{V}u_\sigma^k.
 \]
 
-The projected material step is then
+Let \(D_\sigma\) be the local stress Delassus block and
+\(T_\eta=I+(\eta/V)D_\sigma\). Project the viscous yield stress,
+
+\[
+\sigma_{\mathrm y,p}^{k+1}
+=\Pi_{K_\sigma}\left(
+\sigma_\mathrm y^k-\xi_kH_\sigma^{-1}\widetilde u_\sigma^k
+\right),
+\]
+
+then recover a consistent total stress through the local resolvent,
 
 \[
 \widehat\sigma^{k+1}
-=\Pi_{K_\sigma}\left(
-\sigma_\mathrm y^k-\xi_kH_\sigma^{-1}\widetilde u_\sigma^k
-\right)
--\frac{\eta}{V}u_\sigma^k.
+=\sigma^k+T_\eta^{-1}
+\left(\sigma_{\mathrm y,p}^{k+1}-\sigma_\mathrm y^k\right).
 \]
 
 Thus the projection remains the same simple orthogonal projection; the
 non-associated bias changes its direction and viscosity changes the stress
-variable in which it is applied.
+variable in which it is applied. The resolvent prevents the explicit
+\(-(\eta/V)u_\sigma\) map-back from amplifying updates when viscosity or the
+inverse strain-node volume is large.
 
 For every enabled collider node, split the relative velocity into normal and
 tangential parts and apply the de Saxcé correction
@@ -609,15 +621,17 @@ run.
    of the shifted yield stress.
 2. [Complete] Apply the orthogonal projection in the viscous yield-stress
    variable \(\sigma_\mathrm y=\sigma+(\eta/V)u_\sigma\), then map back to
-   total stress.
+   total stress through the viscosity-scaled local Delassus resolvent.
 3. [Complete] Use the same corrected viscoplastic mapping for the fixed-step
    convergence diagnostic and acceleration restart metric.
 4. [Complete] Retain raw, uncorrected operator differences for the BB2
-   spectral step.
+   spectral step, measured in the viscous yield-stress variable.
 5. [Complete] Compare a converged non-associated viscous coupled solve with
    the existing Gauss-Seidel path on CPU and CUDA.
 6. [Complete] Smoke-test the public granular and viscous examples with
    collider contact on CUDA.
+7. [Complete] Run the full viscous-funnel example and compare a
+   large-viscosity coupled regression with Gauss-Seidel on CPU and CUDA.
 
 The raw coupled operator, exact admissible-set projection, acceleration, and
 residual framework remain shared with associated materials. A future
@@ -658,8 +672,8 @@ Solver tests:
   quadratic energy;
 - warm-start and cold-start agreement;
 - non-associated and viscous one-step agreement with an independent reference;
-- converged non-associated viscous agreement with the existing Gauss-Seidel
-  solver;
+- converged moderate- and large-viscosity non-associated agreement with the
+  existing Gauss-Seidel solver;
 - inactive fixed-grid capacity rows do not enter the specialized stencil
   evaluation.
 
@@ -676,11 +690,12 @@ corrections, viscosity, coupled Algorithm B.2 acceleration, guarded
 raw-response BB2 updates, device-resident stopping reductions, and feasible
 final reconstruction.
 
-The focused suite has 54 passing CPU/CUDA cases. Scene-level smoke tests cover
+The focused suite has 60 passing CPU/CUDA cases. Scene-level tests cover
 associated snow, non-associated granular flow with fixed-grid inactive
-capacity, viscous flow, collider contact, and CUDA graph capture. Dedicated
-regressions also cover per-environment APGD reductions, independent-world
-replay, empty environments, fixed-grid capacity padding, and multi-world outer
-graph capture. Remaining work is broader regression testing and further
-scene-level performance/robustness tuning, including additional accuracy
-thresholds and cross-device non-associated timing.
+capacity, the complete viscous funnel, collider contact, and CUDA graph
+capture. Dedicated regressions also cover per-environment APGD reductions,
+independent-world replay, empty environments, fixed-grid capacity padding,
+large-viscosity agreement with Gauss-Seidel, and multi-world outer graph
+capture. Remaining work is broader regression testing and further scene-level
+performance/robustness tuning, including additional accuracy thresholds and
+cross-device non-associated timing.

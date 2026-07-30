@@ -769,24 +769,82 @@ def apply_stress_desaxce_correction(
 
 
 @wp.func
+def apgd_stress_viscosity_scale(
+    yield_params: YieldParamVec,
+    strain_node_volume: float,
+):
+    viscosity_scale = float(0.0)
+    if strain_node_volume > 0.0:
+        viscosity_scale = get_viscosity(yield_params) / strain_node_volume
+    return viscosity_scale
+
+
+@wp.func
+def apgd_stress_preconditioner(
+    delassus_diagonal: vec6,
+    viscosity_scale: float,
+):
+    viscous_diagonal = vec6(1.0) + viscosity_scale * delassus_diagonal
+    return wp.dot(wp.cw_div(delassus_diagonal, viscous_diagonal), vec6(1.0))
+
+
+@wp.func
+def apgd_yield_stress_delta_to_stress(
+    yield_stress_delta: vec6,
+    delassus_diagonal: vec6,
+    delassus_rotation: mat55,
+    viscosity_scale: float,
+):
+    local_delta = vec6(yield_stress_delta[0])
+    local_delta[1:6] = yield_stress_delta[1:6] @ delassus_rotation
+    local_delta = wp.cw_div(local_delta, vec6(1.0) + viscosity_scale * delassus_diagonal)
+
+    stress_delta = vec6(local_delta[0])
+    stress_delta[1:6] = delassus_rotation @ local_delta[1:6]
+    return stress_delta
+
+
+@wp.func
+def apgd_stress_delta_to_yield_stress(
+    stress_delta: vec6,
+    delassus_diagonal: vec6,
+    delassus_rotation: mat55,
+    viscosity_scale: float,
+):
+    local_delta = vec6(stress_delta[0])
+    local_delta[1:6] = stress_delta[1:6] @ delassus_rotation
+    local_delta = wp.cw_mul(local_delta, vec6(1.0) + viscosity_scale * delassus_diagonal)
+
+    yield_stress_delta = vec6(local_delta[0])
+    yield_stress_delta[1:6] = delassus_rotation @ local_delta[1:6]
+    return yield_stress_delta
+
+
+@wp.func
 def apgd_project_stress_step(
     step_size: float,
-    preconditioner: float,
+    delassus_diagonal: vec6,
+    delassus_rotation: mat55,
     yield_params: YieldParamVec,
     strain_node_volume: float,
     response: vec6,
     stress: vec6,
 ):
-    """Project one corrected viscoplastic stress fixed-point step."""
+    """Project one viscosity-preconditioned stress fixed-point step."""
 
-    viscosity_scale = float(0.0)
-    if strain_node_volume > 0.0:
-        viscosity_scale = get_viscosity(yield_params) / strain_node_volume
-
+    viscosity_scale = apgd_stress_viscosity_scale(yield_params, strain_node_volume)
+    preconditioner = apgd_stress_preconditioner(delassus_diagonal, viscosity_scale)
     yield_stress = stress + viscosity_scale * response
     corrected_response = apply_stress_desaxce_correction(yield_params, yield_stress, response)
     trial_yield_stress = yield_stress - (step_size / preconditioner) * corrected_response
-    return project_stress_orthogonal(trial_yield_stress, yield_params) - viscosity_scale * response
+    projected_yield_stress = project_stress_orthogonal(trial_yield_stress, yield_params)
+    yield_stress_delta = projected_yield_stress - yield_stress
+    return stress + apgd_yield_stress_delta_to_stress(
+        yield_stress_delta,
+        delassus_diagonal,
+        delassus_rotation,
+        viscosity_scale,
+    )
 
 
 @wp.kernel
@@ -1118,6 +1176,7 @@ def apgd_project_stress_response(
     strain_node_volume: wp.array[float],
     strain_mat_offsets: wp.array[int],
     delassus_diagonal: wp.array[vec6],
+    delassus_rotation: wp.array[mat55],
     response: wp.array[vec6],
     extrapolated_stress: wp.array[vec6],
     stress: wp.array[vec6],
@@ -1133,7 +1192,8 @@ def apgd_project_stress_response(
         next_stress[tau_i] = extrapolated_stress[tau_i]
         return
 
-    preconditioner = wp.dot(delassus_diagonal[tau_i], vec6(1.0))
+    viscosity_scale = apgd_stress_viscosity_scale(yield_params[tau_i], strain_node_volume[tau_i])
+    preconditioner = apgd_stress_preconditioner(delassus_diagonal[tau_i], viscosity_scale)
     if preconditioner <= 0.0:
         next_stress[tau_i] = extrapolated_stress[tau_i]
         return
@@ -1141,7 +1201,8 @@ def apgd_project_stress_response(
     environment = strain_environment[tau_i]
     next_stress[tau_i] = apgd_project_stress_step(
         state[APGD_STATE_STEP_SIZE, environment],
-        preconditioner,
+        delassus_diagonal[tau_i],
+        delassus_rotation[tau_i],
         yield_params[tau_i],
         strain_node_volume[tau_i],
         response[tau_i],
@@ -1179,6 +1240,7 @@ def apgd_compute_stress_restart_metrics(
     strain_node_volume: wp.array[float],
     strain_mat_offsets: wp.array[int],
     delassus_diagonal: wp.array[vec6],
+    delassus_rotation: wp.array[mat55],
     response: wp.array[vec6],
     extrapolated_stress: wp.array[vec6],
     stress: wp.array[vec6],
@@ -1194,26 +1256,39 @@ def apgd_compute_stress_restart_metrics(
         metrics[2, tau_i] = 0.0
         return
 
-    preconditioner = wp.dot(delassus_diagonal[tau_i], vec6(1.0))
-    feasible_delta = next_stress[tau_i] - stress[tau_i]
-    viscosity_scale = float(0.0)
-    if strain_node_volume[tau_i] > 0.0:
-        viscosity_scale = get_viscosity(yield_params[tau_i]) / strain_node_volume[tau_i]
+    viscosity_scale = apgd_stress_viscosity_scale(yield_params[tau_i], strain_node_volume[tau_i])
+    preconditioner = apgd_stress_preconditioner(delassus_diagonal[tau_i], viscosity_scale)
+    stress_delta = next_stress[tau_i] - stress[tau_i]
+    yield_stress_delta = apgd_stress_delta_to_yield_stress(
+        stress_delta,
+        delassus_diagonal[tau_i],
+        delassus_rotation[tau_i],
+        viscosity_scale,
+    )
     yield_stress = extrapolated_stress[tau_i] + viscosity_scale * response[tau_i]
     corrected_response = apply_stress_desaxce_correction(yield_params[tau_i], yield_stress, response[tau_i])
-    restart = wp.dot(feasible_delta, -corrected_response)
+    restart = wp.dot(yield_stress_delta, -corrected_response)
     residual = float(0.0)
     if preconditioner > 0.0 and diagnostic_step_size > 0.0:
         diagnostic_stress = apgd_project_stress_step(
             diagnostic_step_size,
-            preconditioner,
+            delassus_diagonal[tau_i],
+            delassus_rotation[tau_i],
             yield_params[tau_i],
             strain_node_volume[tau_i],
             response[tau_i],
             extrapolated_stress[tau_i],
         )
-        fixed_point_delta = diagnostic_stress - extrapolated_stress[tau_i]
-        residual = preconditioner * wp.length_sq(fixed_point_delta) / (diagnostic_step_size * diagnostic_step_size)
+        diagnostic_stress_delta = diagnostic_stress - extrapolated_stress[tau_i]
+        diagnostic_yield_stress_delta = apgd_stress_delta_to_yield_stress(
+            diagnostic_stress_delta,
+            delassus_diagonal[tau_i],
+            delassus_rotation[tau_i],
+            viscosity_scale,
+        )
+        residual = (
+            preconditioner * wp.length_sq(diagnostic_yield_stress_delta) / (diagnostic_step_size * diagnostic_step_size)
+        )
     metrics[0, tau_i] = restart
     metrics[1, tau_i] = residual
     metrics[2, tau_i] = residual
@@ -1222,6 +1297,8 @@ def apgd_compute_stress_restart_metrics(
 @wp.kernel
 def apgd_compute_stress_bb_metrics(
     condition: wp.array[int],
+    yield_params: wp.array[YieldParamVec],
+    strain_node_volume: wp.array[float],
     strain_mat_offsets: wp.array[int],
     delassus_diagonal: wp.array[vec6],
     previous_stress: wp.array[vec6],
@@ -1241,9 +1318,11 @@ def apgd_compute_stress_bb_metrics(
 
     delta_stress = stress[tau_i] - previous_stress[tau_i]
     delta_response = response[tau_i] - previous_response[tau_i]
-    numerator = wp.dot(delta_stress, delta_response)
+    viscosity_scale = apgd_stress_viscosity_scale(yield_params[tau_i], strain_node_volume[tau_i])
+    delta_yield_stress = delta_stress + viscosity_scale * delta_response
+    numerator = wp.dot(delta_yield_stress, delta_response)
     denominator = float(0.0)
-    preconditioner = wp.dot(delassus_diagonal[tau_i], vec6(1.0))
+    preconditioner = apgd_stress_preconditioner(delassus_diagonal[tau_i], viscosity_scale)
     if preconditioner > 0.0:
         denominator = wp.length_sq(delta_response) / preconditioner
     metrics[0, tau_i] = numerator

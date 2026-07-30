@@ -63,10 +63,23 @@ def apgd_finalize_restart(
 
     environment = wp.tid()
     restart_dot = stress_metrics[0, environment] + contact_metrics[0, environment]
-    stress_residual = wp.sqrt(wp.max(0.0, stress_metrics[1, environment])) / stress_l2_scale[environment]
-    contact_residual = wp.sqrt(wp.max(0.0, contact_metrics[1, environment])) / contact_l2_scale[environment]
-    stress_residual_inf = wp.sqrt(wp.max(0.0, stress_metrics[2, environment]))
-    contact_residual_inf = wp.sqrt(wp.max(0.0, contact_metrics[2, environment]))
+    stress_residual_sq = stress_metrics[1, environment]
+    contact_residual_sq = contact_metrics[1, environment]
+    stress_residual_inf_sq = stress_metrics[2, environment]
+    contact_residual_inf_sq = contact_metrics[2, environment]
+
+    stress_residual = float(1.0e30)
+    contact_residual = float(1.0e30)
+    stress_residual_inf = float(1.0e30)
+    contact_residual_inf = float(1.0e30)
+    if wp.isfinite(stress_residual_sq) and stress_residual_sq >= 0.0:
+        stress_residual = wp.sqrt(stress_residual_sq) / stress_l2_scale[environment]
+    if wp.isfinite(contact_residual_sq) and contact_residual_sq >= 0.0:
+        contact_residual = wp.sqrt(contact_residual_sq) / contact_l2_scale[environment]
+    if wp.isfinite(stress_residual_inf_sq) and stress_residual_inf_sq >= 0.0:
+        stress_residual_inf = wp.sqrt(stress_residual_inf_sq)
+    if wp.isfinite(contact_residual_inf_sq) and contact_residual_inf_sq >= 0.0:
+        contact_residual_inf = wp.sqrt(contact_residual_inf_sq)
 
     state[APGD_STATE_ITERATION_COUNT, environment] += 1.0
     state[APGD_STATE_STRESS_RESIDUAL, environment] = stress_residual

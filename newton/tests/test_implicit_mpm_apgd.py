@@ -320,8 +320,13 @@ def _coupled_apgd_reference_step(
     trial_collider_velocity = collider_velocity - body_inv_mass * impulse
 
     stress_response = strain_rhs + _STRAIN_OPERATOR @ trial_velocity + 0.2 * stress
-    stress_preconditioner = 4.0 + 6.0 * 0.2 + 6.0e-6
     viscosity_scale = float(yield_params[5])
+    delassus = _STRAIN_OPERATOR @ _STRAIN_OPERATOR.T + (0.2 + 1.0e-6) * np.eye(6)
+    delassus[0, 1:] = 0.0
+    delassus[1:, 0] = 0.0
+    viscous_delassus = np.eye(6) + viscosity_scale * delassus
+    effective_delassus = np.linalg.solve(viscous_delassus, delassus)
+    stress_preconditioner = np.trace(effective_delassus)
     yield_stress = stress + viscosity_scale * stress_response
     pmax = float(yield_params[0])
     pmin = -max(0.0, float(yield_params[1]))
@@ -337,7 +342,8 @@ def _coupled_apgd_reference_step(
     corrected_stress_response = stress_response.copy()
     corrected_stress_response[0] += (1.0 - float(yield_params[4])) * active_slope * np.linalg.norm(stress_response[1:])
     trial_yield_stress = yield_stress - (step_size / stress_preconditioner) * corrected_stress_response
-    next_stress = _stress_projection_reference(trial_yield_stress, yield_params) - viscosity_scale * stress_response
+    projected_yield_stress = _stress_projection_reference(trial_yield_stress, yield_params)
+    next_stress = stress + np.linalg.solve(viscous_delassus, projected_yield_stress - yield_stress)
 
     normal = np.array([1.0, 0.0, 0.0])
     relative_velocity = trial_velocity - trial_collider_velocity
@@ -804,6 +810,52 @@ def test_coupled_apgd_matches_gs_with_non_associated_viscosity(test, device):
     np.testing.assert_allclose(apgd[0].velocity.numpy(), gs[0].velocity.numpy(), rtol=3.0e-5, atol=8.0e-6)
 
 
+def test_coupled_apgd_matches_gs_with_large_viscosity(test, device):
+    """Match GS while keeping a large-viscosity APGD solve finite."""
+    initial_stress = np.array([-0.5, 0.3, 0.0, 0.0, 0.0, 0.2], dtype=np.float32)
+    initial_impulse = np.array([0.2, 0.05, 0.0], dtype=np.float32)
+    apgd = _make_coupled_apgd_data(device, initial_stress, initial_impulse)
+    gs = _make_coupled_apgd_data(device, initial_stress, initial_impulse)
+    yield_params = apgd[6].copy()
+    yield_params[4] = 0.25
+    yield_params[5] = 1.0e4
+
+    for _momentum, rheology, _collision, *_rest in (apgd, gs):
+        rheology.yield_params.assign([yield_params])
+        rheology.has_dilatancy = True
+        rheology.has_viscosity = True
+
+    with wp.ScopedDevice(device):
+        result = _solve_rheology_apgd_prototype(
+            max_iterations=200,
+            momentum=apgd[0],
+            rheology=apgd[1],
+            collision=apgd[2],
+            residual_tolerance=1.0e-6,
+        )
+        solve_rheology(
+            "gs",
+            max_iterations=400,
+            tolerance=1.0e-6,
+            momentum=gs[0],
+            rheology=gs[1],
+            collision=gs[2],
+            use_graph=False,
+            verbose=False,
+        )
+
+    apgd_stress = apgd[1].stress.numpy()
+    apgd_impulse = apgd[2].collider_impulse.numpy()
+    apgd_velocity = apgd[0].velocity.numpy()
+    test.assertLess(result.iteration_count, 200)
+    test.assertTrue(np.isfinite(apgd_stress).all())
+    test.assertTrue(np.isfinite(apgd_impulse).all())
+    test.assertTrue(np.isfinite(apgd_velocity).all())
+    np.testing.assert_allclose(apgd_stress, gs[1].stress.numpy(), rtol=3.0e-5, atol=8.0e-6)
+    np.testing.assert_allclose(apgd_impulse, gs[2].collider_impulse.numpy(), rtol=3.0e-5, atol=8.0e-6)
+    np.testing.assert_allclose(apgd_velocity, gs[0].velocity.numpy(), rtol=3.0e-5, atol=8.0e-6)
+
+
 def test_coupled_apgd_uses_fixed_diagnostic_step(test, device):
     """Keep convergence diagnostics independent of the adaptive update step."""
     initial_stress = np.array([-0.5, 0.3, 0.0, 0.0, 0.0, 0.2], dtype=np.float32)
@@ -1101,6 +1153,12 @@ add_function_test(
     TestImplicitMPMAPGDProjections,
     "test_coupled_apgd_matches_gs_with_non_associated_viscosity",
     test_coupled_apgd_matches_gs_with_non_associated_viscosity,
+    devices=devices,
+)
+add_function_test(
+    TestImplicitMPMAPGDProjections,
+    "test_coupled_apgd_matches_gs_with_large_viscosity",
+    test_coupled_apgd_matches_gs_with_large_viscosity,
     devices=devices,
 )
 add_function_test(
