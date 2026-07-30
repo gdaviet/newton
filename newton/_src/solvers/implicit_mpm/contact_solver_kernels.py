@@ -219,7 +219,8 @@ def apgd_evaluate_subgrid_contact(
 
 @wp.kernel
 def apgd_project_contact_response(
-    state: wp.array[float],
+    state: wp.array2d[float],
+    collider_environment: wp.array[int],
     condition: wp.array[int],
     collider_delassus_diagonal: wp.array[float],
     collider_friction: wp.array[float],
@@ -237,8 +238,9 @@ def apgd_project_contact_response(
         next_collider_impulse[i] = collider_impulse[i]
         return
 
+    environment = collider_environment[i]
     next_collider_impulse[i] = apgd_project_collider_step(
-        state[APGD_STATE_STEP_SIZE],
+        state[APGD_STATE_STEP_SIZE, environment],
         collider_delassus_diagonal[i],
         collider_friction[i],
         collider_adhesion[i],
@@ -250,7 +252,8 @@ def apgd_project_contact_response(
 
 @wp.kernel
 def apgd_extrapolate_collider_impulse(
-    state: wp.array[float],
+    state: wp.array2d[float],
+    collider_environment: wp.array[int],
     condition: wp.array[int],
     collider_impulse: wp.array[wp.vec3],
     next_collider_impulse: wp.array[wp.vec3],
@@ -264,13 +267,13 @@ def apgd_extrapolate_collider_impulse(
         return
 
     next_impulse = next_collider_impulse[i]
-    beta = state[APGD_STATE_BETA]
+    beta = state[APGD_STATE_BETA, collider_environment[i]]
     extrapolated_collider_impulse[i] = next_impulse + beta * (next_impulse - collider_impulse[i])
 
 
 @wp.kernel
 def apgd_compute_contact_restart_metrics(
-    state: wp.array[float],
+    state: wp.array2d[float],
     condition: wp.array[int],
     diagnostic_step_size: float,
     collider_delassus_diagonal: wp.array[float],
@@ -289,6 +292,7 @@ def apgd_compute_contact_restart_metrics(
     if condition[0] == 0 or collider_friction[i] < 0.0:
         metrics[0, i] = 0.0
         metrics[1, i] = 0.0
+        metrics[2, i] = 0.0
         return
 
     normal = collider_normals[i]
@@ -312,6 +316,7 @@ def apgd_compute_contact_restart_metrics(
         residual = preconditioner * wp.length_sq(fixed_point_delta) / (diagnostic_step_size * diagnostic_step_size)
     metrics[0, i] = restart
     metrics[1, i] = residual
+    metrics[2, i] = residual
 
 
 @wp.kernel
@@ -331,6 +336,7 @@ def apgd_compute_contact_bb_metrics(
     if condition[0] == 0 or collider_friction[i] < 0.0:
         metrics[0, i] = 0.0
         metrics[1, i] = 0.0
+        metrics[2, i] = 0.0
         return
 
     delta_impulse = collider_impulse[i] - previous_collider_impulse[i]
@@ -342,6 +348,7 @@ def apgd_compute_contact_bb_metrics(
         denominator = wp.length_sq(delta_response) / preconditioner
     metrics[0, i] = numerator
     metrics[1, i] = denominator
+    metrics[2, i] = 0.0
 
 
 @wp.kernel

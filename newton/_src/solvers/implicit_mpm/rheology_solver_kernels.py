@@ -1111,7 +1111,8 @@ def make_apgd_evaluate_stress_kernel(
 
 @wp.kernel
 def apgd_project_stress_response(
-    state: wp.array[float],
+    state: wp.array2d[float],
+    strain_environment: wp.array[int],
     condition: wp.array[int],
     yield_params: wp.array[YieldParamVec],
     strain_node_volume: wp.array[float],
@@ -1137,8 +1138,9 @@ def apgd_project_stress_response(
         next_stress[tau_i] = extrapolated_stress[tau_i]
         return
 
+    environment = strain_environment[tau_i]
     next_stress[tau_i] = apgd_project_stress_step(
-        state[APGD_STATE_STEP_SIZE],
+        state[APGD_STATE_STEP_SIZE, environment],
         preconditioner,
         yield_params[tau_i],
         strain_node_volume[tau_i],
@@ -1149,7 +1151,8 @@ def apgd_project_stress_response(
 
 @wp.kernel
 def apgd_extrapolate_stress(
-    state: wp.array[float],
+    state: wp.array2d[float],
+    strain_environment: wp.array[int],
     condition: wp.array[int],
     stress: wp.array[vec6],
     next_stress: wp.array[vec6],
@@ -1163,13 +1166,13 @@ def apgd_extrapolate_stress(
         return
 
     next_value = next_stress[tau_i]
-    beta = state[APGD_STATE_BETA]
+    beta = state[APGD_STATE_BETA, strain_environment[tau_i]]
     extrapolated_stress[tau_i] = next_value + beta * (next_value - stress[tau_i])
 
 
 @wp.kernel
 def apgd_compute_stress_restart_metrics(
-    state: wp.array[float],
+    state: wp.array2d[float],
     condition: wp.array[int],
     diagnostic_step_size: float,
     yield_params: wp.array[YieldParamVec],
@@ -1188,6 +1191,7 @@ def apgd_compute_stress_restart_metrics(
     if condition[0] == 0 or strain_mat_offsets[tau_i] == strain_mat_offsets[tau_i + 1]:
         metrics[0, tau_i] = 0.0
         metrics[1, tau_i] = 0.0
+        metrics[2, tau_i] = 0.0
         return
 
     preconditioner = wp.dot(delassus_diagonal[tau_i], vec6(1.0))
@@ -1212,6 +1216,7 @@ def apgd_compute_stress_restart_metrics(
         residual = preconditioner * wp.length_sq(fixed_point_delta) / (diagnostic_step_size * diagnostic_step_size)
     metrics[0, tau_i] = restart
     metrics[1, tau_i] = residual
+    metrics[2, tau_i] = residual
 
 
 @wp.kernel
@@ -1231,6 +1236,7 @@ def apgd_compute_stress_bb_metrics(
     if condition[0] == 0 or strain_mat_offsets[tau_i] == strain_mat_offsets[tau_i + 1]:
         metrics[0, tau_i] = 0.0
         metrics[1, tau_i] = 0.0
+        metrics[2, tau_i] = 0.0
         return
 
     delta_stress = stress[tau_i] - previous_stress[tau_i]
@@ -1242,6 +1248,7 @@ def apgd_compute_stress_bb_metrics(
         denominator = wp.length_sq(delta_response) / preconditioner
     metrics[0, tau_i] = numerator
     metrics[1, tau_i] = denominator
+    metrics[2, tau_i] = 0.0
 
 
 def make_solve_local_stress(has_viscosity: bool, has_dilatancy: bool, has_rotation: bool = not _ISOTROPIC_LOCAL_LHS):

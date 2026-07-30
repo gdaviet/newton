@@ -24,7 +24,11 @@ Progress:
 - The device-conditional CUDA graph loop is capture-safe and validated on an
   RTX PRO 6000 Blackwell and an RTX 3080 Ti. The first implementation using
   `wp.utils.array_sum` exposed a hidden allocation during conditional capture;
-  it was replaced by a preallocated tiled pair reduction.
+  it was replaced by a preallocated tiled metric reduction.
+- Separated MPM worlds now keep independent acceleration, restart, and BB2
+  state. Stress and contact residuals are reduced per environment, including
+  empty worlds and fixed-grid capacity padding, and termination requires every
+  environment to satisfy both scaled L2 and block-infinity tolerances.
 - Warmed graph benchmarks show negligible acceleration overhead per iteration
   and approximately 12x lower time to a matched residual on the associated
   snow-ball snapshot. A larger B2/P1d subgrid snapshot shows an 18x reduction
@@ -361,11 +365,10 @@ F_\lambda(\lambda)
 \right].
 \]
 
-Track the weighted L2 norm for each family; termination requires both to meet
-their independently scaled tolerances. The current implementation uses global
-stress and contact norms. Preserving the existing per-environment stress
-tolerance behavior and adding compatible per-environment contact accounting
-remains future work.
+Track the weighted L2 and block-infinity norms for each family; termination
+requires both to meet their independently scaled tolerances in every
+environment. Acceleration, restart, and BB2 state are environment-local so
+unrelated worlds cannot alter one another's APGD trajectory.
 
 Return the best or latest feasible \(\widehat z\), never the extrapolated
 \(z\). Reconstruct grid velocity, collider velocity, stress, and collider
@@ -428,9 +431,8 @@ This stage isolates operator/sign/projection errors before adding acceleration.
 1. [Complete] Add projected/extrapolated state separation.
 2. [Complete] Add Algorithm B.2 restart behavior.
 3. [Complete] Add the guarded block-scaled BB step using raw responses.
-4. [Prototype complete] Add separate stress/contact L2 residual reductions
-   and always return the latest feasible iterate. Device-resident L2/infinity
-   reductions and best-iterate tracking, if needed, move to Stage 5.
+4. [Complete] Add separate per-environment stress/contact L2 and block-infinity
+   residual reductions and always return the latest feasible iterate.
 5. [Complete for the synthetic fixture] Compare fixed-step projected-gradient
    and accelerated convergence on the same coupled system. Repeat this on
    end-to-end MPM scenes during Stage 5.
@@ -676,8 +678,9 @@ final reconstruction.
 
 The focused suite has 54 passing CPU/CUDA cases. Scene-level smoke tests cover
 associated snow, non-associated granular flow with fixed-grid inactive
-capacity, viscous flow, collider contact, and CUDA graph capture. Remaining
-work is broader regression testing, code-quality checks, and further
-scene-level performance/robustness tuning—especially per-environment
-tolerances, stress/contact block scaling, additional accuracy thresholds, and
-cross-device non-associated timing.
+capacity, viscous flow, collider contact, and CUDA graph capture. Dedicated
+regressions also cover per-environment APGD reductions, independent-world
+replay, empty environments, fixed-grid capacity padding, and multi-world outer
+graph capture. Remaining work is broader regression testing and further
+scene-level performance/robustness tuning, including additional accuracy
+thresholds and cross-device non-associated timing.

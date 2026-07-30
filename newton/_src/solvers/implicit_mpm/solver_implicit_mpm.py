@@ -3135,6 +3135,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 collider_velocities=scratch.collider_velocity,
                 rigidity_operator=rigidity_operator,
                 collider_impulse=scratch.impulse_field.dof_values,
+                collider_environment_offsets=scratch.collider_environment_offsets,
                 has_colliders=self._mpm_model.collider.collider_mesh.shape[0] > 0,
             )
 

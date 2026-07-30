@@ -8,6 +8,17 @@ import warp as wp
 import warp.fem as fem
 
 import newton
+from newton._src.solvers.implicit_mpm.apgd_solver_kernels import (
+    APGD_STATE_CONTACT_RESIDUAL,
+    APGD_STATE_CONTACT_RESIDUAL_INF,
+    APGD_STATE_RESTART_COUNT,
+    APGD_STATE_SIZE,
+    APGD_STATE_STRESS_RESIDUAL,
+    APGD_STATE_STRESS_RESIDUAL_INF,
+    apgd_finalize_iteration,
+    apgd_finalize_restart,
+    apgd_initialize_state,
+)
 from newton._src.solvers.implicit_mpm.rasterized_collisions import (
     _ALL_COLLIDER_WORLDS,
     Collider,
@@ -15,6 +26,7 @@ from newton._src.solvers.implicit_mpm.rasterized_collisions import (
     rasterize_collider_kernel,
 )
 from newton._src.solvers.implicit_mpm.solve_rheology import (
+    ArrayAPGDMetricReduction,
     ArraySquaredNorm,
     _compute_environment_l2_tolerance_scales,
     _linear_solver_result_norms,
@@ -164,6 +176,99 @@ def test_array_squared_norm_batches(test, device):
         np.testing.assert_array_equal(result_snapshot[1], np.array((7.0, 0.0, 25.0)))
     finally:
         norm.release()
+
+
+def test_apgd_metric_reduction_batches(test, device):
+    """Verify APGD metric reductions remain environment-local."""
+    offsets = wp.array((0, 2, 2, 5), dtype=int, device=device)
+    metrics = wp.array(
+        (
+            (1.0, 2.0, 4.0, 8.0, 16.0),
+            (3.0, 5.0, 7.0, 11.0, 13.0),
+            (9.0, 4.0, 1.0, 25.0, 16.0),
+        ),
+        dtype=float,
+        device=device,
+    )
+    reduction = ArrayAPGDMetricReduction(max_length=5, batch_offsets=offsets, device=device)
+
+    try:
+        result = reduction.compute(metrics)
+        test.assertEqual(result.shape, (3, 3))
+        np.testing.assert_array_equal(
+            result.numpy(),
+            np.array(
+                (
+                    (3.0, 0.0, 28.0),
+                    (8.0, 0.0, 31.0),
+                    (9.0, 0.0, 25.0),
+                ),
+                dtype=np.float32,
+            ),
+        )
+    finally:
+        reduction.release()
+
+
+def test_apgd_environment_convergence(test, device):
+    """Verify APGD convergence checks every environment and norm."""
+    state = wp.empty((APGD_STATE_SIZE, 2), dtype=float, device=device)
+    condition = wp.empty(1, dtype=int, device=device)
+    stress_metrics = wp.array(
+        ((1.0, -1.0), (16.0, 9.0), (4.0, 16.0)),
+        dtype=float,
+        device=device,
+    )
+    contact_metrics = wp.array(
+        ((0.0, 0.0), (1.0, 4.0), (1.0, 4.0)),
+        dtype=float,
+        device=device,
+    )
+    stress_l2_scale = wp.array((2.0, 3.0), dtype=float, device=device)
+    contact_l2_scale = wp.array((1.0, 2.0), dtype=float, device=device)
+    wp.launch(apgd_initialize_state, dim=2, inputs=[0.25, 10, state, condition], device=device)
+    wp.launch(
+        apgd_finalize_restart,
+        dim=2,
+        inputs=[
+            True,
+            stress_metrics,
+            contact_metrics,
+            stress_l2_scale,
+            contact_l2_scale,
+            state,
+            condition,
+        ],
+        device=device,
+    )
+
+    state_snapshot = state.numpy()
+    np.testing.assert_allclose(state_snapshot[APGD_STATE_STRESS_RESIDUAL], (2.0, 1.0))
+    np.testing.assert_allclose(state_snapshot[APGD_STATE_CONTACT_RESIDUAL], (1.0, 1.0))
+    np.testing.assert_allclose(state_snapshot[APGD_STATE_STRESS_RESIDUAL_INF], (2.0, 4.0))
+    np.testing.assert_allclose(state_snapshot[APGD_STATE_CONTACT_RESIDUAL_INF], (1.0, 2.0))
+    np.testing.assert_array_equal(state_snapshot[APGD_STATE_RESTART_COUNT], (0.0, 1.0))
+
+    wp.launch(apgd_finalize_iteration, dim=1, inputs=[10, 2.5, 2.5, state, condition], device=device)
+    test.assertEqual(condition.numpy()[0], 1)
+
+    stress_metrics.assign(((1.0, 1.0), (16.0, 9.0), (4.0, 4.0)))
+    wp.launch(
+        apgd_finalize_restart,
+        dim=2,
+        inputs=[
+            True,
+            stress_metrics,
+            contact_metrics,
+            stress_l2_scale,
+            contact_l2_scale,
+            state,
+            condition,
+        ],
+        device=device,
+    )
+    wp.launch(apgd_finalize_iteration, dim=1, inputs=[10, 2.5, 2.5, state, condition], device=device)
+    test.assertEqual(condition.numpy()[0], 0)
 
 
 def test_linear_solver_result_norms(test, device):
@@ -358,6 +463,11 @@ def test_multiworld_dense_pic_matches_independent(test, device):
     _run_multiworld_reference_case(device, grid_type="dense", integration_scheme="pic")
 
 
+def test_multiworld_dense_pic_apgd_matches_independent(test, device):
+    """Verify multi-world dense PIC APGD matches independent."""
+    _run_multiworld_reference_case(device, grid_type="dense", integration_scheme="pic", solver="apgd")
+
+
 def test_multiworld_dense_gimp_matches_independent(test, device):
     """Verify multi-world dense GIMP matches independent."""
     _run_multiworld_reference_case(device, grid_type="dense", integration_scheme="gimp")
@@ -368,7 +478,7 @@ def test_multiworld_fixed_pic_matches_independent(test, device):
     _run_multiworld_reference_case(device, grid_type="fixed", integration_scheme="pic")
 
 
-def _make_multiworld_fixed_outer_graph_case(device, max_active_cell_count=16):
+def _make_multiworld_fixed_outer_graph_case(device, max_active_cell_count=16, solver="jacobi"):
     local_builder = _make_mpm_particle_builder(gravity=(0.0, 0.0, 0.0))
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, 0.0, 0.0))
     SolverImplicitMPM.register_custom_attributes(builder)
@@ -385,7 +495,7 @@ def _make_multiworld_fixed_outer_graph_case(device, max_active_cell_count=16):
         initial_qd[world_slice, 0] += translation
     model.particle_qd.assign(initial_qd)
 
-    config = _make_mpm_config(grid_type="fixed", integration_scheme="pic", solver="jacobi")
+    config = _make_mpm_config(grid_type="fixed", integration_scheme="pic", solver=solver)
     config.grid_padding = 2
     config.max_active_cell_count = max_active_cell_count
     config.max_iterations = 5
@@ -457,8 +567,7 @@ def test_multiworld_fixed_capped_jacobi_matches_uncapped(test, device):
         test.assertTrue(np.isfinite(array.numpy()).all(), f"Padded {name} contains non-finite values")
 
 
-def test_multiworld_fixed_outer_graph_matches_eager(test, device):
-    """Verify multi-world fixed outer graph matches eager."""
+def _run_multiworld_fixed_outer_graph_case(test, device, solver):
     if (
         not device.is_cuda
         or not device.is_mempool_supported
@@ -468,10 +577,10 @@ def test_multiworld_fixed_outer_graph_matches_eager(test, device):
         test.skipTest("Implicit MPM CUDA capture requires memory pools and conditional graphs.")
 
     eager_model, eager_solver, eager_state_0, eager_state_1, world_starts = _make_multiworld_fixed_outer_graph_case(
-        device
+        device, solver=solver
     )
     captured_model, captured_solver, captured_state_0, captured_state_1, captured_world_starts = (
-        _make_multiworld_fixed_outer_graph_case(device)
+        _make_multiworld_fixed_outer_graph_case(device, solver=solver)
     )
     np.testing.assert_array_equal(captured_world_starts, world_starts)
     initial_q = eager_state_0.particle_q.numpy().copy()
@@ -543,6 +652,16 @@ def test_multiworld_fixed_outer_graph_matches_eager(test, device):
     test.assertLess(mean_displacements[1], 0.0)
     test.assertGreater(mean_velocities[0], 0.0)
     test.assertLess(mean_velocities[1], 0.0)
+
+
+def test_multiworld_fixed_outer_graph_matches_eager(test, device):
+    """Verify multi-world fixed outer graph matches eager."""
+    _run_multiworld_fixed_outer_graph_case(test, device, solver="jacobi")
+
+
+def test_multiworld_fixed_apgd_outer_graph_matches_eager(test, device):
+    """Verify multi-world fixed APGD outer graph matches eager."""
+    _run_multiworld_fixed_outer_graph_case(test, device, solver="apgd")
 
 
 def test_multiworld_sparse_pic_matches_independent(test, device):
@@ -1457,6 +1576,20 @@ add_function_test(
 
 add_function_test(
     TestImplicitMPM,
+    "test_apgd_metric_reduction_batches",
+    test_apgd_metric_reduction_batches,
+    devices=basic_devices,
+)
+
+add_function_test(
+    TestImplicitMPM,
+    "test_apgd_environment_convergence",
+    test_apgd_environment_convergence,
+    devices=basic_devices,
+)
+
+add_function_test(
+    TestImplicitMPM,
     "test_linear_solver_result_norms",
     test_linear_solver_result_norms,
     devices=basic_devices,
@@ -1485,6 +1618,13 @@ add_function_test(
 
 add_function_test(
     TestImplicitMPM,
+    "test_multiworld_dense_pic_apgd_matches_independent",
+    test_multiworld_dense_pic_apgd_matches_independent,
+    devices=basic_devices,
+)
+
+add_function_test(
+    TestImplicitMPM,
     "test_multiworld_dense_gimp_matches_independent",
     test_multiworld_dense_gimp_matches_independent,
     devices=basic_devices,
@@ -1501,6 +1641,13 @@ add_function_test(
     TestImplicitMPM,
     "test_multiworld_fixed_outer_graph_matches_eager",
     test_multiworld_fixed_outer_graph_matches_eager,
+    devices=basic_cuda_devices,
+)
+
+add_function_test(
+    TestImplicitMPM,
+    "test_multiworld_fixed_apgd_outer_graph_matches_eager",
+    test_multiworld_fixed_apgd_outer_graph_matches_eager,
     devices=basic_cuda_devices,
 )
 

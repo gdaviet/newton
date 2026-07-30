@@ -20,12 +20,14 @@ from .apgd_solver_kernels import (
     APGD_STATE_BB_DENOMINATOR,
     APGD_STATE_BB_NUMERATOR,
     APGD_STATE_CONTACT_RESIDUAL,
+    APGD_STATE_CONTACT_RESIDUAL_INF,
     APGD_STATE_ITERATION_COUNT,
     APGD_STATE_RESTART_COUNT,
     APGD_STATE_RESTART_DOT,
     APGD_STATE_SIZE,
     APGD_STATE_STEP_SIZE,
     APGD_STATE_STRESS_RESIDUAL,
+    APGD_STATE_STRESS_RESIDUAL_INF,
     apgd_finalize_bb,
     apgd_finalize_iteration,
     apgd_finalize_restart,
@@ -103,18 +105,45 @@ def _tiled_sum_kernel(
 
 
 @wp.kernel
-def _tiled_pair_sum_kernel(
+def _tiled_apgd_metric_kernel(
     data: wp.array2d[float],
-    partial_sums: wp.array2d[float],
+    partial_metrics: wp.array2d[float],
 ):
-    """Reduce two scalar channels with preallocated tiled sums."""
+    """Reduce APGD sum, squared-L2, and block-maximum channels."""
 
     block_id, _ = wp.tid()
 
     tile = wp.tile_load(data[0], shape=_TILED_SUM_BLOCK_DIM, offset=block_id * _TILED_SUM_BLOCK_DIM)
-    wp.tile_store(partial_sums[0], wp.tile_sum(tile), offset=block_id)
+    wp.tile_store(partial_metrics[0], wp.tile_sum(tile), offset=block_id)
     tile = wp.tile_load(data[1], shape=_TILED_SUM_BLOCK_DIM, offset=block_id * _TILED_SUM_BLOCK_DIM)
-    wp.tile_store(partial_sums[1], wp.tile_sum(tile), offset=block_id)
+    wp.tile_store(partial_metrics[1], wp.tile_sum(tile), offset=block_id)
+    tile = wp.tile_load(data[2], shape=_TILED_SUM_BLOCK_DIM, offset=block_id * _TILED_SUM_BLOCK_DIM)
+    wp.tile_store(partial_metrics[2], wp.tile_max(tile), offset=block_id)
+
+
+@wp.kernel
+def _batched_apgd_metric_kernel(
+    data: wp.array2d[float],
+    batch_offsets: wp.array[int],
+    result: wp.array2d[float],
+):
+    """Reduce APGD metrics independently over offset-delimited batches."""
+
+    batch, lane = wp.tid()
+    batch_start = batch_offsets[batch] + lane
+    batch_end = batch_offsets[batch + 1]
+
+    first_sum = float(0.0)
+    second_sum = float(0.0)
+    max_value = float(0.0)
+    for i in range(batch_start, batch_end, wp.block_dim()):
+        first_sum += data[0, i]
+        second_sum += data[1, i]
+        max_value = wp.max(max_value, data[2, i])
+
+    wp.tile_store(result[0], wp.tile_sum(wp.tile(first_sum)), offset=batch)
+    wp.tile_store(result[1], wp.tile_sum(wp.tile(second_sum)), offset=batch)
+    wp.tile_store(result[2], wp.tile_max(wp.tile(max_value)), offset=batch)
 
 
 @wp.kernel
@@ -156,6 +185,18 @@ def _compute_environment_l2_tolerance_scales(
     environment = wp.tid()
     environment_size = environment_offsets[environment + 1] - environment_offsets[environment]
     tolerance_scales[environment] = wp.sqrt(float(1 + environment_size))
+
+
+@wp.kernel
+def _fill_environment_ids(
+    environment_offsets: wp.array[int],
+    environment_ids: wp.array[int],
+):
+    environment, lane = wp.tid()
+    begin = environment_offsets[environment] + lane
+    end = environment_offsets[environment + 1]
+    for i in range(begin, end, wp.block_dim()):
+        environment_ids[i] = environment
 
 
 @wp.kernel
@@ -281,57 +322,91 @@ class ArraySquaredNorm:
         self.release()
 
 
-class ArrayPairSum:
-    """Reduce two scalar channels without allocating inside the iteration loop."""
+class ArrayAPGDMetricReduction:
+    """Reduce APGD metrics without allocating inside the iteration loop."""
 
-    def __init__(self, max_length: int, device=None, temporary_store=None):
+    def __init__(self, max_length: int, batch_offsets: wp.array[int] | None = None, device=None, temporary_store=None):
         self.tile_size = _TILED_SUM_BLOCK_DIM
         self.device = device
+        self.batch_result = None
+        self.batch_reduce_launch = None
+        self.partial_metrics_a = None
+        self.partial_metrics_b = None
+        self.reduce_launch = None
+
+        if batch_offsets is not None:
+            if not self.device.is_cuda:
+                self.tile_size = 1
+
+            batch_count = batch_offsets.shape[0] - 1
+            self.batch_result = fem.borrow_temporary(
+                temporary_store,
+                shape=(3, batch_count),
+                dtype=float,
+                device=self.device,
+            )
+            self.batch_result.zero_()
+            self.batch_reduce_launch = wp.launch(
+                _batched_apgd_metric_kernel,
+                dim=(batch_count, self.tile_size),
+                inputs=(self.batch_result, batch_offsets),
+                outputs=(self.batch_result,),
+                block_dim=self.tile_size,
+                device=self.device,
+                record_cmd=True,
+            )
+            return
+
         num_blocks = max(1, (max_length + self.tile_size - 1) // self.tile_size)
-        self.partial_sums_a = fem.borrow_temporary(
+        self.partial_metrics_a = fem.borrow_temporary(
             temporary_store,
-            shape=(2, num_blocks),
+            shape=(3, num_blocks),
             dtype=float,
             device=self.device,
         )
-        self.partial_sums_b = fem.borrow_temporary(
+        self.partial_metrics_b = fem.borrow_temporary(
             temporary_store,
-            shape=(2, num_blocks),
+            shape=(3, num_blocks),
             dtype=float,
             device=self.device,
         )
-        self.partial_sums_a.zero_()
-        self.partial_sums_b.zero_()
-        self.sum_launch = wp.launch(
-            _tiled_pair_sum_kernel,
+        self.partial_metrics_a.zero_()
+        self.partial_metrics_b.zero_()
+        self.reduce_launch = wp.launch(
+            _tiled_apgd_metric_kernel,
             dim=(num_blocks, self.tile_size),
-            inputs=(self.partial_sums_a,),
-            outputs=(self.partial_sums_b,),
+            inputs=(self.partial_metrics_a,),
+            outputs=(self.partial_metrics_b,),
             block_dim=self.tile_size,
             device=self.device,
             record_cmd=True,
         )
 
     def compute(self, data: wp.array2d[float]):
-        """Reduce both rows of ``data`` and return a persistent ``(2, 1)`` view."""
+        """Reduce ``data`` and return a persistent ``(3, batch_count)`` view."""
+
+        if self.batch_reduce_launch is not None:
+            self.batch_reduce_launch.set_param_at_index(0, data)
+            self.batch_reduce_launch.launch()
+            return self.batch_result
 
         array_length = data.shape[1]
         if array_length == 0:
-            self.partial_sums_a[:, :1].zero_()
-            return self.partial_sums_a[:, :1]
+            self.partial_metrics_a[:, :1].zero_()
+            return self.partial_metrics_a[:, :1]
 
         flip_flop = False
         while True:
             num_blocks = (array_length + self.tile_size - 1) // self.tile_size
-            partial_sums = (self.partial_sums_a if flip_flop else self.partial_sums_b)[:, :num_blocks]
+            partial_metrics = (self.partial_metrics_a if flip_flop else self.partial_metrics_b)[:, :num_blocks]
 
-            self.sum_launch.set_param_at_index(0, data[:, :array_length])
-            self.sum_launch.set_param_at_index(1, partial_sums)
-            self.sum_launch.set_dim((num_blocks, self.tile_size))
-            self.sum_launch.launch()
+            self.reduce_launch.set_param_at_index(0, data[:, :array_length])
+            self.reduce_launch.set_param_at_index(1, partial_metrics)
+            self.reduce_launch.set_dim((num_blocks, self.tile_size))
+            self.reduce_launch.launch()
 
             array_length = num_blocks
-            data = partial_sums
+            data = partial_metrics
             flip_flop = not flip_flop
             if num_blocks == 1:
                 return data
@@ -339,7 +414,7 @@ class ArrayPairSum:
     def release(self):
         """Return borrowed temporaries to their pool."""
 
-        for attr in ("partial_sums_a", "partial_sums_b"):
+        for attr in ("partial_metrics_a", "partial_metrics_b", "batch_result"):
             temporary = getattr(self, attr, None)
             if temporary is not None:
                 temporary.release()
@@ -519,6 +594,9 @@ class CollisionData:
             nodes to collider DOFs. ``None`` when unused.
         collider_impulse: In/out stored collider impulses for warm-starting
             [N s / V0], shape ``[node_count, 3]``.
+        collider_environment_offsets: Collider-node offsets delimiting
+            independent environments, shape ``[environment_count + 1]``.
+            ``None`` for a single shared solve.
         has_colliders: True when at least one collider mesh is present in the
             scene; used to reject linear-only solvers that do not support
             contact.
@@ -532,6 +610,7 @@ class CollisionData:
     collider_velocities: wp.array[wp.vec3]
     rigidity_operator: tuple[sp.BsrMatrix, sp.BsrMatrix] | None
     collider_impulse: wp.array[wp.vec3]
+    collider_environment_offsets: wp.array[int] | None = None
     has_colliders: bool = False
 
 
@@ -1890,6 +1969,7 @@ class _APGDPrototypeResult:
 
     iteration_count: int
     residual: tuple[float, float]
+    residual_inf: tuple[float, float]
     restart_count: int
     step_size: float
     restart_dot: float
@@ -1911,6 +1991,7 @@ class _APGDPrototypeSolver:
         diagnostic_step_size: float = 0.25,
         min_step_size: float = 1.0e-4,
         max_step_size: float = 0.5,
+        normalize_residuals_by_environment: bool = False,
         temporary_store: fem.TemporaryStore | None = None,
     ) -> None:
         if not 0.0 < min_step_size <= max_step_size <= 0.5:
@@ -1935,6 +2016,7 @@ class _APGDPrototypeSolver:
         self.max_step_size = max_step_size
         self.max_iterations = max_iterations
         self.diagnostic_step_size = diagnostic_step_size
+        self.normalize_residuals_by_environment = normalize_residuals_by_environment
         if residual_tolerance is None:
             self.stress_residual_tolerance = -1.0
             self.contact_residual_tolerance = -1.0
@@ -1951,6 +2033,21 @@ class _APGDPrototypeSolver:
                 f"got {self.collision.collider_impulse.shape[0]} impulses and "
                 f"{self.momentum.velocity.shape[0]} velocity nodes."
             )
+
+        stress_environment_offsets = self.rheology.strain_environment_offsets
+        contact_environment_offsets = self.collision.collider_environment_offsets
+        if (stress_environment_offsets is None) != (contact_environment_offsets is None):
+            raise ValueError("APGD requires both strain and collider environment offsets for separate-world solves.")
+        if stress_environment_offsets is None:
+            self.environment_count = 1
+        else:
+            self.environment_count = stress_environment_offsets.shape[0] - 1
+            contact_environment_count = contact_environment_offsets.shape[0] - 1
+            if contact_environment_count != self.environment_count:
+                raise ValueError(
+                    "APGD strain and collider environment counts must match, got "
+                    f"{self.environment_count} and {contact_environment_count}."
+                )
 
         self.delassus_operator.require_strain_mat_transpose()
         self.delassus_operator.compute_diagonal_factorization(split_mass=True)
@@ -1987,25 +2084,95 @@ class _APGDPrototypeSolver:
             self.collision.collider_impulse,
             temporary_store,
         )
+        self.stress_environment = fem.borrow_temporary(
+            temporary_store,
+            shape=(self.rheology.stress.shape[0],),
+            dtype=int,
+            device=self.device,
+        )
+        self.contact_environment = fem.borrow_temporary(
+            temporary_store,
+            shape=(self.collision.collider_impulse.shape[0],),
+            dtype=int,
+            device=self.device,
+        )
+        self.stress_l2_scale = fem.borrow_temporary(
+            temporary_store,
+            shape=(self.environment_count,),
+            dtype=float,
+            device=self.device,
+        )
+        self.contact_l2_scale = fem.borrow_temporary(
+            temporary_store,
+            shape=(self.environment_count,),
+            dtype=float,
+            device=self.device,
+        )
+        self.stress_environment.zero_()
+        self.contact_environment.zero_()
+        if stress_environment_offsets is None:
+            stress_l2_scale = math.sqrt(1 + self.rheology.stress.shape[0])
+            contact_l2_scale = math.sqrt(1 + self.collision.collider_impulse.shape[0])
+            self.stress_l2_scale.fill_(stress_l2_scale if normalize_residuals_by_environment else 1.0)
+            self.contact_l2_scale.fill_(contact_l2_scale if normalize_residuals_by_environment else 1.0)
+        else:
+            fill_block_dim = 256 if self.device.is_cuda else 1
+            wp.launch(
+                _fill_environment_ids,
+                dim=(self.environment_count, fill_block_dim),
+                inputs=[stress_environment_offsets],
+                outputs=[self.stress_environment],
+                block_dim=fill_block_dim,
+                device=self.device,
+            )
+            wp.launch(
+                _fill_environment_ids,
+                dim=(self.environment_count, fill_block_dim),
+                inputs=[contact_environment_offsets],
+                outputs=[self.contact_environment],
+                block_dim=fill_block_dim,
+                device=self.device,
+            )
+            if normalize_residuals_by_environment:
+                wp.launch(
+                    _compute_environment_l2_tolerance_scales,
+                    dim=self.environment_count,
+                    inputs=[stress_environment_offsets],
+                    outputs=[self.stress_l2_scale],
+                    device=self.device,
+                )
+                wp.launch(
+                    _compute_environment_l2_tolerance_scales,
+                    dim=self.environment_count,
+                    inputs=[contact_environment_offsets],
+                    outputs=[self.contact_l2_scale],
+                    device=self.device,
+                )
+            else:
+                self.stress_l2_scale.fill_(1.0)
+                self.contact_l2_scale.fill_(1.0)
+
         self.stress_metrics = fem.borrow_temporary(
             temporary_store,
-            shape=(2, self.rheology.stress.shape[0]),
+            shape=(3, self.rheology.stress.shape[0]),
             dtype=float,
             device=self.rheology.stress.device,
         )
         self.contact_metrics = fem.borrow_temporary(
             temporary_store,
-            shape=(2, self.collision.collider_impulse.shape[0]),
+            shape=(3, self.collision.collider_impulse.shape[0]),
             dtype=float,
             device=self.collision.collider_impulse.device,
         )
-        self.stress_metric_reduction = ArrayPairSum(
+        self.stress_metric_reduction = ArrayAPGDMetricReduction(
             self.rheology.stress.shape[0],
+            batch_offsets=stress_environment_offsets,
             device=self.rheology.stress.device,
             temporary_store=temporary_store,
         )
-        self.contact_metric_reduction = ArrayPairSum(
+        self.contact_metric_reduction = ArrayAPGDMetricReduction(
             self.collision.collider_impulse.shape[0],
+            batch_offsets=contact_environment_offsets,
             device=self.collision.collider_impulse.device,
             temporary_store=temporary_store,
         )
@@ -2015,7 +2182,7 @@ class _APGDPrototypeSolver:
         self.contact_metric_sum = self.contact_metric_reduction.compute(self.contact_metrics)
         self.state = fem.borrow_temporary(
             temporary_store,
-            shape=(APGD_STATE_SIZE,),
+            shape=(APGD_STATE_SIZE, self.environment_count),
             dtype=float,
             device=self.rheology.stress.device,
         )
@@ -2035,7 +2202,7 @@ class _APGDPrototypeSolver:
         self.base_collider_velocity.assign(self.collision.collider_velocities)
         wp.launch(
             kernel=apgd_initialize_state,
-            dim=1,
+            dim=self.environment_count,
             inputs=[
                 step_size,
                 self.max_iterations,
@@ -2163,6 +2330,7 @@ class _APGDPrototypeSolver:
             dim=self.delassus_operator.size,
             inputs=[
                 self.state,
+                self.stress_environment,
                 self.condition,
                 self.rheology.yield_params,
                 self.rheology.strain_node_volume,
@@ -2180,6 +2348,7 @@ class _APGDPrototypeSolver:
             dim=self.delassus_operator.size,
             inputs=[
                 self.state,
+                self.stress_environment,
                 self.condition,
                 self.rheology.stress,
                 self.next_stress,
@@ -2251,6 +2420,7 @@ class _APGDPrototypeSolver:
             dim=self.collision.collider_impulse.shape[0],
             inputs=[
                 self.state,
+                self.contact_environment,
                 self.condition,
                 self.collider_delassus_diagonal,
                 self.collision.collider_friction,
@@ -2268,6 +2438,7 @@ class _APGDPrototypeSolver:
             dim=self.collision.collider_impulse.shape[0],
             inputs=[
                 self.state,
+                self.contact_environment,
                 self.condition,
                 self.collision.collider_impulse,
                 self.next_collider_impulse,
@@ -2311,11 +2482,13 @@ class _APGDPrototypeSolver:
         )
         self.finalize_restart_launch = wp.launch(
             kernel=apgd_finalize_restart,
-            dim=1,
+            dim=self.environment_count,
             inputs=[
                 self.accelerated,
                 self.stress_metric_sum,
                 self.contact_metric_sum,
+                self.stress_l2_scale,
+                self.contact_l2_scale,
                 self.state,
                 self.condition,
             ],
@@ -2323,7 +2496,7 @@ class _APGDPrototypeSolver:
         )
         self.finalize_bb_launch = wp.launch(
             kernel=apgd_finalize_bb,
-            dim=1,
+            dim=self.environment_count,
             inputs=[
                 self.accelerated,
                 self.min_step_size,
@@ -2400,16 +2573,20 @@ class _APGDPrototypeSolver:
 
         state = self.state.numpy()
         return _APGDPrototypeResult(
-            iteration_count=int(state[APGD_STATE_ITERATION_COUNT]),
+            iteration_count=int(np.max(state[APGD_STATE_ITERATION_COUNT])),
             residual=(
-                float(state[APGD_STATE_STRESS_RESIDUAL]),
-                float(state[APGD_STATE_CONTACT_RESIDUAL]),
+                float(np.max(state[APGD_STATE_STRESS_RESIDUAL])),
+                float(np.max(state[APGD_STATE_CONTACT_RESIDUAL])),
             ),
-            restart_count=int(state[APGD_STATE_RESTART_COUNT]),
-            step_size=float(state[APGD_STATE_STEP_SIZE]),
-            restart_dot=float(state[APGD_STATE_RESTART_DOT]),
-            bb_numerator=float(state[APGD_STATE_BB_NUMERATOR]),
-            bb_denominator=float(state[APGD_STATE_BB_DENOMINATOR]),
+            residual_inf=(
+                float(np.max(state[APGD_STATE_STRESS_RESIDUAL_INF])),
+                float(np.max(state[APGD_STATE_CONTACT_RESIDUAL_INF])),
+            ),
+            restart_count=int(np.max(state[APGD_STATE_RESTART_COUNT])),
+            step_size=float(np.min(state[APGD_STATE_STEP_SIZE])),
+            restart_dot=float(np.sum(state[APGD_STATE_RESTART_DOT])),
+            bb_numerator=float(np.sum(state[APGD_STATE_BB_NUMERATOR])),
+            bb_denominator=float(np.sum(state[APGD_STATE_BB_DENOMINATOR])),
         )
 
     def solve(self, use_graph: bool = False):
@@ -2459,6 +2636,10 @@ class _APGDPrototypeSolver:
         self.contact_metrics.release()
         self.stress_metric_reduction.release()
         self.contact_metric_reduction.release()
+        self.stress_environment.release()
+        self.contact_environment.release()
+        self.stress_l2_scale.release()
+        self.contact_l2_scale.release()
         self.state.release()
         self.condition.release()
         self.collider_inv_mass.release()
@@ -2478,6 +2659,7 @@ def _run_rheology_apgd(
     diagnostic_step_size: float = 0.25,
     min_step_size: float = 1.0e-4,
     max_step_size: float = 0.5,
+    normalize_residuals_by_environment: bool = False,
     use_graph: bool = False,
     temporary_store: fem.TemporaryStore | None = None,
 ) -> tuple[Any, _APGDPrototypeResult | None]:
@@ -2499,6 +2681,7 @@ def _run_rheology_apgd(
         diagnostic_step_size=diagnostic_step_size,
         min_step_size=min_step_size,
         max_step_size=max_step_size,
+        normalize_residuals_by_environment=normalize_residuals_by_environment,
         temporary_store=temporary_store,
     )
 
@@ -2717,7 +2900,8 @@ def solve_rheology(
             only support solid materials without contacts.
         max_iterations: Maximum number of nonlinear iterations.
         tolerance: Solver tolerance for the projected stress residual and,
-            for APGD, the collider contact residual (L2 norm).
+            for APGD, the collider contact residual (scaled L2 and block
+            infinity norms, checked independently per environment).
         momentum: :class:`MomentumData` containing per-node inverse volume
             and velocity DOFs.
         rheology: :class:`RheologyData` containing strain/compliance matrices,
@@ -2746,21 +2930,21 @@ def solve_rheology(
         if solvers != ("apgd",):
             raise ValueError(f"APGD must be used as the only rheology solver, got {solver!r}.")
 
-        stress_tolerance = tolerance * math.sqrt(1 + rheology.stress.shape[0])
-        contact_tolerance = tolerance * math.sqrt(1 + collision.collider_impulse.shape[0])
         solve_graph, result = _run_rheology_apgd(
             max_iterations=max_iterations,
             momentum=momentum,
             rheology=rheology,
             collision=collision,
-            residual_tolerance=(stress_tolerance, contact_tolerance),
+            residual_tolerance=tolerance,
+            normalize_residuals_by_environment=True,
             use_graph=use_graph,
             temporary_store=temporary_store,
         )
         if verbose and result is not None:
             print(
                 f"APGD terminated after {result.iteration_count} iterations with "
-                f"stress/contact residuals {result.residual}"
+                f"stress/contact L2 residuals {result.residual} and "
+                f"block-infinity residuals {result.residual_inf}"
             )
         return solve_graph
 
