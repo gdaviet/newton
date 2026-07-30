@@ -94,6 +94,12 @@ class Example:
             "all particles are above the ground",
             lambda q, qd: q[2] > -voxel_size,
         )
+        velocity_gradient = self.state_0.mpm.particle_qd_grad.numpy()
+        divergence = np.trace(velocity_gradient, axis1=1, axis2=2)
+        relative_divergence = np.linalg.norm(divergence) / max(np.linalg.norm(velocity_gradient), 1.0e-12)
+        if relative_divergence > 0.5:
+            raise ValueError(f"Relative particle velocity divergence is too large: {relative_divergence}")
+
         # Check that some particles flowed through the funnel aperture
         positions = self.state_0.particle_q.numpy()
         below_funnel = np.sum(positions[:, 2] < self.funnel_offset_z)

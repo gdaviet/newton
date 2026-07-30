@@ -203,6 +203,12 @@ def _stress_projection_reference(stress, yield_params):
     else:
         yield_stress = cohesion + friction_slope * p2
 
+    if yield_params[0] >= 1.0e12 and yield_params[1] >= 1.0e12:
+        projected = np.array(stress, dtype=np.float64)
+        if tangential_norm > yield_stress:
+            projected[1:] *= yield_stress / tangential_norm
+        return projected
+
     if pmin <= normal_value <= pmax and tangential_norm <= yield_stress:
         return np.array(stress, dtype=np.float64)
 
@@ -325,9 +331,13 @@ def _coupled_apgd_reference_step(
     delassus[0, 1:] = 0.0
     delassus[1:, 0] = 0.0
     viscous_delassus = np.eye(6) + viscosity_scale * delassus
+    if yield_params[0] >= 1.0e12 and yield_params[1] >= 1.0e12:
+        viscous_delassus[0, 0] = 1.0
     effective_delassus = np.linalg.solve(viscous_delassus, delassus)
     stress_preconditioner = np.trace(effective_delassus)
     yield_stress = stress + viscosity_scale * stress_response
+    if yield_params[0] >= 1.0e12 and yield_params[1] >= 1.0e12:
+        yield_stress[0] = stress[0]
     pmax = float(yield_params[0])
     pmin = -max(0.0, float(yield_params[1]))
     p1 = pmin + 0.5 * pmax
@@ -488,6 +498,17 @@ def test_stress_projection_cases(test, device):
 
     np.testing.assert_allclose(actual, expected, rtol=4.0e-6, atol=3.0e-6)
 
+    fluid_stress = np.array([[-0.908248, 0.2, -0.1, 0.0, 0.0, 0.3]], dtype=np.float32)
+    fluid_yield_params = np.array([_yield_params(1.0e15, 1.0, 0.0, 0.0)])
+    expected_fluid_stress = fluid_stress.copy()
+    expected_fluid_stress[:, 1:] = 0.0
+    np.testing.assert_allclose(
+        _project_stresses(fluid_stress, fluid_yield_params, device),
+        expected_fluid_stress,
+        rtol=0.0,
+        atol=1.0e-6,
+    )
+
 
 def test_stress_projection_properties(test, device):
     """Preserve feasibility, direction, and idempotence of stress projections."""
@@ -601,6 +622,31 @@ def test_coupled_apgd_uses_orthogonal_stress_warmstart(test, device):
     expected_velocity = base_velocity + 0.5 * _STRAIN_OPERATOR.T @ expected_stress
 
     np.testing.assert_allclose(rheology.stress.numpy()[0], expected_stress, rtol=2.0e-5, atol=5.0e-6)
+    np.testing.assert_allclose(momentum.velocity.numpy()[0], expected_velocity, rtol=2.0e-5, atol=5.0e-6)
+
+
+def test_coupled_apgd_preserves_viscous_stress_warmstart(test, device):
+    """Preserve total viscous stress outside the rate-independent yield set."""
+    del test
+    initial_stress = np.array([-3.0, 1.2, 1.6, 0.0, 0.0, 0.0], dtype=np.float32)
+    initial_impulse = np.zeros(3, dtype=np.float32)
+    momentum, rheology, collision, base_velocity, _collider_velocity, _strain_rhs, yield_params = (
+        _make_coupled_apgd_data(device, initial_stress, initial_impulse)
+    )
+    yield_params[5] = 0.4
+    rheology.yield_params.assign([yield_params])
+    rheology.has_viscosity = True
+
+    with wp.ScopedDevice(device):
+        _solve_rheology_apgd_prototype(
+            max_iterations=0,
+            momentum=momentum,
+            rheology=rheology,
+            collision=collision,
+        )
+
+    expected_velocity = base_velocity + 0.5 * _STRAIN_OPERATOR.T @ initial_stress
+    np.testing.assert_allclose(rheology.stress.numpy()[0], initial_stress, rtol=2.0e-5, atol=5.0e-6)
     np.testing.assert_allclose(momentum.velocity.numpy()[0], expected_velocity, rtol=2.0e-5, atol=5.0e-6)
 
 
@@ -854,6 +900,49 @@ def test_coupled_apgd_matches_gs_with_large_viscosity(test, device):
     np.testing.assert_allclose(apgd_stress, gs[1].stress.numpy(), rtol=3.0e-5, atol=8.0e-6)
     np.testing.assert_allclose(apgd_impulse, gs[2].collider_impulse.numpy(), rtol=3.0e-5, atol=8.0e-6)
     np.testing.assert_allclose(apgd_velocity, gs[0].velocity.numpy(), rtol=3.0e-5, atol=8.0e-6)
+
+
+def test_coupled_apgd_matches_gs_for_incompressible_viscous_flow(test, device):
+    """Match GS for viscous flow with an unconstrained pressure multiplier."""
+    del test
+    initial_stress = np.array([-0.5, 0.3, 0.0, 0.0, 0.0, 0.2], dtype=np.float32)
+    initial_impulse = np.array([0.2, 0.05, 0.0], dtype=np.float32)
+    apgd = _make_coupled_apgd_data(device, initial_stress, initial_impulse)
+    gs = _make_coupled_apgd_data(device, initial_stress, initial_impulse)
+    yield_params = _yield_params(1.0e15, 1.0, 0.0, 0.0)
+    yield_params[5] = 1.0e4
+
+    for _momentum, rheology, _collision, *_rest in (apgd, gs):
+        rheology.yield_params.assign([yield_params])
+        rheology.has_viscosity = True
+
+    with wp.ScopedDevice(device):
+        _solve_rheology_apgd_prototype(
+            max_iterations=1000,
+            momentum=apgd[0],
+            rheology=apgd[1],
+            collision=apgd[2],
+            residual_tolerance=1.0e-6,
+        )
+        solve_rheology(
+            "gs",
+            max_iterations=400,
+            tolerance=1.0e-6,
+            momentum=gs[0],
+            rheology=gs[1],
+            collision=gs[2],
+            use_graph=False,
+            verbose=False,
+        )
+
+    np.testing.assert_allclose(apgd[1].stress.numpy(), gs[1].stress.numpy(), rtol=3.0e-5, atol=8.0e-6)
+    np.testing.assert_allclose(
+        apgd[2].collider_impulse.numpy(),
+        gs[2].collider_impulse.numpy(),
+        rtol=3.0e-5,
+        atol=8.0e-6,
+    )
+    np.testing.assert_allclose(apgd[0].velocity.numpy(), gs[0].velocity.numpy(), rtol=3.0e-5, atol=8.0e-6)
 
 
 def test_coupled_apgd_uses_fixed_diagnostic_step(test, device):
@@ -1127,6 +1216,12 @@ add_function_test(
 )
 add_function_test(
     TestImplicitMPMAPGDProjections,
+    "test_coupled_apgd_preserves_viscous_stress_warmstart",
+    test_coupled_apgd_preserves_viscous_stress_warmstart,
+    devices=devices,
+)
+add_function_test(
+    TestImplicitMPMAPGDProjections,
     "test_coupled_apgd_reaches_fixed_point",
     test_coupled_apgd_reaches_fixed_point,
     devices=devices,
@@ -1159,6 +1254,12 @@ add_function_test(
     TestImplicitMPMAPGDProjections,
     "test_coupled_apgd_matches_gs_with_large_viscosity",
     test_coupled_apgd_matches_gs_with_large_viscosity,
+    devices=devices,
+)
+add_function_test(
+    TestImplicitMPMAPGDProjections,
+    "test_coupled_apgd_matches_gs_for_incompressible_viscous_flow",
+    test_coupled_apgd_matches_gs_for_incompressible_viscous_flow,
     devices=devices,
 )
 add_function_test(

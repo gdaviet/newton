@@ -11,7 +11,7 @@ Progress:
   states, implements the Algorithm B.2 inertia/restart, computes the scaled
   BB2 step from raw coupled responses, and checks stress and contact residuals
   independently.
-- Twenty test functions generate 60 passing cases across CPU, `cuda:0`, and
+- Twenty-two test functions generate 66 passing cases across CPU, `cuda:0`, and
   `cuda:1`.
 - On the synthetic coupled regression, acceleration reaches a `1e-4`
   two-family residual tolerance in 55 iterations, compared with 884
@@ -42,6 +42,10 @@ Progress:
   resolvent keeps the large-viscosity mapping finite. Converged coupled
   regressions agree with the existing Gauss-Seidel solver for moderate and
   large non-associated viscosity.
+- Unbounded fluid pressure uses an exact cylindrical projection instead of
+  the finite \(10^{15}\) pressure polygon. This preserves the float32 pressure
+  multiplier, excludes it from the viscous flow metric, and restores
+  incompressibility in the complete funnel example.
 - Sparse associated, sparse viscous, and fixed-grid non-associated granular
   examples pass CUDA smoke tests. The fixed-grid test also covers collider
   contact and outer graph capture.
@@ -279,6 +283,14 @@ non-associated bias changes its direction and viscosity changes the stress
 variable in which it is applied. The resolvent prevents the explicit
 \(-(\eta/V)u_\sigma\) map-back from amplifying updates when viscosity or the
 inverse strain-node volume is large.
+
+When both pressure bounds are the infinite material sentinel, the admissible
+set is cylindrical: pressure is an unconstrained incompressibility multiplier.
+In that case, set \((T_\eta)_{NN}=1\), omit the analytically cancelling viscous
+pressure shift, preserve the normal stress exactly in the projector, and
+project only the deviatoric component. This avoids subtracting
+\(O(10^{15})\) polygon vertices to recover ordinary fluid pressures in
+float32.
 
 For every enabled collider node, split the relative velocity into normal and
 tangential parts and apply the de Saxcé correction
@@ -632,6 +644,9 @@ run.
    collider contact on CUDA.
 7. [Complete] Run the full viscous-funnel example and compare a
    large-viscosity coupled regression with Gauss-Seidel on CPU and CUDA.
+8. [Complete] Preserve the unbounded pressure multiplier with an exact
+   cylindrical projection, retain viscous total-stress warm starts, and
+   enforce a relative-divergence check in the viscous example.
 
 The raw coupled operator, exact admissible-set projection, acceleration, and
 residual framework remain shared with associated materials. A future
@@ -650,6 +665,8 @@ Projection tests:
 - stress interior, tensile/compressive caps, all three roof segments, every
   corner, cohesion, zero friction, zero deviatoric input, idempotence, and
   deviatoric rotational invariance;
+- unbounded fluid pressure remains unchanged while deviatoric stress projects
+  onto the cylindrical yield set;
 - compare projected points against a small NumPy boundary enumeration or dense
   sampled reference and verify feasibility and projection optimality.
 
@@ -674,6 +691,8 @@ Solver tests:
 - non-associated and viscous one-step agreement with an independent reference;
 - converged moderate- and large-viscosity non-associated agreement with the
   existing Gauss-Seidel solver;
+- incompressible viscous agreement with Gauss-Seidel and preservation of
+  viscous total-stress warm starts;
 - inactive fixed-grid capacity rows do not enter the specialized stencil
   evaluation.
 
@@ -690,12 +709,14 @@ corrections, viscosity, coupled Algorithm B.2 acceleration, guarded
 raw-response BB2 updates, device-resident stopping reductions, and feasible
 final reconstruction.
 
-The focused suite has 60 passing CPU/CUDA cases. Scene-level tests cover
+The focused suite has 66 passing CPU/CUDA cases. Scene-level tests cover
 associated snow, non-associated granular flow with fixed-grid inactive
 capacity, the complete viscous funnel, collider contact, and CUDA graph
 capture. Dedicated regressions also cover per-environment APGD reductions,
 independent-world replay, empty environments, fixed-grid capacity padding,
-large-viscosity agreement with Gauss-Seidel, and multi-world outer graph
-capture. Remaining work is broader regression testing and further scene-level
+large-viscosity and incompressible-fluid agreement with Gauss-Seidel, viscous
+warm starts, and multi-world outer graph capture. The viscous funnel now
+checks relative particle-velocity divergence rather than finite state alone.
+Remaining work is broader regression testing and further scene-level
 performance/robustness tuning, including additional accuracy thresholds and
 cross-device non-associated timing.

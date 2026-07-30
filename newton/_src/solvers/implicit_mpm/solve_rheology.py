@@ -2945,9 +2945,6 @@ def solve_rheology(
             momentum=momentum,
             rheology=rheology,
             collision=collision,
-            # The viscous block metric is approximate, so keep BB steps within
-            # the globally stable initial bound while retaining APGD inertia.
-            max_step_size=0.25 if rheology.has_viscosity else 0.5,
             residual_tolerance=tolerance,
             normalize_residuals_by_environment=True,
             use_graph=use_graph,

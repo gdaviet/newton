@@ -13,6 +13,9 @@ from .apgd_solver_kernels import APGD_STATE_BETA, APGD_STATE_STEP_SIZE
 _DELASSUS_PROXIMAL_REG = wp.constant(1.0e-6)
 """Cutoff for the trace of the diagonal block of the Delassus operator to disable constraints"""
 
+_UNBOUNDED_YIELD_THRESHOLD = wp.constant(1.0e12)
+"""Value above which both pressure bounds are treated as unbounded"""
+
 _SLIDING_NEWTON_TOL = wp.constant(1.0e-7)
 """Tolerance for the Newton method to solve for the sliding velocity"""
 
@@ -717,6 +720,19 @@ def project_stress_orthogonal(
     r_T_n = wp.length(r_T)
 
     pmin, pmax = normal_yield_bounds(yield_params)
+    if pmax >= _UNBOUNDED_YIELD_THRESHOLD and -pmin >= _UNBOUNDED_YIELD_THRESHOLD:
+        # Avoid subtracting O(1e15) polygon vertices to recover ordinary
+        # fluid pressures. The unbounded set is cylindrical in this regime.
+        yield_stress, _slope, _region_min, _region_max = shear_yield_stress(yield_params, r_N)
+        if r_T_n <= yield_stress:
+            return r
+        projected = vec6(0.0)
+        projected[0] = r_N
+        if r_T_n > 0.0:
+            projected += (yield_stress / r_T_n) * r_T
+            projected[0] = r_N
+        return projected
+
     mu = wp.where(pmax > 0.0, wp.max(0.0, yield_params[3] / pmax), 0.0)
     cohesion = wp.max(0.0, yield_params[2])
 
@@ -780,24 +796,50 @@ def apgd_stress_viscosity_scale(
 
 
 @wp.func
-def apgd_stress_preconditioner(
+def apgd_has_unbounded_pressure(
+    yield_params: YieldParamVec,
+):
+    return yield_params[0] >= _UNBOUNDED_YIELD_THRESHOLD and yield_params[1] >= _UNBOUNDED_YIELD_THRESHOLD
+
+
+@wp.func
+def apgd_stress_metric_diagonal(
+    yield_params: YieldParamVec,
     delassus_diagonal: vec6,
     viscosity_scale: float,
 ):
     viscous_diagonal = vec6(1.0) + viscosity_scale * delassus_diagonal
+    if apgd_has_unbounded_pressure(yield_params):
+        # With no pressure bounds, this mode is the Lagrange multiplier for
+        # incompressibility and must not inherit the viscous flow metric.
+        viscous_diagonal[0] = 1.0
+    return viscous_diagonal
+
+
+@wp.func
+def apgd_stress_preconditioner(
+    yield_params: YieldParamVec,
+    delassus_diagonal: vec6,
+    viscosity_scale: float,
+):
+    viscous_diagonal = apgd_stress_metric_diagonal(yield_params, delassus_diagonal, viscosity_scale)
     return wp.dot(wp.cw_div(delassus_diagonal, viscous_diagonal), vec6(1.0))
 
 
 @wp.func
 def apgd_yield_stress_delta_to_stress(
     yield_stress_delta: vec6,
+    yield_params: YieldParamVec,
     delassus_diagonal: vec6,
     delassus_rotation: mat55,
     viscosity_scale: float,
 ):
     local_delta = vec6(yield_stress_delta[0])
     local_delta[1:6] = yield_stress_delta[1:6] @ delassus_rotation
-    local_delta = wp.cw_div(local_delta, vec6(1.0) + viscosity_scale * delassus_diagonal)
+    local_delta = wp.cw_div(
+        local_delta,
+        apgd_stress_metric_diagonal(yield_params, delassus_diagonal, viscosity_scale),
+    )
 
     stress_delta = vec6(local_delta[0])
     stress_delta[1:6] = delassus_rotation @ local_delta[1:6]
@@ -807,13 +849,17 @@ def apgd_yield_stress_delta_to_stress(
 @wp.func
 def apgd_stress_delta_to_yield_stress(
     stress_delta: vec6,
+    yield_params: YieldParamVec,
     delassus_diagonal: vec6,
     delassus_rotation: mat55,
     viscosity_scale: float,
 ):
     local_delta = vec6(stress_delta[0])
     local_delta[1:6] = stress_delta[1:6] @ delassus_rotation
-    local_delta = wp.cw_mul(local_delta, vec6(1.0) + viscosity_scale * delassus_diagonal)
+    local_delta = wp.cw_mul(
+        local_delta,
+        apgd_stress_metric_diagonal(yield_params, delassus_diagonal, viscosity_scale),
+    )
 
     yield_stress_delta = vec6(local_delta[0])
     yield_stress_delta[1:6] = delassus_rotation @ local_delta[1:6]
@@ -833,14 +879,19 @@ def apgd_project_stress_step(
     """Project one viscosity-preconditioned stress fixed-point step."""
 
     viscosity_scale = apgd_stress_viscosity_scale(yield_params, strain_node_volume)
-    preconditioner = apgd_stress_preconditioner(delassus_diagonal, viscosity_scale)
+    preconditioner = apgd_stress_preconditioner(yield_params, delassus_diagonal, viscosity_scale)
     yield_stress = stress + viscosity_scale * response
+    if apgd_has_unbounded_pressure(yield_params):
+        # The viscous pressure shift cancels analytically when pressure is
+        # unconstrained; omitting it avoids cancellation at fluid scales.
+        yield_stress[0] = stress[0]
     corrected_response = apply_stress_desaxce_correction(yield_params, yield_stress, response)
     trial_yield_stress = yield_stress - (step_size / preconditioner) * corrected_response
     projected_yield_stress = project_stress_orthogonal(trial_yield_stress, yield_params)
     yield_stress_delta = projected_yield_stress - yield_stress
     return stress + apgd_yield_stress_delta_to_stress(
         yield_stress_delta,
+        yield_params,
         delassus_diagonal,
         delassus_rotation,
         viscosity_scale,
@@ -855,7 +906,8 @@ def apgd_project_stress(
     """Project APGD stress warm starts onto the admissible yield set."""
 
     i = wp.tid()
-    stress[i] = project_stress_orthogonal(stress[i], yield_params[i])
+    if get_viscosity(yield_params[i]) <= 0.0:
+        stress[i] = project_stress_orthogonal(stress[i], yield_params[i])
 
 
 @wp.kernel
@@ -865,7 +917,7 @@ def preprocess_stress_and_strain_apgd(
     stress: wp.array[vec6],
     yield_params: wp.array[YieldParamVec],
 ):
-    """Prepare the strain right-hand side and project an APGD stress warm start."""
+    """Prepare the strain right-hand side and an APGD stress warm start."""
 
     tau_i = wp.tid()
     params = yield_params[tau_i]
@@ -879,7 +931,10 @@ def preprocess_stress_and_strain_apgd(
         params[1] = 0.0
         yield_params[tau_i] = params
 
-    stress[tau_i] = project_stress_orthogonal(stress[tau_i], params)
+    # Viscoplastic total stress need not lie on the rate-independent yield
+    # surface; only its shifted yield stress is projected during iteration.
+    if get_viscosity(params) <= 0.0:
+        stress[tau_i] = project_stress_orthogonal(stress[tau_i], params)
 
 
 @wp.func
@@ -1193,7 +1248,7 @@ def apgd_project_stress_response(
         return
 
     viscosity_scale = apgd_stress_viscosity_scale(yield_params[tau_i], strain_node_volume[tau_i])
-    preconditioner = apgd_stress_preconditioner(delassus_diagonal[tau_i], viscosity_scale)
+    preconditioner = apgd_stress_preconditioner(yield_params[tau_i], delassus_diagonal[tau_i], viscosity_scale)
     if preconditioner <= 0.0:
         next_stress[tau_i] = extrapolated_stress[tau_i]
         return
@@ -1257,10 +1312,11 @@ def apgd_compute_stress_restart_metrics(
         return
 
     viscosity_scale = apgd_stress_viscosity_scale(yield_params[tau_i], strain_node_volume[tau_i])
-    preconditioner = apgd_stress_preconditioner(delassus_diagonal[tau_i], viscosity_scale)
+    preconditioner = apgd_stress_preconditioner(yield_params[tau_i], delassus_diagonal[tau_i], viscosity_scale)
     stress_delta = next_stress[tau_i] - stress[tau_i]
     yield_stress_delta = apgd_stress_delta_to_yield_stress(
         stress_delta,
+        yield_params[tau_i],
         delassus_diagonal[tau_i],
         delassus_rotation[tau_i],
         viscosity_scale,
@@ -1282,6 +1338,7 @@ def apgd_compute_stress_restart_metrics(
         diagnostic_stress_delta = diagnostic_stress - extrapolated_stress[tau_i]
         diagnostic_yield_stress_delta = apgd_stress_delta_to_yield_stress(
             diagnostic_stress_delta,
+            yield_params[tau_i],
             delassus_diagonal[tau_i],
             delassus_rotation[tau_i],
             viscosity_scale,
@@ -1319,10 +1376,13 @@ def apgd_compute_stress_bb_metrics(
     delta_stress = stress[tau_i] - previous_stress[tau_i]
     delta_response = response[tau_i] - previous_response[tau_i]
     viscosity_scale = apgd_stress_viscosity_scale(yield_params[tau_i], strain_node_volume[tau_i])
-    delta_yield_stress = delta_stress + viscosity_scale * delta_response
+    viscous_delta_response = delta_response
+    if apgd_has_unbounded_pressure(yield_params[tau_i]):
+        viscous_delta_response[0] = 0.0
+    delta_yield_stress = delta_stress + viscosity_scale * viscous_delta_response
     numerator = wp.dot(delta_yield_stress, delta_response)
     denominator = float(0.0)
-    preconditioner = apgd_stress_preconditioner(delassus_diagonal[tau_i], viscosity_scale)
+    preconditioner = apgd_stress_preconditioner(yield_params[tau_i], delassus_diagonal[tau_i], viscosity_scale)
     if preconditioner > 0.0:
         denominator = wp.length_sq(delta_response) / preconditioner
     metrics[0, tau_i] = numerator
