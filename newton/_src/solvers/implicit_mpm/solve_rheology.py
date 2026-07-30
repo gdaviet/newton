@@ -16,7 +16,31 @@ import warp.sparse as sp
 from warp.fem.linalg import array_axpy
 from warp.optim.linear import LinearOperator, cg, cr, gmres
 
+from .apgd_solver_kernels import (
+    APGD_STATE_BB_DENOMINATOR,
+    APGD_STATE_BB_NUMERATOR,
+    APGD_STATE_CONTACT_RESIDUAL,
+    APGD_STATE_ITERATION_COUNT,
+    APGD_STATE_RESTART_COUNT,
+    APGD_STATE_RESTART_DOT,
+    APGD_STATE_SIZE,
+    APGD_STATE_STEP_SIZE,
+    APGD_STATE_STRESS_RESIDUAL,
+    apgd_finalize_bb,
+    apgd_finalize_iteration,
+    apgd_finalize_restart,
+    apgd_initialize_state,
+)
 from .contact_solver_kernels import (
+    apgd_apply_nodal_impulse,
+    apgd_compute_contact_bb_metrics,
+    apgd_compute_contact_restart_metrics,
+    apgd_compute_nodal_delassus_diagonal,
+    apgd_evaluate_nodal_contact,
+    apgd_evaluate_subgrid_contact,
+    apgd_extrapolate_collider_impulse,
+    apgd_project_collider_impulse,
+    apgd_project_contact_response,
     apply_nodal_impulse_warmstart,
     apply_subgrid_impulse,
     apply_subgrid_impulse_warmstart,
@@ -27,6 +51,10 @@ from .contact_solver_kernels import (
 )
 from .rheology_solver_kernels import (
     YieldParamVec,
+    apgd_compute_stress_bb_metrics,
+    apgd_compute_stress_restart_metrics,
+    apgd_extrapolate_stress,
+    apgd_project_stress_response,
     apply_stress_delta_jacobi,
     apply_stress_gs,
     apply_velocity_delta,
@@ -43,6 +71,7 @@ from .rheology_solver_kernels import (
     fill_batch_transpose,
     globalize_batch_offsets,
     jacobi_preconditioner,
+    make_apgd_evaluate_stress_kernel,
     make_batched_solve_kernel,
     make_gs_solve_kernel,
     make_jacobi_solve_kernel,
@@ -51,6 +80,7 @@ from .rheology_solver_kernels import (
     mat55,
     postprocess_stress_and_strain,
     preprocess_stress_and_strain,
+    preprocess_stress_and_strain_apgd,
     reorder_strain_mat,
     vec6,
 )
@@ -70,6 +100,21 @@ def _tiled_sum_kernel(
     wp.tile_store(partial_sums[0], wp.tile_sum(tile), offset=block_id)
     tile = wp.tile_load(data[1], shape=_TILED_SUM_BLOCK_DIM, offset=block_id * _TILED_SUM_BLOCK_DIM)
     wp.tile_store(partial_sums[1], wp.tile_max(tile), offset=block_id)
+
+
+@wp.kernel
+def _tiled_pair_sum_kernel(
+    data: wp.array2d[float],
+    partial_sums: wp.array2d[float],
+):
+    """Reduce two scalar channels with preallocated tiled sums."""
+
+    block_id, _ = wp.tid()
+
+    tile = wp.tile_load(data[0], shape=_TILED_SUM_BLOCK_DIM, offset=block_id * _TILED_SUM_BLOCK_DIM)
+    wp.tile_store(partial_sums[0], wp.tile_sum(tile), offset=block_id)
+    tile = wp.tile_load(data[1], shape=_TILED_SUM_BLOCK_DIM, offset=block_id * _TILED_SUM_BLOCK_DIM)
+    wp.tile_store(partial_sums[1], wp.tile_sum(tile), offset=block_id)
 
 
 @wp.kernel
@@ -227,6 +272,74 @@ class ArraySquaredNorm:
     def release(self):
         """Return borrowed temporaries to their pool."""
         for attr in ("partial_sums_a", "partial_sums_b", "batch_result"):
+            temporary = getattr(self, attr, None)
+            if temporary is not None:
+                temporary.release()
+                setattr(self, attr, None)
+
+    def __del__(self):
+        self.release()
+
+
+class ArrayPairSum:
+    """Reduce two scalar channels without allocating inside the iteration loop."""
+
+    def __init__(self, max_length: int, device=None, temporary_store=None):
+        self.tile_size = _TILED_SUM_BLOCK_DIM
+        self.device = device
+        num_blocks = max(1, (max_length + self.tile_size - 1) // self.tile_size)
+        self.partial_sums_a = fem.borrow_temporary(
+            temporary_store,
+            shape=(2, num_blocks),
+            dtype=float,
+            device=self.device,
+        )
+        self.partial_sums_b = fem.borrow_temporary(
+            temporary_store,
+            shape=(2, num_blocks),
+            dtype=float,
+            device=self.device,
+        )
+        self.partial_sums_a.zero_()
+        self.partial_sums_b.zero_()
+        self.sum_launch = wp.launch(
+            _tiled_pair_sum_kernel,
+            dim=(num_blocks, self.tile_size),
+            inputs=(self.partial_sums_a,),
+            outputs=(self.partial_sums_b,),
+            block_dim=self.tile_size,
+            device=self.device,
+            record_cmd=True,
+        )
+
+    def compute(self, data: wp.array2d[float]):
+        """Reduce both rows of ``data`` and return a persistent ``(2, 1)`` view."""
+
+        array_length = data.shape[1]
+        if array_length == 0:
+            self.partial_sums_a[:, :1].zero_()
+            return self.partial_sums_a[:, :1]
+
+        flip_flop = False
+        while True:
+            num_blocks = (array_length + self.tile_size - 1) // self.tile_size
+            partial_sums = (self.partial_sums_a if flip_flop else self.partial_sums_b)[:, :num_blocks]
+
+            self.sum_launch.set_param_at_index(0, data[:, :array_length])
+            self.sum_launch.set_param_at_index(1, partial_sums)
+            self.sum_launch.set_dim((num_blocks, self.tile_size))
+            self.sum_launch.launch()
+
+            array_length = num_blocks
+            data = partial_sums
+            flip_flop = not flip_flop
+            if num_blocks == 1:
+                return data
+
+    def release(self):
+        """Return borrowed temporaries to their pool."""
+
+        for attr in ("partial_sums_a", "partial_sums_b"):
             temporary = getattr(self, attr, None)
             if temporary is not None:
                 temporary.release()
@@ -428,6 +541,7 @@ class _DelassusOperator:
         rheology: RheologyData,
         momentum: MomentumData,
         temporary_store: fem.TemporaryStore | None = None,
+        orthogonal_projection: bool = False,
     ):
         self.rheology = rheology
         self.momentum = momentum
@@ -441,7 +555,7 @@ class _DelassusOperator:
 
         self._has_strain_mat_transpose = False
 
-        self.preprocess_stress_and_strain()
+        self.preprocess_stress_and_strain(orthogonal_projection)
 
     def compute_diagonal_factorization(
         self,
@@ -528,10 +642,10 @@ class _DelassusOperator:
             sp.bsr_set_transpose(dest=self.rheology.transposed_strain_mat, src=self.rheology.strain_mat)
             self._has_strain_mat_transpose = True
 
-    def preprocess_stress_and_strain(self):
+    def preprocess_stress_and_strain(self, orthogonal_projection: bool = False):
         # Project initial stress on yield surface
         wp.launch(
-            kernel=preprocess_stress_and_strain,
+            kernel=preprocess_stress_and_strain_apgd if orthogonal_projection else preprocess_stress_and_strain,
             dim=self.size,
             inputs=[
                 self.rheology.unilateral_strain_offset,
@@ -1770,6 +1884,674 @@ class _SubgridContactSolver(_ContactSolver):
         super().release()
 
 
+@dataclass
+class _APGDPrototypeResult:
+    """Summarize one internal APGD prototype solve."""
+
+    iteration_count: int
+    residual: tuple[float, float]
+    restart_count: int
+    step_size: float
+    restart_dot: float
+    bb_numerator: float
+    bb_denominator: float
+
+
+class _APGDPrototypeSolver:
+    """Run coupled APGD projections for stress and collider contact."""
+
+    def __init__(
+        self,
+        delassus_operator: _DelassusOperator,
+        collision: CollisionData,
+        max_iterations: int,
+        step_size: float = 0.25,
+        accelerated: bool = True,
+        residual_tolerance: float | tuple[float, float] | None = None,
+        diagnostic_step_size: float = 0.25,
+        min_step_size: float = 1.0e-4,
+        max_step_size: float = 0.5,
+        temporary_store: fem.TemporaryStore | None = None,
+    ) -> None:
+        if not 0.0 < min_step_size <= max_step_size <= 0.5:
+            raise ValueError(
+                "The APGD prototype step bounds must satisfy "
+                f"0 < min_step_size <= max_step_size <= 0.5, got [{min_step_size}, {max_step_size}]."
+            )
+        if not min_step_size <= step_size <= max_step_size:
+            raise ValueError(
+                f"The APGD prototype step size must be in [{min_step_size}, {max_step_size}], got {step_size}."
+            )
+        if diagnostic_step_size <= 0.0:
+            raise ValueError(f"The APGD diagnostic step size must be positive, got {diagnostic_step_size}.")
+
+        self.delassus_operator = delassus_operator
+        self.momentum = delassus_operator.momentum
+        self.rheology = delassus_operator.rheology
+        self.collision = collision
+        self.device = self.rheology.stress.device
+        self.accelerated = accelerated
+        self.min_step_size = min_step_size
+        self.max_step_size = max_step_size
+        self.max_iterations = max_iterations
+        self.diagnostic_step_size = diagnostic_step_size
+        if residual_tolerance is None:
+            self.stress_residual_tolerance = -1.0
+            self.contact_residual_tolerance = -1.0
+        elif isinstance(residual_tolerance, tuple):
+            self.stress_residual_tolerance, self.contact_residual_tolerance = residual_tolerance
+        else:
+            self.stress_residual_tolerance = residual_tolerance
+            self.contact_residual_tolerance = residual_tolerance
+        self.subgrid_collisions = self.collision.collider_mat.nnz > 0
+
+        if not self.subgrid_collisions and self.collision.collider_impulse.shape[0] != self.momentum.velocity.shape[0]:
+            raise ValueError(
+                "The nodal APGD prototype requires one collider impulse per velocity node, "
+                f"got {self.collision.collider_impulse.shape[0]} impulses and "
+                f"{self.momentum.velocity.shape[0]} velocity nodes."
+            )
+
+        self.delassus_operator.require_strain_mat_transpose()
+        self.delassus_operator.compute_diagonal_factorization(split_mass=True)
+
+        self.base_velocity = fem.borrow_temporary_like(self.momentum.velocity, temporary_store)
+        self.base_collider_velocity = fem.borrow_temporary_like(
+            self.collision.collider_velocities,
+            temporary_store,
+        )
+        self.trial_velocity = fem.borrow_temporary_like(self.momentum.velocity, temporary_store)
+        self.trial_collider_velocity = fem.borrow_temporary_like(
+            self.collision.collider_velocities,
+            temporary_store,
+        )
+        self.next_stress = fem.borrow_temporary_like(self.rheology.stress, temporary_store)
+        self.next_collider_impulse = fem.borrow_temporary_like(
+            self.collision.collider_impulse,
+            temporary_store,
+        )
+        self.extrapolated_stress = fem.borrow_temporary_like(self.rheology.stress, temporary_store)
+        self.previous_extrapolated_stress = fem.borrow_temporary_like(self.rheology.stress, temporary_store)
+        self.extrapolated_collider_impulse = fem.borrow_temporary_like(
+            self.collision.collider_impulse,
+            temporary_store,
+        )
+        self.previous_extrapolated_collider_impulse = fem.borrow_temporary_like(
+            self.collision.collider_impulse,
+            temporary_store,
+        )
+        self.stress_response = fem.borrow_temporary_like(self.rheology.stress, temporary_store)
+        self.previous_stress_response = fem.borrow_temporary_like(self.rheology.stress, temporary_store)
+        self.contact_response = fem.borrow_temporary_like(self.collision.collider_impulse, temporary_store)
+        self.previous_contact_response = fem.borrow_temporary_like(
+            self.collision.collider_impulse,
+            temporary_store,
+        )
+        self.stress_metrics = fem.borrow_temporary(
+            temporary_store,
+            shape=(2, self.rheology.stress.shape[0]),
+            dtype=float,
+            device=self.rheology.stress.device,
+        )
+        self.contact_metrics = fem.borrow_temporary(
+            temporary_store,
+            shape=(2, self.collision.collider_impulse.shape[0]),
+            dtype=float,
+            device=self.collision.collider_impulse.device,
+        )
+        self.stress_metric_reduction = ArrayPairSum(
+            self.rheology.stress.shape[0],
+            device=self.rheology.stress.device,
+            temporary_store=temporary_store,
+        )
+        self.contact_metric_reduction = ArrayPairSum(
+            self.collision.collider_impulse.shape[0],
+            device=self.collision.collider_impulse.device,
+            temporary_store=temporary_store,
+        )
+        self.stress_metrics.zero_()
+        self.contact_metrics.zero_()
+        self.stress_metric_sum = self.stress_metric_reduction.compute(self.stress_metrics)
+        self.contact_metric_sum = self.contact_metric_reduction.compute(self.contact_metrics)
+        self.state = fem.borrow_temporary(
+            temporary_store,
+            shape=(APGD_STATE_SIZE,),
+            dtype=float,
+            device=self.rheology.stress.device,
+        )
+        self.condition = fem.borrow_temporary(
+            temporary_store,
+            shape=(1,),
+            dtype=int,
+            device=self.rheology.stress.device,
+        )
+        self.collider_inv_mass = fem.borrow_temporary_like(self.collision.collider_friction, temporary_store)
+        self.collider_delassus_diagonal = fem.borrow_temporary_like(
+            self.collision.collider_friction,
+            temporary_store,
+        )
+
+        self.base_velocity.assign(self.momentum.velocity)
+        self.base_collider_velocity.assign(self.collision.collider_velocities)
+        wp.launch(
+            kernel=apgd_initialize_state,
+            dim=1,
+            inputs=[
+                step_size,
+                self.max_iterations,
+                self.state,
+                self.condition,
+            ],
+        )
+
+        if self.collision.rigidity_operator is None:
+            self.delta_body_qd = None
+            self.collider_inv_mass.zero_()
+        else:
+            J, IJtm = self.collision.rigidity_operator
+            self.delta_body_qd = fem.borrow_temporary(temporary_store, shape=J.shape[1], dtype=float)
+            wp.launch(
+                kernel=compute_collider_inv_mass,
+                dim=self.collision.collider_impulse.shape[0],
+                inputs=[
+                    J.offsets,
+                    J.columns,
+                    J.values,
+                    IJtm.offsets,
+                    IJtm.columns,
+                    IJtm.values,
+                ],
+                outputs=[
+                    self.collider_inv_mass,
+                ],
+            )
+
+        wp.launch(
+            kernel=apgd_project_collider_impulse,
+            dim=self.collision.collider_impulse.shape[0],
+            inputs=[
+                self.collision.collider_friction,
+                self.collision.collider_normals,
+                self.collision.collider_adhesion,
+                self.collision.collider_impulse,
+            ],
+        )
+        self.extrapolated_stress.assign(self.rheology.stress)
+        self.extrapolated_collider_impulse.assign(self.collision.collider_impulse)
+
+        self.apply_stress_launch = self.delassus_operator.apply_stress_delta(
+            self.extrapolated_stress,
+            self.trial_velocity,
+            record_cmd=True,
+        )
+        if self.subgrid_collisions:
+            sp.bsr_set_transpose(dest=self.collision.transposed_collider_mat, src=self.collision.collider_mat)
+            wp.launch(
+                kernel=compute_collider_delassus_diagonal,
+                dim=self.collision.collider_impulse.shape[0],
+                inputs=[
+                    self.collision.collider_mat.offsets,
+                    self.collision.collider_mat.columns,
+                    self.collision.collider_mat.values,
+                    self.collider_inv_mass,
+                    self.collision.transposed_collider_mat.offsets,
+                    self.momentum.inv_volume,
+                ],
+                outputs=[
+                    self.collider_delassus_diagonal,
+                ],
+            )
+            self.apply_collider_impulse_launch = wp.launch(
+                kernel=apply_subgrid_impulse,
+                dim=self.momentum.velocity.shape[0],
+                inputs=[
+                    self.collision.transposed_collider_mat.offsets,
+                    self.collision.transposed_collider_mat.columns,
+                    self.collision.transposed_collider_mat.values,
+                    self.momentum.inv_volume,
+                    self.extrapolated_collider_impulse,
+                    self.trial_velocity,
+                ],
+                record_cmd=True,
+            )
+        else:
+            wp.launch(
+                kernel=apgd_compute_nodal_delassus_diagonal,
+                dim=self.collision.collider_impulse.shape[0],
+                inputs=[
+                    self.momentum.inv_volume,
+                    self.collider_inv_mass,
+                ],
+                outputs=[
+                    self.collider_delassus_diagonal,
+                ],
+            )
+            self.apply_collider_impulse_launch = wp.launch(
+                kernel=apgd_apply_nodal_impulse,
+                dim=self.collision.collider_impulse.shape[0],
+                inputs=[
+                    self.momentum.inv_volume,
+                    self.extrapolated_collider_impulse,
+                    self.trial_velocity,
+                ],
+                record_cmd=True,
+            )
+
+        stress_evaluation_kernel = make_apgd_evaluate_stress_kernel(
+            has_compliance_mat=self.rheology.compliance_mat.nnz > 0,
+            strain_velocity_node_count=self.rheology.strain_velocity_node_count,
+        )
+        self.stress_evaluation_launch = wp.launch(
+            kernel=stress_evaluation_kernel,
+            dim=self.delassus_operator.size,
+            inputs=[
+                self.rheology.compliance_mat.offsets,
+                self.rheology.compliance_mat.columns,
+                self.rheology.compliance_mat.values,
+                self.rheology.strain_mat.offsets,
+                self.rheology.strain_mat.columns,
+                self.rheology.strain_mat.values.view(dtype=mat13),
+                self.rheology.elastic_strain_delta,
+                self.trial_velocity,
+                self.extrapolated_stress,
+                self.stress_response,
+            ],
+            record_cmd=True,
+        )
+        self.stress_projection_launch = wp.launch(
+            kernel=apgd_project_stress_response,
+            dim=self.delassus_operator.size,
+            inputs=[
+                self.state,
+                self.condition,
+                self.rheology.yield_params,
+                self.rheology.strain_node_volume,
+                self.rheology.strain_mat.offsets,
+                self.delassus_operator.delassus_diagonal,
+                self.stress_response,
+                self.extrapolated_stress,
+                self.rheology.stress,
+                self.next_stress,
+            ],
+            record_cmd=True,
+        )
+        self.stress_extrapolation_launch = wp.launch(
+            kernel=apgd_extrapolate_stress,
+            dim=self.delassus_operator.size,
+            inputs=[
+                self.state,
+                self.condition,
+                self.rheology.stress,
+                self.next_stress,
+                self.extrapolated_stress,
+            ],
+            record_cmd=True,
+        )
+        self.stress_restart_metrics_launch = wp.launch(
+            kernel=apgd_compute_stress_restart_metrics,
+            dim=self.delassus_operator.size,
+            inputs=[
+                self.state,
+                self.condition,
+                self.diagnostic_step_size,
+                self.rheology.yield_params,
+                self.rheology.strain_node_volume,
+                self.rheology.strain_mat.offsets,
+                self.delassus_operator.delassus_diagonal,
+                self.stress_response,
+                self.extrapolated_stress,
+                self.rheology.stress,
+                self.next_stress,
+                self.stress_metrics,
+            ],
+            record_cmd=True,
+        )
+        self.stress_bb_metrics_launch = wp.launch(
+            kernel=apgd_compute_stress_bb_metrics,
+            dim=self.delassus_operator.size,
+            inputs=[
+                self.condition,
+                self.rheology.strain_mat.offsets,
+                self.delassus_operator.delassus_diagonal,
+                self.previous_extrapolated_stress,
+                self.extrapolated_stress,
+                self.previous_stress_response,
+                self.stress_response,
+                self.stress_metrics,
+            ],
+            record_cmd=True,
+        )
+        if self.subgrid_collisions:
+            self.contact_evaluation_launch = wp.launch(
+                kernel=apgd_evaluate_subgrid_contact,
+                dim=self.collision.collider_impulse.shape[0],
+                inputs=[
+                    self.trial_velocity,
+                    self.collision.collider_mat.offsets,
+                    self.collision.collider_mat.columns,
+                    self.collision.collider_mat.values,
+                    self.trial_collider_velocity,
+                    self.contact_response,
+                ],
+                record_cmd=True,
+            )
+        else:
+            self.contact_evaluation_launch = wp.launch(
+                kernel=apgd_evaluate_nodal_contact,
+                dim=self.collision.collider_impulse.shape[0],
+                inputs=[
+                    self.trial_velocity,
+                    self.trial_collider_velocity,
+                    self.contact_response,
+                ],
+                record_cmd=True,
+            )
+        self.contact_projection_launch = wp.launch(
+            kernel=apgd_project_contact_response,
+            dim=self.collision.collider_impulse.shape[0],
+            inputs=[
+                self.state,
+                self.condition,
+                self.collider_delassus_diagonal,
+                self.collision.collider_friction,
+                self.collision.collider_adhesion,
+                self.collision.collider_normals,
+                self.contact_response,
+                self.extrapolated_collider_impulse,
+                self.collision.collider_impulse,
+                self.next_collider_impulse,
+            ],
+            record_cmd=True,
+        )
+        self.contact_extrapolation_launch = wp.launch(
+            kernel=apgd_extrapolate_collider_impulse,
+            dim=self.collision.collider_impulse.shape[0],
+            inputs=[
+                self.state,
+                self.condition,
+                self.collision.collider_impulse,
+                self.next_collider_impulse,
+                self.extrapolated_collider_impulse,
+            ],
+            record_cmd=True,
+        )
+        self.contact_restart_metrics_launch = wp.launch(
+            kernel=apgd_compute_contact_restart_metrics,
+            dim=self.collision.collider_impulse.shape[0],
+            inputs=[
+                self.state,
+                self.condition,
+                self.diagnostic_step_size,
+                self.collider_delassus_diagonal,
+                self.collision.collider_friction,
+                self.collision.collider_adhesion,
+                self.collision.collider_normals,
+                self.contact_response,
+                self.extrapolated_collider_impulse,
+                self.collision.collider_impulse,
+                self.next_collider_impulse,
+                self.contact_metrics,
+            ],
+            record_cmd=True,
+        )
+        self.contact_bb_metrics_launch = wp.launch(
+            kernel=apgd_compute_contact_bb_metrics,
+            dim=self.collision.collider_impulse.shape[0],
+            inputs=[
+                self.condition,
+                self.collider_delassus_diagonal,
+                self.collision.collider_friction,
+                self.previous_extrapolated_collider_impulse,
+                self.extrapolated_collider_impulse,
+                self.previous_contact_response,
+                self.contact_response,
+                self.contact_metrics,
+            ],
+            record_cmd=True,
+        )
+        self.finalize_restart_launch = wp.launch(
+            kernel=apgd_finalize_restart,
+            dim=1,
+            inputs=[
+                self.accelerated,
+                self.stress_metric_sum,
+                self.contact_metric_sum,
+                self.state,
+                self.condition,
+            ],
+            record_cmd=True,
+        )
+        self.finalize_bb_launch = wp.launch(
+            kernel=apgd_finalize_bb,
+            dim=1,
+            inputs=[
+                self.accelerated,
+                self.min_step_size,
+                self.max_step_size,
+                self.stress_metric_sum,
+                self.contact_metric_sum,
+                self.state,
+                self.condition,
+            ],
+            record_cmd=True,
+        )
+        self.finalize_iteration_launch = wp.launch(
+            kernel=apgd_finalize_iteration,
+            dim=1,
+            inputs=[
+                self.max_iterations,
+                self.stress_residual_tolerance,
+                self.contact_residual_tolerance,
+                self.state,
+                self.condition,
+            ],
+            record_cmd=True,
+        )
+        self._evaluate_raw_response()
+
+    def _reconstruct_trial_state(self):
+        self.trial_velocity.assign(self.base_velocity)
+        self.trial_collider_velocity.assign(self.base_collider_velocity)
+        self.apply_stress_launch.launch()
+        self.apply_collider_impulse_launch.launch()
+        if self.collision.rigidity_operator is not None:
+            apply_rigidity_operator(
+                self.collision.rigidity_operator,
+                self.extrapolated_collider_impulse,
+                self.trial_collider_velocity,
+                self.delta_body_qd,
+            )
+
+    def _evaluate_raw_response(self):
+        self._reconstruct_trial_state()
+        self.stress_evaluation_launch.launch()
+        self.contact_evaluation_launch.launch()
+
+    def step(self):
+        """Project stress and contact from one shared raw operator evaluation."""
+
+        self.stress_projection_launch.launch()
+        self.contact_projection_launch.launch()
+        self.stress_restart_metrics_launch.launch()
+        self.contact_restart_metrics_launch.launch()
+        self.stress_metric_reduction.compute(self.stress_metrics)
+        self.contact_metric_reduction.compute(self.contact_metrics)
+        self.finalize_restart_launch.launch()
+
+        self.previous_extrapolated_stress.assign(self.extrapolated_stress)
+        self.previous_extrapolated_collider_impulse.assign(self.extrapolated_collider_impulse)
+        self.previous_stress_response.assign(self.stress_response)
+        self.previous_contact_response.assign(self.contact_response)
+
+        self.stress_extrapolation_launch.launch()
+        self.contact_extrapolation_launch.launch()
+        self.rheology.stress.assign(self.next_stress)
+        self.collision.collider_impulse.assign(self.next_collider_impulse)
+        self._evaluate_raw_response()
+        self.stress_bb_metrics_launch.launch()
+        self.contact_bb_metrics_launch.launch()
+        self.stress_metric_reduction.compute(self.stress_metrics)
+        self.contact_metric_reduction.compute(self.contact_metrics)
+        self.finalize_bb_launch.launch()
+        self.finalize_iteration_launch.launch()
+
+    def result(self) -> _APGDPrototypeResult:
+        """Copy the final compact APGD state to the host."""
+
+        state = self.state.numpy()
+        return _APGDPrototypeResult(
+            iteration_count=int(state[APGD_STATE_ITERATION_COUNT]),
+            residual=(
+                float(state[APGD_STATE_STRESS_RESIDUAL]),
+                float(state[APGD_STATE_CONTACT_RESIDUAL]),
+            ),
+            restart_count=int(state[APGD_STATE_RESTART_COUNT]),
+            step_size=float(state[APGD_STATE_STEP_SIZE]),
+            restart_dot=float(state[APGD_STATE_RESTART_DOT]),
+            bb_numerator=float(state[APGD_STATE_BB_NUMERATOR]),
+            bb_denominator=float(state[APGD_STATE_BB_DENOMINATOR]),
+        )
+
+    def solve(self, use_graph: bool = False):
+        """Run APGD iterations, optionally in a device-conditional CUDA graph."""
+
+        if not use_graph or not self.device.is_cuda:
+            for _ in range(self.max_iterations):
+                self.step()
+            return None
+
+        if self.device.is_capturing:
+            with _ScopedDisableGC():
+                wp.capture_while(self.condition, self.step)
+            return None
+
+        with _ScopedDisableGC():
+            with wp.ScopedCapture(force_module_load=False) as capture:
+                wp.capture_while(self.condition, self.step)
+        wp.capture_launch(capture.graph)
+        return capture.graph
+
+    def write_back_velocity(self):
+        """Reconstruct physical velocities from the latest feasible iterate."""
+
+        self.extrapolated_stress.assign(self.rheology.stress)
+        self.extrapolated_collider_impulse.assign(self.collision.collider_impulse)
+        self._reconstruct_trial_state()
+        self.momentum.velocity.assign(self.trial_velocity)
+        self.collision.collider_velocities.assign(self.trial_collider_velocity)
+
+    def release(self):
+        self.base_velocity.release()
+        self.base_collider_velocity.release()
+        self.trial_velocity.release()
+        self.trial_collider_velocity.release()
+        self.next_stress.release()
+        self.next_collider_impulse.release()
+        self.extrapolated_stress.release()
+        self.previous_extrapolated_stress.release()
+        self.extrapolated_collider_impulse.release()
+        self.previous_extrapolated_collider_impulse.release()
+        self.stress_response.release()
+        self.previous_stress_response.release()
+        self.contact_response.release()
+        self.previous_contact_response.release()
+        self.stress_metrics.release()
+        self.contact_metrics.release()
+        self.stress_metric_reduction.release()
+        self.contact_metric_reduction.release()
+        self.state.release()
+        self.condition.release()
+        self.collider_inv_mass.release()
+        self.collider_delassus_diagonal.release()
+        if self.delta_body_qd is not None:
+            self.delta_body_qd.release()
+
+
+def _run_rheology_apgd(
+    max_iterations: int,
+    momentum: MomentumData,
+    rheology: RheologyData,
+    collision: CollisionData,
+    step_size: float = 0.25,
+    accelerated: bool = True,
+    residual_tolerance: float | tuple[float, float] | None = None,
+    diagnostic_step_size: float = 0.25,
+    min_step_size: float = 1.0e-4,
+    max_step_size: float = 0.5,
+    use_graph: bool = False,
+    temporary_store: fem.TemporaryStore | None = None,
+) -> tuple[Any, _APGDPrototypeResult | None]:
+    """Run APGD and optionally collect host diagnostics outside capture."""
+
+    delassus_operator = _DelassusOperator(
+        rheology,
+        momentum,
+        temporary_store,
+        orthogonal_projection=True,
+    )
+    solver = _APGDPrototypeSolver(
+        delassus_operator,
+        collision,
+        max_iterations=max_iterations,
+        step_size=step_size,
+        accelerated=accelerated,
+        residual_tolerance=residual_tolerance,
+        diagnostic_step_size=diagnostic_step_size,
+        min_step_size=min_step_size,
+        max_step_size=max_step_size,
+        temporary_store=temporary_store,
+    )
+
+    solve_graph = solver.solve(use_graph=use_graph)
+    solver.write_back_velocity()
+    result = None if solver.device.is_capturing else solver.result()
+    solver.release()
+
+    delassus_operator.postprocess_stress_and_strain()
+    delassus_operator.release()
+    return solve_graph, result
+
+
+def _solve_rheology_apgd_prototype(
+    max_iterations: int,
+    momentum: MomentumData,
+    rheology: RheologyData,
+    collision: CollisionData,
+    step_size: float = 0.25,
+    accelerated: bool = True,
+    residual_tolerance: float | tuple[float, float] | None = None,
+    diagnostic_step_size: float = 0.25,
+    min_step_size: float = 1.0e-4,
+    max_step_size: float = 0.5,
+    use_graph: bool = False,
+    temporary_store: fem.TemporaryStore | None = None,
+) -> _APGDPrototypeResult:
+    """Run the internal APGD implementation and return host diagnostics."""
+
+    if residual_tolerance is not None:
+        tolerances = residual_tolerance if isinstance(residual_tolerance, tuple) else (residual_tolerance,)
+        if any(tolerance < 0.0 for tolerance in tolerances):
+            raise ValueError(f"APGD residual tolerance must be nonnegative, got {residual_tolerance}.")
+
+    _solve_graph, result = _run_rheology_apgd(
+        max_iterations=max_iterations,
+        momentum=momentum,
+        rheology=rheology,
+        collision=collision,
+        step_size=step_size,
+        accelerated=accelerated,
+        residual_tolerance=residual_tolerance,
+        diagnostic_step_size=diagnostic_step_size,
+        min_step_size=min_step_size,
+        max_step_size=max_step_size,
+        use_graph=use_graph,
+        temporary_store=temporary_store,
+    )
+    if result is None:
+        raise RuntimeError("APGD host diagnostics are unavailable while an outer graph capture is active.")
+    return result
+
+
 def _nonlinear_solver_result_norms(residual, l2_tolerance_scale: float | np.ndarray) -> tuple[float, float]:
     """Return the largest independently scaled residual across solver batches."""
 
@@ -1902,11 +2684,11 @@ def solve_rheology(
 
     - Builds the Delassus operator diagonal blocks and rotates all local
       quantities into the decoupled eigenbasis (normal vs tangential).
-    - Runs either Gauss-Seidel (with coloring) or Jacobi iterations to solve
-      the local stress projection problem per strain node.
+    - Runs Gauss-Seidel, Jacobi, linear, or APGD iterations to solve the local
+      stress projection problem per strain node.
     - Applies collider impulses and, when provided, a rigidity coupling step on
       collider velocities each iteration.
-    - Iterates until the residual on the stress update falls below
+    - Iterates until the relevant stress and contact residuals fall below
       ``tolerance`` or ``max_iterations`` is reached. Optionally records and
       executes CUDA graphs to reduce CPU overhead.
 
@@ -1918,7 +2700,7 @@ def solve_rheology(
             Base solvers: ``"gauss-seidel"`` (or ``"gs"``),
             ``"gauss-seidel-soa"`` (or ``"gs-soa"``),
             ``"gauss-seidel-batched"`` (or ``"gs-batched"``),
-            ``"jacobi"``, ``"cg"``, ``"cr"``, ``"gmres"``.
+            ``"jacobi"``, ``"apgd"``, ``"cg"``, ``"cr"``, ``"gmres"``.
             Chained solvers run left-to-right as warmstarts for the
             final solver, e.g. ``("cr", "gs")`` runs CR then Gauss-Seidel,
             ``("cg", "jacobi", "gs-batched")`` runs CG, then a Jacobi smoother,
@@ -1928,10 +2710,14 @@ def solve_rheology(
             ``"gauss-seidel-batched"`` additionally merges colors into
             batches with Jacobi-style mass splitting within each
             batch. Good for wide velocity stencils (B2/B3).
+            ``"apgd"`` jointly projects stress and collider contact, including
+            non-associated de Saxcé corrections and viscoplastic stress shifts.
+            It must be used as the only solver in the sequence.
             The iterative linear solvers (``"cg"``, ``"cr"``, ``"gmres"``)
             only support solid materials without contacts.
         max_iterations: Maximum number of nonlinear iterations.
-        tolerance: Solver tolerance for the stress residual (L2 norm).
+        tolerance: Solver tolerance for the projected stress residual and,
+            for APGD, the collider contact residual (L2 norm).
         momentum: :class:`MomentumData` containing per-node inverse volume
             and velocity DOFs.
         rheology: :class:`RheologyData` containing strain/compliance matrices,
@@ -1952,6 +2738,32 @@ def solve_rheology(
     """
 
     verbose = verbose if verbose is not None else wp.config.log_level <= wp.LOG_DEBUG
+    solvers = (solver,) if isinstance(solver, str) else tuple(solver)
+    if len(solvers) == 0:
+        raise ValueError("Solver sequence must contain at least one solver.")
+
+    if "apgd" in solvers:
+        if solvers != ("apgd",):
+            raise ValueError(f"APGD must be used as the only rheology solver, got {solver!r}.")
+
+        stress_tolerance = tolerance * math.sqrt(1 + rheology.stress.shape[0])
+        contact_tolerance = tolerance * math.sqrt(1 + collision.collider_impulse.shape[0])
+        solve_graph, result = _run_rheology_apgd(
+            max_iterations=max_iterations,
+            momentum=momentum,
+            rheology=rheology,
+            collision=collision,
+            residual_tolerance=(stress_tolerance, contact_tolerance),
+            use_graph=use_graph,
+            temporary_store=temporary_store,
+        )
+        if verbose and result is not None:
+            print(
+                f"APGD terminated after {result.iteration_count} iterations with "
+                f"stress/contact residuals {result.residual}"
+            )
+        return solve_graph
+
     subgrid_collisions = collision.collider_mat.nnz > 0
     if subgrid_collisions:
         contact_solver = _SubgridContactSolver(momentum, collision, temporary_store)
@@ -1980,10 +2792,6 @@ def solve_rheology(
             device=momentum.velocity.device,
         )
         tolerance_scale = batch_tolerance_scales
-
-    solvers = (solver,) if isinstance(solver, str) else tuple(solver)
-    if len(solvers) == 0:
-        raise ValueError("Solver sequence must contain at least one solver.")
 
     if len(solvers) == 1 and solvers[0] in _ITERATIVE_LINEAR_SOLVERS:
         if collision.has_colliders:

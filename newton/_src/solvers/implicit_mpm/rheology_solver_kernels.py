@@ -8,6 +8,8 @@ import warp.fem as fem
 import warp.sparse as sp
 from warp.fem.linalg import symmetric_eigenvalues_qr
 
+from .apgd_solver_kernels import APGD_STATE_BETA, APGD_STATE_STEP_SIZE
+
 _DELASSUS_PROXIMAL_REG = wp.constant(1.0e-6)
 """Cutoff for the trace of the diagonal block of the Delassus operator to disable constraints"""
 
@@ -677,6 +679,152 @@ def project_stress(
 
 
 @wp.func
+def _project_on_segment_2d(
+    point: wp.vec2,
+    segment_start: wp.vec2,
+    segment_end: wp.vec2,
+):
+    segment = segment_end - segment_start
+    segment_length_sq = wp.length_sq(segment)
+    if segment_length_sq == 0.0:
+        return segment_start
+
+    coordinate = wp.clamp(wp.dot(point - segment_start, segment) / segment_length_sq, 0.0, 1.0)
+    return segment_start + coordinate * segment
+
+
+@wp.func
+def _select_closer_point_2d(
+    point: wp.vec2,
+    candidate: wp.vec2,
+    closest: wp.vec2,
+):
+    if wp.length_sq(candidate - point) < wp.length_sq(closest - point):
+        return candidate
+    return closest
+
+
+@wp.func
+def project_stress_orthogonal(
+    r: vec6,
+    yield_params: YieldParamVec,
+):
+    """Projects a stress vector orthogonally onto the piecewise-linear yield set."""
+
+    r_N = r[0]
+    r_T = r
+    r_T[0] = 0.0
+    r_T_n = wp.length(r_T)
+
+    pmin, pmax = normal_yield_bounds(yield_params)
+    mu = wp.where(pmax > 0.0, wp.max(0.0, yield_params[3] / pmax), 0.0)
+    cohesion = wp.max(0.0, yield_params[2])
+
+    if r_N >= pmin and r_N <= pmax:
+        yield_stress, _slope, _region_min, _region_max = shear_yield_stress(yield_params, r_N)
+        if r_T_n <= yield_stress:
+            return r
+
+    p1 = pmin + 0.5 * pmax
+    p2 = 0.5 * pmax
+    peak = cohesion + mu * p2
+
+    point = wp.vec2(r_N, r_T_n)
+    vertex_0 = wp.vec2(pmin, 0.0)
+    vertex_1 = wp.vec2(pmin, cohesion)
+    vertex_2 = wp.vec2(p1, peak)
+    vertex_3 = wp.vec2(p2, peak)
+    vertex_4 = wp.vec2(pmax, cohesion)
+    vertex_5 = wp.vec2(pmax, 0.0)
+
+    closest = _project_on_segment_2d(point, vertex_0, vertex_1)
+    closest = _select_closer_point_2d(point, _project_on_segment_2d(point, vertex_1, vertex_2), closest)
+    closest = _select_closer_point_2d(point, _project_on_segment_2d(point, vertex_2, vertex_3), closest)
+    closest = _select_closer_point_2d(point, _project_on_segment_2d(point, vertex_3, vertex_4), closest)
+    closest = _select_closer_point_2d(point, _project_on_segment_2d(point, vertex_4, vertex_5), closest)
+    closest = _select_closer_point_2d(point, _project_on_segment_2d(point, vertex_5, vertex_0), closest)
+
+    projected = vec6(0.0)
+    projected[0] = closest[0]
+    if r_T_n > 0.0:
+        projected += (closest[1] / r_T_n) * r_T
+        projected[0] = closest[0]
+    return projected
+
+
+@wp.func
+def apply_stress_desaxce_correction(
+    yield_params: YieldParamVec,
+    stress: vec6,
+    response: vec6,
+):
+    """Apply the non-associated de Saxcé correction to a strain response."""
+
+    corrected = response
+    tangential_response = response
+    tangential_response[0] = 0.0
+    _yield_stress, yield_slope, _region_min, _region_max = shear_yield_stress(yield_params, stress[0])
+    corrected[0] += (1.0 - get_dilatancy(yield_params)) * yield_slope * wp.length(tangential_response)
+    return corrected
+
+
+@wp.func
+def apgd_project_stress_step(
+    step_size: float,
+    preconditioner: float,
+    yield_params: YieldParamVec,
+    strain_node_volume: float,
+    response: vec6,
+    stress: vec6,
+):
+    """Project one corrected viscoplastic stress fixed-point step."""
+
+    viscosity_scale = float(0.0)
+    if strain_node_volume > 0.0:
+        viscosity_scale = get_viscosity(yield_params) / strain_node_volume
+
+    yield_stress = stress + viscosity_scale * response
+    corrected_response = apply_stress_desaxce_correction(yield_params, yield_stress, response)
+    trial_yield_stress = yield_stress - (step_size / preconditioner) * corrected_response
+    return project_stress_orthogonal(trial_yield_stress, yield_params) - viscosity_scale * response
+
+
+@wp.kernel
+def apgd_project_stress(
+    yield_params: wp.array[YieldParamVec],
+    stress: wp.array[vec6],
+):
+    """Project APGD stress warm starts onto the admissible yield set."""
+
+    i = wp.tid()
+    stress[i] = project_stress_orthogonal(stress[i], yield_params[i])
+
+
+@wp.kernel
+def preprocess_stress_and_strain_apgd(
+    unilateral_strain_offset: wp.array[float],
+    strain_rhs: wp.array[vec6],
+    stress: wp.array[vec6],
+    yield_params: wp.array[YieldParamVec],
+):
+    """Prepare the strain right-hand side and project an APGD stress warm start."""
+
+    tau_i = wp.tid()
+    params = yield_params[tau_i]
+    offset = unilateral_strain_offset[tau_i]
+
+    if offset > 0.0:
+        rhs = strain_rhs[tau_i]
+        rhs += unilateral_offset_to_strain_rhs(offset)
+        strain_rhs[tau_i] = rhs
+
+        params[1] = 0.0
+        yield_params[tau_i] = params
+
+    stress[tau_i] = project_stress_orthogonal(stress[tau_i], params)
+
+
+@wp.func
 def _world_to_local(
     world_vec: vec6,
     rotation: mat55,
@@ -863,6 +1011,237 @@ def make_compute_local_strain(has_compliance_mat: bool = True, strain_velocity_n
         return tau
 
     return compute_local_strain_impl
+
+
+def make_apgd_step_stress_kernel(
+    has_compliance_mat: bool,
+    strain_velocity_node_count: int = -1,
+):
+    """Return a kernel taking one scalar-preconditioned stress step."""
+
+    key = (has_compliance_mat, strain_velocity_node_count)
+
+    @fem.cache.dynamic_kernel(suffix=key, kernel_options={"fast_math": True})
+    def apgd_step_stress_impl(
+        step_size: float,
+        yield_params: wp.array[YieldParamVec],
+        compliance_mat_offsets: wp.array[int],
+        compliance_mat_columns: wp.array[int],
+        compliance_mat_values: wp.array[mat66],
+        strain_mat_offsets: wp.array[int],
+        strain_mat_columns: wp.array[int],
+        strain_mat_values: wp.array[mat13],
+        delassus_diagonal: wp.array[vec6],
+        strain_rhs: wp.array[vec6],
+        velocity: wp.array[wp.vec3],
+        stress: wp.array[vec6],
+        next_stress: wp.array[vec6],
+    ):
+        tau_i = wp.tid()
+
+        if strain_mat_offsets[tau_i] == strain_mat_offsets[tau_i + 1]:
+            next_stress[tau_i] = stress[tau_i]
+            return
+
+        stress_response = wp.static(make_compute_local_strain(has_compliance_mat, strain_velocity_node_count))(
+            tau_i,
+            compliance_mat_offsets,
+            compliance_mat_columns,
+            compliance_mat_values,
+            strain_mat_offsets,
+            strain_mat_columns,
+            strain_mat_values,
+            strain_rhs,
+            velocity,
+            stress,
+        )
+
+        preconditioner = wp.dot(delassus_diagonal[tau_i], vec6(1.0))
+        if preconditioner <= 0.0:
+            next_stress[tau_i] = stress[tau_i]
+            return
+
+        trial_stress = stress[tau_i] - (step_size / preconditioner) * stress_response
+        next_stress[tau_i] = project_stress_orthogonal(trial_stress, yield_params[tau_i])
+
+    return apgd_step_stress_impl
+
+
+def make_apgd_evaluate_stress_kernel(
+    has_compliance_mat: bool,
+    strain_velocity_node_count: int = -1,
+):
+    """Return a kernel evaluating the raw stress response."""
+
+    key = (has_compliance_mat, strain_velocity_node_count)
+
+    @fem.cache.dynamic_kernel(suffix=key, kernel_options={"fast_math": True})
+    def apgd_evaluate_stress_impl(
+        compliance_mat_offsets: wp.array[int],
+        compliance_mat_columns: wp.array[int],
+        compliance_mat_values: wp.array[mat66],
+        strain_mat_offsets: wp.array[int],
+        strain_mat_columns: wp.array[int],
+        strain_mat_values: wp.array[mat13],
+        strain_rhs: wp.array[vec6],
+        velocity: wp.array[wp.vec3],
+        stress: wp.array[vec6],
+        response: wp.array[vec6],
+    ):
+        tau_i = wp.tid()
+        if strain_mat_offsets[tau_i] == strain_mat_offsets[tau_i + 1]:
+            response[tau_i] = vec6(0.0)
+            return
+
+        response[tau_i] = wp.static(make_compute_local_strain(has_compliance_mat, strain_velocity_node_count))(
+            tau_i,
+            compliance_mat_offsets,
+            compliance_mat_columns,
+            compliance_mat_values,
+            strain_mat_offsets,
+            strain_mat_columns,
+            strain_mat_values,
+            strain_rhs,
+            velocity,
+            stress,
+        )
+
+    return apgd_evaluate_stress_impl
+
+
+@wp.kernel
+def apgd_project_stress_response(
+    state: wp.array[float],
+    condition: wp.array[int],
+    yield_params: wp.array[YieldParamVec],
+    strain_node_volume: wp.array[float],
+    strain_mat_offsets: wp.array[int],
+    delassus_diagonal: wp.array[vec6],
+    response: wp.array[vec6],
+    extrapolated_stress: wp.array[vec6],
+    stress: wp.array[vec6],
+    next_stress: wp.array[vec6],
+):
+    """Project one corrected viscoplastic stress step from a raw response."""
+
+    tau_i = wp.tid()
+    if condition[0] == 0:
+        next_stress[tau_i] = stress[tau_i]
+        return
+    if strain_mat_offsets[tau_i] == strain_mat_offsets[tau_i + 1]:
+        next_stress[tau_i] = extrapolated_stress[tau_i]
+        return
+
+    preconditioner = wp.dot(delassus_diagonal[tau_i], vec6(1.0))
+    if preconditioner <= 0.0:
+        next_stress[tau_i] = extrapolated_stress[tau_i]
+        return
+
+    next_stress[tau_i] = apgd_project_stress_step(
+        state[APGD_STATE_STEP_SIZE],
+        preconditioner,
+        yield_params[tau_i],
+        strain_node_volume[tau_i],
+        response[tau_i],
+        extrapolated_stress[tau_i],
+    )
+
+
+@wp.kernel
+def apgd_extrapolate_stress(
+    state: wp.array[float],
+    condition: wp.array[int],
+    stress: wp.array[vec6],
+    next_stress: wp.array[vec6],
+    extrapolated_stress: wp.array[vec6],
+):
+    """Extrapolate a complete stress field from feasible iterates."""
+
+    tau_i = wp.tid()
+    if condition[0] == 0:
+        extrapolated_stress[tau_i] = stress[tau_i]
+        return
+
+    next_value = next_stress[tau_i]
+    beta = state[APGD_STATE_BETA]
+    extrapolated_stress[tau_i] = next_value + beta * (next_value - stress[tau_i])
+
+
+@wp.kernel
+def apgd_compute_stress_restart_metrics(
+    state: wp.array[float],
+    condition: wp.array[int],
+    diagnostic_step_size: float,
+    yield_params: wp.array[YieldParamVec],
+    strain_node_volume: wp.array[float],
+    strain_mat_offsets: wp.array[int],
+    delassus_diagonal: wp.array[vec6],
+    response: wp.array[vec6],
+    extrapolated_stress: wp.array[vec6],
+    stress: wp.array[vec6],
+    next_stress: wp.array[vec6],
+    metrics: wp.array2d[float],
+):
+    """Compute stress restart and projected fixed-point residual terms."""
+
+    tau_i = wp.tid()
+    if condition[0] == 0 or strain_mat_offsets[tau_i] == strain_mat_offsets[tau_i + 1]:
+        metrics[0, tau_i] = 0.0
+        metrics[1, tau_i] = 0.0
+        return
+
+    preconditioner = wp.dot(delassus_diagonal[tau_i], vec6(1.0))
+    feasible_delta = next_stress[tau_i] - stress[tau_i]
+    viscosity_scale = float(0.0)
+    if strain_node_volume[tau_i] > 0.0:
+        viscosity_scale = get_viscosity(yield_params[tau_i]) / strain_node_volume[tau_i]
+    yield_stress = extrapolated_stress[tau_i] + viscosity_scale * response[tau_i]
+    corrected_response = apply_stress_desaxce_correction(yield_params[tau_i], yield_stress, response[tau_i])
+    restart = wp.dot(feasible_delta, -corrected_response)
+    residual = float(0.0)
+    if preconditioner > 0.0 and diagnostic_step_size > 0.0:
+        diagnostic_stress = apgd_project_stress_step(
+            diagnostic_step_size,
+            preconditioner,
+            yield_params[tau_i],
+            strain_node_volume[tau_i],
+            response[tau_i],
+            extrapolated_stress[tau_i],
+        )
+        fixed_point_delta = diagnostic_stress - extrapolated_stress[tau_i]
+        residual = preconditioner * wp.length_sq(fixed_point_delta) / (diagnostic_step_size * diagnostic_step_size)
+    metrics[0, tau_i] = restart
+    metrics[1, tau_i] = residual
+
+
+@wp.kernel
+def apgd_compute_stress_bb_metrics(
+    condition: wp.array[int],
+    strain_mat_offsets: wp.array[int],
+    delassus_diagonal: wp.array[vec6],
+    previous_stress: wp.array[vec6],
+    stress: wp.array[vec6],
+    previous_response: wp.array[vec6],
+    response: wp.array[vec6],
+    metrics: wp.array2d[float],
+):
+    """Compute raw-response stress contributions to the scaled BB step."""
+
+    tau_i = wp.tid()
+    if condition[0] == 0 or strain_mat_offsets[tau_i] == strain_mat_offsets[tau_i + 1]:
+        metrics[0, tau_i] = 0.0
+        metrics[1, tau_i] = 0.0
+        return
+
+    delta_stress = stress[tau_i] - previous_stress[tau_i]
+    delta_response = response[tau_i] - previous_response[tau_i]
+    numerator = wp.dot(delta_stress, delta_response)
+    denominator = float(0.0)
+    preconditioner = wp.dot(delassus_diagonal[tau_i], vec6(1.0))
+    if preconditioner > 0.0:
+        denominator = wp.length_sq(delta_response) / preconditioner
+    metrics[0, tau_i] = numerator
+    metrics[1, tau_i] = denominator
 
 
 def make_solve_local_stress(has_viscosity: bool, has_dilatancy: bool, has_rotation: bool = not _ISOTROPIC_LOCAL_LHS):

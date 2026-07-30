@@ -390,7 +390,7 @@ class Example:
             "-s",
             nargs="+",
             default=("cg", "gauss-seidel"),
-            help="Rheology solver sequence, e.g. --solver cg gauss-seidel",
+            help="Rheology solver sequence, e.g. --solver cg gauss-seidel, or --solver apgd for coupled projection",
         )
 
         parser.add_argument("--strain-basis", "-sb", type=str, default="P0")

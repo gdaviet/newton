@@ -4,6 +4,8 @@
 import warp as wp
 import warp.sparse as sp
 
+from .apgd_solver_kernels import APGD_STATE_BETA, APGD_STATE_STEP_SIZE
+
 wp.set_module_options({"enable_backward": False})
 
 
@@ -58,6 +60,349 @@ def project_on_friction_cone(
         r_t *= mu_rn / wp.sqrt(r_t_n2)
 
     return r_n * nor + r_t
+
+
+@wp.func
+def project_on_friction_cone_orthogonal(
+    mu: float,
+    nor: wp.vec3,
+    r: wp.vec3,
+):
+    """Projects a vector ``r`` orthogonally onto the Coulomb friction cone."""
+
+    mu = wp.max(0.0, mu)
+    r_n = wp.dot(r, nor)
+    r_t = r - r_n * nor
+    r_t_n = wp.length(r_t)
+
+    if r_n + mu * r_t_n <= 0.0:
+        return wp.vec3(0.0)
+
+    if r_t_n <= mu * r_n:
+        return r
+
+    projected_n = (r_n + mu * r_t_n) / (1.0 + mu * mu)
+    projected_t = wp.vec3(0.0)
+    if r_t_n > 0.0:
+        projected_t = (mu * projected_n / r_t_n) * r_t
+
+    return projected_n * nor + projected_t
+
+
+@wp.func
+def project_collider_impulse_orthogonal(
+    friction: float,
+    nor: wp.vec3,
+    adhesion: float,
+    impulse: wp.vec3,
+):
+    """Projects a collider impulse orthogonally onto its adhesive friction cone."""
+
+    if friction < 0.0:
+        return wp.vec3(0.0)
+
+    shifted_impulse = impulse + adhesion * nor
+    return project_on_friction_cone_orthogonal(friction, nor, shifted_impulse) - adhesion * nor
+
+
+@wp.func
+def apply_contact_desaxce_correction(
+    friction: float,
+    nor: wp.vec3,
+    velocity: wp.vec3,
+):
+    """Apply the de Saxcé correction to a relative contact velocity."""
+
+    normal_velocity = wp.dot(velocity, nor)
+    tangential_velocity = velocity - normal_velocity * nor
+    return velocity + wp.max(0.0, friction) * wp.length(tangential_velocity) * nor
+
+
+@wp.kernel
+def apgd_project_collider_impulse(
+    collider_friction: wp.array[float],
+    collider_normals: wp.array[wp.vec3],
+    collider_adhesion: wp.array[float],
+    collider_impulse: wp.array[wp.vec3],
+):
+    """Project APGD collider-impulse warm starts onto their admissible sets."""
+
+    i = wp.tid()
+    collider_impulse[i] = project_collider_impulse_orthogonal(
+        collider_friction[i],
+        collider_normals[i],
+        collider_adhesion[i],
+        collider_impulse[i],
+    )
+
+
+@wp.kernel
+def apgd_apply_nodal_impulse(
+    inv_mass: wp.array[float],
+    collider_impulse: wp.array[wp.vec3],
+    velocity: wp.array[wp.vec3],
+):
+    """Apply a complete nodal APGD impulse field to a baseline velocity."""
+
+    i = wp.tid()
+    velocity[i] += inv_mass[i] * collider_impulse[i]
+
+
+@wp.kernel
+def apgd_compute_nodal_delassus_diagonal(
+    inv_mass: wp.array[float],
+    collider_inv_mass: wp.array[float],
+    collider_delassus_diagonal: wp.array[float],
+):
+    """Compute scalar nodal contact preconditioners."""
+
+    i = wp.tid()
+    collider_delassus_diagonal[i] = inv_mass[i] + collider_inv_mass[i]
+
+
+@wp.func
+def apgd_project_collider_step(
+    step_size: float,
+    effective_inv_mass: float,
+    friction: float,
+    adhesion: float,
+    normal: wp.vec3,
+    relative_velocity: wp.vec3,
+    collider_impulse: wp.vec3,
+):
+    """Project one preconditioned, de Saxcé-corrected collider impulse step."""
+
+    if friction < 0.0:
+        return wp.vec3(0.0)
+    if effective_inv_mass <= 0.0:
+        return collider_impulse
+
+    corrected_velocity = apply_contact_desaxce_correction(friction, normal, relative_velocity)
+    trial_impulse = collider_impulse - (step_size / effective_inv_mass) * corrected_velocity
+    return project_collider_impulse_orthogonal(
+        friction,
+        normal,
+        adhesion,
+        trial_impulse,
+    )
+
+
+@wp.kernel
+def apgd_evaluate_nodal_contact(
+    velocity: wp.array[wp.vec3],
+    collider_velocity: wp.array[wp.vec3],
+    response: wp.array[wp.vec3],
+):
+    """Evaluate the raw nodal relative-velocity response."""
+
+    i = wp.tid()
+    response[i] = velocity[i] - collider_velocity[i]
+
+
+@wp.kernel
+def apgd_evaluate_subgrid_contact(
+    velocity: wp.array[wp.vec3],
+    collider_mat_offsets: wp.array[int],
+    collider_mat_columns: wp.array[int],
+    collider_mat_values: wp.array[float],
+    collider_velocity: wp.array[wp.vec3],
+    response: wp.array[wp.vec3],
+):
+    """Evaluate the raw subgrid relative-velocity response."""
+
+    i = wp.tid()
+    relative_velocity = -collider_velocity[i]
+    for b in range(collider_mat_offsets[i], collider_mat_offsets[i + 1]):
+        relative_velocity += collider_mat_values[b] * velocity[collider_mat_columns[b]]
+    response[i] = relative_velocity
+
+
+@wp.kernel
+def apgd_project_contact_response(
+    state: wp.array[float],
+    condition: wp.array[int],
+    collider_delassus_diagonal: wp.array[float],
+    collider_friction: wp.array[float],
+    collider_adhesion: wp.array[float],
+    collider_normals: wp.array[wp.vec3],
+    response: wp.array[wp.vec3],
+    extrapolated_collider_impulse: wp.array[wp.vec3],
+    collider_impulse: wp.array[wp.vec3],
+    next_collider_impulse: wp.array[wp.vec3],
+):
+    """Project one contact step from a previously evaluated raw response."""
+
+    i = wp.tid()
+    if condition[0] == 0:
+        next_collider_impulse[i] = collider_impulse[i]
+        return
+
+    next_collider_impulse[i] = apgd_project_collider_step(
+        state[APGD_STATE_STEP_SIZE],
+        collider_delassus_diagonal[i],
+        collider_friction[i],
+        collider_adhesion[i],
+        collider_normals[i],
+        response[i],
+        extrapolated_collider_impulse[i],
+    )
+
+
+@wp.kernel
+def apgd_extrapolate_collider_impulse(
+    state: wp.array[float],
+    condition: wp.array[int],
+    collider_impulse: wp.array[wp.vec3],
+    next_collider_impulse: wp.array[wp.vec3],
+    extrapolated_collider_impulse: wp.array[wp.vec3],
+):
+    """Extrapolate a complete collider-impulse field from feasible iterates."""
+
+    i = wp.tid()
+    if condition[0] == 0:
+        extrapolated_collider_impulse[i] = collider_impulse[i]
+        return
+
+    next_impulse = next_collider_impulse[i]
+    beta = state[APGD_STATE_BETA]
+    extrapolated_collider_impulse[i] = next_impulse + beta * (next_impulse - collider_impulse[i])
+
+
+@wp.kernel
+def apgd_compute_contact_restart_metrics(
+    state: wp.array[float],
+    condition: wp.array[int],
+    diagnostic_step_size: float,
+    collider_delassus_diagonal: wp.array[float],
+    collider_friction: wp.array[float],
+    collider_adhesion: wp.array[float],
+    collider_normals: wp.array[wp.vec3],
+    response: wp.array[wp.vec3],
+    extrapolated_collider_impulse: wp.array[wp.vec3],
+    collider_impulse: wp.array[wp.vec3],
+    next_collider_impulse: wp.array[wp.vec3],
+    metrics: wp.array2d[float],
+):
+    """Compute contact restart and projected fixed-point residual terms."""
+
+    i = wp.tid()
+    if condition[0] == 0 or collider_friction[i] < 0.0:
+        metrics[0, i] = 0.0
+        metrics[1, i] = 0.0
+        return
+
+    normal = collider_normals[i]
+    direction = -apply_contact_desaxce_correction(collider_friction[i], normal, response[i])
+    feasible_delta = next_collider_impulse[i] - collider_impulse[i]
+
+    restart = wp.dot(feasible_delta, direction)
+    residual = float(0.0)
+    preconditioner = collider_delassus_diagonal[i]
+    if preconditioner > 0.0 and diagnostic_step_size > 0.0:
+        diagnostic_impulse = apgd_project_collider_step(
+            diagnostic_step_size,
+            preconditioner,
+            collider_friction[i],
+            collider_adhesion[i],
+            normal,
+            response[i],
+            extrapolated_collider_impulse[i],
+        )
+        fixed_point_delta = diagnostic_impulse - extrapolated_collider_impulse[i]
+        residual = preconditioner * wp.length_sq(fixed_point_delta) / (diagnostic_step_size * diagnostic_step_size)
+    metrics[0, i] = restart
+    metrics[1, i] = residual
+
+
+@wp.kernel
+def apgd_compute_contact_bb_metrics(
+    condition: wp.array[int],
+    collider_delassus_diagonal: wp.array[float],
+    collider_friction: wp.array[float],
+    previous_collider_impulse: wp.array[wp.vec3],
+    collider_impulse: wp.array[wp.vec3],
+    previous_response: wp.array[wp.vec3],
+    response: wp.array[wp.vec3],
+    metrics: wp.array2d[float],
+):
+    """Compute raw-response contact contributions to the scaled BB step."""
+
+    i = wp.tid()
+    if condition[0] == 0 or collider_friction[i] < 0.0:
+        metrics[0, i] = 0.0
+        metrics[1, i] = 0.0
+        return
+
+    delta_impulse = collider_impulse[i] - previous_collider_impulse[i]
+    delta_response = response[i] - previous_response[i]
+    numerator = wp.dot(delta_impulse, delta_response)
+    denominator = float(0.0)
+    preconditioner = collider_delassus_diagonal[i]
+    if preconditioner > 0.0:
+        denominator = wp.length_sq(delta_response) / preconditioner
+    metrics[0, i] = numerator
+    metrics[1, i] = denominator
+
+
+@wp.kernel
+def apgd_step_nodal_contact(
+    step_size: float,
+    collider_delassus_diagonal: wp.array[float],
+    collider_friction: wp.array[float],
+    collider_adhesion: wp.array[float],
+    collider_normals: wp.array[wp.vec3],
+    velocity: wp.array[wp.vec3],
+    collider_velocity: wp.array[wp.vec3],
+    collider_impulse: wp.array[wp.vec3],
+    next_collider_impulse: wp.array[wp.vec3],
+):
+    """Take one preconditioned, de Saxcé-corrected nodal APGD contact step."""
+
+    i = wp.tid()
+    normal = collider_normals[i]
+    relative_velocity = velocity[i] - collider_velocity[i]
+    next_collider_impulse[i] = apgd_project_collider_step(
+        step_size,
+        collider_delassus_diagonal[i],
+        collider_friction[i],
+        collider_adhesion[i],
+        normal,
+        relative_velocity,
+        collider_impulse[i],
+    )
+
+
+@wp.kernel
+def apgd_step_subgrid_contact(
+    step_size: float,
+    velocity: wp.array[wp.vec3],
+    collider_mat_offsets: wp.array[int],
+    collider_mat_columns: wp.array[int],
+    collider_mat_values: wp.array[float],
+    collider_delassus_diagonal: wp.array[float],
+    collider_friction: wp.array[float],
+    collider_adhesion: wp.array[float],
+    collider_normals: wp.array[wp.vec3],
+    collider_velocity: wp.array[wp.vec3],
+    collider_impulse: wp.array[wp.vec3],
+    next_collider_impulse: wp.array[wp.vec3],
+):
+    """Take one preconditioned, de Saxcé-corrected subgrid APGD contact step."""
+
+    i = wp.tid()
+    relative_velocity = -collider_velocity[i]
+    for b in range(collider_mat_offsets[i], collider_mat_offsets[i + 1]):
+        relative_velocity += collider_mat_values[b] * velocity[collider_mat_columns[b]]
+
+    next_collider_impulse[i] = apgd_project_collider_step(
+        step_size,
+        collider_delassus_diagonal[i],
+        collider_friction[i],
+        collider_adhesion[i],
+        collider_normals[i],
+        relative_velocity,
+        collider_impulse[i],
+    )
 
 
 @wp.func

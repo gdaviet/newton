@@ -132,6 +132,7 @@ class Example:
             "-s",
             type=str,
             default="auto",
+            help="Rheology solver; use apgd for coupled viscous material and collider projection",
         )
         parser.add_argument("--max-iterations", "-it", type=int, default=250)
         parser.add_argument("--tolerance", "-tol", type=float, default=1.0e-6)

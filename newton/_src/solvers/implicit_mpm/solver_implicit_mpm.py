@@ -195,6 +195,7 @@ _RheologySolverName = Literal[
     "gs-batched",
     "gauss-seidel-batched",
     "jacobi",
+    "apgd",
     "cg",
     "cr",
     "gmres",
@@ -798,8 +799,10 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         (B2, B3).  Accepted values: ``"auto"``, ``"gs"`` (or
         ``"gauss-seidel"``), ``"gs-soa"`` (or ``"gauss-seidel-soa"``),
         ``"gs-batched"`` (or ``"gauss-seidel-batched"``), ``"jacobi"``,
-        ``"cg"``, ``"cr"``, ``"gmres"``.  Pass an ordered sequence to
-        warmstart solvers left-to-right, e.g. ``("cr", "gs")`` or
+        ``"apgd"``, ``"cg"``, ``"cr"``, ``"gmres"``. ``"apgd"`` jointly
+        solves material and collider constraints and cannot be combined with
+        another solver. Pass an ordered sequence to warmstart other solvers
+        left-to-right, e.g. ``("cr", "gs")`` or
         ``("cg", "jacobi", "gs")``."""
         warmstart_mode: Literal["none", "auto", "particles", "grid", "smoothed"] = "auto"
         """Warmstart mode to use for the rheology solver.
