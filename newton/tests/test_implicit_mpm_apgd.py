@@ -209,6 +209,48 @@ def _stress_projection_reference(stress, yield_params):
             projected[1:] *= yield_stress / tangential_norm
         return projected
 
+    if yield_params[0] >= 1.0e12:
+        if normal_value >= pmin and tangential_norm <= cohesion + friction_slope * (normal_value - pmin):
+            return np.array(stress, dtype=np.float64)
+
+        point = np.array([normal_value, tangential_norm])
+        cap = _project_segment(point, np.array([pmin, 0.0]), np.array([pmin, cohesion]))
+        ray_start = np.array([pmin, cohesion])
+        ray_direction = np.array([1.0, friction_slope])
+        ray_coordinate = max(0.0, np.dot(point - ray_start, ray_direction) / np.dot(ray_direction, ray_direction))
+        ray = ray_start + ray_coordinate * ray_direction
+        projected_point = min((cap, ray), key=lambda candidate: np.dot(candidate - point, candidate - point))
+
+        projected = np.zeros(6)
+        projected[0] = projected_point[0]
+        if tangential_norm > 0.0:
+            projected[1:] = projected_point[1] * tangential[1:] / tangential_norm
+        return projected
+
+    if yield_params[1] >= 1.0e12:
+        p2 = 0.5 * pmax
+        peak = cohesion + friction_slope * p2
+        yield_stress = peak if normal_value <= p2 else cohesion + friction_slope * (pmax - normal_value)
+        if normal_value <= pmax and tangential_norm <= yield_stress:
+            return np.array(stress, dtype=np.float64)
+
+        point = np.array([normal_value, tangential_norm])
+        ray_start = np.array([p2, peak])
+        ray_direction = np.array([-1.0, 0.0])
+        ray_coordinate = max(0.0, np.dot(point - ray_start, ray_direction))
+        candidates = [
+            ray_start + ray_coordinate * ray_direction,
+            _project_segment(point, ray_start, np.array([pmax, cohesion])),
+            _project_segment(point, np.array([pmax, cohesion]), np.array([pmax, 0.0])),
+        ]
+        projected_point = min(candidates, key=lambda candidate: np.dot(candidate - point, candidate - point))
+
+        projected = np.zeros(6)
+        projected[0] = projected_point[0]
+        if tangential_norm > 0.0:
+            projected[1:] = projected_point[1] * tangential[1:] / tangential_norm
+        return projected
+
     if pmin <= normal_value <= pmax and tangential_norm <= yield_stress:
         return np.array(stress, dtype=np.float64)
 
@@ -508,6 +550,49 @@ def test_stress_projection_cases(test, device):
         rtol=0.0,
         atol=1.0e-6,
     )
+
+
+def test_stress_projection_infinite_drucker_prager(test, device):
+    """Project onto the exact infinite Drucker-Prager cone."""
+    del test
+    stress = np.array(
+        [
+            [1.0, 1.8, 0.0, 2.4, 0.0, 0.0],
+            [-2.0, 0.3, 0.4, 0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0, 0.0, 4.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    yield_params = np.repeat(_yield_params(1.0e20, 0.0, 1.0, 0.5)[None, :], len(stress), axis=0)
+    expected = np.array(
+        [_stress_projection_reference(value, params) for value, params in zip(stress, yield_params, strict=True)]
+    )
+    actual = _project_stresses(stress, yield_params, device)
+
+    np.testing.assert_allclose(actual, expected, rtol=5.0e-6, atol=3.0e-6)
+    np.testing.assert_allclose(_project_stresses(actual, yield_params, device), actual, rtol=5.0e-6, atol=3.0e-6)
+
+
+def test_stress_projection_infinite_tension(test, device):
+    """Project onto the exact infinite-tension yield surface."""
+    del test
+    stress = np.array(
+        [
+            [-2.0, 1.8, 0.0, 2.4, 0.0, 0.0],
+            [3.0, 0.0, 0.0, 0.0, 4.0, 0.0],
+            [5.0, 0.3, 0.4, 0.0, 0.0, 0.0],
+            [-3.0, 0.6, 0.0, 0.8, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    yield_params = np.repeat(_yield_params(4.0, 2.5e19, 1.0, 0.5)[None, :], len(stress), axis=0)
+    expected = np.array(
+        [_stress_projection_reference(value, params) for value, params in zip(stress, yield_params, strict=True)]
+    )
+    actual = _project_stresses(stress, yield_params, device)
+
+    np.testing.assert_allclose(actual, expected, rtol=5.0e-6, atol=3.0e-6)
+    np.testing.assert_allclose(_project_stresses(actual, yield_params, device), actual, rtol=5.0e-6, atol=3.0e-6)
 
 
 def test_stress_projection_properties(test, device):
@@ -1194,6 +1279,18 @@ add_function_test(
     TestImplicitMPMAPGDProjections,
     "test_stress_projection_cases",
     test_stress_projection_cases,
+    devices=devices,
+)
+add_function_test(
+    TestImplicitMPMAPGDProjections,
+    "test_stress_projection_infinite_drucker_prager",
+    test_stress_projection_infinite_drucker_prager,
+    devices=devices,
+)
+add_function_test(
+    TestImplicitMPMAPGDProjections,
+    "test_stress_projection_infinite_tension",
+    test_stress_projection_infinite_tension,
     devices=devices,
 )
 add_function_test(

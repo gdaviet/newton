@@ -11,8 +11,8 @@ Progress:
   states, implements the Algorithm B.2 inertia/restart, computes the scaled
   BB2 step from raw coupled responses, and checks stress and contact residuals
   independently.
-- Twenty-two test functions generate 66 passing cases across CPU, `cuda:0`, and
-  `cuda:1`.
+- Twenty-four test functions generate 72 passing cases across CPU, `cuda:0`,
+  and `cuda:1`.
 - On the synthetic coupled regression, acceleration reaches a `1e-4`
   two-family residual tolerance in 55 iterations, compared with 884
   fixed-step iterations.
@@ -46,6 +46,10 @@ Progress:
   the finite \(10^{15}\) pressure polygon. This preserves the float32 pressure
   multiplier, excludes it from the viscous flow metric, and restores
   incompressibility in the complete funnel example.
+- One-sided unbounded pressure limits also use their exact rays instead of
+  artificial far-cap vertices. This covers the default infinite
+  Drucker-Prager cone and the less common infinite-tension configuration
+  without overflow or sentinel-dependent projection errors.
 - Sparse associated, sparse viscous, and fixed-grid non-associated granular
   examples pass CUDA smoke tests. The fixed-grid test also covers collider
   contact and outer graph capture.
@@ -201,7 +205,17 @@ r_T^{\,\mathrm{proj}} =
 
 This construction covers the tensile/compressive caps, the rising and falling
 frictional branches, the plateau, cohesion, and their corners. Degenerate
-zero-friction and zero-pressure cases require explicit tests.
+zero-friction and zero-pressure cases require explicit tests. If either
+pressure cap is represented by the infinite sentinel, replace the incident
+far edges by their analytic rays. In particular, the default granular law is
+the semi-infinite Drucker-Prager cone
+
+\[
+r_N\ge p_{\min}, \qquad
+0\le t\le s+\mu(r_N-p_{\min}),
+\]
+
+whose boundary is the finite tensile cap followed by a rising ray.
 
 ### Collider impulse projection
 
@@ -647,6 +661,9 @@ run.
 8. [Complete] Preserve the unbounded pressure multiplier with an exact
    cylindrical projection, retain viscous total-stress warm starts, and
    enforce a relative-divergence check in the viscous example.
+9. [Complete] Project one-sided unbounded yield sets using exact rays,
+   including the default infinite Drucker-Prager cone, rather than finite
+   sentinel caps.
 
 The raw coupled operator, exact admissible-set projection, acceleration, and
 residual framework remain shared with associated materials. A future
@@ -667,6 +684,8 @@ Projection tests:
   deviatoric rotational invariance;
 - unbounded fluid pressure remains unchanged while deviatoric stress projects
   onto the cylindrical yield set;
+- infinite Drucker-Prager and infinite-tension surfaces agree with analytic
+  ray projections and remain idempotent for very large sentinels;
 - compare projected points against a small NumPy boundary enumeration or dense
   sampled reference and verify feasibility and projection optimality.
 
@@ -709,14 +728,15 @@ corrections, viscosity, coupled Algorithm B.2 acceleration, guarded
 raw-response BB2 updates, device-resident stopping reductions, and feasible
 final reconstruction.
 
-The focused suite has 66 passing CPU/CUDA cases. Scene-level tests cover
+The focused suite has 72 passing CPU/CUDA cases. Scene-level tests cover
 associated snow, non-associated granular flow with fixed-grid inactive
 capacity, the complete viscous funnel, collider contact, and CUDA graph
 capture. Dedicated regressions also cover per-environment APGD reductions,
 independent-world replay, empty environments, fixed-grid capacity padding,
-large-viscosity and incompressible-fluid agreement with Gauss-Seidel, viscous
-warm starts, and multi-world outer graph capture. The viscous funnel now
-checks relative particle-velocity divergence rather than finite state alone.
-Remaining work is broader regression testing and further scene-level
-performance/robustness tuning, including additional accuracy thresholds and
-cross-device non-associated timing.
+all finite and unbounded piecewise-linear yield topologies, large-viscosity
+and incompressible-fluid agreement with Gauss-Seidel, viscous warm starts,
+and multi-world outer graph capture. The viscous funnel now checks relative
+particle-velocity divergence rather than finite state alone. Remaining work
+is broader regression testing and further scene-level performance/robustness
+tuning, including additional accuracy thresholds and cross-device
+non-associated timing.

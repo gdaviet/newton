@@ -14,7 +14,7 @@ _DELASSUS_PROXIMAL_REG = wp.constant(1.0e-6)
 """Cutoff for the trace of the diagonal block of the Delassus operator to disable constraints"""
 
 _UNBOUNDED_YIELD_THRESHOLD = wp.constant(1.0e12)
-"""Value above which both pressure bounds are treated as unbounded"""
+"""Pressure-bound magnitude above which the projection uses its unbounded limit"""
 
 _SLIDING_NEWTON_TOL = wp.constant(1.0e-7)
 """Tolerance for the Newton method to solve for the sliding velocity"""
@@ -697,6 +697,16 @@ def _project_on_segment_2d(
 
 
 @wp.func
+def _project_on_ray_2d(
+    point: wp.vec2,
+    ray_start: wp.vec2,
+    ray_direction: wp.vec2,
+):
+    coordinate = wp.max(0.0, wp.dot(point - ray_start, ray_direction) / wp.length_sq(ray_direction))
+    return ray_start + coordinate * ray_direction
+
+
+@wp.func
 def _select_closer_point_2d(
     point: wp.vec2,
     candidate: wp.vec2,
@@ -735,6 +745,54 @@ def project_stress_orthogonal(
 
     mu = wp.where(pmax > 0.0, wp.max(0.0, yield_params[3] / pmax), 0.0)
     cohesion = wp.max(0.0, yield_params[2])
+
+    if pmax >= _UNBOUNDED_YIELD_THRESHOLD:
+        # The finite tensile cap and rising ray are the exact limit of the
+        # default Drucker-Prager surface as the compression cap recedes.
+        yield_stress = cohesion + mu * (r_N - pmin)
+        if r_N >= pmin and r_T_n <= yield_stress:
+            return r
+
+        point = wp.vec2(r_N, r_T_n)
+        closest = _project_on_segment_2d(point, wp.vec2(pmin, 0.0), wp.vec2(pmin, cohesion))
+        ray = _project_on_ray_2d(point, wp.vec2(pmin, cohesion), wp.vec2(1.0, mu))
+        closest = _select_closer_point_2d(point, ray, closest)
+
+        projected = vec6(0.0)
+        projected[0] = closest[0]
+        if r_T_n > 0.0:
+            projected += (closest[1] / r_T_n) * r_T
+            projected[0] = closest[0]
+        return projected
+
+    if -pmin >= _UNBOUNDED_YIELD_THRESHOLD:
+        # This less common limit has an unbounded tensile plateau followed by
+        # the finite falling branch and compression cap.
+        p2 = 0.5 * pmax
+        peak = cohesion + mu * p2
+        yield_stress = wp.where(r_N <= p2, peak, cohesion + mu * (pmax - r_N))
+        if r_N <= pmax and r_T_n <= yield_stress:
+            return r
+
+        point = wp.vec2(r_N, r_T_n)
+        closest = _project_on_ray_2d(point, wp.vec2(p2, peak), wp.vec2(-1.0, 0.0))
+        closest = _select_closer_point_2d(
+            point,
+            _project_on_segment_2d(point, wp.vec2(p2, peak), wp.vec2(pmax, cohesion)),
+            closest,
+        )
+        closest = _select_closer_point_2d(
+            point,
+            _project_on_segment_2d(point, wp.vec2(pmax, cohesion), wp.vec2(pmax, 0.0)),
+            closest,
+        )
+
+        projected = vec6(0.0)
+        projected[0] = closest[0]
+        if r_T_n > 0.0:
+            projected += (closest[1] / r_T_n) * r_T
+            projected[0] = closest[0]
+        return projected
 
     if r_N >= pmin and r_N <= pmax:
         yield_stress, _slope, _region_min, _region_max = shear_yield_stress(yield_params, r_N)
