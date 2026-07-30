@@ -1588,6 +1588,8 @@ _RHEOLOGY_SOLVERS = {
     "gs-batched": _BatchedGaussSeidelSolver,
 }
 
+_ACCEPTED_RHEOLOGY_SOLVERS = (*_RHEOLOGY_SOLVERS, "apgd", *_ITERATIVE_LINEAR_SOLVERS)
+
 
 def _resolve_batched_gs_batching(color_count: int, n_batches: int | None) -> tuple[int, int]:
     """Resolve batch count and colors per batch for batched Gauss-Seidel."""
@@ -2926,6 +2928,10 @@ def solve_rheology(
     if len(solvers) == 0:
         raise ValueError("Solver sequence must contain at least one solver.")
 
+    invalid_solver = next((candidate for candidate in solvers if candidate not in _ACCEPTED_RHEOLOGY_SOLVERS), None)
+    if invalid_solver is not None:
+        raise ValueError(f"Invalid solver {invalid_solver!r}. Accepted values: {list(_ACCEPTED_RHEOLOGY_SOLVERS)}.")
+
     if "apgd" in solvers:
         if solvers != ("apgd",):
             raise ValueError(f"APGD must be used as the only rheology solver, got {solver!r}.")
@@ -3022,7 +3028,7 @@ def solve_rheology(
         )
     rheology_solver_class = _RHEOLOGY_SOLVERS.get(solvers[0])
     if rheology_solver_class is None:
-        raise ValueError(f"Invalid solver {solvers[0]!r}. Accepted values: {list(_RHEOLOGY_SOLVERS)}.")
+        raise ValueError(f"Invalid solver {solvers[0]!r}. Accepted values: {list(_ACCEPTED_RHEOLOGY_SOLVERS)}.")
 
     rheology_solver = rheology_solver_class(delassus_operator, temporary_store)
     rheology_solver.apply_initial_guess()

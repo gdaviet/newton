@@ -863,6 +863,26 @@ def test_solve_rheology_dispatches_apgd(test, device):
         )
 
 
+def test_solve_rheology_error_mentions_apgd(test, device):
+    """List APGD among the accepted solver values."""
+    momentum, rheology, collision, *_rest = _make_coupled_apgd_data(
+        device,
+        stress=np.zeros(6, dtype=np.float32),
+        impulse=np.zeros(3, dtype=np.float32),
+    )
+
+    with test.assertRaisesRegex(ValueError, r"Accepted values: .*'apgd'"):
+        solve_rheology(
+            "gsa",
+            max_iterations=1,
+            tolerance=0.0,
+            momentum=momentum,
+            rheology=rheology,
+            collision=collision,
+            use_graph=False,
+        )
+
+
 def test_coupled_apgd_reductions_stay_on_device(test, device):
     """Use only preallocated reductions inside the iteration loop."""
     initial_stress = np.array([0.2, 0.1, 0.0, 0.0, 0.0, 0.1], dtype=np.float32)
@@ -1093,6 +1113,12 @@ add_function_test(
     TestImplicitMPMAPGDProjections,
     "test_solve_rheology_dispatches_apgd",
     test_solve_rheology_dispatches_apgd,
+    devices=devices,
+)
+add_function_test(
+    TestImplicitMPMAPGDProjections,
+    "test_solve_rheology_error_mentions_apgd",
+    test_solve_rheology_error_mentions_apgd,
     devices=devices,
 )
 add_function_test(
