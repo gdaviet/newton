@@ -1588,7 +1588,9 @@ _RHEOLOGY_SOLVERS = {
     "gs-batched": _BatchedGaussSeidelSolver,
 }
 
-_ACCEPTED_RHEOLOGY_SOLVERS = (*_RHEOLOGY_SOLVERS, "apgd", *_ITERATIVE_LINEAR_SOLVERS)
+_ACCEPTED_RHEOLOGY_SOLVERS = (*_RHEOLOGY_SOLVERS, "apgd", "aspg", *_ITERATIVE_LINEAR_SOLVERS)
+_APGD_STEP_SIZE_BOUNDS = (1.0e-4, 0.5)
+_ASPG_STEP_SIZE_BOUNDS = (1.0e-6, 1.0e6)
 
 
 def _resolve_batched_gs_batching(color_count: int, n_batches: int | None) -> tuple[int, int]:
@@ -1967,7 +1969,7 @@ class _SubgridContactSolver(_ContactSolver):
 
 @dataclass
 class _APGDPrototypeResult:
-    """Summarize one internal APGD prototype solve."""
+    """Summarize one internal accelerated projected-gradient solve."""
 
     iteration_count: int
     residual: tuple[float, float]
@@ -1980,7 +1982,7 @@ class _APGDPrototypeResult:
 
 
 class _APGDPrototypeSolver:
-    """Run coupled APGD projections for stress and collider contact."""
+    """Run coupled accelerated projections for stress and collider contact."""
 
     def __init__(
         self,
@@ -1996,17 +1998,24 @@ class _APGDPrototypeSolver:
         normalize_residuals_by_environment: bool = False,
         temporary_store: fem.TemporaryStore | None = None,
     ) -> None:
-        if not 0.0 < min_step_size <= max_step_size <= 0.5:
+        if (
+            not math.isfinite(min_step_size)
+            or not math.isfinite(max_step_size)
+            or not 0.0 < min_step_size <= max_step_size
+        ):
             raise ValueError(
-                "The APGD prototype step bounds must satisfy "
-                f"0 < min_step_size <= max_step_size <= 0.5, got [{min_step_size}, {max_step_size}]."
+                "The accelerated projected-gradient step bounds must be finite and satisfy "
+                f"0 < min_step_size <= max_step_size, got [{min_step_size}, {max_step_size}]."
             )
-        if not min_step_size <= step_size <= max_step_size:
+        if not math.isfinite(step_size) or not min_step_size <= step_size <= max_step_size:
             raise ValueError(
-                f"The APGD prototype step size must be in [{min_step_size}, {max_step_size}], got {step_size}."
+                "The accelerated projected-gradient step size must be finite and in "
+                f"[{min_step_size}, {max_step_size}], got {step_size}."
             )
         if diagnostic_step_size <= 0.0:
-            raise ValueError(f"The APGD diagnostic step size must be positive, got {diagnostic_step_size}.")
+            raise ValueError(
+                f"The accelerated projected-gradient diagnostic step size must be positive, got {diagnostic_step_size}."
+            )
 
         self.delassus_operator = delassus_operator
         self.momentum = delassus_operator.momentum
@@ -2031,7 +2040,7 @@ class _APGDPrototypeSolver:
 
         if not self.subgrid_collisions and self.collision.collider_impulse.shape[0] != self.momentum.velocity.shape[0]:
             raise ValueError(
-                "The nodal APGD prototype requires one collider impulse per velocity node, "
+                "The nodal accelerated projected-gradient solver requires one collider impulse per velocity node, "
                 f"got {self.collision.collider_impulse.shape[0]} impulses and "
                 f"{self.momentum.velocity.shape[0]} velocity nodes."
             )
@@ -2039,7 +2048,10 @@ class _APGDPrototypeSolver:
         stress_environment_offsets = self.rheology.strain_environment_offsets
         contact_environment_offsets = self.collision.collider_environment_offsets
         if (stress_environment_offsets is None) != (contact_environment_offsets is None):
-            raise ValueError("APGD requires both strain and collider environment offsets for separate-world solves.")
+            raise ValueError(
+                "Accelerated projected-gradient solvers require both strain and collider environment offsets "
+                "for separate-world solves."
+            )
         if stress_environment_offsets is None:
             self.environment_count = 1
         else:
@@ -2047,7 +2059,7 @@ class _APGDPrototypeSolver:
             contact_environment_count = contact_environment_offsets.shape[0] - 1
             if contact_environment_count != self.environment_count:
                 raise ValueError(
-                    "APGD strain and collider environment counts must match, got "
+                    "Accelerated projected-gradient strain and collider environment counts must match, got "
                     f"{self.environment_count} and {contact_environment_count}."
                 )
 
@@ -2575,7 +2587,7 @@ class _APGDPrototypeSolver:
         self.finalize_iteration_launch.launch()
 
     def result(self) -> _APGDPrototypeResult:
-        """Copy the final compact APGD state to the host."""
+        """Copy the final compact projected-gradient state to the host."""
 
         state = self.state.numpy()
         return _APGDPrototypeResult(
@@ -2596,7 +2608,7 @@ class _APGDPrototypeSolver:
         )
 
     def solve(self, use_graph: bool = False):
-        """Run APGD iterations, optionally in a device-conditional CUDA graph."""
+        """Run accelerated projections, optionally in a device-conditional CUDA graph."""
 
         if not use_graph or not self.device.is_cuda:
             for _ in range(self.max_iterations):
@@ -2669,7 +2681,7 @@ def _run_rheology_apgd(
     use_graph: bool = False,
     temporary_store: fem.TemporaryStore | None = None,
 ) -> tuple[Any, _APGDPrototypeResult | None]:
-    """Run APGD and optionally collect host diagnostics outside capture."""
+    """Run accelerated projections and optionally collect host diagnostics."""
 
     delassus_operator = _DelassusOperator(
         rheology,
@@ -2715,12 +2727,14 @@ def _solve_rheology_apgd_prototype(
     use_graph: bool = False,
     temporary_store: fem.TemporaryStore | None = None,
 ) -> _APGDPrototypeResult:
-    """Run the internal APGD implementation and return host diagnostics."""
+    """Run the internal accelerated projected-gradient implementation."""
 
     if residual_tolerance is not None:
         tolerances = residual_tolerance if isinstance(residual_tolerance, tuple) else (residual_tolerance,)
         if any(tolerance < 0.0 for tolerance in tolerances):
-            raise ValueError(f"APGD residual tolerance must be nonnegative, got {residual_tolerance}.")
+            raise ValueError(
+                f"Accelerated projected-gradient residual tolerance must be nonnegative, got {residual_tolerance}."
+            )
 
     _solve_graph, result = _run_rheology_apgd(
         max_iterations=max_iterations,
@@ -2737,7 +2751,9 @@ def _solve_rheology_apgd_prototype(
         temporary_store=temporary_store,
     )
     if result is None:
-        raise RuntimeError("APGD host diagnostics are unavailable while an outer graph capture is active.")
+        raise RuntimeError(
+            "Accelerated projected-gradient host diagnostics are unavailable while an outer graph capture is active."
+        )
     return result
 
 
@@ -2873,8 +2889,8 @@ def solve_rheology(
 
     - Builds the Delassus operator diagonal blocks and rotates all local
       quantities into the decoupled eigenbasis (normal vs tangential).
-    - Runs Gauss-Seidel, Jacobi, linear, or APGD iterations to solve the local
-      stress projection problem per strain node.
+    - Runs Gauss-Seidel, Jacobi, linear, APGD, or ASPG iterations to solve the
+      local stress projection problem per strain node.
     - Applies collider impulses and, when provided, a rigidity coupling step on
       collider velocities each iteration.
     - Iterates until the relevant stress and contact residuals fall below
@@ -2889,7 +2905,8 @@ def solve_rheology(
             Base solvers: ``"gauss-seidel"`` (or ``"gs"``),
             ``"gauss-seidel-soa"`` (or ``"gs-soa"``),
             ``"gauss-seidel-batched"`` (or ``"gs-batched"``),
-            ``"jacobi"``, ``"apgd"``, ``"cg"``, ``"cr"``, ``"gmres"``.
+            ``"jacobi"``, ``"apgd"``, ``"aspg"``, ``"cg"``, ``"cr"``,
+            ``"gmres"``.
             Chained solvers run left-to-right as warmstarts for the
             final solver, e.g. ``("cr", "gs")`` runs CR then Gauss-Seidel,
             ``("cg", "jacobi", "gs-batched")`` runs CG, then a Jacobi smoother,
@@ -2899,15 +2916,18 @@ def solve_rheology(
             ``"gauss-seidel-batched"`` additionally merges colors into
             batches with Jacobi-style mass splitting within each
             batch. Good for wide velocity stencils (B2/B3).
-            ``"apgd"`` jointly projects stress and collider contact, including
-            non-associated de Saxcé corrections and viscoplastic stress shifts.
-            It must be used as the only solver in the sequence.
+            ``"apgd"`` and ``"aspg"`` jointly project stress and collider
+            contact, including non-associated de Saxcé corrections and
+            viscoplastic stress shifts. Both use a BB2 spectral estimate;
+            ASPG uses the broad step bounds from Algorithm B.2 while APGD
+            retains its conservative bounds. Both must be used as the only
+            solver in the sequence.
             The iterative linear solvers (``"cg"``, ``"cr"``, ``"gmres"``)
             only support solid materials without contacts.
         max_iterations: Maximum number of nonlinear iterations.
         tolerance: Solver tolerance for the projected stress residual and,
-            for APGD, the collider contact residual (scaled L2 and block
-            infinity norms, checked independently per environment).
+            for APGD and ASPG, the collider contact residual (scaled L2 and
+            block infinity norms, checked independently per environment).
         momentum: :class:`MomentumData` containing per-node inverse volume
             and velocity DOFs.
         rheology: :class:`RheologyData` containing strain/compliance matrices,
@@ -2936,9 +2956,18 @@ def solve_rheology(
     if invalid_solver is not None:
         raise ValueError(f"Invalid solver {invalid_solver!r}. Accepted values: {list(_ACCEPTED_RHEOLOGY_SOLVERS)}.")
 
-    if "apgd" in solvers:
-        if solvers != ("apgd",):
-            raise ValueError(f"APGD must be used as the only rheology solver, got {solver!r}.")
+    accelerated_projected_gradient = next(
+        (candidate for candidate in solvers if candidate in ("apgd", "aspg")),
+        None,
+    )
+    if accelerated_projected_gradient is not None:
+        if solvers != (accelerated_projected_gradient,):
+            raise ValueError(
+                f"{accelerated_projected_gradient.upper()} must be used as the only rheology solver, got {solver!r}."
+            )
+        min_step_size, max_step_size = (
+            _ASPG_STEP_SIZE_BOUNDS if accelerated_projected_gradient == "aspg" else _APGD_STEP_SIZE_BOUNDS
+        )
 
         solve_graph, result = _run_rheology_apgd(
             max_iterations=max_iterations,
@@ -2946,13 +2975,15 @@ def solve_rheology(
             rheology=rheology,
             collision=collision,
             residual_tolerance=tolerance,
+            min_step_size=min_step_size,
+            max_step_size=max_step_size,
             normalize_residuals_by_environment=True,
             use_graph=use_graph,
             temporary_store=temporary_store,
         )
         if verbose and result is not None:
             print(
-                f"APGD terminated after {result.iteration_count} iterations with "
+                f"{accelerated_projected_gradient.upper()} terminated after {result.iteration_count} iterations with "
                 f"stress/contact L2 residuals {result.residual} and "
                 f"block-infinity residuals {result.residual_inf}"
             )

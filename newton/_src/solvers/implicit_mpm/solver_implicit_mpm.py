@@ -196,6 +196,7 @@ _RheologySolverName = Literal[
     "gauss-seidel-batched",
     "jacobi",
     "apgd",
+    "aspg",
     "cg",
     "cr",
     "gmres",
@@ -799,11 +800,14 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         (B2, B3).  Accepted values: ``"auto"``, ``"gs"`` (or
         ``"gauss-seidel"``), ``"gs-soa"`` (or ``"gauss-seidel-soa"``),
         ``"gs-batched"`` (or ``"gauss-seidel-batched"``), ``"jacobi"``,
-        ``"apgd"``, ``"cg"``, ``"cr"``, ``"gmres"``. ``"apgd"`` jointly
-        solves material and collider constraints and cannot be combined with
-        another solver. Pass an ordered sequence to warmstart other solvers
-        left-to-right, e.g. ``("cr", "gs")`` or
-        ``("cg", "jacobi", "gs")``."""
+        ``"apgd"``, ``"aspg"``, ``"cg"``, ``"cr"``, ``"gmres"``. ``"apgd"``
+        and ``"aspg"`` jointly solve material and collider constraints and
+        cannot be combined with another solver. Both adapt the projected step
+        size using a BB2 spectral estimate; ASPG uses the broad step bounds
+        from `Algorithm B.2
+        <https://gdaviet.fr/files/these-gdaviet-archivage.pdf>`_. Pass an
+        ordered sequence to warmstart other solvers left-to-right, e.g.
+        ``("cr", "gs")`` or ``("cg", "jacobi", "gs")``."""
         warmstart_mode: Literal["none", "auto", "particles", "grid", "smoothed"] = "auto"
         """Warmstart mode to use for the rheology solver.
 

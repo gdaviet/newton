@@ -468,6 +468,11 @@ def test_multiworld_dense_pic_apgd_matches_independent(test, device):
     _run_multiworld_reference_case(device, grid_type="dense", integration_scheme="pic", solver="apgd")
 
 
+def test_multiworld_dense_pic_aspg_matches_independent(test, device):
+    """Verify multi-world dense PIC ASPG matches independent."""
+    _run_multiworld_reference_case(device, grid_type="dense", integration_scheme="pic", solver="aspg")
+
+
 def test_multiworld_dense_gimp_matches_independent(test, device):
     """Verify multi-world dense GIMP matches independent."""
     _run_multiworld_reference_case(device, grid_type="dense", integration_scheme="gimp")
@@ -662,6 +667,11 @@ def test_multiworld_fixed_outer_graph_matches_eager(test, device):
 def test_multiworld_fixed_apgd_outer_graph_matches_eager(test, device):
     """Verify multi-world fixed APGD outer graph matches eager."""
     _run_multiworld_fixed_outer_graph_case(test, device, solver="apgd")
+
+
+def test_multiworld_fixed_aspg_outer_graph_matches_eager(test, device):
+    """Verify multi-world fixed ASPG outer graph matches eager."""
+    _run_multiworld_fixed_outer_graph_case(test, device, solver="aspg")
 
 
 def test_multiworld_sparse_pic_matches_independent(test, device):
@@ -1625,6 +1635,13 @@ add_function_test(
 
 add_function_test(
     TestImplicitMPM,
+    "test_multiworld_dense_pic_aspg_matches_independent",
+    test_multiworld_dense_pic_aspg_matches_independent,
+    devices=basic_devices,
+)
+
+add_function_test(
+    TestImplicitMPM,
     "test_multiworld_dense_gimp_matches_independent",
     test_multiworld_dense_gimp_matches_independent,
     devices=basic_devices,
@@ -1648,6 +1665,13 @@ add_function_test(
     TestImplicitMPM,
     "test_multiworld_fixed_apgd_outer_graph_matches_eager",
     test_multiworld_fixed_apgd_outer_graph_matches_eager,
+    devices=basic_cuda_devices,
+)
+
+add_function_test(
+    TestImplicitMPM,
+    "test_multiworld_fixed_aspg_outer_graph_matches_eager",
+    test_multiworld_fixed_aspg_outer_graph_matches_eager,
     devices=basic_cuda_devices,
 )
 

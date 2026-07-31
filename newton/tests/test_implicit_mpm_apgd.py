@@ -771,8 +771,29 @@ def test_coupled_apgd_reaches_fixed_point(test, device):
     np.testing.assert_allclose(impulse, next_impulse, rtol=2.0e-5, atol=1.0e-5)
 
 
-def test_coupled_apgd_uses_raw_response_for_bb(test, device):
-    """Compute the scaled BB step from raw, extrapolated operator differences."""
+def test_coupled_apgd_keeps_conservative_spectral_bound(test, device):
+    """Keep the existing conservative APGD spectral upper bound."""
+    initial_stress = np.array([0.2, 0.1, 0.0, 0.0, 0.0, 0.1], dtype=np.float32)
+    initial_impulse = np.array([0.2, 0.05, 0.0], dtype=np.float32)
+    momentum, rheology, collision, *_rest = _make_coupled_apgd_data(device, initial_stress, initial_impulse)
+
+    with wp.ScopedDevice(device):
+        result = _solve_rheology_apgd_prototype(
+            max_iterations=1,
+            momentum=momentum,
+            rheology=rheology,
+            collision=collision,
+            step_size=0.25,
+            accelerated=True,
+        )
+
+    test.assertEqual(result.step_size, 0.5)
+    test.assertGreater(result.bb_numerator, 0.0)
+    test.assertGreater(result.bb_denominator, 0.0)
+
+
+def test_coupled_aspg_uses_raw_response_for_bb(test, device):
+    """Compute the ASPG BB2 step from raw, extrapolated operator differences."""
     initial_stress = np.array([0.2, 0.1, 0.0, 0.0, 0.0, 0.1], dtype=np.float32)
     initial_impulse = np.array([0.2, 0.05, 0.0], dtype=np.float32)
     momentum, rheology, collision, base_velocity, collider_velocity, strain_rhs, _yield_params = (
@@ -786,6 +807,8 @@ def test_coupled_apgd_uses_raw_response_for_bb(test, device):
             rheology=rheology,
             collision=collision,
             accelerated=True,
+            min_step_size=1.0e-6,
+            max_step_size=1.0e6,
         )
 
     next_stress = rheology.stress.numpy()[0]
@@ -816,6 +839,12 @@ def test_coupled_apgd_uses_raw_response_for_bb(test, device):
 
     np.testing.assert_allclose(result.bb_numerator, expected_numerator, rtol=3.0e-5, atol=2.0e-7)
     np.testing.assert_allclose(result.bb_denominator, expected_denominator, rtol=3.0e-5, atol=2.0e-7)
+    np.testing.assert_allclose(
+        result.step_size,
+        expected_numerator / expected_denominator,
+        rtol=3.0e-5,
+        atol=2.0e-7,
+    )
     test.assertGreater(result.restart_dot, 0.0)
 
     normal = np.array([1.0, 0.0, 0.0])
@@ -829,8 +858,8 @@ def test_coupled_apgd_uses_raw_response_for_bb(test, device):
     test.assertGreater(abs(float(result.bb_numerator - corrected_numerator)), 1.0e-5)
 
 
-def test_coupled_apgd_accelerates_with_restart(test, device):
-    """Converge both projected residual blocks with coupled inertia and restart."""
+def test_coupled_aspg_accelerates_with_restart(test, device):
+    """Converge both ASPG residual blocks with coupled inertia and restart."""
     initial_stress = np.array([0.2, 0.1, 0.0, 0.0, 0.0, 0.1], dtype=np.float32)
     initial_impulse = np.array([0.2, 0.05, 0.0], dtype=np.float32)
     momentum, rheology, collision, _base_velocity, _collider_velocity, _strain_rhs, _yield_params = (
@@ -846,14 +875,16 @@ def test_coupled_apgd_accelerates_with_restart(test, device):
             collision=collision,
             accelerated=True,
             residual_tolerance=tolerance,
+            min_step_size=1.0e-6,
+            max_step_size=1.0e6,
         )
 
     test.assertLess(result.iteration_count, 200)
     test.assertLessEqual(result.residual[0], tolerance)
     test.assertLessEqual(result.residual[1], tolerance)
     test.assertGreater(result.restart_count, 0)
-    test.assertGreaterEqual(result.step_size, 1.0e-4)
-    test.assertLessEqual(result.step_size, 0.5)
+    test.assertGreaterEqual(result.step_size, 1.0e-6)
+    test.assertLessEqual(result.step_size, 1.0e6)
 
 
 def test_coupled_apgd_handles_non_associated_viscosity(test, device):
@@ -1089,15 +1120,45 @@ def test_solve_rheology_dispatches_apgd(test, device):
         )
 
 
-def test_solve_rheology_error_mentions_apgd(test, device):
-    """List APGD among the accepted solver values."""
+def test_solve_rheology_dispatches_aspg(test, device):
+    """Dispatch the public rheology solver selector to coupled ASPG."""
+    initial_stress = np.array([0.2, 0.1, 0.0, 0.0, 0.0, 0.1], dtype=np.float32)
+    initial_impulse = np.array([0.2, 0.05, 0.0], dtype=np.float32)
+    momentum, rheology, collision, *_rest = _make_coupled_apgd_data(device, initial_stress, initial_impulse)
+
+    with wp.ScopedDevice(device):
+        solve_rheology(
+            "aspg",
+            max_iterations=1,
+            tolerance=0.0,
+            momentum=momentum,
+            rheology=rheology,
+            collision=collision,
+            use_graph=False,
+        )
+
+    test.assertFalse(np.allclose(rheology.stress.numpy()[0], initial_stress))
+    with test.assertRaisesRegex(ValueError, "only rheology solver"):
+        solve_rheology(
+            ("jacobi", "aspg"),
+            max_iterations=1,
+            tolerance=0.0,
+            momentum=momentum,
+            rheology=rheology,
+            collision=collision,
+            use_graph=False,
+        )
+
+
+def test_solve_rheology_error_mentions_projected_gradient_variants(test, device):
+    """List APGD and ASPG among the accepted solver values."""
     momentum, rheology, collision, *_rest = _make_coupled_apgd_data(
         device,
         stress=np.zeros(6, dtype=np.float32),
         impulse=np.zeros(3, dtype=np.float32),
     )
 
-    with test.assertRaisesRegex(ValueError, r"Accepted values: .*'apgd'"):
+    with test.assertRaisesRegex(ValueError, r"Accepted values: .*'apgd'.*'aspg'"):
         solve_rheology(
             "gsa",
             max_iterations=1,
@@ -1325,14 +1386,20 @@ add_function_test(
 )
 add_function_test(
     TestImplicitMPMAPGDProjections,
-    "test_coupled_apgd_uses_raw_response_for_bb",
-    test_coupled_apgd_uses_raw_response_for_bb,
+    "test_coupled_apgd_keeps_conservative_spectral_bound",
+    test_coupled_apgd_keeps_conservative_spectral_bound,
     devices=devices,
 )
 add_function_test(
     TestImplicitMPMAPGDProjections,
-    "test_coupled_apgd_accelerates_with_restart",
-    test_coupled_apgd_accelerates_with_restart,
+    "test_coupled_aspg_uses_raw_response_for_bb",
+    test_coupled_aspg_uses_raw_response_for_bb,
+    devices=devices,
+)
+add_function_test(
+    TestImplicitMPMAPGDProjections,
+    "test_coupled_aspg_accelerates_with_restart",
+    test_coupled_aspg_accelerates_with_restart,
     devices=devices,
 )
 add_function_test(
@@ -1373,8 +1440,14 @@ add_function_test(
 )
 add_function_test(
     TestImplicitMPMAPGDProjections,
-    "test_solve_rheology_error_mentions_apgd",
-    test_solve_rheology_error_mentions_apgd,
+    "test_solve_rheology_dispatches_aspg",
+    test_solve_rheology_dispatches_aspg,
+    devices=devices,
+)
+add_function_test(
+    TestImplicitMPMAPGDProjections,
+    "test_solve_rheology_error_mentions_projected_gradient_variants",
+    test_solve_rheology_error_mentions_projected_gradient_variants,
     devices=devices,
 )
 add_function_test(

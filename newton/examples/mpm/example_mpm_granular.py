@@ -271,8 +271,9 @@ class Example:
                 "gauss-seidel-batched",
                 "jacobi",
                 "apgd",
+                "aspg",
             ],
-            help="Rheology solver; APGD jointly projects non-associated material and collider constraints",
+            help="Rheology solver; APGD/ASPG jointly project non-associated material and collider constraints",
         )
         parser.add_argument("--transfer-scheme", "-ts", type=str, default="apic", choices=["apic", "pic"])
         parser.add_argument("--integration-scheme", "-is", type=str, default="pic", choices=["pic", "gimp"])
