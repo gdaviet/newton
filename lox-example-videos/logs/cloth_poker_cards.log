@@ -1,0 +1,1 @@
+Warning: LOX dropped deformable edge-edge contact candidates because the per-edge buffer is full (capacity 64). Increase deformable_self_contact_edge_buffer_size.

@@ -1,0 +1,11 @@
+SensorContact initialized:
+  Sensing objects: 1 (shapes)
+  Counterpart columns: 0
+  total_force: yes, force_matrix: no
+SensorContact initialized:
+  Sensing objects: 2 (shapes)
+  Counterpart columns: 2 (shapes)
+  total_force: no, force_matrix: yes
+Resetting
+Plate /env/Plate1 was touched by counterpart /env/Sphere
+Plate /env/Plate2 was touched by counterpart /env/Sphere

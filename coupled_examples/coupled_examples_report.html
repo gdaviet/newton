@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Newton Coupled Examples Report</title>
+  <style>
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #1d2430;
+      background: #f4f6f8;
+    }
+    header {
+      padding: 28px 32px 18px;
+      background: #111827;
+      color: white;
+    }
+    h1 {
+      margin: 0 0 6px;
+      font-size: 28px;
+      letter-spacing: 0;
+    }
+    main {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      gap: 18px;
+      padding: 24px;
+    }
+    .card {
+      background: white;
+      border: 1px solid #d7dde5;
+      border-radius: 8px;
+      padding: 16px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+    }
+    .card.failed {
+      border-color: #dc8a8a;
+    }
+    h2 {
+      margin: 0 0 4px;
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+    p {
+      margin: 0 0 12px;
+      color: #526070;
+    }
+    img, video {
+      display: block;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      object-fit: contain;
+      background: #162033;
+      border-radius: 6px;
+    }
+    video {
+      margin-top: 10px;
+    }
+    ul {
+      margin: 10px 0 0;
+      padding-left: 18px;
+      color: #526070;
+    }
+    .error {
+      color: #9f1239;
+      white-space: pre-wrap;
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #334155;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Newton Coupled Examples Report</h1>
+    <p>Headless OpenGL captures from coupled solver examples. Screenshots are auto-framed from the final state; every card includes a low-resolution MP4 preview.</p>
+  </header>
+  <main>
+    <section class="card summary">
+      <h2>Contact Sheet</h2>
+      <p>Quick overview of the generated screenshots.</p>
+      <img src="assets/coupled_examples_contact_sheet.jpg" alt="Coupled examples contact sheet">
+    </section>
+    
+            <section class="card ok">
+              <h2>ADMM Contact, XPBD Particles In A Drawer</h2>
+              <p><code>admm_contact_solver</code> · captured after 90 frames · ok</p>
+              <img src="assets/admm_contact_solver.png" alt="ADMM Contact, XPBD Particles In A Drawer screenshot"><video controls muted loop preload="metadata" src="assets/admm_contact_solver.mp4"><a href="assets/admm_contact_solver.mp4">video</a></video>
+              
+              <ul></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>ADMM Rigid Contact, Tilting Plane</h2>
+              <p><code>admm_rigid_contact_solver</code> · captured after 120 frames · ok</p>
+              <img src="assets/admm_rigid_contact_solver.png" alt="ADMM Rigid Contact, Tilting Plane screenshot"><video controls muted loop preload="metadata" src="assets/admm_rigid_contact_solver.mp4"><a href="assets/admm_rigid_contact_solver.mp4">video</a></video>
+              
+              <ul></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>MuJoCo Robot + VBD Cable Proxy Coupling</h2>
+              <p><code>cable_robot_proxy_coupled_solver</code> · captured after 1279 frames · ok</p>
+              <img src="assets/cable_robot_proxy_coupled_solver.png" alt="MuJoCo Robot + VBD Cable Proxy Coupling screenshot"><video controls muted loop preload="metadata" src="assets/cable_robot_proxy_coupled_solver.mp4"><a href="assets/cable_robot_proxy_coupled_solver.mp4">video</a></video>
+              
+              <ul><li>Video uses the example's default camera preset and runs until the state machine reaches DONE.</li></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>Franka IK Pick-and-Place + VBD Cable Proxy Coupling</h2>
+              <p><code>franka_cable_ik_pick_place</code> · captured after 300 frames · ok</p>
+              <img src="assets/franka_cable_ik_pick_place.png" alt="Franka IK Pick-and-Place + VBD Cable Proxy Coupling screenshot"><video controls muted loop preload="metadata" src="assets/franka_cable_ik_pick_place.mp4"><a href="assets/franka_cable_ik_pick_place.mp4">video</a></video>
+              
+              <ul><li>Captures the proxy-coupled Franka/cable pick-and-place example through the later lift phase.</li></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>Franka Cloth Manipulation + VBD Proxy Coupling</h2>
+              <p><code>franka_cloth_manipulation</code> · captured after 420 frames · ok</p>
+              <img src="assets/franka_cloth_manipulation.png" alt="Franka Cloth Manipulation + VBD Proxy Coupling screenshot"><video controls muted loop preload="metadata" src="assets/franka_cloth_manipulation.mp4"><a href="assets/franka_cloth_manipulation.mp4">video</a></video>
+              
+              <ul><li>Captures the proxy-coupled Franka/cloth manipulation example through the grasp/lift/hold sequence.</li></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>Kamino + MuJoCo ADMM Four-Bar</h2>
+              <p><code>kamino_mujoco_admm_solver</code> · captured after 90 frames · ok</p>
+              <img src="assets/kamino_mujoco_admm_solver.png" alt="Kamino + MuJoCo ADMM Four-Bar screenshot"><video controls muted loop preload="metadata" src="assets/kamino_mujoco_admm_solver.mp4"><a href="assets/kamino_mujoco_admm_solver.mp4">video</a></video>
+              
+              <ul></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>MuJoCo + MPM Proxy Coupling</h2>
+              <p><code>mujoco_mpm_coupled_solver</code> · captured after 70 frames · ok</p>
+              <img src="assets/mujoco_mpm_coupled_solver.png" alt="MuJoCo + MPM Proxy Coupling screenshot"><video controls muted loop preload="metadata" src="assets/mujoco_mpm_coupled_solver.mp4"><a href="assets/mujoco_mpm_coupled_solver.mp4">video</a></video>
+              
+              <ul></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>MuJoCo + VBD ADMM Pendulum And Cloth</h2>
+              <p><code>mujoco_vbd_admm_solver</code> · captured after 110 frames · ok</p>
+              <img src="assets/mujoco_vbd_admm_solver.png" alt="MuJoCo + VBD ADMM Pendulum And Cloth screenshot"><video controls muted loop preload="metadata" src="assets/mujoco_vbd_admm_solver.mp4"><a href="assets/mujoco_vbd_admm_solver.mp4">video</a></video>
+              
+              <ul></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>MuJoCo Franka + VBD Cable ADMM</h2>
+              <p><code>mujoco_franka_vbd_cable_admm_solver</code> · captured after 180 frames · ok</p>
+              <img src="assets/mujoco_franka_vbd_cable_admm_solver.png" alt="MuJoCo Franka + VBD Cable ADMM screenshot"><video controls muted loop preload="metadata" src="assets/mujoco_franka_vbd_cable_admm_solver.mp4"><a href="assets/mujoco_franka_vbd_cable_admm_solver.mp4">video</a></video>
+              
+              <ul><li>Runs a longer preview of the dedicated ADMM Franka/cable example with its default parameters.</li></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>MuJoCo + VBD Proxy Coupling</h2>
+              <p><code>mujoco_vbd_coupled_solver</code> · captured after 90 frames · ok</p>
+              <img src="assets/mujoco_vbd_coupled_solver.png" alt="MuJoCo + VBD Proxy Coupling screenshot"><video controls muted loop preload="metadata" src="assets/mujoco_vbd_coupled_solver.mp4"><a href="assets/mujoco_vbd_coupled_solver.mp4">video</a></video>
+              
+              <ul></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>MuJoCo + XPBD Proxy Coupling</h2>
+              <p><code>mujoco_xpbd_coupled_solver</code> · captured after 90 frames · ok</p>
+              <img src="assets/mujoco_xpbd_coupled_solver.png" alt="MuJoCo + XPBD Proxy Coupling screenshot"><video controls muted loop preload="metadata" src="assets/mujoco_xpbd_coupled_solver.mp4"><a href="assets/mujoco_xpbd_coupled_solver.mp4">video</a></video>
+              
+              <ul></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>Proxy Coupling Convergence</h2>
+              <p><code>proxy_coupling_convergence</code> · captured after 12 frames · ok</p>
+              <img src="assets/proxy_coupling_convergence_plot.png" alt="Proxy coupling convergence plot"><img src="assets/proxy_coupling_factor_map.png" alt="Proxy coupling fixed-point factor map">
+              
+              <ul><li>Also writes the convergence and fixed-point-factor plots.</li></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>MuJoCo + VBD Proxy-Joint Gripper</h2>
+              <p><code>proxy_joint_gripper</code> · captured after 60 frames · ok</p>
+              <img src="assets/proxy_joint_gripper.png" alt="MuJoCo + VBD Proxy-Joint Gripper screenshot"><video controls muted loop preload="metadata" src="assets/proxy_joint_gripper.mp4"><a href="assets/proxy_joint_gripper.mp4">video</a></video>
+              
+              <ul><li>Prismatic proxy joints track the MuJoCo drive targets during the VBD grasp attempt.</li></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>Rigid/Soft Contact, Coupled</h2>
+              <p><code>rigid_soft_contact_coupled_solver</code> · captured after 90 frames · ok</p>
+              <img src="assets/rigid_soft_contact_coupled_solver.png" alt="Rigid/Soft Contact, Coupled screenshot"><video controls muted loop preload="metadata" src="assets/rigid_soft_contact_coupled_solver.mp4"><a href="assets/rigid_soft_contact_coupled_solver.mp4">video</a></video>
+              
+              <ul></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>Soft Body Drop Onto Cloth, Coupled</h2>
+              <p><code>softbody_dropping_to_cloth_coupled_solver</code> · captured after 90 frames · ok</p>
+              <img src="assets/softbody_dropping_to_cloth_coupled_solver.png" alt="Soft Body Drop Onto Cloth, Coupled screenshot"><video controls muted loop preload="metadata" src="assets/softbody_dropping_to_cloth_coupled_solver.mp4"><a href="assets/softbody_dropping_to_cloth_coupled_solver.mp4">video</a></video>
+              
+              <ul></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>VBD Soft Body + MPM Proxy Coupling</h2>
+              <p><code>vbd_mpm_coupled_solver</code> · captured after 90 frames · ok</p>
+              <img src="assets/vbd_mpm_coupled_solver.png" alt="VBD Soft Body + MPM Proxy Coupling screenshot"><video controls muted loop preload="metadata" src="assets/vbd_mpm_coupled_solver.mp4"><a href="assets/vbd_mpm_coupled_solver.mp4">video</a></video>
+              
+              <ul></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>XPBD Particles + MPM Transfer Proxy Coupling</h2>
+              <p><code>xpbd_mpm_coupled_solver</code> · captured after 90 frames · ok</p>
+              <img src="assets/xpbd_mpm_coupled_solver.png" alt="XPBD Particles + MPM Transfer Proxy Coupling screenshot"><video controls muted loop preload="metadata" src="assets/xpbd_mpm_coupled_solver.mp4"><a href="assets/xpbd_mpm_coupled_solver.mp4">video</a></video>
+              
+              <ul></ul>
+            </section>
+            
+            <section class="card ok">
+              <h2>XPBD Particles + VBD Cloth Proxy Coupling</h2>
+              <p><code>xpbd_vbd_coupled_solver</code> · captured after 90 frames · ok</p>
+              <img src="assets/xpbd_vbd_coupled_solver.png" alt="XPBD Particles + VBD Cloth Proxy Coupling screenshot"><video controls muted loop preload="metadata" src="assets/xpbd_vbd_coupled_solver.mp4"><a href="assets/xpbd_vbd_coupled_solver.mp4">video</a></video>
+              
+              <ul></ul>
+            </section>
+            
+  </main>
+</body>
+</html>

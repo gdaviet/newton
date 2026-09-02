@@ -1,0 +1,12 @@
+{
+  "name": "cable_robot_proxy_coupled_solver",
+  "title": "MuJoCo Robot + VBD Cable Proxy Coupling",
+  "screenshot": "cable_robot_proxy_coupled_solver.png",
+  "images": [],
+  "video": "cable_robot_proxy_coupled_solver.mp4",
+  "frames": 1279,
+  "status": "ok",
+  "notes": [
+    "Video uses the example's default camera preset and runs until the state machine reaches DONE."
+  ]
+}

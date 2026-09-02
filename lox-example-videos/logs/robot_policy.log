@@ -1,0 +1,9 @@
+/home/gdaviet/Projects/worktrees/simple-scalable/newton/examples/robot/example_robot_policy.py:315: DeprecationWarning: Model.contacts() is deprecated; create a CollisionPipeline and call pipeline.contacts() instead.
+  self.contacts = self.model.contacts()
+[INFO] Selected robot: g1_29dof
+[INFO] Asset directory: /home/gdaviet/.cache/newton/newton-assets_unitree_g1_110bd790_261cd1f4/unitree_g1
+[INFO] Loaded config with 43 DOFs
+[INFO] Seeded LOX joint penalty scales per world: [827]
+[INFO] Loading policy from: /home/gdaviet/.cache/newton/newton-assets_unitree_g1_110bd790_261cd1f4/unitree_g1/rl_policies/mjw_g1_29DOF.onnx
+[INFO] Using graph capture
+[INFO] Resetting example

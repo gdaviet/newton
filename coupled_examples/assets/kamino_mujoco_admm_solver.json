@@ -1,0 +1,10 @@
+{
+  "name": "kamino_mujoco_admm_solver",
+  "title": "Kamino + MuJoCo ADMM Four-Bar",
+  "screenshot": "kamino_mujoco_admm_solver.png",
+  "images": [],
+  "video": "kamino_mujoco_admm_solver.mp4",
+  "frames": 90,
+  "status": "ok",
+  "notes": []
+}

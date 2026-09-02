@@ -1,0 +1,10 @@
+{
+  "name": "mujoco_mpm_coupled_solver",
+  "title": "MuJoCo + MPM Proxy Coupling",
+  "screenshot": "mujoco_mpm_coupled_solver.png",
+  "images": [],
+  "video": "mujoco_mpm_coupled_solver.mp4",
+  "frames": 70,
+  "status": "ok",
+  "notes": []
+}

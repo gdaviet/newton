@@ -1,0 +1,12 @@
+{
+  "name": "mujoco_franka_vbd_cable_admm_solver",
+  "title": "MuJoCo Franka + VBD Cable ADMM",
+  "screenshot": "mujoco_franka_vbd_cable_admm_solver.png",
+  "images": [],
+  "video": "mujoco_franka_vbd_cable_admm_solver.mp4",
+  "frames": 180,
+  "status": "ok",
+  "notes": [
+    "Runs a longer preview of the dedicated ADMM Franka/cable example with its default parameters."
+  ]
+}

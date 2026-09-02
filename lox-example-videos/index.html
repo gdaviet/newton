@@ -1,0 +1,1462 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Newton LOX example videos</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #11151b; color: #e8edf2; }
+    body { margin: 0; padding: 2rem; }
+    header { max-width: 90rem; margin: 0 auto 2rem; }
+    .summary { display: flex; flex-wrap: wrap; gap: 1rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr)); gap: 1.25rem; }
+    .card { background: #1a212b; border: 1px solid #344154; border-radius: .7rem; padding: 1rem; }
+    .card h2 { margin: 0; font-size: 1.1rem; }
+    .status { display: inline-block; padding: .2rem .55rem; border-radius: 1rem; background: #39485d; }
+    .status-passed .status { background: #17653b; }
+    .status-timeout .status, .status-startup_timeout .status { background: #765214; }
+    .status-environment_blocked .status { background: #654a8a; }
+    .status-failed .status, .status-encode_failed .status { background: #782c37; }
+    video, .no-video { width: 100%; aspect-ratio: 4 / 3; background: #080a0d; border-radius: .4rem; object-fit: contain; }
+    .no-video { display: grid; place-items: center; color: #9ca9b8; }
+    dl { display: grid; grid-template-columns: auto 1fr; gap: .25rem .75rem; }
+    dt { color: #9ca9b8; } dd { margin: 0; }
+    code, pre { font-family: ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    pre { max-height: 14rem; overflow: auto; background: #0f1319; padding: .6rem; }
+    a { color: #75b9ff; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Newton LOX example videos</h1>
+    <p>Videos use each example's simulation frame rate. Capture targets and post-first-frame time limits are shown per card. Partial frame sequences were encoded after failures or timeouts.</p>
+    <p class="summary"><span><b>Completed entries</b>: 69/69</span><span><b>passed</b>: 66</span> <span><b>timeout</b>: 3</span></p>
+    <details open><summary>Known LOX exclusions</summary><ul><li><code>recording</code>: Uses D6/GIMBAL joints, which SolverKamino does not support.</li></ul></details>
+    <details><summary>Supported selection examples omitted because their LOX options were intentionally removed</summary><ul><li><code>selection_cartpole</code></li><li><code>selection_materials</code></li><li><code>selection_multiple</code></li></ul></details>
+  </header>
+  <main class="grid">
+            <article class="card status-passed">
+              <h2>basic_conveyor</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/basic_conveyor.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>100</dd>
+                <dt>Wall time</dt><dd>11.4 s</dd>
+                <dt>After first frame</dt><dd>5.6 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example basic_conveyor --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/basic_conveyor --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/basic_conveyor.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>basic_dzhanibekov</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/basic_dzhanibekov.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>8.2 s</dd>
+                <dt>After first frame</dt><dd>3.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example basic_dzhanibekov --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/basic_dzhanibekov --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/basic_dzhanibekov.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>basic_heightfield</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/basic_heightfield.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>100</dd>
+                <dt>Wall time</dt><dd>9.6 s</dd>
+                <dt>After first frame</dt><dd>4.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example basic_heightfield --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/basic_heightfield --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/basic_heightfield.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>basic_joints</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/basic_joints.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>100</dd>
+                <dt>Wall time</dt><dd>9.6 s</dd>
+                <dt>After first frame</dt><dd>4.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example basic_joints --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/basic_joints --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:10:33,977][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/basic_joints.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>basic_multi_solver_overlay</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/basic_multi_solver_overlay.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>100</dd>
+                <dt>Wall time</dt><dd>25.2 s</dd>
+                <dt>After first frame</dt><dd>6.8 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example basic_multi_solver_overlay --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/basic_multi_solver_overlay --max-frames 240 --width 640 --height 480 --device cuda:0 -- --include-lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:10:57,111][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/basic_multi_solver_overlay.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>basic_pendulum</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/basic_pendulum.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>100</dd>
+                <dt>Wall time</dt><dd>9.6 s</dd>
+                <dt>After first frame</dt><dd>4.0 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example basic_pendulum --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/basic_pendulum --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:10,212][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/basic_pendulum.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>basic_shapes</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/basic_shapes.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>100</dd>
+                <dt>Wall time</dt><dd>10.2 s</dd>
+                <dt>After first frame</dt><dd>4.8 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example basic_shapes --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/basic_shapes --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/basic_shapes.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>basic_urdf</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/basic_urdf.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>100</dd>
+                <dt>Wall time</dt><dd>11.4 s</dd>
+                <dt>After first frame</dt><dd>5.6 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example basic_urdf --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/basic_urdf --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,173][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,761][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,767][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,772][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,777][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,781][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,786][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,790][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,795][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,799][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m</pre></details>
+              <a href="logs/basic_urdf.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cable_cross_slide_table</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cable_cross_slide_table.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>21.6 s</dd>
+                <dt>After first frame</dt><dd>15.6 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cable_cross_slide_table --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cable_cross_slide_table --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:44,459][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/cable_cross_slide_table.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cable_pile</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cable_pile.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>35.2 s</dd>
+                <dt>After first frame</dt><dd>20.6 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cable_pile --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cable_pile --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/cable_pile.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cable_plectoneme</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cable_plectoneme.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>480</dd>
+                <dt>Frame target</dt><dd>480</dd>
+                <dt>Time limit</dt><dd>240 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>33.6 s</dd>
+                <dt>After first frame</dt><dd>27.4 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cable_plectoneme --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cable_plectoneme --max-frames 480 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/cable_plectoneme.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cable_twist</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cable_twist.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>15.0 s</dd>
+                <dt>After first frame</dt><dd>9.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cable_twist --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cable_twist --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/cable_twist.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cable_y_junction</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cable_y_junction.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>27.0 s</dd>
+                <dt>After first frame</dt><dd>21.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cable_y_junction --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cable_y_junction --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:13:14,300][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/cable_y_junction.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cloth_bending</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cloth_bending.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>11.6 s</dd>
+                <dt>After first frame</dt><dd>6.0 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cloth_bending --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cloth_bending --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:13:42,087][conversions.py:1398][WARNING]: Zero bodies in world 0, no base body assigned.[0m</pre></details>
+              <a href="logs/cloth_bending.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cloth_franka</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cloth_franka.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>960</dd>
+                <dt>Frame target</dt><dd>960</dd>
+                <dt>Time limit</dt><dd>480 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>167.4 s</dd>
+                <dt>After first frame</dt><dd>158.0 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cloth_franka --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cloth_franka --max-frames 960 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 10:03:25,340][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/cloth_franka.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cloth_hanging</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cloth_hanging.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>12.6 s</dd>
+                <dt>After first frame</dt><dd>7.0 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cloth_hanging --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cloth_hanging --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:14:36,666][conversions.py:1398][WARNING]: Zero bodies in world 0, no base body assigned.[0m</pre></details>
+              <a href="logs/cloth_hanging.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cloth_poker_cards</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cloth_poker_cards.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>82.1 s</dd>
+                <dt>After first frame</dt><dd>75.3 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cloth_poker_cards --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cloth_poker_cards --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>Warning: LOX dropped deformable edge-edge contact candidates because the per-edge buffer is full (capacity 64). Increase deformable_self_contact_edge_buffer_size.</pre></details>
+              <a href="logs/cloth_poker_cards.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cloth_rollers</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cloth_rollers.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>480</dd>
+                <dt>Frame target</dt><dd>480</dd>
+                <dt>Time limit</dt><dd>240 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>204.1 s</dd>
+                <dt>After first frame</dt><dd>195.5 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cloth_rollers --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cloth_rollers --max-frames 480 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 08:49:12,540][conversions.py:1398][WARNING]: Zero bodies in world 0, no base body assigned.[0m
+Warning: LOX dropped deformable edge-edge contact candidates because the per-edge buffer is full (capacity 64). Increase deformable_self_contact_edge_buffer_size.</pre></details>
+              <a href="logs/cloth_rollers.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cloth_twist</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cloth_twist.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>480</dd>
+                <dt>Frame target</dt><dd>480</dd>
+                <dt>Time limit</dt><dd>240 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>171.9 s</dd>
+                <dt>After first frame</dt><dd>165.3 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cloth_twist --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cloth_twist --max-frames 480 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 08:52:37,941][conversions.py:1398][WARNING]: Zero bodies in world 0, no base body assigned.[0m</pre></details>
+              <a href="logs/cloth_twist.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>balance_bird</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/balance_bird.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>9.2 s</dd>
+                <dt>After first frame</dt><dd>3.8 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example balance_bird --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/balance_bird --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/balance_bird.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>brick_stacking</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/brick_stacking.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>480</dd>
+                <dt>Frame target</dt><dd>480</dd>
+                <dt>Time limit</dt><dd>240 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>52.2 s</dd>
+                <dt>After first frame</dt><dd>42.4 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example brick_stacking --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/brick_stacking --max-frames 480 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/brick_stacking.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>contacts_rj45_plug</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/contacts_rj45_plug.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>14.6 s</dd>
+                <dt>After first frame</dt><dd>8.8 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example contacts_rj45_plug --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/contacts_rj45_plug --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 08:45:00,264][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/contacts_rj45_plug.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>domino_spiral</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/domino_spiral.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>10.4 s</dd>
+                <dt>After first frame</dt><dd>5.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example domino_spiral --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/domino_spiral --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/domino_spiral.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>newton_cradle</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/newton_cradle.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>9.2 s</dd>
+                <dt>After first frame</dt><dd>4.0 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example newton_cradle --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/newton_cradle --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:20:44,963][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/newton_cradle.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>nut_bolt_hydro</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/nut_bolt_hydro.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>120</dd>
+                <dt>Wall time</dt><dd>13.6 s</dd>
+                <dt>After first frame</dt><dd>5.8 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example nut_bolt_hydro --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/nut_bolt_hydro --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>Downloading nut/bolt assets...
+Assets downloaded to: /home/gdaviet/.cache/newton/IsaacGymEnvs_assets_factory_mesh_factory_nut_bolt_75dbbba1_aeed2986/assets/factory/mesh/factory_nut_bolt</pre></details>
+              <a href="logs/nut_bolt_hydro.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>nut_bolt_sdf</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/nut_bolt_sdf.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>120</dd>
+                <dt>Wall time</dt><dd>12.6 s</dd>
+                <dt>After first frame</dt><dd>5.8 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example nut_bolt_sdf --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/nut_bolt_sdf --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>Downloading nut/bolt assets...
+Assets downloaded to: /home/gdaviet/.cache/newton/IsaacGymEnvs_assets_factory_mesh_factory_nut_bolt_75dbbba1_aeed2986/assets/factory/mesh/factory_nut_bolt</pre></details>
+              <a href="logs/nut_bolt_sdf.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>pyramid</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/pyramid.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>960</dd>
+                <dt>Frame target</dt><dd>960</dd>
+                <dt>Time limit</dt><dd>480 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>100</dd>
+                <dt>Wall time</dt><dd>55.7 s</dd>
+                <dt>After first frame</dt><dd>41.8 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example pyramid --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/pyramid --max-frames 960 --width 640 --height 480 --device cuda:0 -- --dynamics-backend lox</code><pre>Built 20 pyramids x 20 rows = 4200 boxes</pre></details>
+              <a href="logs/pyramid.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>ik_cube_stacking</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/ik_cube_stacking.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>23.8 s</dd>
+                <dt>After first frame</dt><dd>15.6 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example ik_cube_stacking --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/ik_cube_stacking --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/ik_cube_stacking.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>kamino_basic_dr_testmech</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/kamino_basic_dr_testmech.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>50</dd>
+                <dt>Wall time</dt><dd>12.0 s</dd>
+                <dt>After first frame</dt><dd>6.4 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example kamino_basic_dr_testmech --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/kamino_basic_dr_testmech --max-frames 240 --width 640 --height 480 --device cuda:0 -- --dynamics-solver lox</code><pre></pre></details>
+              <a href="logs/kamino_basic_dr_testmech.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>kamino_basic_fourbar</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/kamino_basic_fourbar.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>50</dd>
+                <dt>Wall time</dt><dd>12.6 s</dd>
+                <dt>After first frame</dt><dd>6.8 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example kamino_basic_fourbar --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/kamino_basic_fourbar --max-frames 240 --width 640 --height 480 --device cuda:0 -- --dynamics-solver lox</code><pre></pre></details>
+              <a href="logs/kamino_basic_fourbar.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>kamino_basic_heterogeneous</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/kamino_basic_heterogeneous.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>50</dd>
+                <dt>Wall time</dt><dd>11.6 s</dd>
+                <dt>After first frame</dt><dd>5.8 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example kamino_basic_heterogeneous --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/kamino_basic_heterogeneous --max-frames 240 --width 640 --height 480 --device cuda:0 -- --dynamics-solver lox</code><pre></pre></details>
+              <a href="logs/kamino_basic_heterogeneous.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>kamino_joint_effort_limits</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/kamino_joint_effort_limits.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>33.8 s</dd>
+                <dt>After first frame</dt><dd>28.4 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example kamino_joint_effort_limits --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/kamino_joint_effort_limits --max-frames 240 --width 640 --height 480 --device cuda:0 --</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:22:50,324][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/kamino_joint_effort_limits.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>kamino_robot_anymal_d</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/kamino_robot_anymal_d.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>50</dd>
+                <dt>Wall time</dt><dd>17.4 s</dd>
+                <dt>After first frame</dt><dd>10.0 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example kamino_robot_anymal_d --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/kamino_robot_anymal_d --max-frames 240 --width 640 --height 480 --device cuda:0 -- --dynamics-solver lox</code><pre>Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RF_FOOT/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_HIP/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_HIP/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_HIP/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_HIP/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_1) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_1) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_1) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_1) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_2) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_2) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_2) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_2) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_SHANK/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_SHANK/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_SHANK/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_SHANK/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_FOOT/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_FOOT/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_FOOT/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_FOOT/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim</pre></details>
+              <a href="logs/kamino_robot_anymal_d.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>kamino_robot_dr_legs</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/kamino_robot_dr_legs.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>50</dd>
+                <dt>Wall time</dt><dd>12.8 s</dd>
+                <dt>After first frame</dt><dd>5.8 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example kamino_robot_dr_legs --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/kamino_robot_dr_legs --max-frames 240 --width 640 --height 480 --device cuda:0 -- --dynamics-solver lox</code><pre></pre></details>
+              <a href="logs/kamino_robot_dr_legs.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>kamino_robot_dr_legs_pyramid</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/kamino_robot_dr_legs_pyramid.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>50</dd>
+                <dt>Wall time</dt><dd>27.2 s</dd>
+                <dt>After first frame</dt><dd>17.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example kamino_robot_dr_legs_pyramid --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/kamino_robot_dr_legs_pyramid --max-frames 240 --width 640 --height 480 --device cuda:0 -- --dynamics-solver lox</code><pre>[INFO] Added 28 supplemental DR Legs colliders
+[INFO] Seeded LOX joint penalty scales per world: [557]
+[INFO] Loaded DR Legs walking policy from /home/gdaviet/.cache/newton/newton-assets_disneyresearch_56289e70_261cd1f4/disneyresearch/dr_legs/rl_policies/drlegs_walk.pt</pre></details>
+              <a href="logs/kamino_robot_dr_legs_pyramid.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>franka_cable_ik_pick_place</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/franka_cable_ik_pick_place.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>480</dd>
+                <dt>Frame target</dt><dd>480</dd>
+                <dt>Time limit</dt><dd>240 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>50.2 s</dd>
+                <dt>After first frame</dt><dd>37.4 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example franka_cable_ik_pick_place --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/franka_cable_ik_pick_place --max-frames 480 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 10:11:31,801][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/franka_cable_ik_pick_place.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>kamino_mujoco_admm_solver</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/kamino_mujoco_admm_solver.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>9.2 s</dd>
+                <dt>After first frame</dt><dd>3.8 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example kamino_mujoco_admm_solver --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/kamino_mujoco_admm_solver --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/kamino_mujoco_admm_solver.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>mujoco_franka_vbd_cable_admm_solver</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/mujoco_franka_vbd_cable_admm_solver.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>36.8 s</dd>
+                <dt>After first frame</dt><dd>27.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example mujoco_franka_vbd_cable_admm_solver --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/mujoco_franka_vbd_cable_admm_solver --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/mujoco_franka_vbd_cable_admm_solver.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>mujoco_vbd_coupled_solver</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/mujoco_vbd_coupled_solver.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>30.0 s</dd>
+                <dt>After first frame</dt><dd>23.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example mujoco_vbd_coupled_solver --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/mujoco_vbd_coupled_solver --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/mujoco_vbd_coupled_solver.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>proxy_joint_gripper</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/proxy_joint_gripper.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>19.2 s</dd>
+                <dt>After first frame</dt><dd>13.4 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example proxy_joint_gripper --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/proxy_joint_gripper --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:26:12,555][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/proxy_joint_gripper.log">Full log</a>
+            </article>
+            
+            <article class="card status-timeout">
+              <h2>rigid_soft_contact</h2>
+              <p class="status">timeout</p>
+              <p>Stopped 120 seconds after the first captured frame; partial frames were encoded.</p>
+              <video controls muted loop preload="metadata"><source src="videos/rigid_soft_contact.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>235</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>128.2 s</dd>
+                <dt>After first frame</dt><dd>120.4 s</dd>
+                <dt>Exit code</dt><dd>-15</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example rigid_soft_contact --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/rigid_soft_contact --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/rigid_soft_contact.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>softbody_dropping_to_cloth</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/softbody_dropping_to_cloth.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>20.8 s</dd>
+                <dt>After first frame</dt><dd>14.6 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example softbody_dropping_to_cloth --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/softbody_dropping_to_cloth --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:28:41,858][conversions.py:1398][WARNING]: Zero bodies in world 0, no base body assigned.[0m</pre></details>
+              <a href="logs/softbody_dropping_to_cloth.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>softbody_gift</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/softbody_gift.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>45.8 s</dd>
+                <dt>After first frame</dt><dd>39.4 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example softbody_gift --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/softbody_gift --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:29:03,340][conversions.py:1398][WARNING]: Zero bodies in world 0, no base body assigned.[0m
+Warning: LOX dropped deformable edge-edge contact candidates because the per-edge buffer is full (capacity 64). Increase deformable_self_contact_edge_buffer_size.</pre></details>
+              <a href="logs/softbody_gift.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>robot_allegro_hand</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/robot_allegro_hand.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>50</dd>
+                <dt>Wall time</dt><dd>18.6 s</dd>
+                <dt>After first frame</dt><dd>11.4 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example robot_allegro_hand --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/robot_allegro_hand --max-frames 240 --width 640 --height 480 --device cuda:0 -- --dynamics-backend lox</code><pre>Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/World/envs/env_0/object/DexCube/visuals/visuals) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/World/envs/env_0/object/DexCube/visuals/visuals) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/World/envs/env_0/object/DexCube/visuals/visuals) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/World/envs/env_0/object/DexCube/visuals/visuals) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/World/envs/env_0/object/DexCube/collisions) but MaterialBindingAPI is not applied on the prim
+Warning: The rigid body at /World/envs/env_0/object/DexCube has a possibly invalid inertia tensor of {1.0, 1.0, 1.0}, small sphere approximated inertia was used. Either specify correct values in the mass properties, or add collider(s) to any shape(s) that you wish to automatically compute mass properties for. If you do not want the objects to collide, add colliders regardless then disable the &#x27;enable collision&#x27; property. [python3.12]
+/home/gdaviet/Projects/worktrees/simple-scalable/newton/_src/sim/builder.py:3646: UserWarning: Body /World/envs/env_0/object/DexCube: authored mass and density without authored diagonalInertia. Ignoring body-level density.
+  return parse_usd(
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 08:45:17,295][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (30000) exceeds Kamino `model_max_contacts_host` (18500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 08:45:17,824][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (30000) exceeds Kamino `model_max_contacts_host` (18500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 08:45:17,830][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (30000) exceeds Kamino `model_max_contacts_host` (18500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 08:45:17,835][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (30000) exceeds Kamino `model_max_contacts_host` (18500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 08:45:17,840][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (30000) exceeds Kamino `model_max_contacts_host` (18500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 08:45:17,845][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (30000) exceeds Kamino `model_max_contacts_host` (18500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 08:45:17,850][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (30000) exceeds Kamino `model_max_contacts_host` (18500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 08:45:17,855][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (30000) exceeds Kamino `model_max_contacts_host` (18500); contacts will be truncated.[0m</pre></details>
+              <a href="logs/robot_allegro_hand.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>robot_anymal_c_walk</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/robot_anymal_c_walk.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>50</dd>
+                <dt>Wall time</dt><dd>15.8 s</dd>
+                <dt>After first frame</dt><dd>6.8 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example robot_anymal_c_walk --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/robot_anymal_c_walk --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/robot_anymal_c_walk.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>robot_anymal_d</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/robot_anymal_d.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>50</dd>
+                <dt>Wall time</dt><dd>14.2 s</dd>
+                <dt>After first frame</dt><dd>7.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example robot_anymal_d --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/robot_anymal_d --max-frames 240 --width 640 --height 480 --device cuda:0 -- --dynamics-backend lox</code><pre>Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RF_FOOT/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_HIP/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_HIP/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_HIP/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_HIP/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_1) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_1) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_1) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_1) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_2) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_2) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_2) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_THIGH/visuals/mesh_2) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_SHANK/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_SHANK/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_SHANK/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_SHANK/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_FOOT/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_FOOT/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_FOOT/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim
+Warning: in BindingsAtPrim at line 669 of /opt/USD/pxr/usd/usdShade/materialBindingAPI.cpp -- Found material bindings on prim at path (/anymal/RH_FOOT/visuals/mesh_0) but MaterialBindingAPI is not applied on the prim</pre></details>
+              <a href="logs/robot_anymal_d.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>robot_cartpole</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/robot_cartpole.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>9.8 s</dd>
+                <dt>After first frame</dt><dd>4.4 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example robot_cartpole --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/robot_cartpole --max-frames 240 --width 640 --height 480 --device cuda:0 -- --dynamics-backend lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:30:41,285][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/robot_cartpole.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>robot_franka</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/robot_franka.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>50</dd>
+                <dt>Wall time</dt><dd>12.0 s</dd>
+                <dt>After first frame</dt><dd>4.6 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example robot_franka --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/robot_franka --max-frames 240 --width 640 --height 480 --device cuda:0 -- --dynamics-backend lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:30:54,028][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/robot_franka.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>robot_g1</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/robot_g1.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>42.8 s</dd>
+                <dt>After first frame</dt><dd>33.0 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example robot_g1 --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/robot_g1 --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/robot_g1.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>robot_h1</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/robot_h1.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>50</dd>
+                <dt>Wall time</dt><dd>19.4 s</dd>
+                <dt>After first frame</dt><dd>12.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example robot_h1 --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/robot_h1 --max-frames 240 --width 640 --height 480 --device cuda:0 -- --dynamics-backend lox</code><pre>[INFO] Seeded LOX joint penalty scales per world: [99.7, 99.7, 99.7, 99.7]</pre></details>
+              <a href="logs/robot_h1.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>robot_panda_hydro</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/robot_panda_hydro.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>480</dd>
+                <dt>Frame target</dt><dd>480</dd>
+                <dt>Time limit</dt><dd>240 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>35.4 s</dd>
+                <dt>After first frame</dt><dd>25.6 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example robot_panda_hydro --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/robot_panda_hydro --max-frames 480 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/robot_panda_hydro.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>robot_policy</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/robot_policy.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>200</dd>
+                <dt>Wall time</dt><dd>17.6 s</dd>
+                <dt>After first frame</dt><dd>9.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example robot_policy --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/robot_policy --max-frames 240 --width 640 --height 480 --device cuda:0 -- --dynamics-backend lox</code><pre>/home/gdaviet/Projects/worktrees/simple-scalable/newton/examples/robot/example_robot_policy.py:315: DeprecationWarning: Model.contacts() is deprecated; create a CollisionPipeline and call pipeline.contacts() instead.
+  self.contacts = self.model.contacts()
+[INFO] Selected robot: g1_29dof
+[INFO] Asset directory: /home/gdaviet/.cache/newton/newton-assets_unitree_g1_110bd790_261cd1f4/unitree_g1
+[INFO] Loaded config with 43 DOFs
+[INFO] Seeded LOX joint penalty scales per world: [827]
+[INFO] Loading policy from: /home/gdaviet/.cache/newton/newton-assets_unitree_g1_110bd790_261cd1f4/unitree_g1/rl_policies/mjw_g1_29DOF.onnx
+[INFO] Using graph capture
+[INFO] Resetting example</pre></details>
+              <a href="logs/robot_policy.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>robot_ur10</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/robot_ur10.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>50</dd>
+                <dt>Wall time</dt><dd>14.8 s</dd>
+                <dt>After first frame</dt><dd>8.6 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example robot_ur10 --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/robot_ur10 --max-frames 240 --width 640 --height 480 --device cuda:0 -- --dynamics-backend lox</code><pre>Warning: The rigid body at /ur10/ee_link has a possibly invalid inertia tensor of {1.0, 1.0, 1.0}, small sphere approximated inertia was used. Either specify correct values in the mass properties, or add collider(s) to any shape(s) that you wish to automatically compute mass properties for. If you do not want the objects to collide, add colliders regardless then disable the &#x27;enable collision&#x27; property. [python3.12]
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:33:07,311][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/robot_ur10.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>sensor_contact</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/sensor_contact.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>480</dd>
+                <dt>Frame target</dt><dd>480</dd>
+                <dt>Time limit</dt><dd>240 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>120</dd>
+                <dt>Wall time</dt><dd>10.0 s</dd>
+                <dt>After first frame</dt><dd>4.6 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example sensor_contact --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/sensor_contact --max-frames 480 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>SensorContact initialized:
+  Sensing objects: 1 (shapes)
+  Counterpart columns: 0
+  total_force: yes, force_matrix: no
+SensorContact initialized:
+  Sensing objects: 2 (shapes)
+  Counterpart columns: 2 (shapes)
+  total_force: no, force_matrix: yes
+Resetting
+Plate /env/Plate1 was touched by counterpart /env/Sphere
+Plate /env/Plate2 was touched by counterpart /env/Sphere</pre></details>
+              <a href="logs/sensor_contact.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>softbody_franka</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/softbody_franka.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>480</dd>
+                <dt>Frame target</dt><dd>480</dd>
+                <dt>Time limit</dt><dd>240 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>42.3 s</dd>
+                <dt>After first frame</dt><dd>32.9 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example softbody_franka --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/softbody_franka --max-frames 480 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>/home/gdaviet/Projects/worktrees/simple-scalable/newton/_src/utils/mesh.py:348: UserWarning: Detected non-manifold edge
+  self.edge_indices, self.edge_tri_indices, self.tri_edge_indices = self._compute_edge_adjacency(tri_indices)
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 08:55:34,220][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/softbody_franka.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>softbody_hanging</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/softbody_hanging.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>35.2 s</dd>
+                <dt>After first frame</dt><dd>29.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example softbody_hanging --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/softbody_hanging --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:34:10,638][conversions.py:1398][WARNING]: Zero bodies in world 0, no base body assigned.[0m</pre></details>
+              <a href="logs/softbody_hanging.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cable_bend_stiffness</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cable_bend_stiffness.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>10.0 s</dd>
+                <dt>After first frame</dt><dd>4.8 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cable_bend_stiffness --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cable_bend_stiffness --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/cable_bend_stiffness.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cable_bend_twist_analytic</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cable_bend_twist_analytic.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>13.4 s</dd>
+                <dt>After first frame</dt><dd>8.0 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cable_bend_twist_analytic --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cable_bend_twist_analytic --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/cable_bend_twist_analytic.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cable_michell_threshold</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cable_michell_threshold.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>15.8 s</dd>
+                <dt>After first frame</dt><dd>10.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cable_michell_threshold --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cable_michell_threshold --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/cable_michell_threshold.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cable_torsion_material_mapping</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cable_torsion_material_mapping.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>10.6 s</dd>
+                <dt>After first frame</dt><dd>5.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cable_torsion_material_mapping --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cable_torsion_material_mapping --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/cable_torsion_material_mapping.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cable_twist_buckling</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cable_twist_buckling.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>11.6 s</dd>
+                <dt>After first frame</dt><dd>5.4 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cable_twist_buckling --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cable_twist_buckling --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/cable_twist_buckling.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cable_twist_transfer</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cable_twist_transfer.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>12.8 s</dd>
+                <dt>After first frame</dt><dd>7.4 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cable_twist_transfer --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cable_twist_transfer --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/cable_twist_transfer.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cloth_stiff_material_hanging</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cloth_stiff_material_hanging.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>15.2 s</dd>
+                <dt>After first frame</dt><dd>9.4 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cloth_stiff_material_hanging --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cloth_stiff_material_hanging --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:36:05,533][conversions.py:1398][WARNING]: Zero bodies in world 0, no base body assigned.[0m</pre></details>
+              <a href="logs/cloth_stiff_material_hanging.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>cloth_stiff_material_stretch</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/cloth_stiff_material_stretch.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>25.8 s</dd>
+                <dt>After first frame</dt><dd>20.2 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example cloth_stiff_material_stretch --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/cloth_stiff_material_stretch --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:36:21,453][conversions.py:1398][WARNING]: Zero bodies in world 0, no base body assigned.[0m</pre></details>
+              <a href="logs/cloth_stiff_material_stretch.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>vbd_gripper_soft_grid</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/vbd_gripper_soft_grid.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>66.7 s</dd>
+                <dt>After first frame</dt><dd>60.9 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example vbd_gripper_soft_grid --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/vbd_gripper_soft_grid --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>/home/gdaviet/Projects/worktrees/simple-scalable/newton/examples/vbd/example_vbd_gripper_soft_grid.py:140: UserWarning: Inertia validation corrected 2 bodies. Set validate_inertia_detailed=True for detailed per-body warnings.
+  self.model = builder.finalize()
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 09:51:01,020][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/vbd_gripper_soft_grid.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>vbd_gripper_soft_triangle</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/vbd_gripper_soft_triangle.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>73.5 s</dd>
+                <dt>After first frame</dt><dd>67.9 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example vbd_gripper_soft_triangle --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/vbd_gripper_soft_triangle --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>/home/gdaviet/Projects/worktrees/simple-scalable/newton/examples/vbd/example_vbd_gripper_soft_triangle.py:144: UserWarning: Inertia validation corrected 2 bodies. Set validate_inertia_detailed=True for detailed per-body warnings.
+  self.model = builder.finalize()
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 09:52:08,390][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m</pre></details>
+              <a href="logs/vbd_gripper_soft_triangle.log">Full log</a>
+            </article>
+            
+            <article class="card status-passed">
+              <h2>vbd_rigid_rigid_contact</h2>
+              <p class="status">passed</p>
+              <p>Reached the requested capture-frame limit.</p>
+              <video controls muted loop preload="metadata"><source src="videos/vbd_rigid_rigid_contact.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>240</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>8.6 s</dd>
+                <dt>After first frame</dt><dd>3.4 s</dd>
+                <dt>Exit code</dt><dd>0</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example vbd_rigid_rigid_contact --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/vbd_rigid_rigid_contact --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre>/home/gdaviet/Projects/worktrees/simple-scalable/newton/examples/vbd/example_vbd_rigid_rigid_contact.py:86: DeprecationWarning: Passing &#x27;xform&#x27; positionally to ModelBuilder.add_shape_box() is deprecated. Pass these arguments as keyword arguments instead.
+  builder.add_shape_box(
+/home/gdaviet/Projects/worktrees/simple-scalable/newton/examples/vbd/example_vbd_rigid_rigid_contact.py:95: DeprecationWarning: Passing &#x27;xform&#x27; positionally to ModelBuilder.add_shape_box() is deprecated. Pass these arguments as keyword arguments instead.
+  builder.add_shape_box(
+/home/gdaviet/Projects/worktrees/simple-scalable/newton/examples/vbd/example_vbd_rigid_rigid_contact.py:104: DeprecationWarning: Passing &#x27;xform&#x27; positionally to ModelBuilder.add_shape_box() is deprecated. Pass these arguments as keyword arguments instead.
+  builder.add_shape_box(
+/home/gdaviet/Projects/worktrees/simple-scalable/newton/examples/vbd/example_vbd_rigid_rigid_contact.py:113: DeprecationWarning: Passing &#x27;xform&#x27; positionally to ModelBuilder.add_shape_box() is deprecated. Pass these arguments as keyword arguments instead.
+  builder.add_shape_box(
+/home/gdaviet/Projects/worktrees/simple-scalable/newton/examples/vbd/example_vbd_rigid_rigid_contact.py:122: DeprecationWarning: Passing &#x27;xform&#x27; positionally to ModelBuilder.add_shape_box() is deprecated. Pass these arguments as keyword arguments instead.
+  builder.add_shape_box(</pre></details>
+              <a href="logs/vbd_rigid_rigid_contact.log">Full log</a>
+            </article>
+            
+            <article class="card status-timeout">
+              <h2>vbd_soft_rigid_contact</h2>
+              <p class="status">timeout</p>
+              <p>Stopped 120 seconds after the first captured frame; partial frames were encoded.</p>
+              <video controls muted loop preload="metadata"><source src="videos/vbd_soft_rigid_contact.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>234</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>127.2 s</dd>
+                <dt>After first frame</dt><dd>120.4 s</dd>
+                <dt>Exit code</dt><dd>-15</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example vbd_soft_rigid_contact --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/vbd_soft_rigid_contact --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/vbd_soft_rigid_contact.log">Full log</a>
+            </article>
+            
+            <article class="card status-timeout">
+              <h2>vbd_soft_rigid_mix_contact</h2>
+              <p class="status">timeout</p>
+              <p>Stopped 120 seconds after the first captured frame; partial frames were encoded.</p>
+              <video controls muted loop preload="metadata"><source src="videos/vbd_soft_rigid_mix_contact.mp4" type="video/mp4"></video>
+              <dl>
+                <dt>Device</dt><dd>cuda:0</dd>
+                <dt>Frames</dt><dd>155</dd>
+                <dt>Frame target</dt><dd>240</dd>
+                <dt>Time limit</dt><dd>120 s after first frame</dd>
+                <dt>Encoding FPS</dt><dd>60</dd>
+                <dt>Wall time</dt><dd>127.2 s</dd>
+                <dt>After first frame</dt><dd>120.4 s</dd>
+                <dt>Exit code</dt><dd>-15</dd>
+              </dl>
+              <details><summary>Command and log tail</summary><code>/home/gdaviet/Projects/worktrees/simple-scalable/.venv/bin/python3 /home/gdaviet/Projects/worktrees/simple-scalable/scripts/run_lox_example_videos.py --child --example vbd_soft_rigid_mix_contact --capture-dir /home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957/frames/vbd_soft_rigid_mix_contact --max-frames 240 --width 640 --height 480 --device cuda:0 -- --solver lox</code><pre></pre></details>
+              <a href="logs/vbd_soft_rigid_mix_contact.log">Full log</a>
+            </article>
+            </main>
+</body>
+</html>

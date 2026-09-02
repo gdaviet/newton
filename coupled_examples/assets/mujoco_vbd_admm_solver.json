@@ -1,0 +1,10 @@
+{
+  "name": "mujoco_vbd_admm_solver",
+  "title": "MuJoCo + VBD ADMM Pendulum And Cloth",
+  "screenshot": "mujoco_vbd_admm_solver.png",
+  "images": [],
+  "video": "mujoco_vbd_admm_solver.mp4",
+  "frames": 110,
+  "status": "ok",
+  "notes": []
+}

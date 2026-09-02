@@ -1,0 +1,10 @@
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,173][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,761][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,767][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,772][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,777][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,781][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,786][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,790][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,795][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 00:11:32,799][contacts.py:1363][WARNING]: Newton `rigid_contact_max` (12800) exceeds Kamino `model_max_contacts_host` (6500); contacts will be truncated.[0m

@@ -1,0 +1,3 @@
+[INFO] Added 28 supplemental DR Legs colliders
+[INFO] Seeded LOX joint penalty scales per world: [557]
+[INFO] Loaded DR Legs walking policy from /home/gdaviet/.cache/newton/newton-assets_disneyresearch_56289e70_261cd1f4/disneyresearch/dr_legs/rl_policies/drlegs_walk.pt
