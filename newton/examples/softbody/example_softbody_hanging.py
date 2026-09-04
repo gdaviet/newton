@@ -8,7 +8,7 @@
 # from fixed particles on the left side. Four grids with different damping values
 # (1e4 to 1e1) showcase the effect of damping on Neo-Hookean elastic behavior.
 #
-# Command: uv run -m newton.examples softbody.example_softbody_hanging
+# Command: uv run -m newton.examples softbody_hanging --solver [vbd, lox]
 #
 ###########################################################################
 
@@ -28,9 +28,6 @@ class Example:
         self.sim_substeps = 10
         self.iterations = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
-
-        if self.solver_type != "vbd":
-            raise ValueError("The hanging softbody example only supports the VBD solver.")
 
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
@@ -64,20 +61,26 @@ class Example:
                 fix_left=True,
             )
 
-        # Color the mesh for VBD solver
-        builder.color()
+        builder.color(include_bending=True)
 
         self.model = builder.finalize()
         self.model.soft_contact_ke = 1.0e2
         self.model.soft_contact_kd = 0
         self.model.soft_contact_mu = 1.0
 
-        self.solver = newton.solvers.SolverVBD(
-            model=self.model,
-            iterations=self.iterations,
-            particle_enable_self_contact=False,
-            particle_enable_tile_solve=False,
-        )
+        if self.solver_type == "vbd":
+            self.solver = newton.solvers.SolverVBD(
+                model=self.model,
+                iterations=self.iterations,
+                particle_enable_self_contact=False,
+                particle_enable_tile_solve=False,
+            )
+        else:
+            config = newton.solvers.SolverKamino.Config(dynamics_solver="lox")
+            config.lox.max_iterations = 12
+            config.lox.projection_iterations = 2
+            config.lox.deformable_cr_iterations = 6
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -117,6 +120,7 @@ class Example:
         self.sim_time += self.frame_dt
 
     def test_final(self):
+        """Verify that the simulated soft bodies remain in a reasonable volume."""
         # Test that particles are in a reasonable range (soft body may settle or deform)
         # We check that they haven't exploded or collapsed completely
         # 4 grids, each roughly 1.2 x 0.4 x 0.4 in size, positioned along Y-axis
@@ -141,9 +145,9 @@ class Example:
         parser = newton.examples.create_parser()
         parser.add_argument(
             "--solver",
-            help="Type of solver (only 'vbd' supports volumetric soft bodies)",
+            help="Type of volumetric soft-body solver",
             type=str,
-            choices=["vbd"],
+            choices=["vbd", "lox"],
             default="vbd",
         )
         return parser

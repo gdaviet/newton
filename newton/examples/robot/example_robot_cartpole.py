@@ -8,6 +8,7 @@
 # from a USD stage using newton.ModelBuilder.add_usd().
 #
 # Command: python -m newton.examples robot_cartpole --world-count 100
+#          python -m newton.examples robot_cartpole --dynamics-backend lox
 #
 ###########################################################################
 
@@ -27,11 +28,15 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.world_count = args.world_count
+        self.dynamics_backend = args.dynamics_backend
 
         self.viewer = viewer
 
         cartpole = newton.ModelBuilder()
-        newton.solvers.SolverMuJoCo.register_custom_attributes(cartpole)
+        if self.dynamics_backend == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(cartpole)
+        else:
+            newton.solvers.SolverMuJoCo.register_custom_attributes(cartpole)
         cartpole.default_shape_cfg.density = 100.0
         cartpole.default_joint_cfg.armature = 0.1
 
@@ -57,9 +62,12 @@ class Example:
         # finalize model
         self.model = builder.finalize()
 
-        self.solver = newton.solvers.SolverMuJoCo(self.model)
-        # self.solver = newton.solvers.SolverSemiImplicit(self.model, joint_attach_ke=1600.0, joint_attach_kd=20.0)
-        # self.solver = newton.solvers.SolverFeatherstone(self.model)
+        if self.dynamics_backend == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
+        else:
+            self.solver = newton.solvers.SolverMuJoCo(self.model)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -193,6 +201,12 @@ class Example:
         parser = newton.examples.create_parser()
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(world_count=100)
+        parser.add_argument(
+            "--dynamics-backend",
+            choices=("mujoco", "lox"),
+            default="mujoco",
+            help="Rigid-body dynamics backend.",
+        )
         return parser
 
 

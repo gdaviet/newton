@@ -7,6 +7,7 @@
 # Shows how to simulate Anymal D with multiple worlds using SolverMuJoCo.
 #
 # Command: python -m newton.examples robot_anymal_d --world-count 16
+#          python -m newton.examples robot_anymal_d --dynamics-backend lox
 #
 ###########################################################################
 
@@ -16,7 +17,7 @@ import newton
 import newton.examples
 import newton.utils
 from newton import JointTargetMode
-from newton.solvers import SolverMuJoCo
+from newton.solvers import SolverKamino, SolverMuJoCo
 
 
 class Example:
@@ -28,13 +29,17 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.world_count = args.world_count
+        self.dynamics_backend = args.dynamics_backend
 
         self.viewer = viewer
 
         self.device = wp.get_device()
 
         articulation_builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        newton.solvers.SolverMuJoCo.register_custom_attributes(articulation_builder)
+        if self.dynamics_backend == "lox":
+            SolverKamino.register_custom_attributes(articulation_builder)
+        else:
+            SolverMuJoCo.register_custom_attributes(articulation_builder)
         articulation_builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
             limit_ke=1.0e3, limit_kd=1.0e1, friction=1e-5
         )
@@ -71,16 +76,28 @@ class Example:
 
         self.model = builder.finalize()
         use_mujoco_contacts = args.use_mujoco_contacts if args else False
-        self.solver = SolverMuJoCo(
-            self.model,
-            cone="elliptic",
-            impratio=100,
-            iterations=100,
-            ls_iterations=50,
-            nconmax=45,
-            njmax=100,
-            use_mujoco_contacts=use_mujoco_contacts,
-        )
+        if self.dynamics_backend == "lox" and use_mujoco_contacts:
+            raise ValueError("--use-mujoco-contacts requires --dynamics-backend mujoco")
+
+        if not use_mujoco_contacts:
+            self.collision_pipeline = newton.CollisionPipeline(self.model)
+            self.contacts = self.collision_pipeline.contacts()
+
+        if self.dynamics_backend == "lox":
+            config = SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            self.solver = SolverKamino(self.model, config=config)
+        else:
+            self.solver = SolverMuJoCo(
+                self.model,
+                cone="elliptic",
+                impratio=100,
+                iterations=100,
+                ls_iterations=50,
+                nconmax=45,
+                njmax=100,
+                use_mujoco_contacts=use_mujoco_contacts,
+            )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -92,9 +109,6 @@ class Example:
         self.use_mujoco_contacts = use_mujoco_contacts
         if use_mujoco_contacts:
             self.contacts = newton.Contacts(self.solver.get_max_contact_count(), 0)
-        else:
-            self.collision_pipeline = newton.CollisionPipeline(self.model)
-            self.contacts = self.collision_pipeline.contacts()
 
         # ensure this is called at the end of the Example constructor
         self.viewer.set_model(self.model)
@@ -165,6 +179,12 @@ class Example:
         newton.examples.add_world_count_arg(parser)
         newton.examples.add_mujoco_contacts_arg(parser)
         parser.set_defaults(world_count=8)
+        parser.add_argument(
+            "--dynamics-backend",
+            choices=("mujoco", "lox"),
+            default="mujoco",
+            help="Rigid-body dynamics backend.",
+        )
         return parser
 
 

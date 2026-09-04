@@ -11,9 +11,10 @@
 #
 # Run interactively:
 #   uv run --extra examples python -m newton.examples.cable.example_cable_pile
+#   uv run --extra examples python -m newton.examples.cable.example_cable_pile --solver lox
 #
 # Run as a test:
-#   uv run --extra examples python -m newton.examples.cable.example_cable_pile --test --viewer null
+#   uv run --extra examples python -m newton.examples.cable.example_cable_pile --solver lox --test --viewer null
 #
 ###########################################################################
 
@@ -39,17 +40,22 @@ class Example:
     ):
         self.viewer = viewer
         self.args = args
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
+        layers = int(getattr(args, "layers", layers))
+        lanes_per_layer = int(getattr(args, "lanes_per_layer", lanes_per_layer))
 
         # Simulation cadence
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 10
-        self.sim_iterations = 5
+        default_substeps = 4 if self.solver_type == "lox" else 10
+        default_iterations = 40 if self.solver_type == "lox" else 5
+        self.sim_substeps = int(getattr(args, "substeps", None) or default_substeps)
+        self.sim_iterations = int(getattr(args, "iterations", None) or default_iterations)
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         # Cable pile parameters
-        self.num_elements = 40
+        self.num_elements = int(getattr(args, "segments", 40))
         segment_length = 0.05
         self.cable_length = self.num_elements * segment_length
         cable_radius = 0.012
@@ -63,6 +69,8 @@ class Example:
         layer_gap = cable_radius * 3.0
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         builder.rigid_gap = 0.0
 
         # Material properties
@@ -106,7 +114,7 @@ class Example:
             )
         else:
             ground_cfg = newton.ModelBuilder.ShapeConfig(
-                mu=1.0e9,
+                mu=1.0 if self.solver_type == "lox" else 1.0e9,
                 ke=builder.default_shape_cfg.ke,
                 kd=builder.default_shape_cfg.kd,
             )
@@ -169,17 +177,24 @@ class Example:
         self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="sticky")
         self.contacts = self.collision_pipeline.contacts()
 
-        self.solver = newton.solvers.SolverVBD(
-            self.model,
-            iterations=self.sim_iterations,
-            rigid_compliant_alm=True,
-            rigid_body_contact_buffer_size=256,
-            rigid_contact_history=True,
-        )
+        if self.solver_type == "vbd":
+            self.solver = newton.solvers.SolverVBD(
+                self.model,
+                iterations=self.sim_iterations,
+                rigid_compliant_alm=True,
+                rigid_body_contact_buffer_size=256,
+                rigid_contact_history=True,
+            )
+        else:
+            config = newton.solvers.SolverKamino.Config(dynamics_solver="lox")
+            config.lox.max_iterations = self.sim_iterations
+            config.lox.projection_iterations = 5
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
+        self.max_contact_count = 0
 
         self.viewer.set_model(self.model)
         if hasattr(self.viewer, "camera"):
@@ -233,6 +248,11 @@ class Example:
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
+    def test_post_step(self):
+        """Record that the cable pile generates contact."""
+        contact_count = int(self.contacts.rigid_contact_count.numpy()[0])
+        self.max_contact_count = max(self.max_contact_count, contact_count)
+
     def test_final(self):
         """Test cable pile simulation for stability and correctness (called after simulation)."""
         cable_radius = 0.012
@@ -263,8 +283,22 @@ class Example:
             )
 
             assert (np.abs(body_velocities) < 5e2).all(), "Velocities too large"
+            if self.solver_type == "lox":
+                assert self.max_contact_count > 0, "LOX cable pile did not generate any contacts"
+
+    @staticmethod
+    def create_parser():
+        """Create the example command-line parser."""
+        parser = newton.examples.create_parser()
+        parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd", help="Cable dynamics solver.")
+        parser.add_argument("--iterations", type=int, default=None, help="Solver iterations per simulation substep.")
+        parser.add_argument("--substeps", type=int, default=None, help="Simulation substeps per rendered frame.")
+        parser.add_argument("--layers", type=int, default=10, help="Number of cable layers.")
+        parser.add_argument("--lanes-per-layer", type=int, default=10, help="Number of cables in each layer.")
+        parser.add_argument("--segments", type=int, default=40, help="Number of segments in each cable.")
+        return parser
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    viewer, args = newton.examples.init(Example.create_parser())
     newton.examples.run(Example(viewer, args), args)

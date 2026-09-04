@@ -220,6 +220,36 @@ class TestSDFUSDParsing(unittest.TestCase):
                 "Expected SDF built from default_shape_cfg during finalize.",
             )
 
+    def test_usd_force_sdf_with_default_shape_cfg(self, device=None):
+        """Propagate the builder's force-SDF default to imported USD meshes."""
+        if device is None or not wp.get_device(device).is_cuda:
+            self.skipTest("SDF tests require CUDA device")
+
+        from pxr import Usd, UsdPhysics
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            usd_path = Path(tmpdir) / "test_default_force_sdf.usda"
+            stage = Usd.Stage.CreateNew(str(usd_path))
+            UsdPhysics.Scene.Define(stage, "/PhysicsScene")
+
+            _add_rigid_body(stage, "/World/Body1")
+            _add_collision_mesh(stage, "/World/Body1/CollisionMesh")
+            stage.Save()
+
+            builder = newton.ModelBuilder()
+            builder.default_shape_cfg.configure_sdf(force_sdf=True)
+
+            result = builder.add_usd(str(usd_path))
+            shape = result["path_shape_map"]["/World/Body1/CollisionMesh"]
+            self.assertTrue(builder.shape_force_sdf[shape])
+
+            model = builder.finalize(device=device)
+            self.assertGreaterEqual(
+                int(model._shape_sdf_index.numpy()[shape]),
+                0,
+                "Expected SDF forced by default_shape_cfg during finalize.",
+            )
+
     def test_usd_hydroelastic_attributes(self, device=None):
         """Authoring newton:hydroelasticEnabled=true with kh on NewtonSDFCollisionAPI opts into hydroelastic."""
         if device is None or not wp.get_device(device).is_cuda:
@@ -818,6 +848,12 @@ add_function_test(
     TestSDFUSDParsing,
     "test_usd_sdf_with_default_shape_cfg",
     TestSDFUSDParsing.test_usd_sdf_with_default_shape_cfg,
+    devices=devices,
+)
+add_function_test(
+    TestSDFUSDParsing,
+    "test_usd_force_sdf_with_default_shape_cfg",
+    TestSDFUSDParsing.test_usd_force_sdf_with_default_shape_cfg,
     devices=devices,
 )
 add_function_test(

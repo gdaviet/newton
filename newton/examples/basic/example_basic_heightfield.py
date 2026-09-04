@@ -5,10 +5,11 @@
 # Example Basic Heightfield
 #
 # Demonstrates heightfield terrain with objects dropped onto it.
-# Supports both Newton's native CollisionPipeline and MuJoCo solver.
+# Supports Newton's native collision pipeline with XPBD or LOX, and MuJoCo.
 #
 # Command: uv run -m newton.examples basic_heightfield
 # MuJoCo: uv run -m newton.examples basic_heightfield --solver mujoco
+# LOX: uv run -m newton.examples basic_heightfield --solver lox
 #
 ###########################################################################
 
@@ -31,6 +32,8 @@ class Example:
         self.solver_type = args.solver if hasattr(args, "solver") and args.solver else "xpbd"
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         # Create a wave-like heightfield terrain
         nrow, ncol = 50, 50
@@ -74,8 +77,16 @@ class Example:
             self.use_mujoco_contacts = True
             self.contacts = newton.Contacts(self.solver.get_max_contact_count(), 0)
         else:
-            self.solver = newton.solvers.SolverXPBD(self.model, iterations=10)
-            self.collision_pipeline = newton.CollisionPipeline(self.model)
+            if self.solver_type == "lox":
+                config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+                config.use_collision_detector = False
+                self.solver = newton.solvers.SolverKamino(self.model, config=config)
+            else:
+                self.solver = newton.solvers.SolverXPBD(self.model, iterations=10)
+            self.collision_pipeline = newton.CollisionPipeline(
+                self.model,
+                rigid_contact_max=160 if self.solver_type == "lox" else None,
+            )
             self.contacts = self.collision_pipeline.contacts()
 
         self.state_0 = self.model.state()
@@ -129,8 +140,8 @@ if __name__ == "__main__":
         "--solver",
         type=str,
         default="xpbd",
-        choices=["xpbd", "mujoco"],
-        help="Solver type: xpbd (default, native collision) or mujoco",
+        choices=["xpbd", "mujoco", "lox"],
+        help="Solver type: xpbd (default), mujoco, or lox",
     )
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

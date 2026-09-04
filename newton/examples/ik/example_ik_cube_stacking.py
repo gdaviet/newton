@@ -194,6 +194,7 @@ class Example:
         self.world_count = args.world_count
         self.headless = args.headless
         self.verbose = args.verbose
+        self.solver_type = str(getattr(args, "solver", "mujoco")).lower()
 
         self.viewer = viewer
 
@@ -222,18 +223,23 @@ class Example:
         self.model = scene.finalize()
         self.num_bodies_per_world = self.model.body_count // self.world_count
 
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            solver="newton",
-            integrator="implicitfast",
-            iterations=20,
-            ls_iterations=100,
-            nconmax=1000,
-            njmax=2000,
-            cone="elliptic",
-            impratio=1000.0,
-            use_mujoco_contacts=self.use_mujoco_contacts,
-        )
+        if self.solver_type == "mujoco":
+            self.solver = newton.solvers.SolverMuJoCo(
+                self.model,
+                solver="newton",
+                integrator="implicitfast",
+                iterations=20,
+                ls_iterations=100,
+                nconmax=1000,
+                njmax=2000,
+                cone="elliptic",
+                impratio=1000.0,
+                use_mujoco_contacts=self.use_mujoco_contacts,
+            )
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -328,6 +334,8 @@ class Example:
     def build_franka_with_table(self):
         builder = newton.ModelBuilder()
         newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         builder.add_urdf(
             newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
@@ -431,6 +439,8 @@ class Example:
         min_distance = np.sqrt(2) * self.cube_size + 0.04
 
         scene = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(scene)
         for world_id in range(self.world_count):
             scene.begin_world()
             scene.add_builder(franka_with_table)
@@ -710,6 +720,7 @@ class Example:
         newton.examples.add_mujoco_contacts_arg(parser)
         parser.set_defaults(world_count=16)
         parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
+        parser.add_argument("--solver", choices=("mujoco", "lox"), default="mujoco")
         return parser
 
 

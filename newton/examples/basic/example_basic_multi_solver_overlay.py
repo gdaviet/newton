@@ -4,7 +4,7 @@
 ###########################################################################
 # Example Basic Multi-Solver Overlay
 #
-# Demonstrates the viewer "layer" system by running three simulations of
+# Demonstrates the viewer "layer" system by running simulations of
 # the same quadruple-pendulum chain in a single viewer window, each driven
 # by a different solver (XPBD, Featherstone, MuJoCo Warp). By default the
 # layers overlay exactly so the per-solver divergence is obvious; bumping
@@ -23,6 +23,7 @@
 # layers overlay exactly.
 #
 # Command: python -m newton.examples basic_multi_solver_overlay
+#          python -m newton.examples basic_multi_solver_overlay --include-lox
 #
 ###########################################################################
 
@@ -32,6 +33,13 @@ import warp as wp
 
 import newton
 import newton.examples
+
+
+def _make_lox_solver(model: newton.Model) -> newton.solvers.SolverKamino:
+    """Create a LOX solver for one comparison layer."""
+    config = newton.solvers.SolverKamino.Config.from_model(model, dynamics_solver="lox")
+    config.use_collision_detector = False
+    return newton.solvers.SolverKamino(model, config=config)
 
 
 def _build_pendulum_model(num_links: int = 4) -> tuple[newton.Model, list[int]]:
@@ -176,6 +184,8 @@ class Example:
             ("Featherstone", (0.20, 0.70, 0.95), newton.solvers.SolverFeatherstone),
             ("MuJoCo Warp", (0.50, 0.85, 0.30), newton.solvers.SolverMuJoCo),
         ]
+        if args.include_lox:
+            specs.append(("LOX", (0.75, 0.30, 0.85), _make_lox_solver))
         self.layers: list[_SolverLayer] = [
             _SolverLayer(name, color, factory, self.viewer, self.sim_substeps, self.sim_dt)
             for name, color, factory in specs
@@ -229,5 +239,7 @@ class Example:
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    parser = newton.examples.create_parser()
+    parser.add_argument("--include-lox", action="store_true", help="Add a SolverKamino LOX comparison layer.")
+    viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)
