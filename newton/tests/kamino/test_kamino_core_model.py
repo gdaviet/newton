@@ -24,6 +24,7 @@ from newton._src.solvers.kamino._src.core.joints import (
     JOINT_TAUMAX,
     DofActuationPath,
     JointActuationType,
+    JointDoFType,
 )
 from newton._src.solvers.kamino._src.core.model import ModelKamino
 from newton._src.solvers.kamino._src.utils import logger as msg
@@ -1071,6 +1072,145 @@ class TestModelConversions(unittest.TestCase):
         geom_material = model_kamino.geoms.material.numpy()
         self.assertNotEqual(geom_material[0], -1)
         self.assertEqual(geom_material[1], -1)
+
+    def test_rod_conversion_preserves_storage_and_excludes_fk_partitions(self):
+        """Preserve rod storage offsets without adding ordinary joint rows."""
+        builder = ModelBuilder()
+        builder.begin_world()
+        parent = builder.add_link(mass=1.0)
+        child = builder.add_link(
+            mass=1.0,
+            xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+        )
+        builder.add_shape_box(parent, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_shape_box(child, hx=0.1, hy=0.1, hz=0.1)
+        parent_rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.4)
+        child_rotation = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), -0.3)
+        builder.add_joint_rod(
+            parent=-1,
+            child=parent,
+            parent_xform=wp.transform(wp.vec3(), parent_rotation),
+            child_xform=wp.transform(wp.vec3(), child_rotation),
+            stretch_stiffness=10.0,
+            stretch_damping=2.0,
+        )
+        builder.add_joint_revolute(
+            parent=parent,
+            child=child,
+            axis=wp.vec3(1.0, 0.0, 0.0),
+        )
+        builder.end_world()
+        model = builder.finalize(device=self.default_device, skip_validation_joints=True)
+
+        converted = ModelKamino.from_newton(model)
+        joints = converted.joints
+
+        np.testing.assert_array_equal(
+            joints.dof_type.numpy(),
+            [int(JointDoFType.ROD), int(JointDoFType.REVOLUTE)],
+        )
+        np.testing.assert_array_equal(joints.num_coords.numpy(), [4, 1])
+        np.testing.assert_array_equal(joints.num_dofs.numpy(), [4, 1])
+        np.testing.assert_array_equal(joints.num_kinematic_cts.numpy(), [0, 5])
+        np.testing.assert_array_equal(joints.num_dynamic_cts.numpy(), [0, 0])
+        np.testing.assert_array_equal(joints.coords_offset.numpy(), [0, 4, 5])
+        np.testing.assert_array_equal(joints.dofs_offset.numpy(), [0, 4, 5])
+        np.testing.assert_array_equal(joints.passive_coords_offset.numpy(), [0, 0, 1])
+        np.testing.assert_array_equal(joints.passive_dofs_offset.numpy(), [0, 0, 1])
+        np.testing.assert_array_equal(
+            joints.act_type.numpy(),
+            [int(JointActuationType.PASSIVE), int(JointActuationType.PASSIVE)],
+        )
+        self.assertEqual(converted.size.sum_of_num_joint_coords, 5)
+        self.assertEqual(converted.size.sum_of_num_joint_dofs, 5)
+        self.assertEqual(converted.size.sum_of_num_passive_joints, 1)
+        self.assertEqual(converted.size.sum_of_num_passive_joint_coords, 1)
+        self.assertEqual(converted.size.sum_of_num_passive_joint_dofs, 1)
+        self.assertIs(joints.q_j_0, model.joint_q)
+        self.assertIs(joints.dq_j_0, model.joint_qd)
+        np.testing.assert_allclose(
+            joints.X_Bj.numpy()[0],
+            np.asarray(wp.quat_to_matrix(parent_rotation)).reshape(3, 3),
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            joints.X_Fj.numpy()[0],
+            np.asarray(wp.quat_to_matrix(child_rotation)).reshape(3, 3),
+            atol=1.0e-6,
+        )
+
+    def test_rod_compatibility_requires_lox_without_fk_or_generic_dynamics(self):
+        """Require the supported LOX rod subset during compatibility validation."""
+        builder = ModelBuilder()
+        builder.begin_world()
+        body = builder.add_link(mass=1.0)
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_joint_rod(parent=-1, child=body)
+        builder.end_world()
+        model = builder.finalize(device=self.default_device, skip_validation_joints=True)
+
+        SolverKamino._validate_model_compatibility(
+            model,
+            SolverKamino.Config(dynamics_solver="lox"),
+        )
+        with self.assertRaisesRegex(ValueError, "only with.*dynamics_solver='lox'"):
+            SolverKamino._validate_model_compatibility(
+                model,
+                SolverKamino.Config(dynamics_solver="padmm"),
+            )
+        with self.assertRaisesRegex(ValueError, "use_fk_solver=True"):
+            SolverKamino._validate_model_compatibility(
+                model,
+                SolverKamino.Config(dynamics_solver="lox", use_fk_solver=True),
+            )
+
+        model.joint_damping.fill_(1.0)
+        with self.assertRaisesRegex(ValueError, "does not support nonzero joint_damping"):
+            SolverKamino._validate_model_compatibility(
+                model,
+                SolverKamino.Config(dynamics_solver="lox"),
+            )
+
+        model.joint_damping.zero_()
+        model.joint_target_ke.fill_(-1.0)
+        with self.assertRaisesRegex(ValueError, "stiffness values must be finite and nonnegative"):
+            SolverKamino._validate_model_compatibility(
+                model,
+                SolverKamino.Config(dynamics_solver="lox"),
+            )
+
+        model.joint_target_ke.zero_()
+        model.joint_target_kd.fill_(float("nan"))
+        with self.assertRaisesRegex(ValueError, "damping values must be finite and nonnegative"):
+            SolverKamino._validate_model_compatibility(
+                model,
+                SolverKamino.Config(dynamics_solver="lox"),
+            )
+
+    def test_rod_compatibility_rejects_cross_world_endpoints(self):
+        """Reject rod endpoints owned by different explicit worlds."""
+        builder = ModelBuilder()
+        builder.begin_world()
+        parent = builder.add_link(mass=1.0)
+        child = builder.add_link(mass=1.0)
+        builder.add_shape_box(parent, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_shape_box(child, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_joint_rod(parent=parent, child=child)
+        builder.end_world()
+        builder.begin_world()
+        other = builder.add_link(mass=1.0)
+        builder.add_shape_box(other, hx=0.1, hy=0.1, hz=0.1)
+        builder.end_world()
+        model = builder.finalize(device=self.default_device, skip_validation_joints=True)
+        body_world = model.body_world.numpy()
+        body_world[parent] = 1
+        model.body_world.assign(body_world)
+
+        with self.assertRaisesRegex(ValueError, "parent body.*must share a world"):
+            SolverKamino._validate_model_compatibility(
+                model,
+                SolverKamino.Config(dynamics_solver="lox"),
+            )
 
 
 class TestStateControlConversions(unittest.TestCase):

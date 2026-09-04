@@ -173,7 +173,10 @@ def _compute_and_write_joint_coords_and_vel(
     joint_q: wp.array[wp.float32],
     joint_u: wp.array[wp.float32],
 ):
-    if dof_type == JointDoFType.CARTESIAN:
+    if dof_type == JointDoFType.ROD:
+        pass  # Rod material slots do not define body-relative coordinates.
+
+    elif dof_type == JointDoFType.CARTESIAN:
         wp.static(make_compute_and_write_joint_coords(JointDoFType.CARTESIAN))(
             r_j, q_j, coords_offset, joint_q_ref, joint_q
         )

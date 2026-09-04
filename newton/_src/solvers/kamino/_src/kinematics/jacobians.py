@@ -257,7 +257,10 @@ def store_joint_cts_jacobian_dense(
     Stores the constraints Jacobian block of a joint into the provided flat data array at the given offset.
     """
 
-    if dof_type == JointDoFType.REVOLUTE:
+    if dof_type == JointDoFType.ROD:
+        pass  # Rod material Jacobians are assembled by the LOX rod path.
+
+    elif dof_type == JointDoFType.REVOLUTE:
         wp.static(make_store_joint_jacobian_dense_func(JointDoFType.REVOLUTE.cts_axes))(
             J_row_offset, num_body_dofs, bid_offset, bid_B, bid_F, JT_B, JT_F, J_data
         )
@@ -318,7 +321,10 @@ def store_joint_dofs_jacobian_dense(
     Stores the DoFs Jacobian block of a joint into the provided flat data array at the given offset.
     """
 
-    if dof_type == JointDoFType.REVOLUTE:
+    if dof_type == JointDoFType.ROD:
+        pass  # Rod storage slots have no ordinary DoF Jacobian rows.
+
+    elif dof_type == JointDoFType.REVOLUTE:
         wp.static(make_store_joint_jacobian_dense_func(JointDoFType.REVOLUTE.dofs_axes))(
             J_row_offset, num_body_dofs, bid_offset, bid_B, bid_F, JT_B, JT_F, J_data
         )
@@ -398,7 +404,10 @@ def store_joint_cts_jacobian_sparse(
     Stores the constraints Jacobian block of a joint into the provided flat data array at the given offset.
     """
 
-    if dof_type == JointDoFType.REVOLUTE:
+    if dof_type == JointDoFType.ROD:
+        pass  # Rod material Jacobians are assembled by the LOX rod path.
+
+    elif dof_type == JointDoFType.REVOLUTE:
         wp.static(make_store_joint_jacobian_sparse_func(JointDoFType.REVOLUTE.cts_axes))(
             is_binary, JT_B_j, JT_F_j, J_nzb_offset, J_nzb_values
         )
@@ -456,7 +465,10 @@ def store_joint_dofs_jacobian_sparse(
     Stores the DoFs Jacobian block of a joint into the provided flat data array at the given offset.
     """
 
-    if dof_type == JointDoFType.REVOLUTE:
+    if dof_type == JointDoFType.ROD:
+        pass  # Rod storage slots have no ordinary DoF Jacobian rows.
+
+    elif dof_type == JointDoFType.REVOLUTE:
         wp.static(make_store_joint_jacobian_sparse_func(JointDoFType.REVOLUTE.dofs_axes))(
             is_binary, JT_B_j, JT_F_j, J_nzb_offset, J_nzb_values
         )
