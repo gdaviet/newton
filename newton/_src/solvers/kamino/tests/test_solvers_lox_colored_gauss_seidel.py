@@ -14,6 +14,19 @@ from newton._src.solvers.kamino._src.solvers.lox.colored_gauss_seidel import (
     ColoredGaussSeidelProjection,
     _ColorFamily,
 )
+from newton._src.solvers.kamino._src.solvers.lox.deformable_contact import (
+    DEFORMABLE_CONTACT_STATUS_CROSS_WORLD,
+    DEFORMABLE_CONTACT_STATUS_MALFORMED,
+    DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE,
+    DEFORMABLE_CONTACT_STATUS_VALID,
+)
+from newton._src.solvers.kamino._src.solvers.lox.sweep import (
+    _DeformableRigidContactProjectionData,
+    _DeformableRigidProjectionState,
+    _make_colored_projection_index,
+    _make_project_contacts_kernel,
+    _make_projection_struct,
+)
 from newton._src.solvers.kamino.tests import setup_tests, test_context
 
 
@@ -131,6 +144,47 @@ def _multiplicity_objective(occupancy):
     return int(np.sum(np.asarray(occupancy, dtype=np.int64) ** 2))
 
 
+def _make_deformable(device, *, body, status, world_status, global_status):
+    particle_indices = wp.array([[0, -1, -1, -1]], dtype=wp.int32, device=device)
+    deformable = SimpleNamespace(
+        device=device,
+        contact_capacity=1,
+        cloth_system=SimpleNamespace(
+            particle_count=1,
+            inverse_weight=wp.ones(1, dtype=wp.float32, device=device),
+        ),
+        particle_indices=particle_indices,
+        coefficients=wp.array([[1.0, 0.0, 0.0, 0.0]], dtype=wp.float32, device=device),
+        contact_world=wp.zeros(1, dtype=wp.int32, device=device),
+        body=wp.array([body], dtype=wp.int32, device=device),
+        body_jacobian=wp.zeros(1, dtype=mat36f, device=device),
+        frame=wp.array([np.eye(3, dtype=np.float32)], dtype=wp.mat33f, device=device),
+        bias=wp.zeros(1, dtype=wp.vec3f, device=device),
+        friction=wp.zeros(1, dtype=wp.float32, device=device),
+        status=wp.full(1, status, dtype=wp.int32, device=device),
+        gauss_seidel_scalar_delassus=wp.zeros(1, dtype=wp.float32, device=device),
+        gauss_seidel_delassus=wp.zeros(1, dtype=wp.mat33f, device=device),
+        rigid_delassus=wp.zeros(1, dtype=wp.mat33f, device=device),
+        reaction=wp.zeros(1, dtype=wp.vec3f, device=device),
+        particle_delta=wp.zeros(1, dtype=wp.vec3f, device=device),
+        world_status=wp.array([world_status], dtype=wp.int32, device=device),
+        global_status=wp.array([global_status], dtype=wp.int32, device=device),
+        invalid_count=wp.full(
+            1,
+            int(status != DEFORMABLE_CONTACT_STATUS_VALID),
+            dtype=wp.int32,
+            device=device,
+        ),
+        _empty_body_inverse_weight=wp.empty(0, dtype=mat66f, device=device),
+    )
+
+    def prepare_rigid_projection(*_args):
+        return None
+
+    deformable.prepare_rigid_projection = prepare_rigid_projection
+    return deformable
+
+
 class TestLOXColoredGaussSeidel(unittest.TestCase):
     def setUp(self):
         if not test_context.setup_done:
@@ -141,7 +195,7 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
         """Expose each completed color's velocity update to the following color."""
         adapter = _make_adapter(self.device, [(0, -1), (0, -1)])
         adapter.contact_bias.assign([[0.0, 0.0, -1.0], [0.0, 0.0, -2.0]])
-        projection = ColoredGaussSeidelProjection(adapter, 2)
+        projection = ColoredGaussSeidelProjection(adapter, None, 2)
         inverse_weight = wp.array([np.eye(6, dtype=np.float32)], dtype=mat66f, device=self.device)
         prepared_status = wp.zeros(1, dtype=wp.int32, device=self.device)
         projection.prepare(inverse_weight, prepared_status)
@@ -156,6 +210,7 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
             inverse_weight,
             projected_twist,
             wp.zeros(1, dtype=vec6f, device=self.device),
+            None,
             prepared_status,
             projection_status,
         )
@@ -166,7 +221,7 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
         """Clear stale body deltas after valid and rejected projection calls."""
         adapter = _make_adapter(self.device, [(0, -1)])
         adapter.contact_bias.assign([[0.0, 0.0, -1.0]])
-        projection = ColoredGaussSeidelProjection(adapter, 2)
+        projection = ColoredGaussSeidelProjection(adapter, None, 2)
         inverse_weight = wp.array([np.eye(6, dtype=np.float32)], dtype=mat66f, device=self.device)
         prepared_status = wp.ones(1, dtype=wp.int32, device=self.device)
         projection.prepare(inverse_weight, prepared_status)
@@ -179,6 +234,7 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
             inverse_weight,
             projected_twist,
             twist_delta,
+            None,
             prepared_status,
             projection_status,
         )
@@ -204,7 +260,7 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
         jacobians[1] = 0.0
         adapter.contact_jacobian_first.assign(jacobians)
         adapter.contact_bias.assign([[0.0, 0.0, -1.0], [0.0, 0.0, -1.0]])
-        projection = ColoredGaussSeidelProjection(adapter, 2)
+        projection = ColoredGaussSeidelProjection(adapter, None, 2)
         inverse_weight = wp.array([np.eye(6, dtype=np.float32)] * 2, dtype=mat66f, device=self.device)
         prepared_status = wp.zeros(2, dtype=wp.int32, device=self.device)
         projection.prepare(inverse_weight, prepared_status)
@@ -220,6 +276,7 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
             inverse_weight,
             projected_twist,
             twist_delta,
+            None,
             prepared_status,
             projection_status,
         )
@@ -295,7 +352,7 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
             limit_projection_delassus=_empty(device, wp.float32),
             limit_reaction=_empty(device, wp.float32),
         )
-        projection = ColoredGaussSeidelProjection(adapter, 2)
+        projection = ColoredGaussSeidelProjection(adapter, None, 2)
         inverse_weight = wp.array(
             np.repeat(np.eye(6, dtype=np.float32)[None, :, :], world_count, axis=0),
             dtype=mat66f,
@@ -317,6 +374,7 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
                 inverse_weight,
                 projected_twist,
                 twist_delta,
+                None,
                 prepared_status,
                 projection_status,
             )
@@ -327,6 +385,118 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
         for global_value, world_value in zip(global_result[:-1], world_result[:-1], strict=True):
             np.testing.assert_allclose(world_value, global_value, rtol=0.0, atol=2.0e-6)
         np.testing.assert_array_equal(world_result[-1], global_result[-1])
+
+    def test_pure_deformable_preserves_global_preparation_failure(self):
+        """Reject a pure deformable world when contact adaptation failed globally."""
+        deformable = _make_deformable(
+            self.device,
+            body=-1,
+            status=DEFORMABLE_CONTACT_STATUS_MALFORMED,
+            world_status=0,
+            global_status=DEFORMABLE_CONTACT_STATUS_MALFORMED,
+        )
+        projection = ColoredGaussSeidelProjection(None, deformable, 2)
+        prepared_status = wp.ones(1, dtype=wp.int32, device=self.device)
+
+        projection.prepare(None, prepared_status)
+
+        np.testing.assert_array_equal(prepared_status.numpy(), [0])
+
+    def test_mixed_deformable_preserves_world_preparation_failure(self):
+        """Reject only the mixed-contact world whose adapted record crossed worlds."""
+        adapter = _make_adapter(self.device, [(0, -1)])
+        adapter.world_contact_count.zero_()
+        deformable = _make_deformable(
+            self.device,
+            body=0,
+            status=DEFORMABLE_CONTACT_STATUS_MALFORMED,
+            world_status=DEFORMABLE_CONTACT_STATUS_CROSS_WORLD,
+            global_status=0,
+        )
+        projection = ColoredGaussSeidelProjection(adapter, deformable, 2)
+        prepared_status = wp.ones(1, dtype=wp.int32, device=self.device)
+
+        projection.prepare(
+            wp.array([np.eye(6, dtype=np.float32)], dtype=mat66f, device=self.device),
+            prepared_status,
+        )
+
+        np.testing.assert_array_equal(prepared_status.numpy(), [0])
+
+    def test_nonfinite_mixed_body_correction_marks_contact_failure(self):
+        """Record deformable diagnostics when a mixed body correction becomes nonfinite."""
+        adapter = _make_adapter(self.device, [(0, -1)])
+        adapter.world_contact_count.zero_()
+        deformable = _make_deformable(
+            self.device,
+            body=0,
+            status=DEFORMABLE_CONTACT_STATUS_VALID,
+            world_status=DEFORMABLE_CONTACT_STATUS_VALID,
+            global_status=0,
+        )
+        projection = ColoredGaussSeidelProjection(adapter, deformable, 2)
+        valid_inverse_weight = wp.array([np.eye(6, dtype=np.float32)], dtype=mat66f, device=self.device)
+        prepared_status = wp.ones(1, dtype=wp.int32, device=self.device)
+        projection.prepare(valid_inverse_weight, prepared_status)
+        invalid_inverse_weight = wp.array(
+            [np.full((6, 6), np.nan, dtype=np.float32)],
+            dtype=mat66f,
+            device=self.device,
+        )
+        projection_status = wp.ones(1, dtype=wp.int32, device=self.device)
+        body_delta = wp.zeros(1, dtype=vec6f, device=self.device)
+        color = int(projection.deformable.colors.numpy()[0])
+        index = _make_colored_projection_index(
+            deformable.contact_world,
+            projection.deformable.counts,
+            projection.deformable.offsets,
+            projection.deformable.order,
+        )
+        data = _make_projection_struct(
+            _DeformableRigidContactProjectionData,
+            particle_indices=deformable.particle_indices,
+            coefficients=deformable.coefficients,
+            body=deformable.body,
+            frame=deformable.frame,
+            body_jacobian=deformable.body_jacobian,
+            delassus=deformable.gauss_seidel_delassus,
+            bias=deformable.bias,
+            friction=deformable.friction,
+            reaction=deformable.reaction,
+            status=deformable.status,
+            contact_world_status=deformable.world_status,
+        )
+        state = _make_projection_struct(
+            _DeformableRigidProjectionState,
+            world_active=wp.ones(1, dtype=wp.bool, device=self.device),
+            projected_twist=wp.zeros(1, dtype=vec6f, device=self.device),
+            twist_delta=body_delta,
+            world_status=projection_status,
+            occupancy=projection.body_occupancy,
+            inverse_weight=invalid_inverse_weight,
+            particle_occupancy=projection.particle_occupancy,
+            particle_inverse_weight=deformable.cloth_system.inverse_weight,
+            projected_velocity=wp.zeros(1, dtype=wp.vec3f, device=self.device),
+            particle_delta=deformable.particle_delta,
+        )
+        wp.launch(
+            _make_project_contacts_kernel(
+                True,
+                True,
+                DEFORMABLE_CONTACT_STATUS_VALID,
+                DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE,
+            ),
+            dim=1,
+            inputs=[1, color, index, data, state],
+            device=self.device,
+        )
+
+        np.testing.assert_array_equal(deformable.status.numpy(), [DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE])
+        np.testing.assert_array_equal(
+            deformable.world_status.numpy(),
+            [DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE],
+        )
+        np.testing.assert_array_equal(projection_status.numpy(), [0])
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA is required for graph capture")
     def test_cuda_graph_capture_replays_large_color_compaction(self):
@@ -361,7 +531,7 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
         device = wp.get_device("cuda:0")
         adapter = _make_adapter(device, [(0, -1), (0, -1)])
         adapter.contact_bias.assign([[0.0, 0.0, -1.0], [0.0, 0.0, -2.0]])
-        projection = ColoredGaussSeidelProjection(adapter, 2)
+        projection = ColoredGaussSeidelProjection(adapter, None, 2)
         inverse_weight = wp.array([np.eye(6, dtype=np.float32)], dtype=mat66f, device=device)
         prepared_status = wp.zeros(1, dtype=wp.int32, device=device)
         projection_status = wp.zeros(1, dtype=wp.int32, device=device)
@@ -379,6 +549,7 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
                 inverse_weight,
                 projected_twist,
                 twist_delta,
+                None,
                 prepared_status,
                 projection_status,
             )

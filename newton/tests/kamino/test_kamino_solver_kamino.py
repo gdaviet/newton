@@ -424,6 +424,8 @@ class TestSolverKaminoConfig(unittest.TestCase):
         """Accept supported LOX projection methods and reject invalid config values."""
         config = SolverKaminoImpl.Config(dynamics_solver="lox")
         self.assertEqual(config.dynamics_solver, "lox")
+        self.assertEqual(kamino_config.LOXSolverConfig().deformable_preconditioner, "two_level")
+
         for projection_method in ("jacobi", "gauss_seidel", "apgd"):
             with self.subTest(projection_method=projection_method):
                 self.assertEqual(
@@ -433,6 +435,15 @@ class TestSolverKaminoConfig(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "'jacobi'.*'gauss_seidel'.*'apgd'"):
             kamino_config.LOXSolverConfig(projection_method="invalid")
+
+        for preconditioner in ("incomplete_ldlt", "two_level", "block_jacobi"):
+            with self.subTest(deformable_preconditioner=preconditioner):
+                self.assertEqual(
+                    kamino_config.LOXSolverConfig(deformable_preconditioner=preconditioner).deformable_preconditioner,
+                    preconditioner,
+                )
+        with self.assertRaisesRegex(ValueError, "incomplete_ldlt.*two_level.*block_jacobi"):
+            kamino_config.LOXSolverConfig(deformable_preconditioner="invalid")
 
         for color_count in (0, 1, 2, 17):
             with self.subTest(gauss_seidel_max_colors=color_count):
@@ -461,6 +472,8 @@ class TestSolverKaminoConfig(unittest.TestCase):
             {"weight_sigma": 1.1},
             {"weight_beta": 0.0},
             {"weight_beta": 0.5},
+            {"deformable_weight_beta": 0.0},
+            {"deformable_weight_beta": 0.5},
             {"selective_weights": 1},
             {"joint_penalty_scale": 0.0},
             {"joint_multiplier_projected_fraction": -0.1},
@@ -472,6 +485,7 @@ class TestSolverKaminoConfig(unittest.TestCase):
             {"position_tolerance": float("nan")},
             {"velocity_tolerance": float("nan")},
             {"weight_beta": float("inf")},
+            {"deformable_weight_beta": float("inf")},
             {"joint_multiplier_projected_fraction": float("nan")},
             {"joint_warmstart_factor": float("nan")},
             {"impact_velocity_threshold": float("nan")},

@@ -58,6 +58,33 @@ if TYPE_CHECKING:
 __all__ = ["SolverKamino"]
 
 
+@wp.kernel
+def _set_global_reset_success(
+    source_world_mask: wp.array[wp.bool],
+    reset_all: bool,
+    has_global_particles: bool,
+    success_mask: wp.array[wp.bool],
+):
+    """Report whether selected global deformable state was reset."""
+    global_slot = success_mask.shape[0] - 1
+    selected = True
+    if not reset_all:
+        selected = source_world_mask[global_slot]
+    success_mask[global_slot] = has_global_particles and selected
+
+
+@wp.kernel
+def _reset_lox_body_dual_impulse(
+    body_world: wp.array[wp.int32],
+    world_mask: wp.array[wp.bool],
+    body_lox_dual_impulse: wp.array[wp.spatial_vector],
+):
+    body = wp.tid()
+    world = wp.max(body_world[body], 0)
+    if world_mask[world]:
+        body_lox_dual_impulse[body] = wp.spatial_vectorf(0.0)
+
+
 def _estimate_dvi_contacts_per_world(model, newton_model: Model) -> int:
     """Estimate DVI contact capacity using the collision pipeline's weights."""
     theoretical = max(model.geoms.world_minimum_contacts, default=0)
@@ -102,18 +129,6 @@ def _estimate_dvi_contacts_per_world(model, newton_model: Model) -> int:
     )
 
     return min(theoretical, max_world_contacts) if theoretical > 0 else max_world_contacts
-
-
-@wp.kernel
-def _reset_lox_body_dual_impulse(
-    body_world: wp.array[wp.int32],
-    world_mask: wp.array[wp.bool],
-    body_lox_dual_impulse: wp.array[wp.spatial_vector],
-):
-    body = wp.tid()
-    world = wp.max(body_world[body], 0)
-    if world_mask[world]:
-        body_lox_dual_impulse[body] = wp.spatial_vectorf(0.0)
 
 
 ###
@@ -877,6 +892,8 @@ class SolverKamino(SolverBase, CouplingInterface):
         )
         self._cull_speculative_contacts = self._config.dynamics.cull_speculative_contacts
         self._skip_fully_prescribed_contacts = False
+        self._has_deformables = model.particle_count > 0
+        self._has_global_particles = self._has_deformables and bool((model.particle_world.numpy() == -1).any())
         if self._config.dynamics_solver == "lox":
             self._cull_speculative_contacts = False
             self._skip_fully_prescribed_contacts = True
@@ -992,8 +1009,8 @@ class SolverKamino(SolverBase, CouplingInterface):
             world_mask: Optional array of per-world masks indicating which
                 worlds should be reset. Shape ``(world_count + 1,)``, with the
                 final entry representing global world ``-1``. The global entry
-                is a no-op because Kamino does not support global dynamic
-                objects.
+                selects global deformable particles. Kamino rigid bodies remain
+                local-world objects.
 
                 .. deprecated:: 1.5
                     Passing a mask with shape ``(world_count,)`` is deprecated.
@@ -1008,19 +1025,57 @@ class SolverKamino(SolverBase, CouplingInterface):
             config: Optional reset configuration, controlling the reset behavior
                 for body poses/velocities as well as floating base pose/velocity.
                 If not provided, all components are reset to default (initial) values.
-            success_mask: Optional mask, filled with a success boolean per world if provided
-                (True if reset successfully, False if not reset due to world_mask, or if reset
-                was unsuccessful, e.g. due to an unconverged FK solve).
+            success_mask: Optional boolean mask with shape ``(world_count + 1,)``,
+                filled with one result per local world and a final result for
+                global deformable particles. An entry is ``True`` if selected
+                state was reset successfully and ``False`` if it was unselected,
+                unsupported, or unsuccessful (for example, due to an
+                unconverged FK solve).
+
+                .. deprecated:: 1.5
+                    Passing a mask with shape ``(world_count,)`` is deprecated.
+                    The legacy shape reports local-world results only.
         """
         if state is None:
             raise ValueError("'state' argument is required.")
         world_mask = self._normalize_reset_world_mask(world_mask)
         local_world_mask = None if world_mask is None else world_mask[: self.model.world_count]
+        canonical_success_mask = False
+        if success_mask is not None:
+            if not isinstance(success_mask, wp.array):
+                raise TypeError("'success_mask' must be a Warp array or None.")
+            if success_mask.dtype != wp.bool:
+                raise TypeError("'success_mask' must have dtype bool.")
+            if success_mask.device != self.model.device:
+                raise ValueError(
+                    f"'success_mask' device {success_mask.device} does not match expected device {self.model.device}."
+                )
+            canonical_success_mask = success_mask.shape == (self.model.world_count + 1,)
+            if success_mask.shape == (self.model.world_count,):
+                warnings.warn(
+                    "success_mask with shape (world_count,) is deprecated; use shape (world_count + 1,), "
+                    "where the final entry reports global deformable resets.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            elif not canonical_success_mask:
+                raise ValueError(
+                    f"'success_mask' must have shape ({self.model.world_count},) or ({self.model.world_count + 1},)."
+                )
+        local_success_mask = (
+            None
+            if success_mask is None
+            else success_mask[: self.model.world_count]
+            if canonical_success_mask
+            else success_mask
+        )
 
         # Process None arguments
         state_flags = int(StateFlags.ALL if flags is None else flags)
         config = SolverKamino.ResetConfig.to_default() if config is None else config
         self._reset_lox_body_dual_impulse_state(state, state_flags, local_world_mask)
+        if self._has_deformables:
+            self._solver_kamino.solver_fd.reset_deformable_state(state, state_flags, world_mask)
 
         # Convert/alias the input state as a StateKamino object
         state_kamino = self._kamino.StateKamino.from_newton(
@@ -1070,8 +1125,21 @@ class SolverKamino(SolverBase, CouplingInterface):
             state=state_kamino,
             world_mask=local_world_mask,
             config=config,
-            success_mask=success_mask,
+            success_mask=local_success_mask,
         )
+
+        if canonical_success_mask:
+            wp.launch(
+                _set_global_reset_success,
+                dim=1,
+                inputs=[
+                    world_mask if world_mask is not None else success_mask,
+                    world_mask is None,
+                    self._has_global_particles,
+                ],
+                outputs=[success_mask],
+                device=self.model.device,
+            )
 
         # Restore fields excluded from the reset op
         for array, snapshot in restore_after_reset:
@@ -1116,10 +1184,10 @@ class SolverKamino(SolverBase, CouplingInterface):
         # to the arrays of the source Newton containers.
         state_in_kamino = self._kamino.StateKamino.from_newton(self._model_kamino.size, self.model, state_in)
         state_out_kamino = self._kamino.StateKamino.from_newton(self._model_kamino.size, self.model, state_out)
-        if self._config.dynamics_solver == "lox":
+        if self._config.dynamics_solver == "lox" and not self._has_deformables:
             body_dual_impulse_in = self._ensure_lox_body_dual_impulse_state(state_in)
             self._ensure_lox_body_dual_impulse_state(state_out)
-            self._solver_kamino.solver_fd.load_state_dual_impulses(body_dual_impulse_in)
+            self._solver_kamino.solver_fd.load_state_dual_impulses(body_dual_impulse_in, None)
 
         # Handle the control input, defaulting to the model's
         # internal control arrays if None is provided.
@@ -1144,11 +1212,17 @@ class SolverKamino(SolverBase, CouplingInterface):
                     cull_speculative_contacts=self._cull_speculative_contacts,
                     skip_fully_prescribed_contacts=self._skip_fully_prescribed_contacts,
                 )
+            elif self._contacts_kamino is not None:
+                # Pure deformables consume Newton soft contacts directly.
+                self._contacts_kamino.clear()
         else:
             self._detector = None
             # Clear the internal contacts container to avoid using stale contacts from previous steps.
             if self._contacts_kamino is not None:
                 self._contacts_kamino.clear()
+
+        if self._has_deformables:
+            self._solver_kamino.solver_fd.bind_deformable_step(state_in, state_out, contacts)
 
         # Convert Newton body-frame poses to Kamino CoM-frame poses
         self._kamino.convert_body_origin_to_com(
@@ -1166,8 +1240,10 @@ class SolverKamino(SolverBase, CouplingInterface):
             detector=self._detector,
             dt=dt,
         )
-        if self._config.dynamics_solver == "lox":
-            self._solver_kamino.solver_fd.write_state_dual_impulses(getattr(state_out, "body_lox_dual_impulse", None))
+        if self._config.dynamics_solver == "lox" and not self._has_deformables:
+            self._solver_kamino.solver_fd.write_state_dual_impulses(
+                getattr(state_out, "body_lox_dual_impulse", None), None
+            )
 
         # Convert back from Kamino CoM-frame to Newton body-frame poses. When
         # stepping in place, the output write replaced the aliased input pose,
@@ -1353,6 +1429,16 @@ class SolverKamino(SolverBase, CouplingInterface):
                 default=wp.spatial_vectorf(0.0),
             )
         )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="particle_lox_dual_impulse",
+                assignment=Model.AttributeAssignment.STATE,
+                frequency=Model.AttributeFrequency.PARTICLE,
+                dtype=wp.vec3f,
+                default=wp.vec3f(0.0),
+            )
+        )
+
         # Register FK custom actuation types
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
@@ -1408,20 +1494,29 @@ class SolverKamino(SolverBase, CouplingInterface):
         """
 
         unsupported_features = []
+        has_deformables = model.particle_count > 0
         use_lox = config.dynamics_solver == "lox"
         if use_lox:
             from ._src.solvers.lox import validate_rod_model  # noqa: PLC0415
 
             validate_rod_model(model, use_fk_solver=config.use_fk_solver)
-        if model.particle_count > 0:
+        if has_deformables and use_lox:
+            from ._src.solvers.lox import validate_deformable_model  # noqa: PLC0415
+
+            validate_deformable_model(model)
+            if config.integrator == "moreau":
+                unsupported_features.append(
+                    "the Moreau integrator with deformables (LOX deformables currently use Euler integration)"
+                )
+        elif has_deformables:
             unsupported_features.append(f"particles (found {model.particle_count})")
         if model.spring_count > 0:
             unsupported_features.append(f"springs (found {model.spring_count})")
-        if model.tri_count > 0:
+        if model.tri_count > 0 and not (has_deformables and config.dynamics_solver == "lox"):
             unsupported_features.append(f"triangle elements (found {model.tri_count})")
-        if model.edge_count > 0:
+        if model.edge_count > 0 and not (has_deformables and config.dynamics_solver == "lox"):
             unsupported_features.append(f"edge elements (found {model.edge_count})")
-        if model.tet_count > 0:
+        if model.tet_count > 0 and not (has_deformables and config.dynamics_solver == "lox"):
             unsupported_features.append(f"tetrahedral elements (found {model.tet_count})")
         if model.muscle_count > 0:
             unsupported_features.append(f"muscles (found {model.muscle_count})")

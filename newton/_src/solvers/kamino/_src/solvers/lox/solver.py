@@ -16,7 +16,12 @@ from ...core.bodies import update_body_wrenches
 from ...core.types import vec6f
 from .adapter import LOXKaminoAdapter
 from .colored_gauss_seidel import ColoredGaussSeidelProjection
-from .integration import _write_integrator_body_inputs
+from .deformable_contact import DeformableContactSystem
+from .deformable_penetration import DeformablePenetrationFreeLimiter
+from .deformable_self_contact import DeformableSelfContactDetector
+from .deformable_splitting import DeformableSplittingState
+from .deformable_system import DeformableFEMSystem
+from .integration import _LOXDeformableIntegration, _write_integrator_body_inputs
 from .joint_delassus import BatchedStructuralDelassus
 from .projection import PROJECTION_STATUS_VALID
 from .rod import validate_rod_model
@@ -29,7 +34,7 @@ from .sweep import (
 from .time import validate_world_time_steps
 
 if TYPE_CHECKING:
-    from ......sim import Model
+    from ......sim import Contacts, Model, State
     from ....config import ConstraintStabilizationConfig, LOXSolverConfig
     from ...core.data import DataKamino
     from ...core.joints import JointCorrectionMode
@@ -99,6 +104,7 @@ def _reset_solver_worlds_masked(
     world_failed: wp.array[wp.bool],
     world_iteration_limit: wp.array[wp.bool],
     iteration_count: wp.array[wp.int32],
+    cloth_only_residual_total: wp.array[wp.float32],
     world_accepted: wp.array[wp.bool],
     world_status: wp.array[wp.int32],
     contact_residual_max: wp.array[wp.float32],
@@ -112,6 +118,7 @@ def _reset_solver_worlds_masked(
         world_failed[world] = False
         world_iteration_limit[world] = False
         iteration_count[world] = 0
+        cloth_only_residual_total[world] = 0.0
         world_accepted[world] = False
         world_status[world] = LOX_STATUS_ACTIVE
         contact_residual_max[world] = 0.0
@@ -178,8 +185,10 @@ class LOXSolver:
     integration, and nonlinear relinearization. This class owns the smooth
     system update, weight construction, blocked dense LLT solve, unilateral
     projections, convergence freezing, and output conversion for one such
-    linearization. A nonfailed world that reaches the iteration limit is
-    accepted using its last projected iterate.
+    linearization. Optional cloth uses a separately assembled Warp BSR system
+    and shares the same per-world iteration and acceptance state. A nonfailed
+    world that reaches the iteration limit is accepted using its last projected
+    iterate, matching the rigid LOX behavior.
     """
 
     def __init__(
@@ -190,7 +199,7 @@ class LOXSolver:
         limits: LimitsKamino | None,
         contacts: ContactsKamino | None,
         config: LOXSolverConfig,
-        source_model: Model,
+        deformable_model: Model | None,
         constraints: ConstraintStabilizationConfig,
         rotation_correction: JointCorrectionMode,
     ):
@@ -208,15 +217,17 @@ class LOXSolver:
                 joint_proximal_relaxation=config.joint_proximal_relaxation,
                 rod_proximal_relaxation=config.rod_proximal_relaxation,
             )
-        if rigid_adapter is None:
-            raise ValueError("LOX requires at least one rigid body.")
+        if rigid_adapter is None and deformable_model is None:
+            raise ValueError("LOX requires a rigid adapter, a deformable model, or both.")
         self._config = config
-        self._newton_model = source_model
+        self._newton_model = deformable_model
         self.model = model
         self._constraints = constraints
         self.rigid_adapter = rigid_adapter
         self.device = model.device
         self.num_worlds = model.info.num_worlds
+        if deformable_model is not None and int(deformable_model.world_count) != self.num_worlds:
+            raise ValueError("Rigid and deformable LOX systems must contain the same number of worlds.")
         self.max_iterations = config.max_iterations
         self.use_graph_conditionals = config.use_graph_conditionals
         self.fixed_iterations = config.fixed_iterations
@@ -236,6 +247,7 @@ class LOXSolver:
         self.joint_multiplier_projected_fraction = config.joint_multiplier_projected_fraction
         self.joint_warmstart_factor = config.joint_warmstart_factor
         self._bind_rigid_topology()
+        self._cloth_only_residual_total = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
         self.world_accepted = wp.zeros(self.num_worlds, dtype=wp.bool, device=self.device)
         self.world_status = wp.zeros(self.num_worlds, dtype=wp.int32, device=self.device)
         self._iteration_condition = wp.zeros(1, dtype=wp.int32, device=self.device)
@@ -254,6 +266,70 @@ class LOXSolver:
             if config.projection_method == "apgd"
             else None
         )
+        self.deformable_system = None
+        self._deformable_integration = None
+        self.deformable_splitting = None
+        self.deformable_self_contact_detector = None
+        self.deformable_penetration_free_limiter = None
+        self._deformable_self_contacts_enabled = config.deformable_enable_self_contact
+        self._deformable_rigid_contact_normal_cone_filtering_enabled = (
+            config.deformable_enable_rigid_contact_normal_cone_filtering
+        )
+        self._deformable_normal_cone_filtering_min_distance = float(
+            config.deformable_normal_cone_filtering_min_distance
+        )
+        if deformable_model is not None and deformable_model.particle_count > 0:
+            if config.fixed_iterations:
+                raise ValueError("fixed_iterations is not supported for deformable LOX simulations.")
+            self.deformable_system = DeformableFEMSystem(
+                deformable_model,
+                cr_iterations=config.deformable_cr_iterations,
+                direct_max_particles=config.deformable_direct_max_particles,
+                weight_sigma=config.weight_sigma,
+                weight_beta=config.deformable_weight_beta,
+                preconditioner=config.deformable_preconditioner,
+                preconditioner_regularization=config.deformable_hessian_regularization,
+                proximal_iterations=config.deformable_proximal_iterations,
+                proximal_relaxation=config.deformable_proximal_relaxation,
+            )
+            self._deformable_integration = _LOXDeformableIntegration(deformable_model)
+            self.deformable_system.selective_consensus = config.selective_weights
+            self.deformable_splitting = DeformableSplittingState(self.deformable_system)
+            if config.deformable_enable_self_contact and deformable_model.tri_count < 1:
+                raise ValueError("LOX deformable self-contact requires a triangulated surface.")
+            if deformable_model.tri_count > 0 and (
+                config.deformable_enable_self_contact or config.deformable_enable_penetration_free_contact
+            ):
+                self.deformable_self_contact_detector = DeformableSelfContactDetector(
+                    deformable_model,
+                    margin=config.deformable_self_contact_margin,
+                    gap=config.deformable_self_contact_gap,
+                    vertex_contact_buffer_size=config.deformable_self_contact_vertex_buffer_size,
+                    edge_contact_buffer_size=config.deformable_self_contact_edge_buffer_size,
+                    topological_contact_filter_threshold=config.deformable_self_contact_topological_filter_threshold,
+                    rest_contact_exclusion_radius=config.deformable_self_contact_rest_exclusion_radius,
+                    edge_parallel_epsilon=config.deformable_self_contact_edge_parallel_epsilon,
+                    enable_normal_cone_filtering=config.deformable_enable_normal_cone_filtering,
+                    normal_cone_filtering_min_distance=config.deformable_normal_cone_filtering_min_distance,
+                )
+            if config.deformable_enable_penetration_free_contact and self.deformable_self_contact_detector is not None:
+                # This limiter can truncate every dynamic node, not only nodes in current contact stencils.
+                self.deformable_system.selective_consensus = False
+                self.deformable_penetration_free_limiter = DeformablePenetrationFreeLimiter(
+                    self.deformable_self_contact_detector,
+                    self.deformable_system.topology,
+                    self.deformable_system.inverse_weight,
+                    config.deformable_penetration_free_contact_relaxation,
+                )
+        use_parallel_candidates = (
+            self.device.is_cuda and rigid_adapter is not None and self.deformable_system is not None
+        )
+        self._deformable_stream = wp.Stream(self.device) if use_parallel_candidates else None
+        self._deformable_start_event = wp.Event(self.device) if use_parallel_candidates else None
+        self._deformable_complete_event = wp.Event(self.device) if use_parallel_candidates else None
+        self.deformable_contacts = None
+        self._deformable_contacts_active = False
+        self._deformable_prepared = False
         self.has_bounded_effort = rigid_adapter is not None and rigid_adapter.has_bounded_effort
         self._time_step: wp.array[wp.float32] | None = None
         self._inverse_time_step: wp.array[wp.float32] | None = None
@@ -435,6 +511,27 @@ class LOXSolver:
         finally:
             self.reset()
 
+    def bind_deformable_step(self, state_in: State, state_out: State, contacts: Contacts | None) -> None:
+        """Bind Newton-owned deformable inputs and outputs for one step."""
+        if self._deformable_integration is not None:
+            self._deformable_integration.bind_step(self, state_in, state_out, contacts)
+
+    def reset_deformable_state(
+        self,
+        state: State,
+        state_flags: int,
+        world_mask: wp.array[wp.bool] | None,
+    ) -> None:
+        """Reset deformable Newton state and map its ownership to solve worlds."""
+        if self._deformable_integration is not None:
+            global_world_mask = self._deformable_integration.reset_deformable_state(
+                state,
+                state_flags,
+                world_mask,
+            )
+            if global_world_mask is not None:
+                self.reset(world_mask=global_world_mask)
+
     def solve_forward_dynamics(
         self,
         _contacts: object | None = None,
@@ -444,6 +541,18 @@ class LOXSolver:
         time_step = self.model.time.dt
         inverse_time_step = self.model.time.inv_dt
         rigid_adapter = self.rigid_adapter
+        deformable_integration = self._deformable_integration
+
+        if deformable_integration is not None:
+            deformable_integration.begin_step(
+                self,
+                time_step,
+                inverse_time_step,
+                contact_stabilization_fraction=constraints.gamma,
+                contact_dead_zone=constraints.delta,
+                impact_velocity_threshold=self._config.impact_velocity_threshold,
+                contact_recoverable_response=self._config.contact_recoverable_response,
+            )
         self.begin_time_step(
             time_step,
             inverse_time_step,
@@ -462,12 +571,16 @@ class LOXSolver:
 
         if rigid_adapter is not None:
             rigid_adapter.write_outputs(time_step, inverse_time_step, write_body_velocity=False)
+        if deformable_integration is not None:
+            deformable_integration.finish_step(self, time_step, inverse_time_step)
+
         if rigid_adapter is not None:
             model = rigid_adapter.model
             data = rigid_adapter.data
             update_body_wrenches(model.bodies, data.bodies)
-            # Expose the accepted LOX velocity as equivalent inputs to the
-            # selected Kamino integrator.
+            # Rigid-deformable impulses are not represented by Kamino's rigid
+            # constraint-wrench arrays, so expose the accepted LOX velocity as
+            # equivalent inputs to the selected Kamino integrator.
             wp.launch(
                 _write_integrator_body_inputs,
                 dim=model.size.sum_of_num_bodies,
@@ -539,6 +652,11 @@ class LOXSolver:
             self.world_failed.zero_()
             self.world_iteration_limit.zero_()
             self.iteration_count.zero_()
+            self._cloth_only_residual_total.zero_()
+        if self.deformable_splitting is not None:
+            self.deformable_splitting.reset(world_mask=world_mask)
+        if self.deformable_contacts is not None:
+            self.deformable_contacts.reset()
         if world_mask is None:
             self.world_accepted.zero_()
             self.world_status.fill_(LOX_STATUS_ACTIVE)
@@ -556,6 +674,7 @@ class LOXSolver:
                     self.world_failed,
                     self.world_iteration_limit,
                     self.iteration_count,
+                    self._cloth_only_residual_total,
                     self.world_accepted,
                     self.world_status,
                     self.contact_residual_max,
@@ -565,11 +684,13 @@ class LOXSolver:
                 device=self.device,
             )
         self._initial_twist.zero_()
+        self._deformable_prepared = False
         self._time_step_prepared = False
 
     def load_state_dual_impulses(
         self,
         body_dual_impulse: wp.array[wp.spatial_vector] | None,
+        particle_dual_impulse: wp.array[wp.vec3] | None,
     ) -> None:
         """Load consensus impulse warm starts from the input Newton state."""
         if self.splitting is not None:
@@ -580,10 +701,15 @@ class LOXSolver:
             if body_dual_impulse.dtype != wp.spatial_vectorf or body_dual_impulse.device != self.device:
                 raise ValueError("State.body_lox_dual_impulse has an incompatible dtype or device.")
             wp.copy(self.splitting.splitting_dual_impulse, body_dual_impulse.view(dtype=vec6f))
+        if self.deformable_splitting is not None:
+            if particle_dual_impulse is None:
+                raise ValueError("LOX deformables require State.particle_lox_dual_impulse.")
+            self.deformable_splitting.load_state_dual_impulse(particle_dual_impulse)
 
     def write_state_dual_impulses(
         self,
         body_dual_impulse: wp.array[wp.spatial_vector] | None,
+        particle_dual_impulse: wp.array[wp.vec3] | None,
     ) -> None:
         """Write consensus impulse warm starts to the output Newton state."""
         if self.splitting is not None:
@@ -594,6 +720,10 @@ class LOXSolver:
             if body_dual_impulse.dtype != wp.spatial_vectorf or body_dual_impulse.device != self.device:
                 raise ValueError("State.body_lox_dual_impulse has an incompatible dtype or device.")
             wp.copy(body_dual_impulse.view(dtype=vec6f), self.splitting.splitting_dual_impulse)
+        if self.deformable_splitting is not None:
+            if particle_dual_impulse is None:
+                raise ValueError("LOX deformables require State.particle_lox_dual_impulse.")
+            self.deformable_splitting.write_state_dual_impulse(particle_dual_impulse)
 
     def begin_time_step(
         self,
@@ -626,6 +756,12 @@ class LOXSolver:
                 impact_velocity_threshold=impact_velocity_threshold,
                 contact_recoverable_response=contact_recoverable_response,
             )
+            if self._deformable_contacts_active:
+                self.deformable_contacts.accumulate_rigid_incidence(
+                    self.rigid_adapter.body_constraint_count,
+                    self.rigid_adapter.body_has_unilateral,
+                    self.rigid_adapter.world_has_unilateral,
+                )
             wp.launch(
                 _initialize_body_velocity_guess,
                 dim=self.rigid_adapter.model.size.sum_of_num_bodies,
@@ -648,15 +784,103 @@ class LOXSolver:
                 self.splitting.splitting_dual_impulse.zero_()
         self._time_step_prepared = True
 
+    def begin_deformable_time_step(
+        self,
+        state,
+        contacts,
+        time_step: wp.array[wp.float32],
+        inverse_time_step: wp.array[wp.float32],
+        contact_stabilization_fraction: float = 0.01,
+        contact_dead_zone: float = 1.0e-6,
+        impact_velocity_threshold: float = 1.0e-3,
+        contact_recoverable_response: bool = False,
+        body_pose: wp.array[wp.transform] | None = None,
+    ) -> None:
+        """Assemble and factor the first deformable linearization for the step."""
+        if self.deformable_system is None or self.deformable_splitting is None:
+            return
+        validate_world_time_steps(time_step, inverse_time_step, self.num_worlds, self.device)
+        # Contact preparation needs the broad weights to discover and size the
+        # support. Factor only after that support has been frozen for this step.
+        self.deformable_system.assemble(state, time_step, finalize_consensus=False)
+        rigid_contact_capacity = contacts.soft_contact_max if contacts is not None else 0
+        self_contact_capacity = (
+            self.deformable_self_contact_detector.capacity
+            if self._deformable_self_contacts_enabled and self.deformable_self_contact_detector is not None
+            else 0
+        )
+        self._deformable_contacts_active = rigid_contact_capacity + self_contact_capacity > 0
+        if self.deformable_self_contact_detector is not None:
+            self.deformable_self_contact_detector.detect(state.particle_q)
+        if self.deformable_penetration_free_limiter is not None:
+            self.deformable_penetration_free_limiter.begin_time_step(state.particle_q)
+        if self._deformable_contacts_active:
+            capacities_changed = self.deformable_contacts is not None and (
+                self.deformable_contacts.rigid_contact_capacity != rigid_contact_capacity
+                or self.deformable_contacts.self_contact_capacity != self_contact_capacity
+            )
+            if self.deformable_contacts is None or capacities_changed:
+                if self.device.is_cuda and self.device.is_capturing and not self.device.is_mempool_enabled:
+                    raise RuntimeError(
+                        "LOX deformable contact storage cannot be initialized during CUDA capture without "
+                        "a stream-ordered memory pool. Enable the Warp memory pool or run one uncaptured step "
+                        "before capture."
+                    )
+                self.deformable_contacts = DeformableContactSystem(
+                    self.deformable_system.model,
+                    self.deformable_system,
+                    contact_capacity=rigid_contact_capacity,
+                    self_contact_capacity=self_contact_capacity,
+                    stabilization_fraction=contact_stabilization_fraction,
+                    dead_zone=contact_dead_zone,
+                    impact_velocity_threshold=impact_velocity_threshold,
+                    recoverable_response=contact_recoverable_response,
+                    enable_rigid_normal_cone_filtering=(self._deformable_rigid_contact_normal_cone_filtering_enabled),
+                    normal_cone_filtering_min_distance=self._deformable_normal_cone_filtering_min_distance,
+                    projection_method=self.projection_method,
+                )
+            self.deformable_contacts.prepare(
+                contacts,
+                state,
+                time_step,
+                self_contact_detector=(
+                    self.deformable_self_contact_detector if self._deformable_self_contacts_enabled else None
+                ),
+                body_pose=body_pose,
+            )
+            self.deformable_system.set_unilateral_incidence(self.deformable_contacts.particle_multiplicity)
+            self.deformable_contacts.update_weight_metric()
+            if (
+                self.projection_method == "gauss_seidel"
+                and not self._has_dynamic_rigid_bodies
+                and self.gauss_seidel_max_colors > 1
+            ):
+                self._prepare_colored_gauss_seidel_projection()
+        else:
+            self.deformable_system.set_unilateral_incidence(None)
+        self.deformable_splitting.begin_time_step(time_step, self.inertial_warmstart_fraction)
+        wp.copy(self.deformable_system.smooth_velocity, self.deformable_splitting.projected_velocity)
+        self._deformable_prepared = True
+
     def _prepare_colored_gauss_seidel_projection(self) -> None:
-        projection_adapter = self.rigid_adapter
-        if self._colored_gauss_seidel is None or self._colored_gauss_seidel.rigid_adapter is not projection_adapter:
+        deformable_contacts = self.deformable_contacts if self._deformable_contacts_active else None
+        projection_adapter = self.rigid_adapter if self._has_dynamic_rigid_bodies else None
+        if (
+            self._colored_gauss_seidel is None
+            or self._colored_gauss_seidel.rigid_adapter is not projection_adapter
+            or not self._colored_gauss_seidel.matches(deformable_contacts)
+        ):
             self._colored_gauss_seidel = ColoredGaussSeidelProjection(
                 projection_adapter,
+                deformable_contacts,
                 self.gauss_seidel_max_colors,
             )
-        prepared_status = self.rigid_adapter.world_jacobi_projection_status
-        inverse_weight = self.system.inverse_weight
+        if projection_adapter is not None:
+            prepared_status = self.rigid_adapter.world_jacobi_projection_status
+            inverse_weight = self.system.inverse_weight
+        else:
+            prepared_status = self.deformable_contacts.projection_status
+            inverse_weight = None
         self._colored_gauss_seidel.prepare(inverse_weight, prepared_status)
 
     def _prepare_body_space_projection(self) -> None:
@@ -730,6 +954,13 @@ class LOXSolver:
                 rigid_adapter.limit_projection_delassus,
                 rigid_adapter.world_jacobi_projection_status,
             )
+            if self._deformable_contacts_active:
+                self.deformable_contacts.prepare_rigid_projection(
+                    rigid_adapter.body_constraint_count,
+                    rigid_adapter.static_body_constraint_count,
+                    self.system.inverse_weight,
+                    rigid_adapter.world_jacobi_projection_status,
+                )
         elif self.projection_method == "gauss_seidel" and self.gauss_seidel_max_colors > 1:
             self._prepare_colored_gauss_seidel_projection()
 
@@ -781,6 +1012,10 @@ class LOXSolver:
                 rigid_adapter.friction_reaction,
                 rigid_adapter.world_jacobi_projection_status,
                 rigid_adapter.projection_status,
+                deformable_contacts=self.deformable_contacts if self._deformable_contacts_active else None,
+                deformable_projected_velocity=(
+                    self.deformable_splitting.projected_velocity if self._deformable_contacts_active else None
+                ),
                 world_body_offset=rigid_adapter.model.info.bodies_offset,
                 world_body_count=rigid_adapter.model.info.num_bodies,
                 world_friction_offset=rigid_adapter.world_friction_offset,
@@ -805,6 +1040,7 @@ class LOXSolver:
                 self.system.inverse_weight,
                 splitting.projected_twist,
                 rigid_adapter.projection_twist_delta,
+                (self.deformable_splitting.projected_velocity if self._deformable_contacts_active else None),
                 rigid_adapter.world_jacobi_projection_status,
                 rigid_adapter.projection_status,
             )
@@ -822,6 +1058,115 @@ class LOXSolver:
             outputs=[self._iteration_condition],
             device=self.device,
         )
+
+    def _deformable_candidate_projection(self, time_step: wp.array[wp.float32]) -> None:
+        deformable_system = self.deformable_system
+        deformable_splitting = self.deformable_splitting
+        if deformable_system is None or deformable_splitting is None:
+            return
+        center = deformable_splitting.build_consensus_center(self.world_active)
+        deformable_system.solve_candidate(center)
+        deformable_system.update_proximal(time_step)
+        deformable_splitting.prepare_projection(deformable_system.smooth_velocity)
+        contact_system = self.deformable_contacts if self._deformable_contacts_active else None
+        if contact_system is not None and not self._has_dynamic_rigid_bodies:
+            if self.projection_method in ("jacobi", "apgd"):
+                contact_system.project(
+                    deformable_splitting.projected_velocity,
+                    iterations=self.projection_iterations,
+                    warm_start=True,
+                    world_active=self.world_active if self.projection_method == "apgd" else None,
+                    theta=self._projection_theta if self.projection_method == "apgd" else None,
+                    beta=self._projection_beta if self.projection_method == "apgd" else None,
+                    restart_dot=self._projection_restart_dot if self.projection_method == "apgd" else None,
+                )
+            elif self.projection_method == "gauss_seidel" and self.gauss_seidel_max_colors == 1:
+                contact_system.apply_reaction_warm_start(deformable_splitting.projected_velocity)
+                contact_system.project(
+                    deformable_splitting.projected_velocity,
+                    iterations=self.projection_iterations,
+                )
+                contact_system.prepare_particle_projection_status()
+            elif self.projection_method == "gauss_seidel":
+                self._colored_gauss_seidel.project(
+                    self.projection_iterations,
+                    self.world_active,
+                    None,
+                    None,
+                    None,
+                    None,
+                    deformable_splitting.projected_velocity,
+                    contact_system.projection_status,
+                    contact_system.projection_status,
+                )
+            if self.rigid_adapter is not None:
+                wp.copy(self.rigid_adapter.projection_status, contact_system.projection_status)
+
+    def _finish_deformable_iteration(self, time_step: wp.array[wp.float32]) -> None:
+        deformable_splitting = self.deformable_splitting
+        if deformable_splitting is None:
+            return
+        contact_system = self.deformable_contacts if self._deformable_contacts_active else None
+        residual_total = (
+            self.splitting.residual_total if self.splitting is not None else self._cloth_only_residual_total
+        )
+        if self.splitting is None:
+            residual_total.zero_()
+            self.world_converged.fill_(True)
+        deformable_splitting.finish_iteration(
+            self.world_active,
+            self.world_converged,
+            self.world_failed,
+            self.iteration_count,
+            residual_total,
+            time_step,
+            self.position_tolerance,
+            self.velocity_tolerance,
+            contact_system=contact_system,
+            rigid_projected_twist=(self.splitting.projected_twist if self._has_dynamic_rigid_bodies else None),
+            increment_iteration_count=self.splitting is None,
+        )
+
+    def _truncate_deformable_projection(self, time_step: wp.array[wp.float32]) -> None:
+        """Apply deformable-only directional limiting before ADMM updates."""
+        if self.deformable_penetration_free_limiter is None or self.deformable_splitting is None:
+            return
+        self.deformable_penetration_free_limiter.truncate(
+            self.deformable_splitting.projected_velocity,
+            self.deformable_splitting.world_active,
+            time_step,
+        )
+
+    def _combined_iteration(
+        self,
+        time_step: wp.array[wp.float32],
+        linearization_twist: wp.array[vec6f] | None,
+        conditional: bool,
+    ) -> None:
+        if self._deformable_stream is None:
+            self._deformable_candidate_projection(time_step)
+            if self.rigid_adapter is not None:
+                assert linearization_twist is not None
+                self._prepare_body_space_candidate(time_step, linearization_twist)
+                self._project_body_space_constraints()
+        else:
+            main_stream = wp.get_stream(self.device)
+            main_stream.record_event(self._deformable_start_event)
+            self._deformable_stream.wait_event(self._deformable_start_event)
+            with wp.ScopedStream(self._deformable_stream):
+                self._deformable_candidate_projection(time_step)
+            self._deformable_stream.record_event(self._deformable_complete_event)
+            assert linearization_twist is not None
+            self._prepare_body_space_candidate(time_step, linearization_twist)
+            main_stream.wait_event(self._deformable_complete_event)
+            self._project_body_space_constraints()
+
+        self._truncate_deformable_projection(time_step)
+        if self.rigid_adapter is not None:
+            self._finish_body_space_iteration(time_step, linearization_twist)
+        self._finish_deformable_iteration(time_step)
+        if conditional:
+            self._update_conditional_iteration()
 
     def _prepare_body_space_candidate(
         self,
@@ -949,6 +1294,13 @@ class LOXSolver:
             if initial_twist is None:
                 initial_twist = self._initial_twist
             self.splitting.begin(initial_twist, reset_dual=False)
+        else:
+            self.world_active.fill_(True)
+            self.world_converged.zero_()
+            self.world_failed.zero_()
+            self.world_iteration_limit.zero_()
+            self.iteration_count.zero_()
+            self._cloth_only_residual_total.zero_()
         self.world_accepted.zero_()
         self.world_status.fill_(LOX_STATUS_ACTIVE)
         if self.rigid_adapter is not None:
@@ -958,6 +1310,9 @@ class LOXSolver:
         self.contact_residual_max.zero_()
         self.limit_residual_max.zero_()
         self.friction_residual_max.zero_()
+        if self.deformable_system is not None and not self._deformable_prepared:
+            raise RuntimeError("begin_deformable_time_step() must be called before solving LOX deformables.")
+
         rigid_adapter = self.rigid_adapter
         system = self.system
         splitting = self.splitting
@@ -986,16 +1341,28 @@ class LOXSolver:
         )
         if use_conditional_loop:
             self._iteration_condition.fill_(1)
-            wp.capture_while(
-                self._iteration_condition,
-                self._body_space_iteration,
-                time_step=time_step,
-                linearization_twist=linearization_twist,
-                conditional=True,
-            )
+            if self.deformable_system is None:
+                wp.capture_while(
+                    self._iteration_condition,
+                    self._body_space_iteration,
+                    time_step=time_step,
+                    linearization_twist=linearization_twist,
+                    conditional=True,
+                )
+            else:
+                wp.capture_while(
+                    self._iteration_condition,
+                    self._combined_iteration,
+                    time_step=time_step,
+                    linearization_twist=linearization_twist,
+                    conditional=True,
+                )
         else:
             for _iteration in range(self.max_iterations):
-                self._body_space_iteration(time_step, linearization_twist, conditional=False)
+                if self.deformable_system is None:
+                    self._body_space_iteration(time_step, linearization_twist, conditional=False)
+                else:
+                    self._combined_iteration(time_step, linearization_twist, conditional=False)
 
         if splitting is not None:
             splitting.store_dual_impulse(system.weight, rigid_adapter.body_has_unilateral)
@@ -1015,6 +1382,8 @@ class LOXSolver:
             outputs=[self.world_accepted, self.world_status],
             device=self.device,
         )
+        if self.deformable_splitting is not None:
+            self.deformable_splitting.accept_projected(self.world_accepted)
         if rigid_adapter is not None:
             compute_projection_residuals(
                 self.world_accepted,
@@ -1063,3 +1432,15 @@ class LOXSolver:
             )
             if write_output:
                 rigid_adapter.write_outputs(time_step, inverse_time_step, body_velocity=splitting.projected_twist)
+        self._deformable_prepared = False
+
+    def write_deformable_output(
+        self,
+        state_out,
+        time_step: wp.array[wp.float32],
+        inverse_time_step: wp.array[wp.float32],
+    ) -> None:
+        """Write accepted projected cloth state into Newton output arrays."""
+        validate_world_time_steps(time_step, inverse_time_step, self.num_worlds, self.device)
+        if self.deformable_splitting is not None:
+            self.deformable_splitting.write_output(state_out, time_step)

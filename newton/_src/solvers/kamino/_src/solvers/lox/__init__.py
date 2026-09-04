@@ -10,6 +10,7 @@ from .contact import (
     project_contact_coulomb_cone,
     solve_contact_coulomb_newton,
 )
+from .deformable_system import validate_deformable_model
 from .iteration import SplittingState
 from .problem import (
     PrimalRowContribution,
@@ -91,5 +92,6 @@ __all__ = [
     "project_constraints_jacobi",
     "project_contact_coulomb_cone",
     "solve_contact_coulomb_newton",
+    "validate_deformable_model",
     "validate_rod_model",
 ]

@@ -1223,6 +1223,7 @@ class TestModelConversions(unittest.TestCase):
         )
         self.assertIsNotNone(state_newton.body_lox_dual_impulse)
         self.assertEqual(state_newton.body_lox_dual_impulse.size, model_newton.body_count)
+
         # Create a Kamino state container
         state_kamino: StateKamino = model_kamino.state()
         self.assertIsInstance(state_kamino.q_i, wp.array)

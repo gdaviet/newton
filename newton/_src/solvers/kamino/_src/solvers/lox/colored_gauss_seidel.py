@@ -10,18 +10,31 @@ from typing import Any
 import warp as wp
 
 from ...core.types import mat36f, mat66f, vec6f
+from .deformable_contact import (
+    _COEFFICIENT_TOLERANCE,
+    DEFORMABLE_CONTACT_STATUS_INVALID_DELASSUS,
+    DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE,
+    DEFORMABLE_CONTACT_STATUS_VALID,
+    _make_project_particle_contacts_kernel,
+    _merge_rigid_prepared_status,
+    _ParticleContactColoredState,
+    _ParticleContactProjectionData,
+)
 from .projection import (
     PROJECTION_STATUS_INVALID,
     PROJECTION_STATUS_VALID,
     _can_fuse_rigid_projection_by_world,
     compute_limit_delassus,
     prepare_contact_coulomb,
+    prepare_contact_coulomb_delassus,
     project_contact_coulomb_local,
     project_friction_local,
     project_limit_local,
 )
 from .sweep import (
     _atomic_add_twist,
+    _DeformableRigidContactProjectionData,
+    _DeformableRigidProjectionState,
     _initialize_jacobi_projection_status,
     _is_finite_twist,
     _make_colored_projection_index,
@@ -273,6 +286,220 @@ def _commit_two_endpoint_repairs(
     colors[constraint] = candidate
 
 
+@wp.func
+def _deformable_endpoint_occupancy(
+    particle_indices: wp.array2d[wp.int32],
+    contact: int,
+    body: int,
+    color: int,
+    particle_occupancy: wp.array2d[wp.int32],
+    body_occupancy: wp.array2d[wp.int32],
+) -> int:
+    score = _occupancy(body_occupancy, body, color)
+    for slot in range(4):
+        particle = particle_indices[contact, slot]
+        unique = particle >= 0
+        for previous in range(slot):
+            unique = unique and particle_indices[contact, previous] != particle
+        if unique:
+            score += particle_occupancy[particle, color]
+    return score
+
+
+@wp.func
+def _deformable_endpoint_maximum(
+    particle_indices: wp.array2d[wp.int32],
+    contact: int,
+    body: int,
+    color: int,
+    particle_occupancy: wp.array2d[wp.int32],
+    body_occupancy: wp.array2d[wp.int32],
+) -> int:
+    maximum = _occupancy(body_occupancy, body, color)
+    for slot in range(4):
+        particle = particle_indices[contact, slot]
+        unique = particle >= 0
+        for previous in range(slot):
+            unique = unique and particle_indices[contact, previous] != particle
+        if unique:
+            maximum = wp.max(maximum, particle_occupancy[particle, color])
+    return maximum
+
+
+@wp.kernel
+def _assign_deformable_colors(
+    particle_indices: wp.array2d[wp.int32],
+    contact_world: wp.array[wp.int32],
+    contact_body: wp.array[wp.int32],
+    contact_status: wp.array[wp.int32],
+    color_count: int,
+    colors: wp.array[wp.int32],
+):
+    contact = wp.tid()
+    if contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID:
+        colors[contact] = _NO_PROPOSAL
+        return
+    first = particle_indices[contact, 0]
+    second = particle_indices[contact, 1]
+    colors[contact] = _initial_color(contact_world[contact], contact, first, second, 3, color_count)
+
+
+@wp.kernel
+def _count_deformable_occupancy(
+    particle_indices: wp.array2d[wp.int32],
+    contact_body: wp.array[wp.int32],
+    contact_status: wp.array[wp.int32],
+    colors: wp.array[wp.int32],
+    particle_occupancy: wp.array2d[wp.int32],
+    body_occupancy: wp.array2d[wp.int32],
+):
+    contact = wp.tid()
+    if contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID:
+        return
+    color = colors[contact]
+    for slot in range(4):
+        particle = particle_indices[contact, slot]
+        unique = particle >= 0
+        for previous in range(slot):
+            unique = unique and particle_indices[contact, previous] != particle
+        if unique:
+            wp.atomic_add(particle_occupancy, particle, color, 1)
+    body = contact_body[contact]
+    if body >= 0:
+        wp.atomic_add(body_occupancy, body, color, 1)
+
+
+@wp.kernel
+def _accumulate_deformable_majorizer_weights(
+    particle_indices: wp.array2d[wp.int32],
+    coefficients: wp.array2d[wp.float32],
+    contact_status: wp.array[wp.int32],
+    colors: wp.array[wp.int32],
+    particle_weight_sum: wp.array2d[wp.float32],
+):
+    contact = wp.tid()
+    if contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID:
+        return
+    color = colors[contact]
+    if color < 0:
+        return
+    for slot in range(4):
+        particle = particle_indices[contact, slot]
+        coefficient = wp.abs(coefficients[contact, slot])
+        if particle >= 0 and coefficient > _COEFFICIENT_TOLERANCE:
+            wp.atomic_add(particle_weight_sum, particle, color, coefficient)
+
+
+@wp.kernel
+def _propose_and_claim_deformable_repairs(
+    particle_indices: wp.array2d[wp.int32],
+    contact_body: wp.array[wp.int32],
+    contact_status: wp.array[wp.int32],
+    color_count: int,
+    key_offset: int,
+    colors: wp.array[wp.int32],
+    particle_occupancy: wp.array2d[wp.int32],
+    body_occupancy: wp.array2d[wp.int32],
+    proposals: wp.array[wp.int32],
+    particle_locks: wp.array[wp.int32],
+    body_locks: wp.array[wp.int32],
+):
+    contact = wp.tid()
+    if contact_status[contact] != DEFORMABLE_CONTACT_STATUS_VALID:
+        proposals[contact] = _NO_PROPOSAL
+        return
+    current = colors[contact]
+    current_sum = _deformable_endpoint_occupancy(
+        particle_indices, contact, contact_body[contact], current, particle_occupancy, body_occupancy
+    )
+    endpoint_count = int(contact_body[contact] >= 0)
+    for slot in range(4):
+        particle = particle_indices[contact, slot]
+        unique = particle >= 0
+        for previous in range(slot):
+            unique = unique and particle_indices[contact, previous] != particle
+        if unique:
+            endpoint_count += 1
+    best = current
+    best_sum = current_sum
+    best_max = _deformable_endpoint_maximum(
+        particle_indices, contact, contact_body[contact], current, particle_occupancy, body_occupancy
+    )
+    for color in range(color_count):
+        score = _deformable_endpoint_occupancy(
+            particle_indices, contact, contact_body[contact], color, particle_occupancy, body_occupancy
+        )
+        maximum = _deformable_endpoint_maximum(
+            particle_indices, contact, contact_body[contact], color, particle_occupancy, body_occupancy
+        )
+        if score < best_sum or (score == best_sum and maximum < best_max):
+            best = color
+            best_sum = score
+            best_max = maximum
+    proposal = _NO_PROPOSAL
+    if best != current and best_sum + endpoint_count < current_sum:
+        proposal = best
+    proposals[contact] = proposal
+    if proposal < 0:
+        return
+    key = key_offset + contact
+    for slot in range(4):
+        particle = particle_indices[contact, slot]
+        unique = particle >= 0
+        for previous in range(slot):
+            unique = unique and particle_indices[contact, previous] != particle
+        if unique:
+            wp.atomic_min(particle_locks, particle, key)
+    body = contact_body[contact]
+    if body >= 0:
+        wp.atomic_min(body_locks, body, key)
+
+
+@wp.kernel
+def _commit_deformable_repairs(
+    particle_indices: wp.array2d[wp.int32],
+    contact_body: wp.array[wp.int32],
+    key_offset: int,
+    colors: wp.array[wp.int32],
+    proposals: wp.array[wp.int32],
+    particle_locks: wp.array[wp.int32],
+    body_locks: wp.array[wp.int32],
+    particle_occupancy: wp.array2d[wp.int32],
+    body_occupancy: wp.array2d[wp.int32],
+):
+    contact = wp.tid()
+    candidate = proposals[contact]
+    if candidate < 0:
+        return
+    key = key_offset + contact
+    accepted = True
+    for slot in range(4):
+        particle = particle_indices[contact, slot]
+        unique = particle >= 0
+        for previous in range(slot):
+            unique = unique and particle_indices[contact, previous] != particle
+        if unique:
+            accepted = accepted and particle_locks[particle] == key
+    body = contact_body[contact]
+    if body >= 0:
+        accepted = accepted and body_locks[body] == key
+    if not accepted:
+        return
+    current = colors[contact]
+    for slot in range(4):
+        particle = particle_indices[contact, slot]
+        unique = particle >= 0
+        for previous in range(slot):
+            unique = unique and particle_indices[contact, previous] != particle
+        if unique:
+            wp.atomic_add(particle_occupancy, particle, current, -1)
+            wp.atomic_add(particle_occupancy, particle, candidate, 1)
+    if body >= 0:
+        wp.atomic_add(body_occupancy, body, current, -1)
+        wp.atomic_add(body_occupancy, body, candidate, 1)
+    colors[contact] = candidate
+
+
 @wp.kernel
 def _count_colors(colors: wp.array[wp.int32], color_count: int, counts: wp.array[wp.int32]):
     item = wp.tid()
@@ -506,6 +733,61 @@ def _prepare_rigid_colored(
         limit_delassus[constraint] = value
         if not wp.isfinite(value) or value <= 0.0:
             world_status[limit_world[constraint]] = PROJECTION_STATUS_INVALID
+
+
+@wp.kernel
+def _prepare_deformable_colored(
+    launch_dim: int,
+    target_color: int,
+    color_counts: wp.array[wp.int32],
+    color_offsets: wp.array[wp.int32],
+    order: wp.array[wp.int32],
+    particle_indices: wp.array2d[wp.int32],
+    coefficients: wp.array2d[wp.float32],
+    contact_world: wp.array[wp.int32],
+    contact_body: wp.array[wp.int32],
+    body_jacobian: wp.array[mat36f],
+    rigid_bias: wp.array[wp.vec3f],
+    friction: wp.array[wp.float32],
+    particle_weight_sum: wp.array2d[wp.float32],
+    body_occupancy: wp.array2d[wp.int32],
+    particle_inverse_weight: wp.array[wp.float32],
+    body_inverse_weight: wp.array[mat66f],
+    include_rigid: bool,
+    contact_status: wp.array[wp.int32],
+    scalar_delassus: wp.array[wp.float32],
+    delassus: wp.array[wp.mat33f],
+    prepared_status: wp.array[wp.int32],
+    contact_world_status: wp.array[wp.int32],
+):
+    lane = wp.tid()
+    begin = color_offsets[target_color] + lane
+    end = color_offsets[target_color] + color_counts[target_color]
+    for ordered in range(begin, end, launch_dim):
+        contact = order[ordered]
+        particle_value = wp.float32(0.0)
+        for particle_slot in range(4):
+            particle = particle_indices[contact, particle_slot]
+            if particle >= 0:
+                coefficient = wp.abs(coefficients[contact, particle_slot])
+                if coefficient > _COEFFICIENT_TOLERANCE:
+                    particle_value += (
+                        coefficient * particle_weight_sum[particle, target_color] * particle_inverse_weight[particle]
+                    )
+        value = particle_value * wp.identity(3, dtype=wp.float32)
+        body = contact_body[contact]
+        if include_rigid and body >= 0:
+            multiplicity = wp.max(1, body_occupancy[body, target_color])
+            jacobian = body_jacobian[contact]
+            value += jacobian @ (wp.float32(multiplicity) * body_inverse_weight[body]) @ wp.transpose(jacobian)
+        data = prepare_contact_coulomb_delassus(value, rigid_bias[contact], friction[contact])
+        scalar_delassus[contact] = particle_value
+        delassus[contact] = data.delassus
+        if data.status == PROJECTION_STATUS_INVALID or (not include_rigid and particle_value <= 0.0):
+            contact_status[contact] = DEFORMABLE_CONTACT_STATUS_INVALID_DELASSUS
+            world = contact_world[contact]
+            prepared_status[world] = PROJECTION_STATUS_INVALID
+            wp.atomic_max(contact_world_status, world, DEFORMABLE_CONTACT_STATUS_INVALID_DELASSUS)
 
 
 @wp.kernel
@@ -901,6 +1183,48 @@ def _apply_body_delta(
     delta[body] = vec6f(0.0)
 
 
+@wp.kernel
+def _apply_particle_delta_colored(
+    particle_world: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_status: wp.array[wp.int32],
+    delta: wp.array[wp.vec3f],
+    projected_velocity: wp.array[wp.vec3f],
+):
+    particle = wp.tid()
+    world = particle_world[particle]
+    if world_active[world] and world_status[world] == PROJECTION_STATUS_VALID:
+        projected_velocity[particle] += delta[particle]
+    delta[particle] = wp.vec3f(0.0)
+
+
+@wp.kernel
+def _apply_body_particle_delta_colored(
+    launch_dim: int,
+    body_count: int,
+    particle_count: int,
+    body_world: wp.array[wp.int32],
+    particle_world: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_status: wp.array[wp.int32],
+    body_delta: wp.array[vec6f],
+    particle_delta: wp.array[wp.vec3f],
+    projected_twist: wp.array[vec6f],
+    projected_velocity: wp.array[wp.vec3f],
+):
+    lane = wp.tid()
+    for body in range(lane, body_count, launch_dim):
+        world = body_world[body]
+        if world_active[world] and world_status[world] == PROJECTION_STATUS_VALID:
+            projected_twist[body] += body_delta[body]
+        body_delta[body] = vec6f(0.0)
+    for particle in range(lane, particle_count, launch_dim):
+        world = particle_world[particle]
+        if world_active[world] and world_status[world] == PROJECTION_STATUS_VALID:
+            projected_velocity[particle] += particle_delta[particle]
+        particle_delta[particle] = wp.vec3f(0.0)
+
+
 class _ColorFamily:
     def __init__(self, capacity: int, color_count: int, device):
         self.capacity = capacity
@@ -948,35 +1272,67 @@ class ColoredGaussSeidelProjection:
     The effective color count is the requested maximum bounded by total
     allocated unilateral capacity, with one internal color retained for empty
     or single-constraint systems. The endpoint occupancy tables use int32
-    atomics. Scratch is allocated only for requested counts of at least two;
-    the one-color endpoint uses the existing Jacobi
+    atomics, and deformable coefficient weights use an additional float32
+    particle-by-color table. They are only allocated for requested counts of
+    at least two; the one-color endpoint uses the existing Jacobi
     implementation directly.
     """
 
-    def __init__(self, rigid_adapter, color_count: int):
+    def __init__(self, rigid_adapter, deformable_contacts, color_count: int):
         if color_count < 2:
             raise ValueError("Colored Gauss-Seidel requires at least two colors.")
         self.rigid_adapter = rigid_adapter
-        rigid_capacity = rigid_adapter.friction_capacity + rigid_adapter.contact_capacity + rigid_adapter.limit_capacity
-        self.color_count = max(1, min(color_count, rigid_capacity))
-        self.device = rigid_adapter.device
-        body_count = rigid_adapter.body_constraint_count.shape[0]
+        self.deformable_contacts = deformable_contacts
+        rigid_capacity = 0
+        if rigid_adapter is not None:
+            rigid_capacity = (
+                rigid_adapter.friction_capacity + rigid_adapter.contact_capacity + rigid_adapter.limit_capacity
+            )
+        deformable_capacity = deformable_contacts.contact_capacity if deformable_contacts is not None else 0
+        self.color_count = max(1, min(color_count, rigid_capacity + deformable_capacity))
+        self.device = rigid_adapter.device if rigid_adapter is not None else deformable_contacts.device
+        body_count = rigid_adapter.body_constraint_count.shape[0] if rigid_adapter is not None else 0
+        particle_count = deformable_contacts.cloth_system.particle_count if deformable_contacts is not None else 0
         self.body_occupancy = wp.zeros((body_count, self.color_count), dtype=wp.int32, device=self.device)
+        self.particle_occupancy = wp.zeros((particle_count, self.color_count), dtype=wp.int32, device=self.device)
+        self.particle_majorizer_weight_sum = wp.zeros(
+            (particle_count, self.color_count), dtype=wp.float32, device=self.device
+        )
         self.rigid_world_color_count = wp.zeros(
-            (rigid_adapter.world_contact_count.shape[0], self.color_count),
+            (rigid_adapter.world_contact_count.shape[0] if rigid_adapter is not None else 0, self.color_count),
             dtype=wp.int32,
             device=self.device,
         )
         self.body_locks = wp.full(body_count, _LOCK_FREE, dtype=wp.int32, device=self.device)
-        self.friction = _ColorFamily(rigid_adapter.friction_capacity, self.color_count, self.device)
-        self.contact = _ColorFamily(rigid_adapter.contact_capacity, self.color_count, self.device)
-        self.limit = _ColorFamily(rigid_adapter.limit_capacity, self.color_count, self.device)
+        self.particle_locks = wp.full(particle_count, _LOCK_FREE, dtype=wp.int32, device=self.device)
+        self.friction = _ColorFamily(
+            rigid_adapter.friction_capacity if rigid_adapter is not None else 0, self.color_count, self.device
+        )
+        self.contact = _ColorFamily(
+            rigid_adapter.contact_capacity if rigid_adapter is not None else 0, self.color_count, self.device
+        )
+        self.limit = _ColorFamily(
+            rigid_adapter.limit_capacity if rigid_adapter is not None else 0, self.color_count, self.device
+        )
+        self.deformable = _ColorFamily(
+            deformable_contacts.contact_capacity if deformable_contacts is not None else 0,
+            self.color_count,
+            self.device,
+        )
         self.friction_delassus = wp.zeros(self.friction.capacity, dtype=wp.float32, device=self.device)
         self.contact_delassus = wp.zeros(self.contact.capacity, dtype=wp.mat33f, device=self.device)
         self.limit_delassus = wp.zeros(self.limit.capacity, dtype=wp.float32, device=self.device)
         self._families = (self.friction, self.contact, self.limit)
         self.rigid_worker_count = _bounded_worker_count(rigid_capacity, self.device)
+        deformable_per_color_capacity = (self.deformable.capacity + self.color_count - 1) // self.color_count
+        self.deformable_projection_worker_count = _bounded_worker_count(deformable_per_color_capacity, self.device)
         self._fuse_rigid_families = sum(family.capacity > 0 for family in self._families) > 1
+        self.apply_worker_count = _bounded_worker_count(max(body_count, particle_count), self.device)
+        # Split domain kernels preserve occupancy on older architectures; launch fusion wins on Blackwell and newer.
+        self._combine_apply_domains = self.device.is_cuda and self.device.arch >= 100
+
+    def matches(self, deformable_contacts) -> bool:
+        return self.deformable_contacts is deformable_contacts
 
     def _launch_rigid_families(self, kernel, extra_inputs: tuple = ()) -> None:
         rigid_adapter = self.rigid_adapter
@@ -1041,19 +1397,97 @@ class ColoredGaussSeidelProjection:
 
     def build_colors(self) -> None:
         self.body_occupancy.zero_()
+        self.particle_occupancy.zero_()
+        self.particle_majorizer_weight_sum.zero_()
         self.rigid_world_color_count.zero_()
         self._launch_rigid_families(_assign_two_endpoint_colors)
         self._launch_rigid_families(_count_two_endpoint_occupancy)
+        deformable = self.deformable_contacts
+        deformable_key_offset = sum(family.capacity for family in self._families)
+        if deformable is not None:
+            wp.launch(
+                _assign_deformable_colors,
+                dim=deformable.contact_capacity,
+                inputs=[
+                    deformable.particle_indices,
+                    deformable.contact_world,
+                    deformable.body,
+                    deformable.status,
+                    self.color_count,
+                ],
+                outputs=[self.deformable.colors],
+                device=self.device,
+            )
+            wp.launch(
+                _count_deformable_occupancy,
+                dim=deformable.contact_capacity,
+                inputs=[
+                    deformable.particle_indices,
+                    deformable.body,
+                    deformable.status,
+                    self.deformable.colors,
+                ],
+                outputs=[self.particle_occupancy, self.body_occupancy],
+                device=self.device,
+            )
         for _repair in range(_COLOR_REPAIR_PASSES):
             self.body_locks.fill_(_LOCK_FREE)
+            self.particle_locks.fill_(_LOCK_FREE)
             self._launch_rigid_families(_propose_and_claim_two_endpoint_repairs)
+            if deformable is not None:
+                wp.launch(
+                    _propose_and_claim_deformable_repairs,
+                    dim=deformable.contact_capacity,
+                    inputs=[
+                        deformable.particle_indices,
+                        deformable.body,
+                        deformable.status,
+                        self.color_count,
+                        deformable_key_offset,
+                        self.deformable.colors,
+                        self.particle_occupancy,
+                        self.body_occupancy,
+                    ],
+                    outputs=[self.deformable.proposals, self.particle_locks, self.body_locks],
+                    device=self.device,
+                )
             self._launch_rigid_families(_commit_two_endpoint_repairs)
-        for family in self._families:
+            if deformable is not None:
+                wp.launch(
+                    _commit_deformable_repairs,
+                    dim=deformable.contact_capacity,
+                    inputs=[
+                        deformable.particle_indices,
+                        deformable.body,
+                        deformable_key_offset,
+                        self.deformable.colors,
+                        self.deformable.proposals,
+                        self.particle_locks,
+                        self.body_locks,
+                    ],
+                    outputs=[self.particle_occupancy, self.body_occupancy],
+                    device=self.device,
+                )
+        for family in (*self._families, self.deformable):
             family.compact(self.color_count, self.device)
+        if deformable is not None:
+            wp.launch(
+                _accumulate_deformable_majorizer_weights,
+                dim=deformable.contact_capacity,
+                inputs=[
+                    deformable.particle_indices,
+                    deformable.coefficients,
+                    deformable.status,
+                    self.deformable.colors,
+                ],
+                outputs=[self.particle_majorizer_weight_sum],
+                device=self.device,
+            )
 
     def prepare(self, inverse_weight: wp.array[mat66f] | None, prepared_status: wp.array[wp.int32]) -> None:
         self.build_colors()
         rigid_adapter = self.rigid_adapter
+        empty_body_weight = None
         if rigid_adapter is not None:
             prepare_jacobi_projection_data(
                 rigid_adapter.friction_world,
@@ -1087,6 +1521,14 @@ class ColoredGaussSeidelProjection:
                 rigid_adapter.limit_projection_delassus,
                 prepared_status,
             )
+            if self.deformable_contacts is not None:
+                self.deformable_contacts.prepare_rigid_projection(
+                    rigid_adapter.body_constraint_count,
+                    rigid_adapter.static_body_constraint_count,
+                    inverse_weight,
+                    prepared_status,
+                )
+            empty_body_weight = inverse_weight
             if self.rigid_worker_count > 0:
                 for color in range(self.color_count):
                     if self._fuse_rigid_families:
@@ -1205,6 +1647,50 @@ class ColoredGaussSeidelProjection:
                             )
         else:
             prepared_status.fill_(PROJECTION_STATUS_VALID)
+        deformable = self.deformable_contacts
+        if deformable is not None:
+            include_rigid = rigid_adapter is not None
+            body_weight = empty_body_weight if include_rigid else deformable._empty_body_inverse_weight
+            for color in range(self.color_count):
+                wp.launch(
+                    _prepare_deformable_colored,
+                    dim=self.deformable.worker_count,
+                    inputs=[
+                        self.deformable.worker_count,
+                        color,
+                        self.deformable.counts,
+                        self.deformable.offsets,
+                        self.deformable.order,
+                        deformable.particle_indices,
+                        deformable.coefficients,
+                        deformable.contact_world,
+                        deformable.body,
+                        deformable.body_jacobian,
+                        deformable.bias,
+                        deformable.friction,
+                        self.particle_majorizer_weight_sum,
+                        self.body_occupancy,
+                        deformable.cloth_system.inverse_weight,
+                        body_weight,
+                        include_rigid,
+                    ],
+                    outputs=[
+                        deformable.status,
+                        deformable.gauss_seidel_scalar_delassus,
+                        deformable.gauss_seidel_delassus,
+                        prepared_status,
+                        deformable.world_status,
+                    ],
+                    device=self.device,
+                    block_dim=_COLOR_BLOCK_DIM,
+                )
+            wp.launch(
+                _merge_rigid_prepared_status,
+                dim=prepared_status.shape[0],
+                inputs=[deformable.world_status, deformable.global_status],
+                outputs=[prepared_status],
+                device=self.device,
+            )
 
     def project(
         self,
@@ -1214,10 +1700,12 @@ class ColoredGaussSeidelProjection:
         inverse_weight: wp.array[mat66f] | None,
         projected_twist: wp.array[vec6f] | None,
         twist_delta: wp.array[vec6f] | None,
+        projected_velocity: wp.array[wp.vec3f] | None,
         prepared_status: wp.array[wp.int32],
         projection_status: wp.array[wp.int32],
     ) -> None:
         rigid_adapter = self.rigid_adapter
+        deformable = self.deformable_contacts
         world_count = world_active.shape[0]
         world_body_offset = None
         world_body_count = None
@@ -1235,6 +1723,7 @@ class ColoredGaussSeidelProjection:
         use_world_projection = _can_fuse_rigid_projection_by_world(
             self.device,
             world_count,
+            has_deformable_contacts=deformable is not None,
             required_world_arrays=(
                 world_body_offset,
                 world_body_count,
@@ -1243,21 +1732,28 @@ class ColoredGaussSeidelProjection:
                 world_limit_offset,
             ),
             parallel_constraint_capacity=(
-                rigid_adapter.friction_capacity
-                + rigid_adapter.contact_capacity
-                + rigid_adapter.limit_capacity
-                + self.color_count
-                - 1
-            )
-            // self.color_count
-            if rigid_adapter is not None
-            else None,
+                (
+                    rigid_adapter.friction_capacity
+                    + rigid_adapter.contact_capacity
+                    + rigid_adapter.limit_capacity
+                    + self.color_count
+                    - 1
+                )
+                // self.color_count
+                if rigid_adapter is not None
+                else None
+            ),
             world_block_dim=_WORLD_COLOR_BLOCK_DIM,
             minimum_blocks_per_sm=1,
         )
         if use_world_projection:
             state = _make_rigid_projection_state(
-                world_active, projected_twist, twist_delta, projection_status, self.body_occupancy, inverse_weight
+                world_active,
+                projected_twist,
+                twist_delta,
+                projection_status,
+                self.body_occupancy,
+                inverse_weight,
             )
             contact_data = _make_projection_struct(
                 _RigidContactProjectionData,
@@ -1326,6 +1822,8 @@ class ColoredGaussSeidelProjection:
                 device=self.device,
             )
             twist_delta.zero_()
+            if deformable is not None:
+                deformable.particle_delta.zero_()
             if self.friction.capacity > 0:
                 wp.launch(
                     _warmstart_frictions_jacobi,
@@ -1389,23 +1887,72 @@ class ColoredGaussSeidelProjection:
                     outputs=[twist_delta],
                     device=self.device,
                 )
-            wp.launch(
-                _apply_body_delta,
-                dim=projected_twist.shape[0],
-                inputs=[body_world, world_active, projection_status],
-                outputs=[twist_delta, projected_twist],
-                device=self.device,
-            )
+            if deformable is not None:
+                deformable.accumulate_rigid_reaction_warm_start(
+                    world_active,
+                    prepared_status,
+                    deformable.cloth_system.inverse_weight,
+                    inverse_weight,
+                    True,
+                    projected_velocity,
+                    projected_twist,
+                    twist_delta,
+                    projection_status,
+                )
+            if deformable is not None and self._combine_apply_domains:
+                wp.launch(
+                    _apply_body_particle_delta_colored,
+                    dim=self.apply_worker_count,
+                    inputs=[
+                        self.apply_worker_count,
+                        projected_twist.shape[0],
+                        projected_velocity.shape[0],
+                        body_world,
+                        deformable.cloth_system.topology.packed_solve_world,
+                        world_active,
+                        projection_status,
+                    ],
+                    outputs=[twist_delta, deformable.particle_delta, projected_twist, projected_velocity],
+                    device=self.device,
+                    block_dim=_COLOR_BLOCK_DIM,
+                )
+            else:
+                wp.launch(
+                    _apply_body_delta,
+                    dim=projected_twist.shape[0],
+                    inputs=[body_world, world_active, projection_status],
+                    outputs=[twist_delta, projected_twist],
+                    device=self.device,
+                )
+                if deformable is not None:
+                    wp.launch(
+                        _apply_particle_delta_colored,
+                        dim=projected_velocity.shape[0],
+                        inputs=[deformable.cloth_system.topology.packed_solve_world, world_active, projection_status],
+                        outputs=[deformable.particle_delta, projected_velocity],
+                        device=self.device,
+                    )
         else:
             wp.copy(projection_status, prepared_status)
+            deformable.apply_reaction_warm_start(projected_velocity)
+            deformable.particle_delta.zero_()
+
         rigid_projection_state = None
         rigid_contact_data = None
         friction_index = None
         contact_index = None
         limit_index = None
+        deformable_index = None
+        deformable_data = None
+        deformable_state = None
         if rigid_adapter is not None:
             rigid_projection_state = _make_rigid_projection_state(
-                world_active, projected_twist, twist_delta, projection_status, self.body_occupancy, inverse_weight
+                world_active,
+                projected_twist,
+                twist_delta,
+                projection_status,
+                self.body_occupancy,
+                inverse_weight,
             )
             rigid_contact_data = _make_projection_struct(
                 _RigidContactProjectionData,
@@ -1419,14 +1966,81 @@ class ColoredGaussSeidelProjection:
                 reaction=rigid_adapter.contact_reaction,
             )
             friction_index = _make_colored_projection_index(
-                rigid_adapter.friction_world, self.friction.counts, self.friction.offsets, self.friction.order
+                rigid_adapter.friction_world,
+                self.friction.counts,
+                self.friction.offsets,
+                self.friction.order,
             )
             contact_index = _make_colored_projection_index(
-                rigid_adapter.contact_world, self.contact.counts, self.contact.offsets, self.contact.order
+                rigid_adapter.contact_world,
+                self.contact.counts,
+                self.contact.offsets,
+                self.contact.order,
             )
             limit_index = _make_colored_projection_index(
-                rigid_adapter.limit_world, self.limit.counts, self.limit.offsets, self.limit.order
+                rigid_adapter.limit_world,
+                self.limit.counts,
+                self.limit.offsets,
+                self.limit.order,
             )
+        if deformable is not None:
+            deformable_index = _make_colored_projection_index(
+                deformable.contact_world,
+                self.deformable.counts,
+                self.deformable.offsets,
+                self.deformable.order,
+            )
+            if rigid_adapter is not None:
+                deformable_data = _make_projection_struct(
+                    _DeformableRigidContactProjectionData,
+                    particle_indices=deformable.particle_indices,
+                    coefficients=deformable.coefficients,
+                    body=deformable.body,
+                    frame=deformable.frame,
+                    body_jacobian=deformable.body_jacobian,
+                    delassus=deformable.gauss_seidel_delassus,
+                    bias=deformable.bias,
+                    friction=deformable.friction,
+                    reaction=deformable.reaction,
+                    status=deformable.status,
+                    contact_world_status=deformable.world_status,
+                )
+                deformable_state = _make_projection_struct(
+                    _DeformableRigidProjectionState,
+                    world_active=world_active,
+                    projected_twist=projected_twist,
+                    twist_delta=twist_delta,
+                    world_status=projection_status,
+                    occupancy=self.body_occupancy,
+                    inverse_weight=inverse_weight,
+                    particle_occupancy=self.particle_occupancy,
+                    particle_inverse_weight=deformable.cloth_system.inverse_weight,
+                    projected_velocity=projected_velocity,
+                    particle_delta=deformable.particle_delta,
+                )
+            else:
+                deformable_data = _make_projection_struct(
+                    _ParticleContactProjectionData,
+                    particle_indices=deformable.particle_indices,
+                    coefficients=deformable.coefficients,
+                    contact_body=deformable.body,
+                    frame=deformable.frame,
+                    bias=deformable.bias,
+                    friction=deformable.friction,
+                    delassus=deformable.gauss_seidel_scalar_delassus,
+                    status=deformable.status,
+                    reaction=deformable.reaction,
+                )
+                deformable_state = _make_projection_struct(
+                    _ParticleContactColoredState,
+                    world_active=world_active,
+                    world_status=projection_status,
+                    contact_world_status=deformable.world_status,
+                    occupancy=self.particle_occupancy,
+                    inverse_weight=deformable.cloth_system.inverse_weight,
+                    projected_velocity=projected_velocity,
+                    particle_delta=deformable.particle_delta,
+                )
         for _iteration in range(iterations):
             for color in range(self.color_count):
                 if rigid_adapter is not None:
@@ -1465,7 +2079,10 @@ class ColoredGaussSeidelProjection:
                                     self.limit_delassus,
                                     rigid_projection_state,
                                 ],
-                                outputs=[rigid_adapter.friction_reaction, rigid_adapter.limit_reaction],
+                                outputs=[
+                                    rigid_adapter.friction_reaction,
+                                    rigid_adapter.limit_reaction,
+                                ],
                                 device=self.device,
                                 block_dim=_COLOR_BLOCK_DIM,
                             )
@@ -1525,14 +2142,80 @@ class ColoredGaussSeidelProjection:
                                 device=self.device,
                                 block_dim=_COLOR_BLOCK_DIM,
                             )
-                if rigid_adapter is not None:
+                if deformable is not None:
+                    include_rigid = rigid_adapter is not None
+                    if include_rigid:
+                        wp.launch(
+                            _make_project_contacts_kernel(
+                                True,
+                                True,
+                                DEFORMABLE_CONTACT_STATUS_VALID,
+                                DEFORMABLE_CONTACT_STATUS_NUMERICAL_FAILURE,
+                            ),
+                            dim=self.deformable_projection_worker_count,
+                            inputs=[
+                                self.deformable_projection_worker_count,
+                                color,
+                                deformable_index,
+                                deformable_data,
+                                deformable_state,
+                            ],
+                            device=self.device,
+                            block_dim=_COLOR_BLOCK_DIM,
+                        )
+                    else:
+                        wp.launch(
+                            _make_project_particle_contacts_kernel(True),
+                            dim=self.deformable_projection_worker_count,
+                            inputs=[
+                                self.deformable_projection_worker_count,
+                                color,
+                                deformable_index,
+                                deformable_data,
+                                deformable_state,
+                            ],
+                            device=self.device,
+                            block_dim=_COLOR_BLOCK_DIM,
+                        )
+                if rigid_adapter is not None and deformable is not None and self._combine_apply_domains:
                     wp.launch(
-                        _apply_body_delta,
-                        dim=projected_twist.shape[0],
-                        inputs=[body_world, world_active, projection_status],
-                        outputs=[twist_delta, projected_twist],
+                        _apply_body_particle_delta_colored,
+                        dim=self.apply_worker_count,
+                        inputs=[
+                            self.apply_worker_count,
+                            projected_twist.shape[0],
+                            projected_velocity.shape[0],
+                            body_world,
+                            deformable.cloth_system.topology.packed_solve_world,
+                            world_active,
+                            projection_status,
+                        ],
+                        outputs=[twist_delta, deformable.particle_delta, projected_twist, projected_velocity],
                         device=self.device,
+                        block_dim=_COLOR_BLOCK_DIM,
                     )
+                else:
+                    if rigid_adapter is not None:
+                        wp.launch(
+                            _apply_body_delta,
+                            dim=projected_twist.shape[0],
+                            inputs=[body_world, world_active, projection_status],
+                            outputs=[twist_delta, projected_twist],
+                            device=self.device,
+                        )
+                    if deformable is not None:
+                        wp.launch(
+                            _apply_particle_delta_colored,
+                            dim=projected_velocity.shape[0],
+                            inputs=[
+                                deformable.cloth_system.topology.packed_solve_world,
+                                world_active,
+                                projection_status,
+                            ],
+                            outputs=[deformable.particle_delta, projected_velocity],
+                            device=self.device,
+                        )
+
         if rigid_adapter is not None:
             project_constraints_jacobi(
                 1,
@@ -1574,5 +2257,9 @@ class ColoredGaussSeidelProjection:
                 rigid_adapter.friction_reaction,
                 prepared_status,
                 projection_status,
+                deformable_contacts=deformable,
+                deformable_projected_velocity=projected_velocity,
                 warm_start=False,
             )
+        else:
+            deformable.project_jacobi_smoothing_sweep(world_active, projected_velocity, projection_status)

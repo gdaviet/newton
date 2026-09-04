@@ -10,7 +10,8 @@ kinematic loops, under- or overactuation, joint limits, hard frictional
 contacts, and restitutive impacts.
 
 Unlike the other maximal-coordinate solvers, Kamino focuses on constrained
-rigid mechanical assemblies.
+rigid mechanical assemblies. Its experimental LOX backend additionally supports
+selected rod, cloth, and tetrahedral models.
 Kamino is currently in BETA 1, and Newton users are discouraged from depending
 on it. Evaluate it only when kinematic loops and hard contact constraints are
 primary requirements and an experimental solver is acceptable.
@@ -41,9 +42,9 @@ Kamino provides three forward-dynamics backends:
   less accurately than PADMM, particularly as the number of active inequalities
   grows. Dual preconditioning is not supported.
 * ``"lox"`` (opt-in): a primal splitting method with sparse Jacobians and
-  dense per-island dynamics. LOX supports hard rigid contact and selected rods.
-  It performs one frozen-linearization solve at the configuration supplied by
-  the selected Kamino integrator.
+  dense per-island dynamics. LOX supports hard rigid contact together with
+  selected rods and deformables. It performs one frozen-linearization solve at
+  the configuration supplied by the selected Kamino integrator.
 
 Select the backend when constructing the configuration so dependent defaults
 initialize consistently:
@@ -87,9 +88,10 @@ step using the resulting reactions. Moreau requires
 otherwise Kamino warns and falls back to Euler.
 
 LOX uses the same Euler and Moreau implementations as PADMM and DVI. It does
-not run a separate nonlinear outer loop. LOX retains support for
-singular-inertia frames, including massless fixed attachments found in common
-robot models.
+not run a separate nonlinear outer loop. Moreau is currently limited to rigid
+LOX models because deformable LOX state uses Euler integration. LOX retains
+support for singular-inertia frames, including massless fixed attachments found
+in common robot models.
 
 Actuation and forward kinematics
 --------------------------------
