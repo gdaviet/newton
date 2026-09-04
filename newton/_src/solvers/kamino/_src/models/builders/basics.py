@@ -443,6 +443,7 @@ def build_boxes_hinged(
     ground: bool = True,
     dynamic_joints: bool = False,
     implicit_pd: bool = False,
+    effort_limit: float = math.inf,
     new_world: bool = True,
     world_index: int = 0,
 ) -> ModelBuilderKamino:
@@ -454,6 +455,7 @@ def build_boxes_hinged(
             If `None`, a new builder is created.
         z_offset: A vertical offset to apply to the initial position of the box.
         ground: Whether to add a static ground plane to the model.
+        effort_limit: Maximum actuator effort for the hinge.
         new_world: Whether to create a new world in the builder for this model.
             If `False`, the model is added to the existing world specified by `world_index`.
             If `True`, a new world is created and added to the builder. In this case the `world_index`
@@ -514,7 +516,7 @@ def build_boxes_hinged(
         B_r_Bj=wp.vec3f(0.25, 0.05, 0.0),
         F_r_Fj=wp.vec3f(-0.25, -0.05, 0.0),
         X_Bj=axis_to_mat33(Axis.Y),
-        tau_j_max=math.inf,  # Setting effort limit to match USD convention (`inf` for active joints)
+        tau_j_max=effort_limit,
         a_j=1.0 if dynamic_joints else None,
         b_j=0.1 if dynamic_joints else None,
         k_p_j=100.0 if implicit_pd else None,

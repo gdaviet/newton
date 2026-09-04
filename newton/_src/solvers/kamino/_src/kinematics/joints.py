@@ -580,7 +580,10 @@ def make_write_joint_data(correction: JointCorrectionMode = JointCorrectionMode.
         """
         # TODO: Use wp.static to include conditionals at compile time based on the joint types present in the builder
 
-        if dof_type == JointDoFType.REVOLUTE:
+        if dof_type == JointDoFType.ROD:
+            pass  # Rod material slots are not reconstructed from body-relative motion.
+
+        elif dof_type == JointDoFType.REVOLUTE:
             wp.static(make_typed_write_joint_data(JointDoFType.REVOLUTE, correction))(
                 cts_offset,
                 dofs_offset,

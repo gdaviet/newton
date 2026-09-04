@@ -12,6 +12,7 @@ import numpy as np
 import warp as wp
 
 from .....geometry import ShapeFlags
+from .....sim import JointType
 from .....sim.model import Model
 from ....coupled.model_view import ModelView
 from ..utils import logger as msg
@@ -194,6 +195,7 @@ def update_materials_kernel(
 @wp.kernel
 def validate_joint_dof_updates_kernel(
     # Inputs:
+    joint_type: wp.array[wp.int32],
     joint_qd_start: wp.array[wp.int32],
     joint_armature: wp.array[wp.float32],
     joint_damping: wp.array[wp.float32],
@@ -222,50 +224,51 @@ def validate_joint_dof_updates_kernel(
     if tid < joint_count:
         dof_start = joint_qd_start[tid]
         dof_end = joint_qd_start[tid + 1]
-        dynamic_row = dynamic_cts_offset[tid]
-        dynamic_row_end = dynamic_cts_offset[tid + 1]
-        friction_row = friction_cts_offset[tid]
-        friction_row_end = friction_cts_offset[tid + 1]
-        effort_row = effort_cts_offset[tid]
-        effort_row_end = effort_cts_offset[tid + 1]
-        for axis in range(dof_end - dof_start):
-            dof = dof_start + axis
-            act_type = JointActuationType.from_newton_wp(joint_target_mode[dof])
-            if act_type < 0:
-                wp.atomic_min(violations, StructuralUpdateViolation.INVALID_TARGET_MODE, tid)
-                return
-            dynamic_required = has_dynamic_cts_wp(
-                act_type,
-                joint_target_ke[dof],
-                joint_target_kd[dof],
-                joint_effort_limit[dof],
-                joint_armature[dof],
-                joint_damping[dof],
-            )
-            dynamic_built = dynamic_row < dynamic_row_end and dynamic_cts_axis[dynamic_row] == axis
-            if dynamic_required != dynamic_built:
-                wp.atomic_min(violations, StructuralUpdateViolation.DYNAMIC_CTS, tid)
-            if dynamic_built:
-                dynamic_row += 1
+        if joint_type[tid] != JointType.ROD:
+            dynamic_row = dynamic_cts_offset[tid]
+            dynamic_row_end = dynamic_cts_offset[tid + 1]
+            friction_row = friction_cts_offset[tid]
+            friction_row_end = friction_cts_offset[tid + 1]
+            effort_row = effort_cts_offset[tid]
+            effort_row_end = effort_cts_offset[tid + 1]
+            for axis in range(dof_end - dof_start):
+                dof = dof_start + axis
+                act_type = JointActuationType.from_newton_wp(joint_target_mode[dof])
+                if act_type < 0:
+                    wp.atomic_min(violations, StructuralUpdateViolation.INVALID_TARGET_MODE, tid)
+                    return
+                dynamic_required = has_dynamic_cts_wp(
+                    act_type,
+                    joint_target_ke[dof],
+                    joint_target_kd[dof],
+                    joint_effort_limit[dof],
+                    joint_armature[dof],
+                    joint_damping[dof],
+                )
+                dynamic_built = dynamic_row < dynamic_row_end and dynamic_cts_axis[dynamic_row] == axis
+                if dynamic_required != dynamic_built:
+                    wp.atomic_min(violations, StructuralUpdateViolation.DYNAMIC_CTS, tid)
+                if dynamic_built:
+                    dynamic_row += 1
 
-            friction_required = has_friction_cts_wp(joint_dof_type[tid], joint_friction[dof])
-            friction_built = friction_row < friction_row_end and friction_cts_axis[friction_row] == axis
-            if friction_required and not friction_built:
-                wp.atomic_min(violations, StructuralUpdateViolation.FRICTION_CTS, tid)
-            if friction_built:
-                friction_row += 1
+                friction_required = has_friction_cts_wp(joint_dof_type[tid], joint_friction[dof])
+                friction_built = friction_row < friction_row_end and friction_cts_axis[friction_row] == axis
+                if friction_required and not friction_built:
+                    wp.atomic_min(violations, StructuralUpdateViolation.FRICTION_CTS, tid)
+                if friction_built:
+                    friction_row += 1
 
-            effort_required = has_effort_cts_wp(
-                act_type,
-                joint_target_ke[dof],
-                joint_target_kd[dof],
-                joint_effort_limit[dof],
-            )
-            effort_built = effort_row < effort_row_end and effort_cts_axis[effort_row] == axis
-            if effort_required != effort_built:
-                wp.atomic_min(violations, StructuralUpdateViolation.EFFORT_CTS, tid)
-            if effort_built:
-                effort_row += 1
+                effort_required = has_effort_cts_wp(
+                    act_type,
+                    joint_target_ke[dof],
+                    joint_target_kd[dof],
+                    joint_effort_limit[dof],
+                )
+                effort_built = effort_row < effort_row_end and effort_cts_axis[effort_row] == axis
+                if effort_required != effort_built:
+                    wp.atomic_min(violations, StructuralUpdateViolation.EFFORT_CTS, tid)
+                if effort_built:
+                    effort_row += 1
 
     if tid < dof_count:
         current_finite = joint_limit_lower[tid] > JOINT_QMIN or joint_limit_upper[tid] < JOINT_QMAX
@@ -276,6 +279,7 @@ def validate_joint_dof_updates_kernel(
 @wp.kernel
 def validate_joint_actuation_updates_kernel(
     # Inputs:
+    joint_type: wp.array[wp.int32],
     joint_qd_start: wp.array[wp.int32],
     joint_target_mode: wp.array[wp.int32],
     act_type: wp.array[wp.int32],
@@ -284,6 +288,8 @@ def validate_joint_actuation_updates_kernel(
 ):
     """Find the first joint with an invalid or structurally changed actuation type."""
     joint = wp.tid()
+    if joint_type[joint] == JointType.ROD:
+        return
     current_actuation = JointActuationType.aggregate_from_newton_wp(
         joint_qd_start[joint],
         joint_qd_start[joint + 1],
@@ -382,6 +388,7 @@ def validate_body_inertial_updates_kernel(
 @wp.kernel
 def update_joint_actuation_kernel(
     # Inputs:
+    joint_type: wp.array[wp.int32],
     joint_qd_start: wp.array[wp.int32],
     dof_act_types: wp.array[wp.int32],
     # Outputs:
@@ -389,11 +396,14 @@ def update_joint_actuation_kernel(
 ):
     """Aggregate each joint's Kamino actuation type from its DoF modes."""
     joint = wp.tid()
-    act_type[joint] = JointActuationType.aggregate_wp(
-        joint_qd_start[joint],
-        joint_qd_start[joint + 1],
-        dof_act_types,
-    )
+    if joint_type[joint] == JointType.ROD:
+        act_type[joint] = JointActuationType.PASSIVE
+    else:
+        act_type[joint] = JointActuationType.aggregate_wp(
+            joint_qd_start[joint],
+            joint_qd_start[joint + 1],
+            dof_act_types,
+        )
 
 
 @wp.kernel
@@ -550,6 +560,12 @@ def joint_conversion_kernel(
         else:
             joint_dof_act_paths[dof] = DofActuationPath.BODY_WRENCHES
 
+    if dof_type_j == JointDoFType.ROD:
+        act_type_j = int(JointActuationType.PASSIVE)
+        num_dynamic_cts_j = 0
+        num_friction_cts_j = 0
+        num_effort_cts_j = 0
+
     joint_act_type[joint_id] = act_type_j
     joint_num_dynamic_cts[joint_id] = num_dynamic_cts_j
     joint_num_friction_cts[joint_id] = num_friction_cts_j
@@ -618,6 +634,7 @@ def joint_frame_conversion_kernel(
 def joint_indexing_kernel(
     # Inputs:
     model_joint_world_start: wp.array[wp.int32],
+    joint_dof_type: wp.array[wp.int32],
     joint_act_type: wp.array[wp.int32],
     joint_num_coords: wp.array[wp.int32],
     joint_num_dofs: wp.array[wp.int32],
@@ -707,6 +724,7 @@ def joint_indexing_kernel(
         n_bounded_cts_j = joint_num_bounded_cts[joint_id]
         n_friction_cts_j = joint_num_friction_cts[joint_id]
         n_effort_cts_j = joint_num_effort_cts[joint_id]
+        dof_type_j = joint_dof_type[joint_id]
         act_type_j = joint_act_type[joint_id]
 
         # Update world sizes based on joint sizes
@@ -716,20 +734,21 @@ def joint_indexing_kernel(
         num_kinematic_cts += n_kin_cts_j
 
         # Update sizes based on passive/active joint distinction
-        if act_type_j > JointActuationType.PASSIVE:
-            num_actuated_j += 1
-            num_actuated_coords += ncoords_j
-            num_actuated_dofs += ndofs_j
-            if not model_fk_act_flag or model_fk_act_flag[joint_id] == -1:
+        if dof_type_j != JointDoFType.ROD:
+            if act_type_j > JointActuationType.PASSIVE:
+                num_actuated_j += 1
+                num_actuated_coords += ncoords_j
+                num_actuated_dofs += ndofs_j
+                if not model_fk_act_flag or model_fk_act_flag[joint_id] == -1:
+                    num_fk_actuated_coords += ncoords_j
+                    num_fk_actuated_dofs += ndofs_j
+            else:
+                num_passive_j += 1
+                num_passive_coords += ncoords_j
+                num_passive_dofs += ndofs_j
+            if model_fk_act_flag and model_fk_act_flag[joint_id] == 1:
                 num_fk_actuated_coords += ncoords_j
                 num_fk_actuated_dofs += ndofs_j
-        else:
-            num_passive_j += 1
-            num_passive_coords += ncoords_j
-            num_passive_dofs += ndofs_j
-        if model_fk_act_flag and model_fk_act_flag[joint_id] == 1:
-            num_fk_actuated_coords += ncoords_j
-            num_fk_actuated_dofs += ndofs_j
 
         # Update sizes based on whether joint is dynamic
         if n_dyn_cts_j > 0:
@@ -835,6 +854,8 @@ def pack_joint_constraint_axes_kernel(
     friction_row = joint_friction_cts_start[joint]
     effort_row = joint_effort_cts_start[joint]
     dof_type = joint_dof_type[joint]
+    if dof_type == JointDoFType.ROD:
+        return
     for axis in range(dof_end - dof_start):
         dof = dof_start + axis
         act_type = JointActuationType.from_newton_wp(model_joint_target_mode[dof])
@@ -1111,6 +1132,7 @@ def validate_model_structural_updates(
             dim=dim,
             inputs=[
                 # Inputs:
+                model.joint_type,
                 model.joint_qd_start,
                 model.joint_armature,
                 model.joint_damping,
@@ -1142,6 +1164,7 @@ def validate_model_structural_updates(
             dim=model.joint_count,
             inputs=[
                 # Inputs:
+                model.joint_type,
                 model.joint_qd_start,
                 model.joint_target_mode,
                 joints.act_type,
@@ -1203,6 +1226,7 @@ def convert_model_joint_actuation(model: Model, joints: JointsModel) -> None:
         dim=model.joint_count,
         inputs=[
             # Inputs:
+            model.joint_type,
             model.joint_qd_start,
             joints.dof_act_types,
             # Outputs:
@@ -1665,6 +1689,7 @@ def convert_joints(
         dim=model.world_count,
         inputs=[
             model.joint_world_start,
+            joint_dof_type,
             joint_act_type,
             joint_num_coords,
             joint_num_dofs,

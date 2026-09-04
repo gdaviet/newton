@@ -521,7 +521,12 @@ def _detect_active_joint_configuration_limits(
     # - the DoF type is fixed
     # - if the world has not limits allocated
     # - if the model has not limits allocated
-    if dof_type_j == JointDoFType.FIXED or world_max_limits == 0 or model_max_limits == 0:
+    if (
+        dof_type_j == JointDoFType.FIXED
+        or dof_type_j == JointDoFType.ROD
+        or world_max_limits == 0
+        or model_max_limits == 0
+    ):
         return
 
     # Use global offsets directly
