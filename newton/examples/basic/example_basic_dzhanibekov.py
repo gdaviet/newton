@@ -12,6 +12,7 @@
 # Command: python -m newton.examples basic_dzhanibekov
 # XPBD: python -m newton.examples basic_dzhanibekov --solver xpbd
 # MuJoCo: python -m newton.examples basic_dzhanibekov --solver mujoco
+# LOX: python -m newton.examples basic_dzhanibekov --solver lox
 #
 ###########################################################################
 
@@ -44,6 +45,8 @@ class Example:
         self.min_stem_axis_y = 1.0
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         self.body = builder.add_body(
             xform=wp.transform(wp.vec3(0.0, 0.0, 2.0), wp.quat_identity()),
@@ -115,8 +118,14 @@ class Example:
             )
             self.collision_pipeline = None
             self.contacts = None
+        elif self.solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
+            self.collision_pipeline = None
+            self.contacts = None
         else:
-            raise ValueError(f"Unknown solver type: {self.solver_type}. Choose from 'vbd', 'xpbd', or 'mujoco'.")
+            raise ValueError(f"Unknown solver type: {self.solver_type}. Choose from 'vbd', 'xpbd', 'mujoco', or 'lox'.")
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -189,8 +198,8 @@ if __name__ == "__main__":
         "--solver",
         type=str,
         default="vbd",
-        choices=["vbd", "xpbd", "mujoco"],
-        help="Solver type: vbd (default), xpbd, or mujoco.",
+        choices=["vbd", "xpbd", "mujoco", "lox"],
+        help="Solver type: vbd (default), xpbd, mujoco, or lox.",
     )
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

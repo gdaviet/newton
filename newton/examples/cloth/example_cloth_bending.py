@@ -23,6 +23,7 @@ import newton.usd
 class Example:
     def __init__(self, viewer, args):
         # setup simulation parameters first
+        self.solver_type = args.solver
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
 
@@ -46,6 +47,8 @@ class Example:
         self.faces = mesh_indices.reshape(-1, 3)
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         contact_ke = 1.0e2
         contact_kd = 1.0e2
@@ -76,20 +79,31 @@ class Example:
         self.model.soft_contact_kd = contact_kd
         self.model.soft_contact_mu = contact_mu
 
-        self.solver = newton.solvers.SolverVBD(
-            self.model,
-            iterations=self.iterations,
-            particle_enable_self_contact=True,
-            particle_self_contact_radius=0.2,
-            particle_self_contact_margin=0.35,
-        )
-
         # Use collision pipeline for particle-shape contacts
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             broad_phase="nxn",
             soft_contact_margin=0.1,
         )
+
+        if self.solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = args.lox_iterations
+            config.lox.projection_iterations = 2
+            config.lox.deformable_cr_iterations = 6
+            config.lox.deformable_enable_self_contact = True
+            config.lox.deformable_self_contact_margin = 0.35
+            config.lox.deformable_self_contact_gap = 0.2
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
+        else:
+            self.solver = newton.solvers.SolverVBD(
+                self.model,
+                iterations=self.iterations,
+                particle_enable_self_contact=True,
+                particle_self_contact_radius=0.2,
+                particle_self_contact_margin=0.35,
+            )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -166,7 +180,10 @@ class Example:
 
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
-    viewer, args = newton.examples.init()
+    parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd", help="Dynamics solver to use.")
+    parser.add_argument("--lox-iterations", type=int, default=10, help="LOX splitting iterations per substep.")
+    viewer, args = newton.examples.init(parser)
 
     # Create viewer and run
     newton.examples.run(Example(viewer, args), args)

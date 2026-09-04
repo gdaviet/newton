@@ -11,6 +11,7 @@
 # Users can pick bodies by right-clicking and dragging with the mouse.
 #
 # Command: python -m newton.examples basic_urdf
+#          python -m newton.examples basic_urdf --solver lox
 #
 ###########################################################################
 
@@ -37,6 +38,8 @@ class Example:
         self.viewer = viewer
 
         quadruped = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(quadruped)
 
         # set default parameters for the quadruped
         quadruped.default_joint_cfg.armature = 0.01
@@ -93,6 +96,11 @@ class Example:
                 iterations=2,
                 rigid_compliant_alm=True,
             )
+        elif self.solver_type == "lox":
+            self.update_step_interval = 1
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
         else:
             self.update_step_interval = 1
             self.solver = newton.solvers.SolverXPBD(self.model)
@@ -101,7 +109,10 @@ class Example:
         self.state_1 = self.model.state()
         self.control = self.model.control()
 
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            rigid_contact_max=128 * self.world_count if self.solver_type == "lox" else None,
+        )
         self.contacts = self.collision_pipeline.contacts()
 
         self.viewer.set_model(self.model)
@@ -175,8 +186,8 @@ class Example:
             "--solver",
             type=str,
             default="xpbd",
-            choices=["vbd", "xpbd"],
-            help="Solver type: xpbd (default) or vbd",
+            choices=["vbd", "xpbd", "lox"],
+            help="Solver type: xpbd (default), vbd, or lox",
         )
         return parser
 

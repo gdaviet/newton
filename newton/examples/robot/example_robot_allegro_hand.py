@@ -4,7 +4,7 @@
 ###########################################################################
 # Example Robot Allegro Hand
 #
-# Shows how to set up a simulation of a Allegro hand articulation
+# Shows how to set up a simulation of an Allegro hand articulation
 # from a USD file using newton.ModelBuilder.add_usd().
 # We also apply a sinusoidal trajectory to the joint targets and
 # apply a continuous rotation to the fixed root joint in the form
@@ -13,6 +13,7 @@
 # self.solver.notify_model_changed(ModelFlags.JOINT_PROPERTIES).
 #
 # Command: python -m newton.examples robot_allegro_hand --world-count 16
+#          python -m newton.examples robot_allegro_hand --dynamics-backend lox
 #
 ###########################################################################
 
@@ -69,6 +70,7 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.world_count = args.world_count
+        self.dynamics_backend = args.dynamics_backend
 
         self.viewer = viewer
 
@@ -78,7 +80,10 @@ class Example:
         max_contacts_per_world = 300
 
         allegro_hand = newton.ModelBuilder()
-        newton.solvers.SolverMuJoCo.register_custom_attributes(allegro_hand)
+        if self.dynamics_backend == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(allegro_hand)
+        else:
+            newton.solvers.SolverMuJoCo.register_custom_attributes(allegro_hand)
         allegro_hand.default_shape_cfg.ke = 1.0e3
         allegro_hand.default_shape_cfg.kd = 1.0e2
         allegro_hand.default_shape_cfg.margin = 0.005
@@ -90,7 +95,7 @@ class Example:
             asset_file,
             xform=wp.transform(wp.vec3(0, 0, 0.5)),
             enable_self_collisions=False,
-            ignore_paths=[".*Dummy", ".*CollisionPlane"],
+            ignore_paths=[".*Dummy", ".*CollisionPlane", ".*/ground.*"],
             hide_collision_shapes=True,
         )
 
@@ -130,28 +135,40 @@ class Example:
 
         self.world_time = wp.zeros(self.world_count, dtype=wp.float32)
 
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            solver="newton",
-            integrator="implicitfast",
-            njmax=200,
-            nconmax=max_contacts_per_world,
-            impratio=20.0,
-            # Preserve the example's solref-inherited grasp friction; its
-            # purpose is articulation control rather than kf mapping.
-            cone="pyramidal",
-            iterations=100,
-            ls_iterations=50,
-            use_mujoco_contacts=False,
-        )
+        if self.dynamics_backend == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(
+                self.model,
+                dynamics_solver="lox",
+            )
+            solver_config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        else:
+            self.solver = newton.solvers.SolverMuJoCo(
+                self.model,
+                solver="newton",
+                integrator="implicitfast",
+                njmax=200,
+                nconmax=max_contacts_per_world,
+                impratio=20.0,
+                # Preserve the example's solref-inherited grasp friction; its
+                # purpose is articulation control rather than kf mapping.
+                cone="pyramidal",
+                iterations=100,
+                ls_iterations=50,
+                use_mujoco_contacts=False,
+            )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            rigid_contact_max=max_contacts_per_world * self.world_count,
+        )
         self.contacts = self.collision_pipeline.contacts()
 
         self.viewer.set_model(self.model)
+        self.viewer.set_world_offsets((0.5, 0.5, 0.0))
 
         self.capture()
 
@@ -185,6 +202,8 @@ class Example:
 
             # # update the solver since we have updated the joint parent transforms
             self.solver.notify_model_changed(ModelFlags.JOINT_PROPERTIES)
+            if self.dynamics_backend == "lox":
+                newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
 
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
@@ -243,6 +262,12 @@ class Example:
         parser = newton.examples.create_parser()
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(world_count=100)
+        parser.add_argument(
+            "--dynamics-backend",
+            choices=("mujoco", "lox"),
+            default="mujoco",
+            help="Rigid-body dynamics backend.",
+        )
         return parser
 
 

@@ -57,37 +57,19 @@ def initialize_rotation(
         t[0] = 0.0
 
 
-@wp.kernel
-def apply_rotation(
-    # input
-    vertex_indices_to_rot: wp.array[wp.int32],
-    rot_axes: wp.array[wp.vec3],
-    roots: wp.array[wp.vec3],
-    roots_to_ps: wp.array[wp.vec3],
-    t: wp.array[float],
-    angular_velocity: float,
-    dt: float,
-    end_time: float,
-    # output
-    pos_0: wp.array[wp.vec3],
-    pos_1: wp.array[wp.vec3],
-):
-    cur_t = t[0]
-    if cur_t > end_time:
-        return
-
-    tid = wp.tid()
-    v_index = vertex_indices_to_rot[wp.tid()]
-
-    rot_axis = rot_axes[tid]
-
+@wp.func
+def compute_rotation_target(
+    rot_axis: wp.vec3,
+    root: wp.vec3,
+    root_to_p: wp.vec3,
+    theta: float,
+) -> wp.vec3:
+    """Compute a point's target on its prescribed rotation orbit."""
     ux = rot_axis[0]
     uy = rot_axis[1]
     uz = rot_axis[2]
 
-    theta = cur_t * angular_velocity
-
-    R = wp.mat33(
+    rotation = wp.mat33(
         wp.cos(theta) + ux * ux * (1.0 - wp.cos(theta)),
         ux * uy * (1.0 - wp.cos(theta)) - uz * wp.sin(theta),
         ux * uz * (1.0 - wp.cos(theta)) + uy * wp.sin(theta),
@@ -98,17 +80,67 @@ def apply_rotation(
         uz * uy * (1.0 - wp.cos(theta)) + ux * wp.sin(theta),
         wp.cos(theta) + uz * uz * (1.0 - wp.cos(theta)),
     )
+    return root + rotation * root_to_p
 
-    root = roots[tid]
-    root_to_p = roots_to_ps[tid]
-    root_to_p_rot = R * root_to_p
-    p_rot = root + root_to_p_rot
 
-    pos_0[v_index] = p_rot
-    pos_1[v_index] = p_rot
+@wp.kernel
+def apply_rotation(
+    vertex_indices_to_rot: wp.array[wp.int32],
+    rot_axes: wp.array[wp.vec3],
+    roots: wp.array[wp.vec3],
+    roots_to_ps: wp.array[wp.vec3],
+    t: wp.array[float],
+    angular_velocity: float,
+    dt: float,
+    end_time: float,
+    pos_0: wp.array[wp.vec3],
+    pos_1: wp.array[wp.vec3],
+):
+    """Move prescribed VBD points directly to their rotation targets."""
+    cur_t = t[0]
+    if cur_t >= end_time:
+        return
 
-    if tid == 0:
-        t[0] = cur_t + dt
+    tid = wp.tid()
+    v_index = vertex_indices_to_rot[tid]
+    target_t = wp.min(cur_t + dt, end_time)
+    target = compute_rotation_target(rot_axes[tid], roots[tid], roots_to_ps[tid], target_t * angular_velocity)
+    pos_0[v_index] = target
+    pos_1[v_index] = target
+
+
+@wp.kernel
+def prescribe_rotation_velocity(
+    vertex_indices_to_rot: wp.array[wp.int32],
+    rot_axes: wp.array[wp.vec3],
+    roots: wp.array[wp.vec3],
+    roots_to_ps: wp.array[wp.vec3],
+    t: wp.array[float],
+    angular_velocity: float,
+    dt: float,
+    end_time: float,
+    pos: wp.array[wp.vec3],
+    velocity: wp.array[wp.vec3],
+):
+    """Set velocities that integrate prescribed LOX points to their targets."""
+    tid = wp.tid()
+    v_index = vertex_indices_to_rot[tid]
+    cur_t = t[0]
+    if cur_t >= end_time:
+        velocity[v_index] = wp.vec3(0.0)
+        return
+
+    target_t = wp.min(cur_t + dt, end_time)
+    target = compute_rotation_target(rot_axes[tid], roots[tid], roots_to_ps[tid], target_t * angular_velocity)
+    velocity[v_index] = (target - pos[v_index]) / dt
+
+
+@wp.kernel
+def advance_rotation_time(t: wp.array[float], dt: float, end_time: float):
+    """Advance the prescribed rotation clock while the motion is active."""
+    if t[0] < end_time:
+        cur_t = t[0]
+        t[0] = wp.min(cur_t + dt, end_time)
 
 
 class Example:
@@ -133,6 +165,7 @@ class Example:
 
         # save a reference to the viewer
         self.viewer = viewer
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
 
         usd_stage = Usd.Stage.Open(os.path.join(warp.examples.get_asset_directory(), "square_cloth.usd"))
         usd_prim = usd_stage.GetPrimAtPath("/root/cloth/cloth")
@@ -145,6 +178,8 @@ class Example:
         self.faces = mesh_indices.reshape(-1, 3)
 
         scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(scene)
         scene.add_cloth_mesh(
             pos=wp.vec3(0.0, 0.0, 0.0),
             rot=wp.quat_from_axis_angle(wp.vec3(0, 0, 1), np.pi / 2),
@@ -172,18 +207,41 @@ class Example:
 
         if len(rot_point_indices):
             flags = self.model.particle_flags.numpy()
-            for fixed_vertex_id in rot_point_indices:
-                flags[fixed_vertex_id] = flags[fixed_vertex_id] & ~ParticleFlags.ACTIVE
+            if self.solver_type == "lox":
+                masses = self.model.particle_mass.numpy()
+                inverse_masses = self.model.particle_inv_mass.numpy()
+                for driven_vertex_id in rot_point_indices:
+                    flags[driven_vertex_id] = flags[driven_vertex_id] | ParticleFlags.ACTIVE
+                    masses[driven_vertex_id] = 0.0
+                    inverse_masses[driven_vertex_id] = 0.0
+                self.model.particle_mass = wp.array(masses, dtype=wp.float32, device=self.model.device)
+                self.model.particle_inv_mass = wp.array(inverse_masses, dtype=wp.float32, device=self.model.device)
+            else:
+                for fixed_vertex_id in rot_point_indices:
+                    flags[fixed_vertex_id] = flags[fixed_vertex_id] & ~ParticleFlags.ACTIVE
 
-            self.model.particle_flags = wp.array(flags)
+            self.model.particle_flags = wp.array(flags, dtype=wp.int32, device=self.model.device)
 
-        self.solver = newton.solvers.SolverVBD(
-            self.model,
-            iterations=self.iterations,
-            particle_enable_self_contact=True,
-            particle_self_contact_radius=0.002,
-            particle_self_contact_margin=0.0035,
-        )
+        if self.solver_type == "vbd":
+            self.solver = newton.solvers.SolverVBD(
+                self.model,
+                iterations=self.iterations,
+                particle_enable_self_contact=True,
+                particle_self_contact_radius=0.002,
+                particle_self_contact_margin=0.0035,
+            )
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.projection_iterations = 10
+            config.lox.projection_method = "gauss_seidel"
+            config.lox.deformable_enable_self_contact = True
+            config.lox.deformable_self_contact_margin = 0.002
+            config.lox.deformable_self_contact_gap = 0.0015
+            config.lox.deformable_self_contact_vertex_buffer_size = 64
+            config.lox.deformable_self_contact_edge_buffer_size = 64
+            config.lox.deformable_enable_penetration_free_contact = True
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
@@ -231,31 +289,39 @@ class Example:
 
     def simulate(self):
         self.collision_pipeline.collide(self.state_0, self.contacts)
-        self.solver.rebuild_bvh(self.state_0)
+        if self.solver_type == "vbd":
+            self.solver.rebuild_bvh(self.state_0)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
 
             # apply forces to the model for picking, wind, etc
             self.viewer.apply_forces(self.state_0)
 
-            wp.launch(
-                kernel=apply_rotation,
-                dim=self.rot_point_indices.shape[0],
-                inputs=[
-                    self.rot_point_indices,
-                    self.rot_axes,
-                    self.roots,
-                    self.roots_to_ps,
-                    self.t,
-                    self.rot_angular_velocity,
-                    self.sim_dt,
-                    self.rot_end_time,
-                ],
-                outputs=[
-                    self.state_0.particle_q,
-                    self.state_1.particle_q,
-                ],
-            )
+            rotation_inputs = [
+                self.rot_point_indices,
+                self.rot_axes,
+                self.roots,
+                self.roots_to_ps,
+                self.t,
+                self.rot_angular_velocity,
+                self.sim_dt,
+                self.rot_end_time,
+            ]
+            if self.solver_type == "lox":
+                wp.launch(
+                    kernel=prescribe_rotation_velocity,
+                    dim=self.rot_point_indices.shape[0],
+                    inputs=[*rotation_inputs, self.state_0.particle_q],
+                    outputs=[self.state_0.particle_qd],
+                )
+            else:
+                wp.launch(
+                    kernel=apply_rotation,
+                    dim=self.rot_point_indices.shape[0],
+                    inputs=rotation_inputs,
+                    outputs=[self.state_0.particle_q, self.state_1.particle_q],
+                )
+            wp.launch(kernel=advance_rotation_time, dim=1, inputs=[self.t, self.sim_dt, self.rot_end_time])
 
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
@@ -299,6 +365,7 @@ class Example:
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd")
     parser.set_defaults(num_frames=300)
 
     viewer, args = newton.examples.init(parser)

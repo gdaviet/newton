@@ -9,6 +9,7 @@
 # static annular boundary meshes keep dynamic "bags" on the belt.
 #
 # Command: uv run -m newton.examples basic_conveyor
+#          uv run -m newton.examples basic_conveyor --solver lox
 #
 ###########################################################################
 
@@ -160,10 +161,13 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.viewer = viewer
+        self.solver_type = getattr(args, "solver", "xpbd") if args is not None else "xpbd"
         belt_speed = float(args.belt_speed) if args is not None and hasattr(args, "belt_speed") else BELT_SPEED
         self.belt_angular_speed = belt_speed / BELT_RING_RADIUS
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         ground_shape = builder.add_ground_plane()
 
@@ -343,21 +347,27 @@ class Example:
         builder.color()
         self.model = builder.finalize()
 
-        solver_type = getattr(args, "solver", "xpbd") if args is not None else "xpbd"
-        if solver_type == "vbd":
+        if self.solver_type == "vbd":
             self.solver = newton.solvers.SolverVBD(
                 self.model,
                 iterations=1,
                 rigid_compliant_alm=True,
                 rigid_body_contact_buffer_size=512,
             )
+        elif self.solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
         else:
             self.solver = newton.solvers.SolverXPBD(self.model)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            rigid_contact_max=1024 if self.solver_type == "lox" else None,
+        )
         self.contacts = self.collision_pipeline.contacts()
 
         # Ensure body state is initialized from model joint buffers.
@@ -443,7 +453,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--solver",
         type=str,
-        choices=["xpbd", "vbd"],
+        choices=["xpbd", "vbd", "lox"],
         default="xpbd",
         help="Solver backend to use.",
     )

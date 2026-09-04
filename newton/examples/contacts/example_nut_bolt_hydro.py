@@ -7,6 +7,7 @@
 # Demonstrates nut/bolt mesh collision using hydroelastic contacts.
 #
 # Command: python -m newton.examples nut_bolt_hydro
+#          python -m newton.examples nut_bolt_hydro --solver lox
 #
 ###########################################################################
 
@@ -193,6 +194,8 @@ class Example:
         world_builder = self._build_nut_bolt_scene()
 
         main_scene = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(main_scene)
         main_scene.default_shape_cfg.gap = 0.001 * self.scene_scale
         # Add ground plane at z = ground_plane_offset.
         # For plane equation n·x + d = 0, with n=(0,0,1): z + d = 0, so z = -d.
@@ -206,6 +209,7 @@ class Example:
         main_scene.replicate(world_builder, world_count=self.world_count)
 
         self.model = main_scene.finalize()
+        self.model.rigid_contact_max = self.rigid_contact_max
 
         # Configure the hydroelastic pipeline with our custom (still linear)
         # pressure callback. ``shape_kh`` reuses the per-shape stiffness already
@@ -258,6 +262,11 @@ class Example:
                 if self.deterministic_solver
                 else wp.DeterministicMode.NOT_GUARANTEED,
             )
+        elif self.solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = args.lox_iterations
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
         else:
             raise ValueError(f"Unknown solver '{self.solver_type}'")
 
@@ -497,10 +506,11 @@ class Example:
         parser.add_argument(
             "--solver",
             type=str,
-            choices=["xpbd", "mujoco"],
+            choices=["xpbd", "mujoco", "lox"],
             default="mujoco",
-            help="Solver to use: 'xpbd' or 'mujoco'.",
+            help="Dynamics solver.",
         )
+        parser.add_argument("--lox-iterations", type=int, default=20, help="LOX splitting iterations per substep.")
         parser.add_argument(
             "--num-per-world",
             type=int,

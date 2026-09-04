@@ -7,7 +7,8 @@
 # This simulation demonstrates a coupled robot-cloth simulation
 # using the VBD solver for the cloth and Featherstone for the robot,
 # showcasing its ability to handle complex contacts while ensuring it
-# remains intersection-free.
+# remains intersection-free. LOX instead advances explicitly kinematic body
+# poses using finite-difference twists from the IK velocity command.
 #
 # The simulation runs in centimeter scale for better numerical behavior
 # of the VBD solver. A vis_state is used to convert back to meter scale
@@ -28,6 +29,7 @@ import newton.examples
 import newton.usd
 import newton.utils
 from newton import Model, ModelBuilder, State, eval_fk
+from newton.math import quat_velocity
 from newton.solvers import SolverFeatherstone, SolverVBD
 
 
@@ -67,8 +69,54 @@ def compute_ee_delta(
     ee_delta[world_id] = wp.spatial_vector(pos_diff[0], pos_diff[1], pos_diff[2], ang_diff[0], ang_diff[1], ang_diff[2])
 
 
+@wp.kernel
+def integrate_joint_q(
+    current_q: wp.array[float],
+    joint_qd: wp.array[float],
+    target_q: wp.array[float],
+    dt: float,
+):
+    i = wp.tid()
+    target_q[i] = current_q[i] + dt * joint_qd[i]
+
+
+@wp.kernel
+def interpolate_joint_q(
+    current_q: wp.array[float],
+    target_q: wp.array[float],
+    next_q: wp.array[float],
+    alpha: float,
+):
+    i = wp.tid()
+    next_q[i] = current_q[i] + alpha * (target_q[i] - current_q[i])
+
+
+@wp.kernel
+def compute_body_qd(
+    current_q: wp.array[wp.transform],
+    target_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_qd: wp.array[wp.spatial_vector],
+    dt: float,
+):
+    i = wp.tid()
+    current_xform = current_q[i]
+    target_xform = target_q[i]
+    current_com = wp.transform_point(current_xform, body_com[i])
+    target_com = wp.transform_point(target_xform, body_com[i])
+    body_qd[i] = wp.spatial_vector(
+        (target_com - current_com) / dt,
+        quat_velocity(
+            wp.transform_get_rotation(target_xform),
+            wp.transform_get_rotation(current_xform),
+            dt,
+        ),
+    )
+
+
 class Example:
     def __init__(self, viewer, args):
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
         # parameters
         #   simulation (centimeter scale)
         self.add_cloth = True
@@ -89,7 +137,7 @@ class Example:
         self.cloth_body_contact_margin = 0.8
         #       self-contact
         self.particle_self_contact_radius = 0.2
-        self.particle_self_contact_margin = 0.2
+        self.particle_self_contact_margin = 0.4
 
         self.soft_contact_ke = 1e4
         self.soft_contact_kd = 1e1
@@ -109,12 +157,19 @@ class Example:
         self.bending_kd = 5e-1
 
         self.scene = ModelBuilder(gravity=(0.0, 0.0, -981.0))
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(self.scene)
 
         self.viewer = viewer
 
         if self.add_robot:
-            franka = ModelBuilder()
+            franka = ModelBuilder(gravity=(0.0, 0.0, -981.0))
+            if self.solver_type == "lox":
+                newton.solvers.SolverKamino.register_custom_attributes(franka)
             self.create_articulation(franka)
+            if self.solver_type == "lox":
+                for body in range(franka.body_count):
+                    franka.body_flags[body] = int(newton.BodyFlags.KINEMATIC)
 
             self.scene.add_world(franka)
             self.bodies_per_world = franka.body_count
@@ -152,7 +207,7 @@ class Example:
                 vertices=vertices,
                 indices=mesh_indices,
                 rot=wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), np.pi),
-                pos=wp.vec3(0.0, 70.0, 30.0),
+                pos=wp.vec3(0.0, 70.0, 40.0),
                 vel=wp.vec3(0.0, 0.0, 0.0),
                 density=0.02,
                 scale=1.0,
@@ -222,6 +277,8 @@ class Example:
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
+        self.kinematic_target_state = self.model.state() if self.solver_type == "lox" else None
+        self.target_joint_q = wp.empty_like(self.state_0.joint_q) if self.solver_type == "lox" else None
         self.target_joint_qd = wp.empty_like(self.state_0.joint_qd)
 
         self.control = self.model.control()
@@ -236,25 +293,45 @@ class Example:
         self.sim_time = 0.0
 
         # initialize robot solver
-        self.robot_solver = SolverFeatherstone(self.model, update_mass_matrix_interval=self.sim_substeps)
+        self.robot_solver = None
+        if self.solver_type == "vbd":
+            self.robot_solver = SolverFeatherstone(self.model, update_mass_matrix_interval=self.sim_substeps)
         self.set_up_control()
 
-        self.cloth_solver: SolverVBD | None = None
+        self.cloth_solver = None
         if self.add_cloth:
             self.model.edge_rest_angle.zero_()
-            self.cloth_solver = SolverVBD(
-                self.model,
-                iterations=self.iterations,
-                integrate_with_external_rigid_solver=True,
-                particle_self_contact_radius=self.particle_self_contact_radius,
-                particle_self_contact_margin=self.particle_self_contact_margin,
-                particle_topological_contact_filter_threshold=1,
-                particle_rest_shape_contact_exclusion_radius=0.5,
-                particle_enable_self_contact=True,
-                particle_vertex_contact_buffer_size=16,
-                particle_edge_contact_buffer_size=20,
-                particle_collision_detection_interval=-1,
-            )
+            if self.solver_type == "vbd":
+                self.cloth_solver = SolverVBD(
+                    self.model,
+                    iterations=self.iterations,
+                    integrate_with_external_rigid_solver=True,
+                    particle_self_contact_radius=self.particle_self_contact_radius,
+                    particle_self_contact_margin=self.particle_self_contact_margin,
+                    particle_topological_contact_filter_threshold=1,
+                    particle_rest_shape_contact_exclusion_radius=0.5,
+                    particle_enable_self_contact=True,
+                    particle_vertex_contact_buffer_size=16,
+                    particle_edge_contact_buffer_size=20,
+                    particle_collision_detection_interval=-1,
+                )
+            else:
+                config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+                config.use_collision_detector = False
+                config.lox.max_iterations = self.iterations
+                config.lox.deformable_enable_self_contact = True
+                config.lox.projection_iterations = 10
+                config.lox.projection_method = "apgd"
+                config.lox.deformable_self_contact_edge_buffer_size = 64
+                config.lox.deformable_self_contact_vertex_buffer_size = 64
+                config.lox.deformable_enable_penetration_free_contact = True
+                # LOX splits VBD's detection margin into contact thickness and an additional speculative gap.
+                config.lox.deformable_self_contact_margin = self.particle_self_contact_radius
+                config.lox.deformable_self_contact_gap = (
+                    self.particle_self_contact_margin - self.particle_self_contact_radius
+                )
+                # config.lox.deformable_enable_penetration_free_contact = True
+                self.cloth_solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(wp.vec3(-0.6, 0.6, 1.24), -42.0, -58.0)
@@ -551,7 +628,14 @@ class Example:
         self.sim_time += self.frame_dt
 
     def simulate(self):
-        self.cloth_solver.rebuild_bvh(self.state_0)
+        if self.solver_type == "vbd":
+            self.cloth_solver.rebuild_bvh(self.state_0)
+        elif self.add_robot:
+            wp.launch(
+                integrate_joint_q,
+                dim=self.model.joint_coord_count,
+                inputs=[self.state_0.joint_q, self.target_joint_qd, self.target_joint_q, self.frame_dt],
+            )
         for _step in range(self.sim_substeps):
             # robot sim
             self.state_0.clear_forces()
@@ -560,7 +644,7 @@ class Example:
             # apply forces to the model for picking, wind, etc
             self.viewer.apply_forces(self.state_0)
 
-            if self.add_robot:
+            if self.add_robot and self.solver_type == "vbd":
                 particle_count = self.model.particle_count
                 # set particle_count = 0 to disable particle simulation in robot solver
                 self.model.particle_count = 0
@@ -578,6 +662,39 @@ class Example:
                 # restore original settings
                 self.model.particle_count = particle_count
                 self.model.gravity.assign(self.gravity_earth)
+
+            if self.add_robot and self.solver_type == "lox":
+                # Evaluate the next prescribed pose, then give LOX the twist that
+                # advances the current kinematic body poses to that FK sample.
+                wp.launch(
+                    interpolate_joint_q,
+                    dim=self.model.joint_coord_count,
+                    inputs=[
+                        self.state_0.joint_q,
+                        self.target_joint_q,
+                        self.kinematic_target_state.joint_q,
+                        1.0 / float(self.sim_substeps - _step),
+                    ],
+                )
+                self.kinematic_target_state.joint_qd.assign(self.target_joint_qd)
+                eval_fk(
+                    self.model,
+                    self.kinematic_target_state.joint_q,
+                    self.kinematic_target_state.joint_qd,
+                    self.kinematic_target_state,
+                )
+                wp.launch(
+                    compute_body_qd,
+                    dim=self.model.body_count,
+                    inputs=[
+                        self.state_0.body_q,
+                        self.kinematic_target_state.body_q,
+                        self.model.body_com,
+                        self.state_0.body_qd,
+                        self.sim_dt,
+                    ],
+                )
+                self.state_0.joint_qd.assign(self.target_joint_qd)
 
             # cloth sim
             self.collision_pipeline.collide(self.state_0, self.contacts)
@@ -655,6 +772,7 @@ class Example:
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd")
     parser.set_defaults(num_frames=3850)
     viewer, args = newton.examples.init(parser)
 

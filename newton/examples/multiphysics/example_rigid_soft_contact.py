@@ -109,9 +109,9 @@ class Example:
         self.sim_substeps = 32
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        if self.solver_type not in {"semi_implicit", "xpbd", "vbd", "coupled"}:
+        if self.solver_type not in {"semi_implicit", "xpbd", "vbd", "lox", "coupled"}:
             raise ValueError(
-                "The rigid soft contact example supports the semi_implicit, xpbd, vbd, and coupled solvers."
+                "The rigid soft contact example supports the semi_implicit, xpbd, vbd, lox, and coupled solvers."
             )
 
         if self.soft_solver in {"semi_implicit", "xpbd"}:
@@ -142,7 +142,9 @@ class Example:
             ground_contact_cfg.mu = 0.5
 
         builder = newton.ModelBuilder()
-        if self.solver_type == "coupled":
+        if self.solver_type == "lox":
+            SolverKamino.register_custom_attributes(builder)
+        elif self.solver_type == "coupled":
             _register_rigid_solver_custom_attributes(builder, self.rigid_solver)
         builder.default_particle_radius = 0.01
         builder.particle_max_velocity = 50.0
@@ -190,11 +192,14 @@ class Example:
             self.model.soft_contact_kd = RIGID_SOFT_CONTACT_KD
             self.model.soft_contact_kf = RIGID_SOFT_CONTACT_KF
             self.model.soft_contact_mu = RIGID_SOFT_CONTACT_MU
-        elif self.soft_solver == "vbd":
+        elif self.solver_type == "lox" or self.soft_solver == "vbd":
             self.model.soft_contact_ke = 1.0e5
             self.model.soft_contact_kd = 1.0e-4
             self.model.soft_contact_kf = 1.0e3
             self.model.soft_contact_mu = 0.3
+
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
 
         if self.solver_type == "semi_implicit":
             self.solver = SolverSemiImplicit(model=self.model)
@@ -212,6 +217,12 @@ class Example:
                 rigid_compliant_alm=True,
                 rigid_body_particle_contact_buffer_size=512,
             )
+        elif self.solver_type == "lox":
+            config = SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = args.lox_iterations
+            config.lox.projection_iterations = 3
+            self.solver = SolverKamino(self.model, config=config)
         elif self.solver_type == "coupled":
             rigid_name, rigid_solver, rigid_kwargs = _rigid_solver_entry_args(self.rigid_solver)
             soft_name, soft_solver, soft_kwargs = _soft_solver_entry_args(self.soft_solver, args)
@@ -250,8 +261,6 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
-        self.contacts = self.collision_pipeline.contacts()
 
         newton.examples.configure_coupled_view(self, args)
         self.viewer.set_camera(
@@ -356,8 +365,14 @@ class Example:
             "--solver",
             help="Type of solver",
             type=str,
-            choices=["semi_implicit", "xpbd", "vbd", "coupled"],
+            choices=["semi_implicit", "xpbd", "vbd", "lox", "coupled"],
             default="xpbd",
+        )
+        parser.add_argument(
+            "--lox-iterations",
+            help="LOX splitting iterations per substep",
+            type=int,
+            default=20,
         )
         parser.add_argument(
             "--rigid-solver",

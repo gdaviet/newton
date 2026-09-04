@@ -295,7 +295,7 @@ def build_model(builder, params, seed=42):
     }
 
 
-def setup_sim(builder, info, params):
+def setup_sim(builder, info, params, solver_type):
     model = builder.finalize()
     model.soft_contact_ke = params["soft_contact_ke"]
     model.soft_contact_kd = params["soft_contact_kd"]
@@ -312,20 +312,28 @@ def setup_sim(builder, info, params):
     pinned_original = wp.array(pq[top_idx].copy(), dtype=wp.vec3)
 
     pr = info["particle_radius"]
-    solver = newton.solvers.SolverVBD(
-        model=model,
-        iterations=params["solver_iterations"],
-        rigid_compliant_alm=True,
-        rigid_body_particle_contact_buffer_size=params["rigid_body_particle_contact_buffer_size"],
-        rigid_body_contact_buffer_size=512,
-        particle_enable_self_contact=False,
-        particle_self_contact_radius=pr * params["particle_self_contact_radius_scale"],
-        particle_self_contact_margin=pr * params["particle_self_contact_margin_scale"],
-        particle_topological_contact_filter_threshold=params["particle_topological_contact_filter_threshold"],
-    )
+    if solver_type == "vbd":
+        solver = newton.solvers.SolverVBD(
+            model=model,
+            iterations=params["solver_iterations"],
+            rigid_compliant_alm=True,
+            rigid_body_particle_contact_buffer_size=params["rigid_body_particle_contact_buffer_size"],
+            rigid_body_contact_buffer_size=512,
+            particle_enable_self_contact=False,
+            particle_self_contact_radius=pr * params["particle_self_contact_radius_scale"],
+            particle_self_contact_margin=pr * params["particle_self_contact_margin_scale"],
+            particle_topological_contact_filter_threshold=params["particle_topological_contact_filter_threshold"],
+        )
+    else:
+        config = newton.solvers.SolverKamino.Config.from_model(model, dynamics_solver="lox")
+        config.use_collision_detector = False
+        config.lox.max_iterations = params["solver_iterations"]
+        config.lox.deformable_enable_self_contact = False
+        config.lox.projection_method = "gauss_seidel"
+        solver = newton.solvers.SolverKamino(model, config=config)
 
     pipeline = newton.CollisionPipeline(
-        model, broad_phase="nxn", soft_contact_margin=params["soft_contact_creation_margin"]
+        model, broad_phase="nxn", soft_contact_margin=params["soft_contact_creation_margin"], verify_buffers=True
     )
 
     return model, solver, pipeline, pinned_indices, pinned_original
@@ -334,6 +342,7 @@ def setup_sim(builder, info, params):
 class Example:
     def __init__(self, viewer, args):
         self.viewer = viewer
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
         self.params = PARAMS
         self.sim_time = 0.0
         self.fps = self.params["fps"]
@@ -345,15 +354,18 @@ class Example:
 
         seed = getattr(args, "seed", 42)
         builder = newton.ModelBuilder(gravity=self.params["gravity"])
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         self.info = build_model(builder, self.params, seed=seed)
         self.model, self.solver, self.pipeline, self.pinned_indices, self.pinned_original = setup_sim(
-            builder, self.info, self.params
+            builder, self.info, self.params, self.solver_type
         )
 
         self.state_0 = self.model.state()
-        self.state_1 = self.model.state()
+        self.state_1 = self.model.state() if self.solver_type == "vbd" else None
         self.control = self.model.control()
         self.contacts = self.pipeline.contacts()
+        self.graph = None
 
         self.viewer.set_model(self.model)
         if hasattr(self.viewer, "renderer"):
@@ -363,23 +375,46 @@ class Example:
         if hasattr(self.viewer, "set_camera"):
             self.viewer.set_camera(wp.vec3(0.41, -0.72, 0.54), -5.3, 121.5)
 
+        self.capture()
+
+    def capture(self):
+        """Warm up and capture the LOX solve on a single simulation state."""
+        if self.solver_type != "lox" or not self.model.device.is_cuda or wp.config.verify_cuda:
+            return
+
+        # Initialize lazy contact/solver storage before capture, then restore
+        # both simulation and contact-matching state.
+        self.pipeline.collide(self.state_0, self.contacts)
+        self.solver.step(self.state_0, self.state_0, self.control, self.contacts, self.sim_dt)
+        self.solver.reset(self.state_0)
+        self.pipeline.reset_contact_matching()
+
+        with wp.ScopedCapture(self.model.device) as capture:
+            self.solver.step(self.state_0, self.state_0, self.control, self.contacts, self.sim_dt)
+        self.graph = capture.graph
+
     def simulate(self):
         dz = 0.0
         if self.frame > self.params["settle_frames"]:
             dz = self.params["lift_speed"] * (self.frame - self.params["settle_frames"]) * self.frame_dt
 
         for _ in range(self.sim_substeps):
+            state_1 = self.state_0 if self.state_1 is None else self.state_1
             wp.launch(
                 lift_pinned_vertices,
                 dim=self.pinned_indices.shape[0],
                 inputs=[self.pinned_indices, self.pinned_original, dz],
-                outputs=[self.state_0.particle_q, self.state_1.particle_q],
+                outputs=[self.state_0.particle_q, state_1.particle_q],
             )
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
             self.pipeline.collide(self.state_0, self.contacts)
-            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
-            self.state_0, self.state_1 = self.state_1, self.state_0
+            if self.graph is None:
+                self.solver.step(self.state_0, state_1, self.control, self.contacts, self.sim_dt)
+            else:
+                wp.capture_launch(self.graph)
+            if self.state_1 is not None:
+                self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
         self.frame += 1
@@ -412,6 +447,7 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--seed", type=int, default=42)
+        parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd")
         # Default to the full settle + lift sequence so --test exercises the lift.
         parser.set_defaults(num_frames=PARAMS["settle_frames"] + PARAMS["lift_frames"])
         return parser

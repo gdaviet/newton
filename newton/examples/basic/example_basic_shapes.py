@@ -6,10 +6,11 @@
 #
 # Shows how to programmatically create a variety of
 # collision shapes using the newton.ModelBuilder() API.
-# Supports XPBD (default) and VBD solvers.
+# Supports XPBD (default), VBD, and LOX solvers.
 #
 # Command: python -m newton.examples basic_shapes
 # With VBD: python -m newton.examples basic_shapes --solver vbd
+# With LOX: python -m newton.examples basic_shapes --solver lox
 #
 #
 ###########################################################################
@@ -36,6 +37,8 @@ class Example:
         self.solver_type = args.solver if hasattr(args, "solver") and args.solver else "xpbd"
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         builder.default_shape_cfg.mu = 1.0  # Friction coefficient
 
@@ -108,6 +111,10 @@ class Example:
                 iterations=5,
                 rigid_compliant_alm=True,
             )
+        elif self.solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
         else:
             self.solver = newton.solvers.SolverXPBD(self.model, iterations=5)
 
@@ -115,7 +122,10 @@ class Example:
         self.state_1 = self.model.state()
         self.control = self.model.control()
 
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            rigid_contact_max=256 if self.solver_type == "lox" else None,
+        )
         self.contacts = self.collision_pipeline.contacts()
 
         self.viewer.set_model(self.model)
@@ -237,8 +247,8 @@ if __name__ == "__main__":
         "--solver",
         type=str,
         default="xpbd",
-        choices=["vbd", "xpbd"],
-        help="Solver type: xpbd (default) or vbd",
+        choices=["vbd", "xpbd", "lox"],
+        help="Solver type: xpbd (default), vbd, or lox",
     )
 
     viewer, args = newton.examples.init(parser)

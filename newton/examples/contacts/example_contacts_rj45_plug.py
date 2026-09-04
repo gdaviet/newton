@@ -231,6 +231,7 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.viewer = viewer
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
         self.pick_stiffness = 50.0
         self.pick_damping = 10.0
 
@@ -243,6 +244,8 @@ class Example:
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         SolverVBD.register_custom_attributes(builder)
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         builder.rigid_gap = 0.005
 
         builder.add_ground_plane()
@@ -344,6 +347,7 @@ class Example:
 
         # Lock the kinematic prefix and the far cable end.
         for idx in (*rod_bodies[:CABLE_KINEMATIC_COUNT], rod_bodies[-1]):
+            builder.body_flags[idx] = int(newton.BodyFlags.KINEMATIC)
             builder.body_mass[idx] = 0.0
             builder.body_inv_mass[idx] = 0.0
             builder.body_inertia[idx] = wp.mat33(0.0)
@@ -398,12 +402,18 @@ class Example:
 
         self._initial_body_q = self.state_0.body_q.numpy().copy()
 
-        self.solver = SolverVBD(
-            self.model,
-            iterations=12,
-            rigid_compliant_alm=True,
-            rigid_body_contact_buffer_size=256,
-        )
+        if self.solver_type == "vbd":
+            self.solver = SolverVBD(
+                self.model,
+                iterations=12,
+                rigid_compliant_alm=True,
+                rigid_body_contact_buffer_size=256,
+            )
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.use_fk_solver = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self._rest_pos = plug_pos
         self.gizmo_tf = wp.transform(plug_pos, wp.quat_identity())
@@ -492,13 +502,14 @@ class Example:
 
         self.sim_time += self.frame_dt
 
-        counts = self.solver.body_body_contact_counts.numpy()
-        buf = self.solver.body_body_contact_buffer_pre_alloc
-        overflow = np.where(counts > buf)[0]
-        if len(overflow):
-            for i in overflow:
-                label = self.model.body_label[i] if hasattr(self.model, "body_label") else i
-                print(f"[contact overflow] body {label} (idx={i}): {counts[i]} contacts (buffer={buf})")
+        if self.solver_type == "vbd":
+            counts = self.solver.body_body_contact_counts.numpy()
+            buf = self.solver.body_body_contact_buffer_pre_alloc
+            overflow = np.where(counts > buf)[0]
+            if len(overflow):
+                for i in overflow:
+                    label = self.model.body_label[i] if hasattr(self.model, "body_label") else i
+                    print(f"[contact overflow] body {label} (idx={i}): {counts[i]} contacts (buffer={buf})")
 
         # Snap gizmo to the plug when the user isn't dragging it.
         gizmo_active = bool(getattr(self.viewer, "gizmo_is_using", False))
@@ -527,5 +538,7 @@ class Example:
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd")
+    viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

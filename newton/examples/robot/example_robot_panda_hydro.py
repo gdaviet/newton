@@ -60,6 +60,7 @@ class Example:
     def __init__(self, viewer, args):
         newton.use_coord_layout_targets = True
         self.scene = SceneType(args.scene)
+        self.solver_type = str(getattr(args, "solver", "mujoco")).lower()
         self.test_mode = args.test
         self.deterministic = args.deterministic
         self.deterministic_solver = args.deterministic_solver
@@ -92,6 +93,8 @@ class Example:
         )
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         # URDF mesh colliders are imported as plain meshes; keep hydroelastic disabled
         # for import-time shapes unless they provide explicit mesh.sdf payloads.
         builder.default_shape_cfg = shape_cfg
@@ -278,6 +281,8 @@ class Example:
         self.bodies_per_world = builder.body_count
 
         scene = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(scene)
         scene.replicate(builder, self.world_count)
         scene.add_ground_plane(cfg=shape_cfg)
 
@@ -304,23 +309,27 @@ class Example:
         )
         self.contacts = self.collision_pipeline.contacts()
 
-        # Create MuJoCo solver with Newton contacts
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            use_mujoco_contacts=False,
-            disable_sensors=True,
-            solver="newton",
-            integrator="implicitfast",
-            cone="elliptic",
-            njmax=500,
-            nconmax=500,
-            iterations=15,
-            ls_iterations=100,
-            impratio=1000.0,
-            deterministic=wp.DeterministicMode.RUN_TO_RUN
-            if self.deterministic_solver
-            else wp.DeterministicMode.NOT_GUARANTEED,
-        )
+        if self.solver_type == "mujoco":
+            self.solver = newton.solvers.SolverMuJoCo(
+                self.model,
+                use_mujoco_contacts=False,
+                disable_sensors=True,
+                solver="newton",
+                integrator="implicitfast",
+                cone="elliptic",
+                njmax=500,
+                nconmax=500,
+                iterations=15,
+                ls_iterations=100,
+                impratio=1000.0,
+                deterministic=wp.DeterministicMode.RUN_TO_RUN
+                if self.deterministic_solver
+                else wp.DeterministicMode.NOT_GUARANTEED,
+            )
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.viewer.set_model(self.model)
         self.viewer.picking_enabled = False  # Disable interactive picking for this example
@@ -550,6 +559,7 @@ class Example:
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(num_frames=720)
         parser.set_defaults(world_count=1)
+        parser.add_argument("--solver", choices=("mujoco", "lox"), default="mujoco")
         parser.add_argument(
             "--deterministic",
             action=argparse.BooleanOptionalAction,

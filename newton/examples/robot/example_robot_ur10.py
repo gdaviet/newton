@@ -9,6 +9,7 @@
 # applies a sinusoidal trajectory to the joint targets.
 #
 # Command: python -m newton.examples robot_ur10 --world-count 16
+#          python -m newton.examples robot_ur10 --dynamics-backend lox
 #
 ###########################################################################
 
@@ -58,13 +59,17 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.world_count = args.world_count
+        self.dynamics_backend = args.dynamics_backend
 
         self.viewer = viewer
 
         self.device = wp.get_device()
 
         ur10 = newton.ModelBuilder()
-        newton.solvers.SolverMuJoCo.register_custom_attributes(ur10)
+        if self.dynamics_backend == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(ur10)
+        else:
+            newton.solvers.SolverMuJoCo.register_custom_attributes(ur10)
 
         asset_path = newton.utils.download_asset("universal_robots_ur10")
         asset_file = str(asset_path / "usd" / "ur10_instanceable.usda")
@@ -143,10 +148,15 @@ class Example:
 
         self.ctrl = self.articulation_view.get_attribute("joint_target_q", self.control)
 
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            disable_contacts=True,
-        )
+        if self.dynamics_backend == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
+        else:
+            self.solver = newton.solvers.SolverMuJoCo(
+                self.model,
+                disable_contacts=True,
+            )
 
         self.viewer.set_model(self.model)
 
@@ -200,6 +210,12 @@ class Example:
         parser = newton.examples.create_parser()
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(world_count=100)
+        parser.add_argument(
+            "--dynamics-backend",
+            choices=("mujoco", "lox"),
+            default="mujoco",
+            help="Rigid-body dynamics backend.",
+        )
         return parser
 
 

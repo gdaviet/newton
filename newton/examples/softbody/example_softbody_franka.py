@@ -6,9 +6,9 @@
 #
 # Demonstrates a Franka Panda robot grasping a deformable rubber duck
 # on a table. The robot is positioned via Newton's GPU IK solver;
-# Featherstone is used as a kinematic integrator to produce proper
-# body velocities for VBD friction. The duck is a tetrahedral mesh
-# simulated with VBD.
+# Featherstone is used as a kinematic integrator to produce proper body
+# velocities for VBD friction. LOX instead advances explicitly kinematic body
+# poses using finite-difference twists between animation samples.
 #
 # The simulation runs in meter scale.
 #
@@ -25,6 +25,7 @@ import newton.examples
 import newton.ik as ik
 import newton.utils
 from newton import ModelBuilder, eval_fk
+from newton.math import quat_velocity
 from newton.solvers import SolverFeatherstone, SolverVBD
 
 DUCK_OPACITY = 0.55
@@ -47,10 +48,45 @@ def compute_joint_qd(
     out_qd[i] = (target_q[i] - current_q[i]) * inv_frame_dt
 
 
+@wp.kernel
+def interpolate_joint_q(
+    current_q: wp.array[float],
+    target_q: wp.array[float],
+    next_q: wp.array[float],
+    alpha: float,
+):
+    i = wp.tid()
+    next_q[i] = current_q[i] + alpha * (target_q[i] - current_q[i])
+
+
+@wp.kernel
+def compute_body_qd(
+    current_q: wp.array[wp.transform],
+    target_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_qd: wp.array[wp.spatial_vector],
+    dt: float,
+):
+    i = wp.tid()
+    current_xform = current_q[i]
+    target_xform = target_q[i]
+    current_com = wp.transform_point(current_xform, body_com[i])
+    target_com = wp.transform_point(target_xform, body_com[i])
+    body_qd[i] = wp.spatial_vector(
+        (target_com - current_com) / dt,
+        quat_velocity(
+            wp.transform_get_rotation(target_xform),
+            wp.transform_get_rotation(current_xform),
+            dt,
+        ),
+    )
+
+
 class Example:
     def __init__(self, viewer, args=None):
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
         # simulation parameters (meter scale)
-        self.sim_substeps = 10
+        self.sim_substeps = 2
         self.iterations = 5
         self.fps = 60
         self.frame_dt = 1 / self.fps
@@ -68,12 +104,17 @@ class Example:
         self.self_contact_friction = 0.5
 
         self.scene = ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(self.scene)
 
         self.viewer = viewer
 
         # create robot
         franka = ModelBuilder()
         self.create_articulation(franka)
+        if self.solver_type == "lox":
+            for body in range(franka.body_count):
+                franka.body_flags[body] = int(newton.BodyFlags.KINEMATIC)
         self.scene.add_world(franka)
 
         # add a table (meter scale)
@@ -106,9 +147,9 @@ class Example:
             vel=wp.vec3(0.0, 0.0, 0.0),
             mesh=tetmesh,
             density=100.0,
-            k_mu=1.0e6,
-            k_lambda=1.0e6,
-            k_damp=1e0,
+            k_mu=1.0e3,
+            k_lambda=1.0e3,
+            k_damp=1e-1,
             particle_radius=self.particle_radius,
             opacity=DUCK_OPACITY,
         )
@@ -125,10 +166,11 @@ class Example:
 
         self.model.shape_material_ke.fill_(self.soft_contact_ke)
         self.model.shape_material_kd.fill_(self.soft_contact_kd)
-        self.model.shape_material_mu.fill_(1.5)
+        self.model.shape_material_mu.fill_(0.5)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
+        self.kinematic_target_state = self.model.state() if self.solver_type == "lox" else None
         self.target_joint_qd = wp.empty_like(self.state_0.joint_qd)
 
         self.control = self.model.control()
@@ -142,24 +184,42 @@ class Example:
 
         self.sim_time = 0.0
 
-        # robot solver (Featherstone as kinematic integrator for body velocities)
-        self.robot_solver = SolverFeatherstone(self.model, update_mass_matrix_interval=self.sim_substeps)
+        # Featherstone supplies prescribed robot motion only to VBD. LOX consumes
+        # explicitly kinematic body poses and finite-difference twists instead.
+        self.robot_solver = (
+            SolverFeatherstone(self.model, update_mass_matrix_interval=self.sim_substeps)
+            if self.solver_type == "vbd"
+            else None
+        )
 
         # IK solver setup
         self.set_up_ik()
 
         # soft body solver
-        self.soft_solver = SolverVBD(
-            self.model,
-            iterations=self.iterations,
-            integrate_with_external_rigid_solver=True,
-            particle_self_contact_radius=self.particle_self_contact_radius,
-            particle_self_contact_margin=self.particle_self_contact_margin,
-            particle_enable_self_contact=False,
-            particle_vertex_contact_buffer_size=32,
-            particle_edge_contact_buffer_size=64,
-            particle_collision_detection_interval=-1,
-        )
+        if self.solver_type == "vbd":
+            self.soft_solver = SolverVBD(
+                self.model,
+                iterations=self.iterations,
+                integrate_with_external_rigid_solver=True,
+                particle_self_contact_radius=self.particle_self_contact_radius,
+                particle_self_contact_margin=self.particle_self_contact_margin,
+                particle_enable_self_contact=False,
+                particle_vertex_contact_buffer_size=32,
+                particle_edge_contact_buffer_size=64,
+                particle_collision_detection_interval=-1,
+            )
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = 25
+            config.lox.projection_iterations = 10
+            config.lox.deformable_preconditioner = str(getattr(args, "deformable_preconditioner", "two_level"))
+            # LOX splits VBD's detection margin into contact thickness and an additional speculative gap.
+            config.lox.deformable_self_contact_margin = self.particle_self_contact_radius
+            config.lox.deformable_self_contact_gap = (
+                self.particle_self_contact_margin - self.particle_self_contact_radius
+            )
+            self.soft_solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(wp.vec3(-0.6, 0.6, 1.24), -42.0, -58.0)
@@ -338,25 +398,59 @@ class Example:
             inputs=[self.target_joint_q, self.state_0.joint_q, self.target_joint_qd, 1.0 / self.frame_dt],
         )
 
-        self.soft_solver.rebuild_bvh(self.state_0)
+        if self.solver_type == "vbd":
+            self.soft_solver.rebuild_bvh(self.state_0)
         for _step in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.state_1.clear_forces()
 
             self.viewer.apply_forces(self.state_0)
 
-            # Featherstone as kinematic integrator (disable particles + gravity)
-            particle_count = self.model.particle_count
-            self.model.particle_count = 0
-            self.model.gravity.assign(self.gravity_zero)
-            self.model.shape_contact_pair_count = 0
+            if self.solver_type == "vbd":
+                # Featherstone as kinematic integrator (disable particles + gravity).
+                particle_count = self.model.particle_count
+                self.model.particle_count = 0
+                self.model.gravity.assign(self.gravity_zero)
+                self.model.shape_contact_pair_count = 0
 
-            self.state_0.joint_qd.assign(self.target_joint_qd)
-            self.robot_solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
+                self.state_0.joint_qd.assign(self.target_joint_qd)
+                self.robot_solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
 
-            self.state_0.particle_f.zero_()
-            self.model.particle_count = particle_count
-            self.model.gravity.assign(self.gravity_earth)
+                self.state_0.particle_f.zero_()
+                self.model.particle_count = particle_count
+                self.model.gravity.assign(self.gravity_earth)
+            else:
+                # Evaluate the next prescribed pose, then give LOX the twist that
+                # advances the current kinematic body poses to that FK sample.
+                wp.launch(
+                    interpolate_joint_q,
+                    dim=self.n_coords,
+                    inputs=[
+                        self.state_0.joint_q,
+                        self.target_joint_q,
+                        self.kinematic_target_state.joint_q,
+                        1.0 / float(self.sim_substeps - _step),
+                    ],
+                )
+                self.kinematic_target_state.joint_qd.assign(self.target_joint_qd)
+                eval_fk(
+                    self.model,
+                    self.kinematic_target_state.joint_q,
+                    self.kinematic_target_state.joint_qd,
+                    self.kinematic_target_state,
+                )
+                wp.launch(
+                    compute_body_qd,
+                    dim=self.model.body_count,
+                    inputs=[
+                        self.state_0.body_q,
+                        self.kinematic_target_state.body_q,
+                        self.model.body_com,
+                        self.state_0.body_qd,
+                        self.sim_dt,
+                    ],
+                )
+                self.state_0.joint_qd.assign(self.target_joint_qd)
 
             # collision detection
             self.collision_pipeline.collide(self.state_0, self.contacts)
@@ -398,6 +492,12 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd")
+    parser.add_argument(
+        "--deformable-preconditioner",
+        choices=("incomplete_ldlt", "two_level", "block_jacobi"),
+        default="two_level",
+    )
     parser.set_defaults(num_frames=1000)
     viewer, args = newton.examples.init(parser)
 

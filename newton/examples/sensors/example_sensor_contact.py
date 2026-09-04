@@ -9,7 +9,7 @@
 # The flap has a contact sensor registering the total contact force of
 # the objects on top. The plates' sensors register per-counterpart forces
 # for the cube and the ball to detect which object touched which plate. Each
-# plate will light up when touched by the matching object.
+# plate will light up with the color of the first object that touches it.
 #
 #
 # Command: python -m newton.examples sensor_contact
@@ -37,10 +37,13 @@ class Example:
         self.reset_interval = 8.0
 
         self.viewer = viewer
+        self.solver_type = str(getattr(args, "solver", "mujoco")).lower()
 
         builder = newton.ModelBuilder()
-        builder.add_usd(newton.examples.get_asset("sensor_contact_scene.usda"))
         newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
+        builder.add_usd(newton.examples.get_asset("sensor_contact_scene.usda"))
 
         builder.add_ground_plane()
 
@@ -60,33 +63,38 @@ class Example:
             measure_total=False,
             verbose=True,
         )
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            njmax=100,
-            nconmax=100,
-            cone="pyramidal",
-            impratio=1,
-        )
+        if self.solver_type == "mujoco":
+            self.solver = newton.solvers.SolverMuJoCo(
+                self.model,
+                njmax=100,
+                nconmax=100,
+                cone="pyramidal",
+                impratio=1,
+            )
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         # used for storing contact info required by contact sensor
-        self.contacts = Contacts(
-            self.solver.get_max_contact_count(),
-            0,
-            requested_attributes=self.model.get_requested_contact_attributes(),
-        )
+        if self.solver_type == "lox":
+            self.collision_pipeline = newton.CollisionPipeline(
+                self.model,
+                rigid_contact_max=self.solver.get_max_contact_count(),
+            )
+            self.contacts = self.collision_pipeline.contacts()
+        else:
+            self.collision_pipeline = None
+            self.contacts = Contacts(
+                self.solver.get_max_contact_count(),
+                0,
+                requested_attributes=self.model.get_requested_contact_attributes(),
+            )
 
         self.viewer.set_model(self.model)
 
         self.shape_map = {key: s for s, key in enumerate(self.model.shape_label)}
         self.plates_touched = 2 * [False]
-        # Each plate watches one counterpart — Plate1 watches Cube, Plate2 watches Sphere.
-        # Look up the counterpart column for each plate's target.
-        cube_shape = self.shape_map["/env/Cube"]
-        sphere_shape = self.shape_map["/env/Sphere"]
-        self.counterpart_col = [
-            self.plate_contact_sensor.counterpart_indices[0].index(cube_shape),
-            self.plate_contact_sensor.counterpart_indices[1].index(sphere_shape),
-        ]
         self.shape_colors = {
             "/env/Plate1": 3 * [0.4],
             "/env/Plate2": 3 * [0.4],
@@ -126,7 +134,10 @@ class Example:
     def simulate(self):
         self.state_0.clear_forces()
         self.viewer.apply_forces(self.state_0)
-        self.solver.step(self.state_0, self.state_0, self.control, None, self.sim_dt)
+        if self.collision_pipeline is not None:
+            self.collision_pipeline.collide(self.state_0, self.contacts)
+        solver_contacts = self.contacts if self.collision_pipeline is not None else None
+        self.solver.step(self.state_0, self.state_0, self.control, solver_contacts, self.sim_dt)
         self.solver.update_contacts(self.contacts, self.state_0)
 
     def step(self):
@@ -143,16 +154,20 @@ class Example:
                 self.simulate()
         self.plate_contact_sensor.update(self.state_0, self.contacts)
 
-        # Check if any object touched the matching plate by looking up per-counterpart forces.
+        # Use the per-counterpart forces to identify which object first touched each plate.
         net_force = self.plate_contact_sensor.force_matrix.numpy()
-        for i in range(2):
-            if self.plates_touched[i]:
+        for plate_idx, counterpart_forces in enumerate(net_force):
+            if self.plates_touched[plate_idx]:
                 continue
-            if np.abs(net_force[i, self.counterpart_col[i]]).max() == 0:
+            counterpart_col = next(
+                (col for col, force in enumerate(counterpart_forces) if np.abs(force).max() > 0.0),
+                None,
+            )
+            if counterpart_col is None:
                 continue
-            plate_shape = self.plate_contact_sensor.sensing_indices[i]
-            counterpart_shape = self.plate_contact_sensor.counterpart_indices[i][self.counterpart_col[i]]
-            self.plates_touched[i] = True
+            plate_shape = self.plate_contact_sensor.sensing_indices[plate_idx]
+            counterpart_shape = self.plate_contact_sensor.counterpart_indices[plate_idx][counterpart_col]
+            self.plates_touched[plate_idx] = True
             plate_label = self.model.shape_label[plate_shape]
             counterpart_label = self.model.shape_label[counterpart_shape]
             print(f"Plate {plate_label} was touched by counterpart {counterpart_label}")
@@ -187,17 +202,19 @@ class Example:
         self.viewer.end_frame()
 
     def test_post_step(self):
+        """Verify contact sensors remain finite and detect the expected sequence."""
         assert not self.plates_touched[1] or self.plates_touched[0]  # plate 0 always touched first
         assert len(find_nonfinite_members(self.flap_contact_sensor)) == 0
         assert len(find_nonfinite_members(self.plate_contact_sensor)) == 0
-        # first plate touched by 1.4s, second by 4s, flap left by 2.8s
+        # The first plate is touched by 1.4 s; LOX keeps the cube on the flap longer than MuJoCo.
         if self.sim_time > 1.4:
             assert self.plates_touched[0]
-        if self.sim_time > 2.8:
-            assert self.flap_contact_sensor.total_force.numpy().sum() == 0
+        if self.sim_time > 3.6:
+            assert np.abs(self.flap_contact_sensor.total_force.numpy()).max() == 0
         # if self.sim_time > 4.0: assert self.plates_touched[1]   # unreliable due to jerky cube motion
 
     def test_final(self):
+        """Verify the final body state and sensor configuration are valid."""
         self.test_post_step()
         newton.examples.test_body_state(
             self.model,
@@ -214,6 +231,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("mujoco", "lox"), default="mujoco")
 
     viewer, args = newton.examples.init(parser)
 

@@ -15,8 +15,10 @@
 # - Resolution: 4x6 cells per card
 #
 # Command: uv run -m newton.examples cloth_poker_cards
+#          uv run -m newton.examples cloth_poker_cards --solver lox
 #
 ###########################################################################
+
 
 import numpy as np
 import warp as wp
@@ -41,12 +43,13 @@ class Example:
     def __init__(self, viewer, args):
         newton.use_coord_layout_targets = True
         self.viewer = viewer
+        self.solver_type = args.solver
         self.sim_time = 0.0
 
         # Simulation parameters
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 20
+        self.sim_substeps = 5 if self.solver_type == "lox" else 20
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.iterations = 10
 
@@ -61,7 +64,9 @@ class Example:
         self.cell_y = self.card_height / self.dim_y  # ~0.0148 m
 
         # Number of cards: 52 (13 ranks x 4 suits)
-        self.num_cards = 52
+        self.num_cards = int(getattr(args, "num_cards", 52))
+        if self.num_cards < 1:
+            raise ValueError("num_cards must be positive.")
 
         # Cube (table/platform) parameters in meters
         self.cube_size = 0.1  # m (10 cm) - half-size of the cube
@@ -75,6 +80,8 @@ class Example:
 
         # Build the model (using meters)
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.8))  # m/s²
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         # Add a static cube for cards to stack on
         body_cube = builder.add_body(
@@ -111,6 +118,7 @@ class Example:
                 p=wp.vec3(self.sphere_start_x, 0.0, self.sphere_height),
                 q=wp.quat_identity(),
             ),
+            is_kinematic=True,
             label="sphere",
         )
         sphere_cfg = newton.ModelBuilder.ShapeConfig()
@@ -121,7 +129,7 @@ class Example:
         builder.add_shape_sphere(body_sphere, radius=self.sphere_radius, cfg=sphere_cfg)
 
         # Sphere body index for kinematic animation
-        self.sphere_body_index = 1  # Second body (after cube)
+        self.sphere_body_index = body_sphere
 
         # Random generator for reproducible random offsets
         rng = np.random.default_rng(42)
@@ -202,18 +210,38 @@ class Example:
         self.model.soft_contact_kd = 1.0e2  # Contact damping
         self.model.soft_contact_mu = 0.3  # Friction coefficient
 
-        # Create VBD solver with self-contact enabled
-        self.solver = newton.solvers.SolverVBD(
-            model=self.model,
-            iterations=self.iterations,
-            rigid_compliant_alm=True,
-            particle_enable_self_contact=True,
-            particle_self_contact_radius=0.001,  # m (0.1 cm)
-            particle_self_contact_margin=0.0015,  # m (0.15 cm)
-            particle_topological_contact_filter_threshold=2,
-            particle_rest_shape_contact_exclusion_radius=0.0,  # m (0.5 cm)
-            rigid_body_particle_contact_buffer_size=1024,
+        # Create collision pipeline for ground and cube contact
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            broad_phase="nxn",
+            soft_contact_margin=0.005,  # m (0.5 cm)
         )
+        self.contacts = self.collision_pipeline.contacts()
+
+        if self.solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = self.iterations
+            config.lox.projection_iterations = 10
+            config.lox.projection_method = "apgd"
+            config.lox.deformable_enable_self_contact = True
+            config.lox.deformable_self_contact_margin = 0.001
+            config.lox.deformable_self_contact_gap = 0.0015
+            config.lox.deformable_self_contact_vertex_buffer_size = 64
+            config.lox.deformable_self_contact_edge_buffer_size = 64
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
+        else:
+            self.solver = newton.solvers.SolverVBD(
+                model=self.model,
+                iterations=self.iterations,
+                rigid_compliant_alm=True,
+                particle_enable_self_contact=True,
+                particle_self_contact_radius=0.001,  # m (0.1 cm)
+                particle_self_contact_margin=0.0015,  # m (0.15 cm)
+                particle_topological_contact_filter_threshold=2,
+                particle_rest_shape_contact_exclusion_radius=0.0,  # m (0.5 cm)
+                rigid_body_particle_contact_buffer_size=1024,
+            )
 
         # Create states
         self.state_0 = self.model.state()
@@ -222,14 +250,6 @@ class Example:
 
         # Track sphere position for kinematic animation
         self.sphere_current_x = self.sphere_start_x
-
-        # Create collision pipeline for ground and cube contact
-        self.collision_pipeline = newton.CollisionPipeline(
-            self.model,
-            broad_phase="nxn",
-            soft_contact_margin=0.005,  # m (0.5 cm)
-        )
-        self.contacts = self.collision_pipeline.contacts()
 
         self.viewer.set_model(self.model)
 
@@ -258,12 +278,15 @@ class Example:
 
             # Animate kinematic sphere (move it toward the cards)
             self.sphere_current_x += self.sphere_velocity_x * self.sim_dt
-            body_q = self.state_0.body_q.numpy()
-            # Update sphere position (body_q stores transforms as 7 floats: px, py, pz, qx, qy, qz, qw)
-            body_q[self.sphere_body_index][0] = self.sphere_current_x
-            body_q[self.sphere_body_index][1] = 0.0
-            body_q[self.sphere_body_index][2] = self.sphere_height
-            self.state_0.body_q = wp.array(body_q, dtype=wp.transform)
+            if self.solver_type != "lox":
+                body_q = self.state_0.body_q.numpy()
+                body_q[self.sphere_body_index][0] = self.sphere_current_x
+                body_q[self.sphere_body_index][1] = 0.0
+                body_q[self.sphere_body_index][2] = self.sphere_height
+                self.state_0.body_q.assign(body_q)
+            body_qd = self.state_0.body_qd.numpy()
+            body_qd[self.sphere_body_index] = (self.sphere_velocity_x, 0.0, 0.0, 0.0, 0.0, 0.0)
+            self.state_0.body_qd.assign(body_qd)
 
             # Collision detection
             self.collision_pipeline.collide(self.state_0, self.contacts)
@@ -291,6 +314,38 @@ class Example:
         self.viewer.log_state(self.state_0)
         self.viewer.end_frame()
 
+    def _max_membrane_stretch(self, particle_q):
+        rest_q = self.model.particle_q.numpy()
+        triangles = self.model.tri_indices.numpy()
+        max_stretch = 1.0
+        for first, second in ((0, 1), (1, 2), (2, 0)):
+            rest_length = np.linalg.norm(rest_q[triangles[:, first]] - rest_q[triangles[:, second]], axis=1)
+            length = np.linalg.norm(particle_q[triangles[:, first]] - particle_q[triangles[:, second]], axis=1)
+            max_stretch = max(max_stretch, float(np.max(length / rest_length)))
+        return max_stretch
+
+    def test_post_step(self):
+        """Verify the stiff cards remain finite and approximately inextensible."""
+        particle_q = self.state_0.particle_q.numpy()
+        assert np.all(np.isfinite(particle_q)), "Card positions must remain finite."
+        max_stretch = self._max_membrane_stretch(particle_q)
+        assert max_stretch < 1.05, f"Cards stretched excessively: max_stretch={max_stretch:.4f}"
+
+        body_q = self.state_0.body_q.numpy()
+        body_qd = self.state_0.body_qd.numpy()
+        np.testing.assert_allclose(
+            body_q[self.sphere_body_index, :3],
+            (self.sphere_current_x, 0.0, self.sphere_height),
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            body_qd[self.sphere_body_index],
+            (self.sphere_velocity_x, 0.0, 0.0, 0.0, 0.0, 0.0),
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+
     def test_final(self):
         """Verify simulation reached a valid end state."""
         particle_q = self.state_0.particle_q.numpy()
@@ -309,10 +364,16 @@ class Example:
         # Check no excessive penetration
         assert min_pos[2] > -0.1, f"Excessive penetration: z_min={min_pos[2]:.4f}"
 
+        # Check the nominally stiff cards did not stretch excessively.
+        max_stretch = self._max_membrane_stretch(particle_q)
+        assert max_stretch < 1.05, f"Cards stretched excessively: max_stretch={max_stretch:.4f}"
+
 
 if __name__ == "__main__":
     # Create parser with base arguments
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd", help="Dynamics solver to use.")
+    parser.add_argument("--num-cards", type=int, default=52, help="Number of cards to simulate.")
 
     # Parse arguments and initialize viewer
     viewer, args = newton.examples.init(parser)

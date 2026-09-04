@@ -18,7 +18,7 @@ from newton.solvers.experimental.coupled import ModelView, SolverCoupledProxy
 
 import newton
 import newton.examples
-from newton.solvers import SolverVBD
+from newton.solvers import SolverKamino, SolverVBD
 
 
 class Example:
@@ -28,13 +28,15 @@ class Example:
         self.sim_time = 0.0
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 10
+        self.sim_substeps = 5 if self.solver_type == "lox" else 10
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        if self.solver_type not in {"vbd", "coupled"}:
-            raise ValueError("The softbody dropping to cloth example supports the vbd and coupled solvers.")
+        if self.solver_type not in {"vbd", "lox", "coupled"}:
+            raise ValueError("The softbody dropping to cloth example supports the vbd, lox, and coupled solvers.")
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            SolverKamino.register_custom_attributes(builder)
         builder.add_ground_plane()
 
         cloth_particle_start = builder.particle_count
@@ -87,6 +89,8 @@ class Example:
         self.model.soft_contact_ke = 1.0e5
         self.model.soft_contact_kd = 1e0
         self.model.soft_contact_mu = 1.0
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
 
         vbd_kwargs = {
             "iterations": args.vbd_iterations,
@@ -97,6 +101,15 @@ class Example:
         }
         if self.solver_type == "vbd":
             self.solver = SolverVBD(model=self.model, **vbd_kwargs)
+        elif self.solver_type == "lox":
+            config = SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = args.lox_iterations
+            config.lox.projection_iterations = 2
+            config.lox.deformable_cr_iterations = 6
+            config.lox.deformable_enable_self_contact = True
+            config.lox.deformable_self_contact_margin = 0.02
+            self.solver = SolverKamino(self.model, config=config)
         else:
 
             def configure_soft_view(view: ModelView) -> None:
@@ -141,9 +154,6 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-
-        self.collision_pipeline = newton.CollisionPipeline(self.model)
-        self.contacts = self.collision_pipeline.contacts()
 
         newton.examples.configure_coupled_view(self, args)
 
@@ -201,8 +211,14 @@ class Example:
             "--solver",
             help="Type of solver",
             type=str,
-            choices=["vbd", "coupled"],
+            choices=["vbd", "lox", "coupled"],
             default="vbd",
+        )
+        parser.add_argument(
+            "--lox-iterations",
+            help="LOX splitting iterations per substep",
+            type=int,
+            default=10,
         )
         parser.add_argument(
             "--coupling-mode",

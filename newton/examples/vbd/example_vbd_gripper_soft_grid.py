@@ -54,8 +54,8 @@ def _box_mesh(h: float) -> newton.Mesh:
 PARAMS = {
     # simulation
     "fps": 60,
-    "sim_substeps": 20,
-    "solver_iterations": 5,
+    "sim_substeps": 5,
+    "solver_iterations": 20,
     "gravity": (0.0, 0.0, -9.8),
     "num_frames": 360,
     # water-tight rigid-soft contact. True = grip the grid by its diagonal edge (this
@@ -85,7 +85,7 @@ PARAMS = {
     "gantry_drive_kd": 5.0e3,
     "finger_drive_ke": 1.0e5,
     "finger_drive_kd": 1.0e2,
-    "gantry_link_mass": 0.01,
+    "gantry_link_mass": 1.0,
     # soft 1x1 grid: wide in X (corners outside the jaws), narrow in Y (corners
     # within |y| < open_half_gap so the OPEN jaws start clear and sweep in). The
     # diagonal edge runs corner-to-corner through the pinch centre.
@@ -118,6 +118,7 @@ PARAMS = {
 class Example:
     def __init__(self, viewer, args):
         self.viewer = viewer
+        self.solver_type = getattr(args, "solver", "vbd")
         self.params = PARAMS
         self.sim_time = 0.0
         self.fps = self.params["fps"]
@@ -130,6 +131,8 @@ class Example:
         self._gripper_frac = 0.0
 
         builder = newton.ModelBuilder(gravity=self.params["gravity"])
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         self._build_gripper(builder)
         self._add_soft_mesh(builder)
 
@@ -142,27 +145,34 @@ class Example:
 
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.model)
 
-        self.solver = newton.solvers.SolverVBD(
-            self.model,
-            iterations=self.params["solver_iterations"],
-            rigid_compliant_alm=True,
-            integrate_with_external_rigid_solver=False,
-            rigid_body_contact_buffer_size=self.params["rigid_body_contact_buffer_size"],
-        )
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             broad_phase=self.params["collision_broad_phase"],
             soft_contact_margin=self.params["soft_contact_margin"],
             enable_rigid_soft_full_surface_contact=self.params["enable_water_tight"],
         )
+        self.contacts = self.collision_pipeline.contacts()
 
+        if self.solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = self.params["solver_iterations"]
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
+        else:
+            self.solver = newton.solvers.SolverVBD(
+                self.model,
+                iterations=self.params["solver_iterations"],
+                rigid_compliant_alm=True,
+                integrate_with_external_rigid_solver=False,
+                rigid_body_contact_buffer_size=self.params["rigid_body_contact_buffer_size"],
+            )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.contacts = self.collision_pipeline.contacts()
 
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
-        wp.copy(self.state_1.body_q, self.state_0.body_q)
+        if self.solver_type != "lox":
+            newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
 
         self._build_waypoints()
         self._set_targets(self._waypoints[0][0], 0.0)
@@ -358,6 +368,7 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.set_defaults(num_frames=PARAMS["num_frames"])
+        parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd", help="Dynamics solver.")
         return parser
 
 
