@@ -263,7 +263,8 @@ class StateKamino:
             convert_to_com_frame: If True, convert body poses to local center-of-mass frames.
 
         Returns:
-            A :class:`StateKamino` object that aliases the data of the input :class:`newton.State`.
+            A :class:`StateKamino` object that aliases the rigid and joint data of the input
+            :class:`newton.State`. Particle-only states receive zero-length rigid and joint arrays.
         """
         # Ensure the state is valid
         if state is None:
@@ -271,21 +272,42 @@ class StateKamino:
         if not isinstance(state, State):
             raise TypeError(f"Expected state of type State, but got {type(state)}.")
 
-        # Retrieve the device of the state container
-        device = None
+        # Retrieve the device of the state container. Particle-only models have
+        # no Newton rigid or joint arrays, but still need an empty Kamino state
+        # for the common solver workflow.
+        particle_only = state.body_q is None and state.joint_q is None and state.particle_q is not None
         if state.body_q is not None:
             device = state.body_q.device
         elif state.joint_q is not None:
             device = state.joint_q.device
+        elif particle_only:
+            device = state.particle_q.device
         else:
-            raise ValueError("State must have at least body_q or joint_q defined to determine device for StateKamino.")
+            raise ValueError(
+                "State must have at least body_q, joint_q, or particle_q defined to determine the StateKamino device."
+            )
+
+        if particle_only:
+            if size.sum_of_num_bodies != 0 or size.sum_of_num_joint_coords != 0 or size.sum_of_num_joint_dofs != 0:
+                raise ValueError("A particle-only Newton state cannot represent a Kamino model with bodies or joints.")
+            body_q = wp.empty(shape=0, dtype=wp.transformf, device=device)
+            body_qd = wp.empty(shape=0, dtype=wp.spatial_vectorf, device=device)
+            body_f = wp.empty(shape=0, dtype=wp.spatial_vectorf, device=device)
+            joint_q = wp.empty(shape=0, dtype=wp.float32, device=device)
+            joint_qd = wp.empty(shape=0, dtype=wp.float32, device=device)
+        else:
+            body_q = state.body_q
+            body_qd = state.body_qd.view(dtype=wp.spatial_vectorf)
+            body_f = state.body_f.view(dtype=wp.spatial_vectorf)
+            joint_q = state.joint_q
+            joint_qd = state.joint_qd
 
         # If the state contains the Kamino-specific `body_f_total` custom attribute,
         # capture a reference to it; otherwise, create a new array for it.
-        if hasattr(state, "body_f_total"):
+        if hasattr(state, "body_f_total") and state.body_f_total is not None:
             body_f_total = state.body_f_total
         else:
-            body_f_total = wp.zeros_like(state.body_f)
+            body_f_total = wp.zeros_like(body_f)
             state.body_f_total = body_f_total
 
         # If the state contains the Kamino-specific `joint_q_prev` custom attribute,
@@ -293,7 +315,7 @@ class StateKamino:
         if hasattr(state, "joint_q_prev"):
             joint_q_prev = state.joint_q_prev
         else:
-            joint_q_prev = wp.clone(state.joint_q)
+            joint_q_prev = wp.clone(joint_q)
             state.joint_q_prev = joint_q_prev
 
         # If the state contains the Kamino-specific `joint_lambdas` custom attribute,
@@ -344,17 +366,17 @@ class StateKamino:
 
         # Optionally initialize the `joint_q_prev` array to match the current `joint_q`
         if initialize_state_prev:
-            wp.copy(joint_q_prev, state.joint_q)
+            wp.copy(joint_q_prev, joint_q)
 
-        # Create a new StateKamino object, aliasing the relevant data from the input newton.State
+        # Create a new StateKamino object, aliasing the available data from the input newton.State.
         state_kamino = StateKamino(
-            q_i=state.body_q,
-            u_i=state.body_qd.view(dtype=wp.spatial_vectorf),
+            q_i=body_q,
+            u_i=body_qd,
             w_i=body_f_total.view(dtype=wp.spatial_vectorf),
-            w_i_e=state.body_f.view(dtype=wp.spatial_vectorf),
-            q_j=state.joint_q,
+            w_i_e=body_f,
+            q_j=joint_q,
             q_j_p=joint_q_prev,
-            dq_j=state.joint_qd,
+            dq_j=joint_qd,
             lambda_kin_j=lambda_kin_j,
             lambda_dyn_j=lambda_dyn_j,
             lambda_f_j=lambda_f_j,

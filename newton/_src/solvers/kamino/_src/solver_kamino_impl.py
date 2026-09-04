@@ -267,8 +267,8 @@ class SolverKaminoImpl(SolverBase):
                 jacobians=self._jacobians,
                 limits=self._limits,
                 contacts=contacts,
-                config=self._config.lox,
-                source_model=self._model._model,
+                solver_config=self._config,
+                deformable_model=self._model._model,
                 constraints=self._config.constraints,
                 rotation_correction=self._rotation_correction,
             )

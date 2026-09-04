@@ -73,6 +73,35 @@ class _RigidContactProjectionData:
     reaction: wp.array[wp.vec3f]
 
 
+@wp.struct
+class _DeformableRigidContactProjectionData:
+    particle_indices: wp.array2d[wp.int32]
+    coefficients: wp.array2d[wp.float32]
+    body: wp.array[wp.int32]
+    frame: wp.array[wp.mat33f]
+    body_jacobian: wp.array[mat36f]
+    delassus: wp.array[wp.mat33f]
+    bias: wp.array[wp.vec3f]
+    friction: wp.array[wp.float32]
+    reaction: wp.array[wp.vec3f]
+    status: wp.array[wp.int32]
+    contact_world_status: wp.array[wp.int32]
+
+
+@wp.struct
+class _DeformableRigidProjectionState:
+    world_active: wp.array[wp.bool]
+    occupancy: wp.array2d[wp.int32]
+    inverse_weight: wp.array[mat66f]
+    projected_twist: wp.array[vec6f]
+    twist_delta: wp.array[vec6f]
+    particle_occupancy: wp.array2d[wp.int32]
+    particle_inverse_weight: wp.array[wp.float32]
+    projected_velocity: wp.array[wp.vec3f]
+    particle_delta: wp.array[wp.vec3f]
+    world_status: wp.array[wp.int32]
+
+
 def _make_direct_projection_index(
     constraint_world: wp.array[wp.int32],
     constraint_local: wp.array[wp.int32] | None = None,
@@ -287,6 +316,20 @@ def _accumulate_twist_by_occupancy(
         values[body] += increment
     else:
         wp.atomic_add(values, body, increment)
+
+
+@wp.func
+def _accumulate_particle_by_occupancy(
+    values: wp.array[wp.vec3f],
+    occupancy: wp.array2d[wp.int32],
+    particle: wp.int32,
+    color: wp.int32,
+    increment: wp.vec3f,
+):
+    if occupancy[particle, color] == 1:
+        values[particle] += increment
+    else:
+        wp.atomic_add(values, particle, increment)
 
 
 @wp.func
@@ -736,8 +779,13 @@ def _warmstart_frictions_jacobi(
 
 
 @cache
-def _make_project_contacts_kernel(colored: bool):
-    """Specialize local-frame Coulomb projection by indexing."""
+def _make_project_contacts_kernel(
+    colored: bool,
+    deformable: bool = False,
+    contact_status_valid: int = 0,
+    contact_status_failure: int = 0,
+):
+    """Specialize local-frame Coulomb projection by stencil and indexing."""
 
     @wp.kernel(module="unique")
     def project_contacts_kernel(
@@ -760,55 +808,139 @@ def _make_project_contacts_kernel(colored: bool):
             if wp.static(colored):
                 contact = index.order[ordered]
             world = index.constraint_world[contact]
-            if wp.static(not colored):
+            if wp.static(not colored and not deformable):
                 if index.constraint_local[contact] >= index.world_constraint_count[world]:
+                    continue
+            if wp.static(deformable):
+                if contact_data.status[contact] != wp.static(contact_status_valid) or world < 0:
                     continue
             if not state.world_active[world] or state.world_status[world] != PROJECTION_STATUS_VALID:
                 continue
-            if wp.static(colored):
-                _project_rigid_contact_colored(contact, world, target_color, contact_data, state)
-                continue
-            first = contact_data.body_first[contact]
-            second = contact_data.body_second[contact]
-            if first < 0 and second < 0:
-                contact_data.reaction[contact] = wp.vec3f(0.0)
-                continue
-            velocity = _compute_contact_velocity(
-                contact,
-                first,
-                second,
-                contact_data.jacobian_first,
-                contact_data.jacobian_second,
-                contact_data.bias,
-                state.projected_twist,
-            )
-            reaction_old = contact_data.reaction[contact]
-            if _is_zero_vec3(reaction_old) and velocity[2] >= 0.0:
-                continue
-            projection = project_contact_coulomb_local(
-                velocity,
-                reaction_old,
-                contact_data.delassus[contact],
-                contact_data.friction[contact],
-            )
-            if projection.status == PROJECTION_STATUS_INVALID:
-                state.world_status[world] = PROJECTION_STATUS_INVALID
-                continue
-            if _is_zero_vec3(projection.reaction_delta):
+
+            if wp.static(deformable):
+                contact_frame = contact_data.frame[contact]
+                velocity = contact_data.bias[contact]
+                for slot in range(4):
+                    particle = contact_data.particle_indices[contact, slot]
+                    if particle >= 0:
+                        velocity += contact_data.coefficients[contact, slot] * (
+                            wp.transpose(contact_frame) @ state.projected_velocity[particle]
+                        )
+                body = contact_data.body[contact]
+                if body >= 0:
+                    velocity += contact_data.body_jacobian[contact] @ state.projected_twist[body]
+                projection = project_contact_coulomb_local(
+                    velocity,
+                    contact_data.reaction[contact],
+                    contact_data.delassus[contact],
+                    contact_data.friction[contact],
+                )
+                if projection.status == PROJECTION_STATUS_INVALID:
+                    contact_data.status[contact] = wp.static(contact_status_failure)
+                    wp.atomic_max(contact_data.contact_world_status, world, wp.static(contact_status_failure))
+                    state.world_status[world] = PROJECTION_STATUS_INVALID
+                    continue
+                world_delta = contact_frame @ projection.reaction_delta
+                if not _is_finite_vec3(world_delta):
+                    contact_data.status[contact] = wp.static(contact_status_failure)
+                    wp.atomic_max(contact_data.contact_world_status, world, wp.static(contact_status_failure))
+                    state.world_status[world] = PROJECTION_STATUS_INVALID
+                    continue
+                correction_is_finite = wp.bool(True)
+                for slot in range(4):
+                    particle = contact_data.particle_indices[contact, slot]
+                    if particle >= 0:
+                        coefficient = contact_data.coefficients[contact, slot]
+                        if wp.static(colored):
+                            for later in range(slot + 1, 4):
+                                if contact_data.particle_indices[contact, later] == particle:
+                                    coefficient += contact_data.coefficients[contact, later]
+                        unique = wp.bool(True)
+                        if wp.static(colored):
+                            for previous in range(slot):
+                                unique = unique and contact_data.particle_indices[contact, previous] != particle
+                        if unique:
+                            correction = state.particle_inverse_weight[particle] * coefficient * world_delta
+                            if not _is_finite_vec3(correction):
+                                correction_is_finite = False
+                            elif wp.static(colored):
+                                _accumulate_particle_by_occupancy(
+                                    state.particle_delta,
+                                    state.particle_occupancy,
+                                    particle,
+                                    target_color,
+                                    correction,
+                                )
+                            else:
+                                wp.atomic_add(state.particle_delta, particle, correction)
+                body_correction = vec6f(0.0)
+                if body >= 0:
+                    body_correction = wp.transpose(contact_data.body_jacobian[contact]) @ projection.reaction_delta
+                    if wp.static(colored):
+                        body_correction = state.inverse_weight[body] @ body_correction
+                    correction_is_finite = correction_is_finite and _is_finite_twist(body_correction)
+                if not correction_is_finite:
+                    contact_data.status[contact] = wp.static(contact_status_failure)
+                    wp.atomic_max(contact_data.contact_world_status, world, wp.static(contact_status_failure))
+                    state.world_status[world] = PROJECTION_STATUS_INVALID
+                    continue
+                if body >= 0:
+                    if wp.static(colored):
+                        _accumulate_twist_by_occupancy(
+                            state.twist_delta,
+                            state.occupancy,
+                            body,
+                            target_color,
+                            body_correction,
+                        )
+                    else:
+                        wp.atomic_add(state.twist_delta, body, body_correction)
                 contact_data.reaction[contact] = projection.reaction
-                continue
-            correction_first = vec6f(0.0)
-            correction_second = vec6f(0.0)
-            if first >= 0:
-                correction_first = wp.transpose(contact_data.jacobian_first[contact]) @ projection.reaction_delta
-            if second >= 0:
-                correction_second = wp.transpose(contact_data.jacobian_second[contact]) @ projection.reaction_delta
-            if not _is_finite_twist(correction_first) or not _is_finite_twist(correction_second):
-                state.world_status[world] = PROJECTION_STATUS_INVALID
-                continue
-            _atomic_add_twist(state.twist_delta, first, correction_first)
-            _atomic_add_twist(state.twist_delta, second, correction_second)
-            contact_data.reaction[contact] = projection.reaction
+            else:
+                if wp.static(colored):
+                    _project_rigid_contact_colored(contact, world, target_color, contact_data, state)
+                    continue
+                first = contact_data.body_first[contact]
+                second = contact_data.body_second[contact]
+                if first < 0 and second < 0:
+                    contact_data.reaction[contact] = wp.vec3f(0.0)
+                    continue
+                velocity = _compute_contact_velocity(
+                    contact,
+                    first,
+                    second,
+                    contact_data.jacobian_first,
+                    contact_data.jacobian_second,
+                    contact_data.bias,
+                    state.projected_twist,
+                )
+                reaction_old = contact_data.reaction[contact]
+                if _is_zero_vec3(reaction_old) and velocity[2] >= 0.0:
+                    continue
+                projection = project_contact_coulomb_local(
+                    velocity,
+                    reaction_old,
+                    contact_data.delassus[contact],
+                    contact_data.friction[contact],
+                )
+                if projection.status == PROJECTION_STATUS_INVALID:
+                    state.world_status[world] = PROJECTION_STATUS_INVALID
+                    continue
+                if _is_zero_vec3(projection.reaction_delta):
+                    contact_data.reaction[contact] = projection.reaction
+                    continue
+                correction_first = vec6f(0.0)
+                correction_second = vec6f(0.0)
+                if first >= 0:
+                    correction_first = wp.transpose(contact_data.jacobian_first[contact]) @ projection.reaction_delta
+                if second >= 0:
+                    correction_second = wp.transpose(contact_data.jacobian_second[contact]) @ projection.reaction_delta
+                if not _is_finite_twist(correction_first) or not _is_finite_twist(correction_second):
+                    state.world_status[world] = PROJECTION_STATUS_INVALID
+                    continue
+                _atomic_add_twist(state.twist_delta, first, correction_first)
+                _atomic_add_twist(state.twist_delta, second, correction_second)
+                contact_data.reaction[contact] = projection.reaction
 
     return project_contacts_kernel
 
@@ -1208,6 +1340,68 @@ def _apply_jacobi_warmstart(
         else:
             world_status[world] = PROJECTION_STATUS_INVALID
     twist_delta[body] = vec6f(0.0)
+
+
+@wp.kernel
+def _apply_mixed_jacobi_delta(
+    particle_count: int,
+    body_count: int,
+    particle_world: wp.array[wp.int32],
+    body_world: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_status: wp.array[wp.int32],
+    inverse_weight: wp.array[mat66f],
+    particle_delta: wp.array[wp.vec3],
+    twist_delta: wp.array[vec6f],
+    projected_velocity: wp.array[wp.vec3],
+    projected_twist: wp.array[vec6f],
+):
+    index = wp.tid()
+    if index < particle_count:
+        world = particle_world[index]
+        if world_active[world] and world_status[world] == PROJECTION_STATUS_VALID:
+            projected_velocity[index] += particle_delta[index]
+        particle_delta[index] = wp.vec3(0.0)
+    if index < body_count:
+        world = body_world[index]
+        if world_active[world] and world_status[world] == PROJECTION_STATUS_VALID:
+            correction = inverse_weight[index] @ twist_delta[index]
+            if _is_finite_twist(correction):
+                projected_twist[index] += correction
+            else:
+                world_status[world] = PROJECTION_STATUS_INVALID
+        twist_delta[index] = vec6f(0.0)
+
+
+@wp.kernel
+def _apply_mixed_jacobi_warmstart(
+    particle_count: int,
+    body_count: int,
+    particle_world: wp.array[wp.int32],
+    body_world: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_status: wp.array[wp.int32],
+    inverse_weight: wp.array[mat66f],
+    particle_delta: wp.array[wp.vec3],
+    twist_delta: wp.array[vec6f],
+    projected_velocity: wp.array[wp.vec3],
+    projected_twist: wp.array[vec6f],
+):
+    index = wp.tid()
+    if index < particle_count:
+        world = particle_world[index]
+        if world_active[world] and world_status[world] == PROJECTION_STATUS_VALID:
+            projected_velocity[index] += particle_delta[index]
+        particle_delta[index] = wp.vec3(0.0)
+    if index < body_count:
+        world = body_world[index]
+        if world_active[world] and world_status[world] == PROJECTION_STATUS_VALID:
+            correction = inverse_weight[index] @ twist_delta[index]
+            if _is_finite_twist(correction):
+                projected_twist[index] += correction
+            else:
+                world_status[world] = PROJECTION_STATUS_INVALID
+        twist_delta[index] = vec6f(0.0)
 
 
 @wp.kernel
@@ -2001,12 +2195,34 @@ def _apply_jacobi_delta(
     inverse_weight,
     twist_delta,
     projected_twist,
+    deformable_contacts,
+    deformable_projected_velocity,
 ) -> None:
+    if deformable_contacts is None:
+        wp.launch(
+            _apply_jacobi_twist_delta,
+            dim=projected_twist.shape[0],
+            inputs=[body_world, world_active, world_status, inverse_weight, twist_delta],
+            outputs=[projected_twist],
+            device=projected_twist.device,
+        )
+        return
+    particle_count = deformable_contacts.cloth_system.particle_count
     wp.launch(
-        _apply_jacobi_twist_delta,
-        dim=projected_twist.shape[0],
-        inputs=[body_world, world_active, world_status, inverse_weight, twist_delta],
-        outputs=[projected_twist],
+        _apply_mixed_jacobi_delta,
+        dim=max(particle_count, projected_twist.shape[0]),
+        inputs=[
+            particle_count,
+            projected_twist.shape[0],
+            deformable_contacts.cloth_system.topology.packed_solve_world,
+            body_world,
+            world_active,
+            world_status,
+            inverse_weight,
+            deformable_contacts.particle_delta,
+            twist_delta,
+        ],
+        outputs=[deformable_projected_velocity, projected_twist],
         device=projected_twist.device,
     )
 
@@ -2018,12 +2234,34 @@ def _apply_jacobi_warmstart_delta(
     inverse_weight,
     twist_delta,
     projected_twist,
+    deformable_contacts,
+    deformable_projected_velocity,
 ) -> None:
+    if deformable_contacts is None:
+        wp.launch(
+            _apply_jacobi_warmstart,
+            dim=projected_twist.shape[0],
+            inputs=[body_world, world_active, world_status, inverse_weight, twist_delta],
+            outputs=[projected_twist],
+            device=projected_twist.device,
+        )
+        return
+    particle_count = deformable_contacts.cloth_system.particle_count
     wp.launch(
-        _apply_jacobi_warmstart,
-        dim=projected_twist.shape[0],
-        inputs=[body_world, world_active, world_status, inverse_weight, twist_delta],
-        outputs=[projected_twist],
+        _apply_mixed_jacobi_warmstart,
+        dim=max(particle_count, projected_twist.shape[0]),
+        inputs=[
+            particle_count,
+            projected_twist.shape[0],
+            deformable_contacts.cloth_system.topology.packed_solve_world,
+            body_world,
+            world_active,
+            world_status,
+            inverse_weight,
+            deformable_contacts.particle_delta,
+            twist_delta,
+        ],
+        outputs=[deformable_projected_velocity, projected_twist],
         device=projected_twist.device,
     )
 
@@ -2068,6 +2306,8 @@ def project_constraints_jacobi(
     friction_reaction: wp.array[wp.float32],
     prepared_status: wp.array[wp.int32],
     world_status: wp.array[wp.int32],
+    deformable_contacts=None,
+    deformable_projected_velocity: wp.array[wp.vec3] | None = None,
     warm_start: bool = True,
     world_body_offset: wp.array[wp.int32] | None = None,
     world_body_count: wp.array[wp.int32] | None = None,
@@ -2101,6 +2341,8 @@ def project_constraints_jacobi(
         raise ValueError("Active, prepared-status, and status world arrays must have identical lengths.")
     if body_world.shape[0] != projected_twist.shape[0] or twist_delta.shape[0] != projected_twist.shape[0]:
         raise ValueError("Body world, projected twist, and Jacobi delta arrays must have identical lengths.")
+    if (deformable_contacts is None) != (deformable_projected_velocity is None):
+        raise ValueError("Deformable contacts and projected velocity must be supplied together.")
     if not isinstance(warm_start, bool):
         raise ValueError("warm_start must be a boolean.")
     if not isinstance(accelerated, bool):
@@ -2126,6 +2368,7 @@ def project_constraints_jacobi(
     use_world_projection = not accelerated and _can_fuse_rigid_projection_by_world(
         projected_twist.device,
         world_count,
+        has_deformable_contacts=deformable_contacts is not None,
         required_world_arrays=(
             world_body_offset,
             world_body_count,
@@ -2181,6 +2424,8 @@ def project_constraints_jacobi(
                 ],
                 device=projected_twist.device,
             )
+        if deformable_contacts is not None:
+            deformable_contacts.initialize_acceleration(world_active)
     elif warm_start:
         wp.launch(
             _initialize_jacobi_projection_status,
@@ -2191,6 +2436,8 @@ def project_constraints_jacobi(
         )
     if not use_world_projection:
         twist_delta.zero_()
+    if deformable_contacts is not None:
+        deformable_contacts.begin_rigid_jacobi_accumulation()
     if warm_start and not use_world_projection and contact_world.shape[0] > 0:
         wp.launch(
             _warmstart_contacts_jacobi,
@@ -2254,6 +2501,18 @@ def project_constraints_jacobi(
             outputs=[twist_delta],
             device=projected_twist.device,
         )
+    if warm_start and deformable_contacts is not None:
+        deformable_contacts.accumulate_rigid_reaction_warm_start(
+            world_active,
+            prepared_status,
+            deformable_contacts.cloth_system.inverse_weight,
+            inverse_weight,
+            False,
+            deformable_projected_velocity,
+            projected_twist,
+            twist_delta,
+            world_status,
+        )
     if warm_start and not use_world_projection:
         _apply_jacobi_warmstart_delta(
             body_world,
@@ -2262,6 +2521,8 @@ def project_constraints_jacobi(
             inverse_weight,
             twist_delta,
             projected_twist,
+            deformable_contacts,
+            deformable_projected_velocity,
         )
 
     if use_world_projection:
@@ -2391,6 +2652,15 @@ def project_constraints_jacobi(
                 ],
                 device=projected_twist.device,
             )
+        if deformable_contacts is not None:
+            deformable_contacts.project_rigid_jacobi(
+                world_active,
+                deformable_contacts.cloth_system.inverse_weight,
+                deformable_projected_velocity,
+                projected_twist,
+                twist_delta,
+                world_status,
+            )
         _apply_jacobi_delta(
             body_world,
             world_active,
@@ -2398,6 +2668,8 @@ def project_constraints_jacobi(
             inverse_weight,
             twist_delta,
             projected_twist,
+            deformable_contacts,
+            deformable_projected_velocity,
         )
         if accelerated and _sweep + 1 < projection_iterations:
             if rigid_capacity > 0:
@@ -2430,6 +2702,12 @@ def project_constraints_jacobi(
                     ],
                     outputs=[restart_dot],
                     device=projected_twist.device,
+                )
+            if deformable_contacts is not None:
+                deformable_contacts.accumulate_acceleration_restart(
+                    world_active,
+                    world_status,
+                    restart_dot,
                 )
             wp.launch(
                 _finalize_acceleration,
@@ -2482,6 +2760,13 @@ def project_constraints_jacobi(
                     outputs=[twist_delta],
                     device=projected_twist.device,
                 )
+            if deformable_contacts is not None:
+                deformable_contacts.extrapolate_accelerated_reactions(
+                    world_active,
+                    world_status,
+                    beta,
+                    twist_delta,
+                )
             _apply_jacobi_delta(
                 body_world,
                 world_active,
@@ -2489,4 +2774,6 @@ def project_constraints_jacobi(
                 inverse_weight,
                 twist_delta,
                 projected_twist,
+                deformable_contacts,
+                deformable_projected_velocity,
             )

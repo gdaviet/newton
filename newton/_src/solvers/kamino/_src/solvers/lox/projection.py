@@ -49,6 +49,7 @@ def _can_fuse_rigid_projection_by_world(
     device: wp.Device,
     world_count: int,
     *,
+    has_deformable_contacts: bool,
     required_world_arrays: tuple[wp.array[Any] | None, ...],
     parallel_constraint_capacity: int | None = None,
     world_block_dim: int | None = None,
@@ -65,6 +66,7 @@ def _can_fuse_rigid_projection_by_world(
     return (
         device.is_cuda
         and (enough_world_blocks or small_world_work)
+        and not has_deformable_contacts
         and all(array is not None for array in required_world_arrays)
     )
 

@@ -21,6 +21,7 @@ __all__ = [
     "BODY_WEIGHT_STATUS_INVALID",
     "BODY_WEIGHT_STATUS_REGULARIZED",
     "BODY_WEIGHT_STATUS_VALID",
+    "DEFORMABLE_WEIGHT_BETA_DEFAULT",
     "BodyWeightResult",
     "compute_body_weight_mass_proportional",
 ]
@@ -30,6 +31,9 @@ BODY_WEIGHT_SIGMA_DEFAULT = 1.0e-3
 
 BODY_WEIGHT_BETA_DEFAULT = 4.0
 """Default normalized smooth-weight transition threshold."""
+
+DEFORMABLE_WEIGHT_BETA_DEFAULT = 25.0
+"""Default normalized smooth-weight transition threshold for deformable nodes."""
 
 BODY_WEIGHT_STATUS_INVALID = 0
 """The input contained a non-finite value or an invalid policy parameter."""
