@@ -32,6 +32,8 @@ def spin_first_capsules_kernel(
     dt: float,
     body_q0: wp.array[wp.transform],
     body_q1: wp.array[wp.transform],
+    body_qd0: wp.array[wp.spatial_vector],
+    body_qd1: wp.array[wp.spatial_vector],
 ):
     """Apply continuous twist to the first segment of each cable."""
     tid = wp.tid()
@@ -48,8 +50,26 @@ def spin_first_capsules_kernel(
     rot_new = wp.mul(dq, rot)
 
     T = wp.transform(pos, rot_new)
+    twist = wp.spatial_vector(wp.vec3(0.0), axis_world * twist_rates[tid])
     body_q0[body_id] = T
     body_q1[body_id] = T
+    body_qd0[body_id] = twist
+    body_qd1[body_id] = twist
+
+
+@wp.kernel
+def spin_first_capsules_lox_kernel(
+    body_indices: wp.array[wp.int32],
+    twist_rates: wp.array[float],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Set the prescribed angular velocity integrated by LOX."""
+    tid = wp.tid()
+    body_id = body_indices[tid]
+    rotation = wp.transform_get_rotation(body_q[body_id])
+    axis_world = wp.quat_rotate(rotation, wp.vec3(0.0, 0.0, 1.0))
+    body_qd[body_id] = wp.spatial_vector(wp.vec3(0.0), axis_world * twist_rates[tid])
 
 
 class Example:
@@ -116,6 +136,7 @@ class Example:
         # Store viewer and arguments
         self.viewer = viewer
         self.args = args
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
 
         # Simulation cadence
         self.fps = 60
@@ -142,6 +163,8 @@ class Example:
 
         # Create builder for the simulation
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         # Set default material properties before adding any shapes
         builder.default_shape_cfg.ke = 1.0e6  # Contact stiffness
@@ -185,6 +208,7 @@ class Example:
 
             # Fix the first body to make it kinematic
             first_body = rod_bodies[0]
+            builder.body_flags[first_body] = int(newton.BodyFlags.KINEMATIC)
             builder.body_mass[first_body] = 0.0
             builder.body_inv_mass[first_body] = 0.0
             builder.body_inertia[first_body] = wp.mat33(0.0)
@@ -208,11 +232,18 @@ class Example:
         self.model = builder.finalize()
 
         self.collision_pipeline = newton.CollisionPipeline(self.model)
-        self.solver = newton.solvers.SolverVBD(
-            self.model,
-            iterations=self.sim_iterations,
-            rigid_compliant_alm=True,
-        )
+        if self.solver_type == "vbd":
+            self.solver = newton.solvers.SolverVBD(
+                self.model,
+                iterations=self.sim_iterations,
+                rigid_compliant_alm=True,
+            )
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = self.sim_iterations
+            config.lox.projection_iterations = 3
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -240,12 +271,25 @@ class Example:
             self.state_0.clear_forces()
 
             # Apply continuous spin to first capsules
-            wp.launch(
-                kernel=spin_first_capsules_kernel,
-                dim=self.kinematic_bodies.shape[0],
-                inputs=[self.kinematic_bodies, self.first_twist_rates, self.sim_dt],
-                outputs=[self.state_0.body_q, self.state_1.body_q],
-            )
+            if self.solver_type == "lox":
+                wp.launch(
+                    kernel=spin_first_capsules_lox_kernel,
+                    dim=self.kinematic_bodies.shape[0],
+                    inputs=[self.kinematic_bodies, self.first_twist_rates, self.state_0.body_q],
+                    outputs=[self.state_0.body_qd],
+                )
+            else:
+                wp.launch(
+                    kernel=spin_first_capsules_kernel,
+                    dim=self.kinematic_bodies.shape[0],
+                    inputs=[self.kinematic_bodies, self.first_twist_rates, self.sim_dt],
+                    outputs=[
+                        self.state_0.body_q,
+                        self.state_1.body_q,
+                        self.state_0.body_qd,
+                        self.state_1.body_qd,
+                    ],
+                )
 
             # Apply forces to the model
             self.viewer.apply_forces(self.state_0)
@@ -255,7 +299,8 @@ class Example:
             if refresh_contacts:
                 self.collision_pipeline.collide(self.state_0, self.contacts)
 
-            self.solver.set_rigid_history_update(refresh_contacts)
+            if self.solver_type == "vbd":
+                self.solver.set_rigid_history_update(refresh_contacts)
             self.solver.step(
                 self.state_0,
                 self.state_1,
@@ -299,6 +344,10 @@ class Example:
             assert (np.abs(body_positions) < 1e3).all(), "Body positions too large (>1000)"
             assert (np.abs(body_velocities) < 5e2).all(), "Body velocities too large (>500)"
 
+            # Both solvers must retain the twist prescribed on the kinematic endpoints.
+            angular_speeds = np.linalg.norm(body_velocities[self.first_bodies, 3:], axis=1)
+            np.testing.assert_allclose(angular_speeds, self.first_twist_rates.numpy(), rtol=1.0e-3, atol=1.0e-4)
+
             # Test 2: Check cable connectivity (joint constraints)
             for cable_idx, cable_bodies in enumerate(self.cable_bodies_list):
                 for segment in range(len(cable_bodies) - 1):
@@ -325,8 +374,9 @@ class Example:
 
 
 if __name__ == "__main__":
-    # Parse arguments and initialize viewer
-    viewer, args = newton.examples.init()
+    parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd")
+    viewer, args = newton.examples.init(parser)
 
     # Create example and run
     newton.examples.run(Example(viewer, args), args)

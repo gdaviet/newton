@@ -117,6 +117,7 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.use_graph = bool(args.graph_capture)
         self.world_count = max(1, int(args.world_count))
+        self.solver_type = str(getattr(args, "solver", "coupled")).lower()
 
         template = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         SolverKamino.register_custom_attributes(template)
@@ -140,37 +141,43 @@ class Example:
         kamino_config = _make_kamino_config()
         kamino_config.padmm.max_iterations = args.kamino_iterations
 
-        self.solver = SolverCoupledADMM(
-            model=self.model,
-            entries=[
-                SolverCoupled.Entry(
-                    name="kamino",
-                    solver=lambda v: SolverKamino(model=v, config=kamino_config),
-                    bodies=self.kamino_bodies,
-                    joints=self.kamino_joints,
-                    configure_view=_configure_kamino_rigid_view,
-                ),
-                SolverCoupled.Entry(
-                    name="mjc",
-                    solver=lambda v: SolverMuJoCo(
-                        model=v,
-                        **{"use_mujoco_contacts": False, "njmax": 64, "nconmax": 64},
+        if self.solver_type == "coupled":
+            self.solver = SolverCoupledADMM(
+                model=self.model,
+                entries=[
+                    SolverCoupled.Entry(
+                        name="kamino",
+                        solver=lambda v: SolverKamino(model=v, config=kamino_config),
+                        bodies=self.kamino_bodies,
+                        joints=self.kamino_joints,
+                        configure_view=_configure_kamino_rigid_view,
                     ),
-                    bodies=self.mujoco_bodies,
-                    joints=self.mujoco_joints,
+                    SolverCoupled.Entry(
+                        name="mjc",
+                        solver=lambda v: SolverMuJoCo(
+                            model=v,
+                            **{"use_mujoco_contacts": False, "njmax": 64, "nconmax": 64},
+                        ),
+                        bodies=self.mujoco_bodies,
+                        joints=self.mujoco_joints,
+                    ),
+                ],
+                coupling=SolverCoupledADMM.Config(
+                    iterations=args.admm_iterations,
+                    rho=args.rho,
+                    gamma=args.gamma,
+                    baumgarte=args.baumgarte,
+                    joint_stiffness=args.joint_stiffness,
+                    joint_angular_stiffness=args.joint_stiffness,
+                    joint_damping=args.joint_damping,
+                    joint_angular_damping=args.joint_damping,
                 ),
-            ],
-            coupling=SolverCoupledADMM.Config(
-                iterations=args.admm_iterations,
-                rho=args.rho,
-                gamma=args.gamma,
-                baumgarte=args.baumgarte,
-                joint_stiffness=args.joint_stiffness,
-                joint_angular_stiffness=args.joint_stiffness,
-                joint_damping=args.joint_damping,
-                joint_angular_damping=args.joint_damping,
-            ),
-        )
+            )
+        else:
+            config = SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = args.kamino_iterations
+            self.solver = SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -178,6 +185,8 @@ class Example:
         self.contacts = self.collision_pipeline.contacts()
         self.control = self.model.control()
 
+        if self.solver_type == "lox":
+            args.coupled_view = "combined"
         newton.examples.configure_coupled_view(self, args)
         self.viewer.set_world_offsets((1.35, 1.35, 0.0))
         if isinstance(self.viewer, newton.viewer.ViewerGL):
@@ -328,11 +337,13 @@ class Example:
         self.graph = _capture_frame_graph(self.model, self.simulate, enabled=self.use_graph)
 
     def simulate(self):
-        need_state_copy = self.use_graph and self.sim_substeps % 2 == 1
+        need_state_copy = self.solver_type == "coupled" and self.use_graph and self.sim_substeps % 2 == 1
 
         for i in range(self.sim_substeps):
             self.state_0.clear_forces()
             newton.examples.apply_coupled_viewer_forces(self, self.state_0)
+            if self.solver_type == "lox":
+                self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             if need_state_copy and i == self.sim_substeps - 1:
                 self.state_0.assign(self.state_1)
@@ -370,6 +381,7 @@ class Example:
         newton.examples.add_coupled_view_args(parser)
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(world_count=4)
+        parser.add_argument("--solver", choices=("coupled", "lox"), default="coupled")
         parser.add_argument("--substeps", type=int, default=3, help="Coupled substeps per rendered frame.")
         parser.add_argument("--admm-iterations", type=int, default=2, help="ADMM iterations per coupled substep.")
         parser.add_argument("--rho", type=float, default=50.0, help="ADMM penalty parameter.")

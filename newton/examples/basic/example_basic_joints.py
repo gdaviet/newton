@@ -44,6 +44,9 @@ class Example:
         self.args = args
 
         builder = newton.ModelBuilder()
+        solver_type = getattr(args, "solver", "xpbd") if args is not None else "xpbd"
+        if solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         static_cfg = newton.ModelBuilder.ShapeConfig()
         static_cfg.density = 0.0
@@ -182,7 +185,6 @@ class Example:
         # consistent with the joint_q edits above before constructing the solver.
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.model)
 
-        solver_type = getattr(args, "solver", "xpbd") if args is not None else "xpbd"
         if solver_type == "vbd":
             self.solver = newton.solvers.SolverVBD(
                 self.model,
@@ -191,6 +193,9 @@ class Example:
                 rigid_joint_linear_ke=1.0e6,
                 rigid_joint_angular_ke=1.0e6,
             )
+        elif solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
         else:
             self.solver = newton.solvers.SolverXPBD(self.model)
 
@@ -307,7 +312,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--solver",
         type=str,
-        choices=["xpbd", "vbd"],
+        choices=["xpbd", "vbd", "lox"],
         default="xpbd",
         help="Solver backend to use.",
     )

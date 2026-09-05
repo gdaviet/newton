@@ -3978,6 +3978,7 @@ def parse_usd(
                         sdf_max_resolution=sdf_max_resolution,
                         sdf_narrow_band_range=sdf_narrow_band_range,
                         sdf_target_voxel_size=sdf_target_voxel_size,
+                        force_sdf=builder.default_shape_cfg.force_sdf,
                         sdf_texture_format=sdf_texture_format,
                         sdf_padding=sdf_padding,
                         is_hydroelastic=is_hydroelastic,

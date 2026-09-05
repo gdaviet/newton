@@ -29,11 +29,14 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.world_count = args.world_count
+        self.solver_type = str(getattr(args, "solver", "mujoco")).lower()
 
         self.viewer = viewer
 
         g1 = newton.ModelBuilder()
         newton.solvers.SolverMuJoCo.register_custom_attributes(g1)
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(g1)
         g1.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=1.0e3, limit_kd=1.0e1, friction=1e-5)
         g1.default_shape_cfg.ke = 1.0e3
         g1.default_shape_cfg.kd = 2.0e2
@@ -60,6 +63,8 @@ class Example:
         g1.approximate_meshes("bounding_box")
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         builder.replicate(g1, self.world_count)
 
         builder.default_shape_cfg.ke = 1.0e3
@@ -67,20 +72,25 @@ class Example:
         builder.add_ground_plane()
 
         self.model = builder.finalize()
-        use_mujoco_contacts = args.use_mujoco_contacts if args else False
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            use_mujoco_cpu=False,
-            solver="newton",
-            integrator="implicitfast",
-            njmax=300,
-            nconmax=150,
-            cone="elliptic",
-            impratio=100,
-            iterations=100,
-            ls_iterations=50,
-            use_mujoco_contacts=use_mujoco_contacts,
-        )
+        use_mujoco_contacts = self.solver_type == "mujoco" and bool(args.use_mujoco_contacts)
+        if self.solver_type == "mujoco":
+            self.solver = newton.solvers.SolverMuJoCo(
+                self.model,
+                use_mujoco_cpu=False,
+                solver="newton",
+                integrator="implicitfast",
+                njmax=300,
+                nconmax=150,
+                cone="elliptic",
+                impratio=100,
+                iterations=100,
+                ls_iterations=50,
+                use_mujoco_contacts=use_mujoco_contacts,
+            )
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -160,6 +170,7 @@ class Example:
         newton.examples.add_world_count_arg(parser)
         newton.examples.add_mujoco_contacts_arg(parser)
         parser.set_defaults(world_count=4)
+        parser.add_argument("--solver", choices=("mujoco", "lox"), default="mujoco")
         return parser
 
 

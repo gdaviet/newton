@@ -28,7 +28,7 @@ import newton
 import newton.examples
 import newton.ik as ik
 import newton.utils
-from newton.solvers import SolverMuJoCo, SolverVBD
+from newton.solvers import SolverKamino, SolverMuJoCo, SolverVBD
 
 # Initial Franka joint configuration (7 arm + 2 finger).
 FRANKA_Q = [
@@ -104,6 +104,7 @@ class Example:
         self.world_count = max(1, int(args.world_count))
         self.payload_segments = max(2, int(args.payload_segments))
         self.payload_radius = float(args.payload_radius)
+        self.solver_type = str(getattr(args, "solver", "coupled")).lower()
         # Working-surface height: the cable rests on it and the arm is mounted on it.
         self.surface_z = float(CABLE_CENTER[2]) - self.payload_radius
 
@@ -115,14 +116,20 @@ class Example:
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
-        self.collision_pipeline = newton.CollisionPipeline(
-            self.model,
-            broad_phase="explicit",
-            shape_pairs_filtered=self._ground_shape_pairs(),
-        )
+        if self.solver_type == "coupled":
+            self.collision_pipeline = newton.CollisionPipeline(
+                self.model,
+                broad_phase="explicit",
+                shape_pairs_filtered=self._ground_shape_pairs(),
+            )
+        else:
+            self.collision_pipeline = newton.CollisionPipeline(self.model, broad_phase="explicit")
         self.contacts = self.collision_pipeline.contacts()
-        self.solver.prepare_contacts(self.contacts)
+        if self.solver_type == "coupled":
+            self.solver.prepare_contacts(self.contacts)
 
+        if self.solver_type == "lox":
+            args.coupled_view = "combined"
         newton.examples.configure_coupled_view(self, args)
         if self.world_count > 1:
             self.viewer.set_world_offsets((1.1, 1.1, 0.0))
@@ -159,6 +166,8 @@ class Example:
         template.rigid_gap = 0.01
         SolverMuJoCo.register_custom_attributes(template)
         SolverVBD.register_custom_attributes(template)
+        if self.solver_type == "lox":
+            SolverKamino.register_custom_attributes(template)
         self._emit_template(template)
 
         bodies_per_world = template.body_count
@@ -166,6 +175,8 @@ class Example:
         shapes_per_world = template.shape_count
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        if self.solver_type == "lox":
+            SolverKamino.register_custom_attributes(builder)
         builder.rigid_gap = template.rigid_gap
         builder.replicate(template, world_count=self.world_count)
         self._expand_world_indices(bodies_per_world, joints_per_world, shapes_per_world)
@@ -292,6 +303,14 @@ class Example:
     # Solvers
     # ------------------------------------------------------------------
     def _build_solvers(self, args):
+        if self.solver_type == "lox":
+            config = SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.use_fk_solver = False
+            config.lox.max_iterations = int(args.lox_iterations)
+            self.solver = SolverKamino(self.model, config=config)
+            return
+
         mujoco_contact_budget = max(64, 16 * self.world_count)
         self.solver = SolverCoupledProxy(
             model=self.model,
@@ -530,6 +549,8 @@ class Example:
         newton.examples.add_coupled_view_args(parser)
         newton.examples.add_world_count_arg(parser)
         parser.add_argument("--substeps", type=int, default=10, help="Coupled substeps per rendered frame.")
+        parser.add_argument("--solver", choices=("coupled", "lox"), default="coupled")
+        parser.add_argument("--lox-iterations", type=int, default=40, help="LOX iterations per substep.")
         parser.add_argument("--proxy-iterations", type=int, default=1, help="Proxy relaxation passes per substep.")
         parser.add_argument(
             "--mass-scale",

@@ -7,6 +7,7 @@
 # Demonstrates nut/bolt mesh collision using SDF (Signed Distance Field).
 #
 # Command: python -m newton.examples nut_bolt_sdf
+#          python -m newton.examples nut_bolt_sdf --solver lox
 #
 ###########################################################################
 
@@ -127,6 +128,8 @@ class Example:
         world_builder = self._build_nut_bolt_scene()
 
         main_scene = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(main_scene)
         main_scene.default_shape_cfg.gap = 0.001 * self.scene_scale
         # Add ground plane at z = ground_plane_offset.
         # For plane equation n·x + d = 0, with n=(0,0,1): z + d = 0, so z = -d.
@@ -172,8 +175,13 @@ class Example:
                 ls_iterations=100,
                 impratio=1.0,
             )
+        elif self.solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = args.lox_iterations
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
         else:
-            raise ValueError(f"Unknown solver type: {self.solver_type}. Choose from 'xpbd' or 'mujoco'.")
+            raise ValueError(f"Unknown solver type: {self.solver_type}.")
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -392,10 +400,11 @@ class Example:
         parser.add_argument(
             "--solver",
             type=str,
-            choices=["xpbd", "mujoco"],
+            choices=["xpbd", "mujoco", "lox"],
             default="mujoco",
-            help="Solver to use: 'xpbd' (Extended Position-Based Dynamics) or 'mujoco' (MuJoCo constraint solver).",
+            help="Dynamics solver.",
         )
+        parser.add_argument("--lox-iterations", type=int, default=20, help="LOX splitting iterations per substep.")
         parser.add_argument("--num-per-world", type=int, default=1, help="Number of assemblies per world.")
         return parser
 

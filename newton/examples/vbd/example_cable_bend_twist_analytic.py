@@ -52,6 +52,7 @@ import warp as wp
 import newton
 import newton.examples
 from newton.examples.vbd._viewer import com_from_node, node_xyz, set_viewer_camera
+from newton.math import quat_velocity
 
 
 @wp.kernel
@@ -59,14 +60,43 @@ def _set_kinematic_targets_kernel(
     body_indices: wp.array[wp.int32],
     positions: wp.array[wp.vec3],
     rotations: wp.array[wp.quat],
+    dt: float,
     body_q0: wp.array[wp.transform],
     body_q1: wp.array[wp.transform],
+    body_qd0: wp.array[wp.spatial_vector],
+    body_qd1: wp.array[wp.spatial_vector],
 ):
     tid = wp.tid()
     b = body_indices[tid]
     T = wp.transform(positions[tid], rotations[tid])
+    T_prev = body_q0[b]
+    twist = wp.spatial_vector(
+        (positions[tid] - wp.transform_get_translation(T_prev)) / dt,
+        quat_velocity(rotations[tid], wp.transform_get_rotation(T_prev), dt),
+    )
     body_q0[b] = T
     body_q1[b] = T
+    body_qd0[b] = twist
+    body_qd1[b] = twist
+
+
+@wp.kernel
+def _set_kinematic_targets_lox_kernel(
+    body_indices: wp.array[wp.int32],
+    positions: wp.array[wp.vec3],
+    rotations: wp.array[wp.quat],
+    dt: float,
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Set the velocity that advances a prescribed body to its target in one step."""
+    tid = wp.tid()
+    body = body_indices[tid]
+    current = body_q[body]
+    body_qd[body] = wp.spatial_vector(
+        (positions[tid] - wp.transform_get_translation(current)) / dt,
+        quat_velocity(rotations[tid], wp.transform_get_rotation(current), dt),
+    )
 
 
 class Example:
@@ -93,6 +123,7 @@ class Example:
     def __init__(self, viewer, args=None):
         self.viewer = viewer
         self.args = args
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
 
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -105,6 +136,8 @@ class Example:
         self.num_joints = self.NUM_ELEMENTS - 1
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         self.bend_cases = []
         self.twist_cases = []
@@ -124,9 +157,9 @@ class Example:
                     twist_stiffness=1000.0,
                     label=f"analytic_bend_{int(math.degrees(target))}",
                 )
+                builder.add_articulation(joints, label=f"analytic_bend_articulation_{i}")
                 self._make_kinematic(builder, bodies[0])
                 self._make_kinematic(builder, bodies[-1])
-                builder.add_articulation(joints, label=f"analytic_bend_articulation_{i}")
                 self.bend_cases.append({"target": target, "bodies": bodies, "tip": bodies[-1]})
 
         if mode in ("all", "twist", "twist_max"):
@@ -141,15 +174,20 @@ class Example:
                     twist_stiffness=self.TWIST_STIFFNESS,
                     label=f"analytic_twist_{int(math.degrees(target))}",
                 )
+                builder.add_articulation(joints, label=f"analytic_twist_articulation_{i}")
                 self._make_kinematic(builder, bodies[0])
                 self._make_kinematic(builder, bodies[-1])
-                builder.add_articulation(joints, label=f"analytic_twist_articulation_{i}")
                 self.twist_cases.append({"target": target, "bodies": bodies, "tip": bodies[-1]})
 
         builder.color()
         self.model = builder.finalize()
 
-        self.solver = newton.solvers.SolverVBD(self.model, iterations=self.sim_iterations, rigid_compliant_alm=True)
+        if self.solver_type == "vbd":
+            self.solver = newton.solvers.SolverVBD(self.model, iterations=self.sim_iterations, rigid_compliant_alm=True)
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.lox.max_iterations = self.sim_iterations
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
@@ -216,6 +254,7 @@ class Example:
         return list(bodies), list(joints)
 
     def _make_kinematic(self, builder, body_index: int) -> None:
+        builder.body_flags[body_index] = int(newton.BodyFlags.KINEMATIC)
         builder.body_mass[body_index] = 0.0
         builder.body_inv_mass[body_index] = 0.0
         builder.body_inertia[body_index] = wp.mat33(0.0)
@@ -318,12 +357,31 @@ class Example:
     def _simulate_substeps(self) -> None:
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
-            wp.launch(
-                _set_kinematic_targets_kernel,
-                dim=len(self._kinematic_pos_np),
-                inputs=[self._kinematic_indices, self._kinematic_pos, self._kinematic_rot],
-                outputs=[self.state_0.body_q, self.state_1.body_q],
-            )
+            if self.solver_type == "lox":
+                wp.launch(
+                    _set_kinematic_targets_lox_kernel,
+                    dim=len(self._kinematic_pos_np),
+                    inputs=[
+                        self._kinematic_indices,
+                        self._kinematic_pos,
+                        self._kinematic_rot,
+                        self.sim_dt,
+                        self.state_0.body_q,
+                    ],
+                    outputs=[self.state_0.body_qd],
+                )
+            else:
+                wp.launch(
+                    _set_kinematic_targets_kernel,
+                    dim=len(self._kinematic_pos_np),
+                    inputs=[self._kinematic_indices, self._kinematic_pos, self._kinematic_rot, self.sim_dt],
+                    outputs=[
+                        self.state_0.body_q,
+                        self.state_1.body_q,
+                        self.state_0.body_qd,
+                        self.state_1.body_qd,
+                    ],
+                )
             self.viewer.apply_forces(self.state_0)
             self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
@@ -535,6 +593,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd")
     parser.add_argument(
         "--cable-analytic-mode",
         metavar="MODE",

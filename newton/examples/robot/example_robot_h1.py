@@ -8,6 +8,7 @@
 # from a USD file using newton.ModelBuilder.add_usd().
 #
 # Command: python -m newton.examples robot_h1 --world-count 16
+#          python -m newton.examples robot_h1 --dynamics-backend lox
 #
 ###########################################################################
 
@@ -30,13 +31,17 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.world_count = args.world_count
+        self.dynamics_backend = args.dynamics_backend
 
         self.viewer = viewer
 
         self.device = wp.get_device()
 
         h1 = newton.ModelBuilder()
-        newton.solvers.SolverMuJoCo.register_custom_attributes(h1)
+        if self.dynamics_backend == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(h1)
+        else:
+            newton.solvers.SolverMuJoCo.register_custom_attributes(h1)
         h1.default_joint_cfg = newton.ModelBuilder.JointDofConfig(limit_ke=1.0e3, limit_kd=1.0e1, friction=1e-5)
         h1.default_shape_cfg.ke = 2.0e3
         h1.default_shape_cfg.kd = 1.0e2
@@ -66,15 +71,29 @@ class Example:
         builder.add_ground_plane()
 
         self.model = builder.finalize()
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.model)
         use_mujoco_contacts = args.use_mujoco_contacts if args else False
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            iterations=100,
-            ls_iterations=50,
-            njmax=100,
-            nconmax=210,
-            use_mujoco_contacts=use_mujoco_contacts,
-        )
+        if self.dynamics_backend == "lox":
+            if use_mujoco_contacts:
+                raise ValueError("--use-mujoco-contacts requires --dynamics-backend mujoco")
+            solver_config = newton.solvers.SolverKamino.Config.from_model(
+                self.model,
+                dynamics_solver="lox",
+            )
+            solver_config.use_collision_detector = True
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+            penalty_scales = self.solver.lox_joint_penalty_scale_seed(self.sim_dt)
+            formatted_scales = ", ".join(f"{scale:.3g}" for scale in penalty_scales)
+            print(f"[INFO] Seeded LOX joint penalty scales per world: [{formatted_scales}]")
+        else:
+            self.solver = newton.solvers.SolverMuJoCo(
+                self.model,
+                iterations=100,
+                ls_iterations=50,
+                njmax=100,
+                nconmax=210,
+                use_mujoco_contacts=use_mujoco_contacts,
+            )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -82,9 +101,15 @@ class Example:
 
         # Evaluate forward kinematics for collision detection
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        self._initial_joint_q = wp.clone(self.state_0.joint_q)
+        self._initial_joint_qd = wp.clone(self.state_0.joint_qd)
 
         self.use_mujoco_contacts = use_mujoco_contacts
-        if use_mujoco_contacts:
+        if self.dynamics_backend == "lox":
+            self.collision_pipeline = None
+            self.contacts = newton.Contacts(self.solver.get_max_contact_count(), 0)
+        elif use_mujoco_contacts:
+            self.collision_pipeline = None
             self.contacts = newton.Contacts(self.solver.get_max_contact_count(), 0)
         else:
             self.collision_pipeline = newton.CollisionPipeline(self.model)
@@ -97,12 +122,18 @@ class Example:
 
     def capture(self):
         self.graph = None
+        if self.dynamics_backend == "lox":
+            # Compile and allocate lazy solver data before APIC/CUDA capture.
+            self.simulate()
+            self.reset()
+        if not wp.get_device().is_cuda:
+            return
         with wp.ScopedCapture() as capture:
             self.simulate()
         self.graph = capture.graph
 
     def simulate(self):
-        if not self.use_mujoco_contacts:
+        if self.dynamics_backend != "lox" and not self.use_mujoco_contacts:
             self.collision_pipeline.collide(self.state_0, self.contacts)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -110,13 +141,21 @@ class Example:
             # apply forces to the model for picking, wind, etc
             self.viewer.apply_forces(self.state_0)
 
-            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            contacts = None if self.dynamics_backend == "lox" else self.contacts
+            self.solver.step(self.state_0, self.state_1, self.control, contacts, self.sim_dt)
 
             # swap states
             self.state_0, self.state_1 = self.state_1, self.state_0
 
-        if self.use_mujoco_contacts:
+        if self.dynamics_backend == "lox" or self.use_mujoco_contacts:
             self.solver.update_contacts(self.contacts, self.state_0)
+
+    def reset(self):
+        wp.copy(self.state_0.joint_q, self._initial_joint_q)
+        wp.copy(self.state_0.joint_qd, self._initial_joint_qd)
+        newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
+        self.solver.reset(self.state_0)
+        self.state_1.assign(self.state_0)
 
     def step(self):
         if self.graph:
@@ -139,12 +178,13 @@ class Example:
             "all bodies are above the ground",
             lambda q, qd: q[2] > 0.0,
         )
-        newton.examples.test_body_state(
-            self.model,
-            self.state_0,
-            "all body velocities are small",
-            lambda q, qd: max(abs(qd)) < 5e-3,
-        )
+        if self.dynamics_backend == "mujoco":
+            newton.examples.test_body_state(
+                self.model,
+                self.state_0,
+                "all body velocities are small",
+                lambda q, qd: max(abs(qd)) < 5e-3,
+            )
 
     @staticmethod
     def create_parser():
@@ -152,6 +192,12 @@ class Example:
         newton.examples.add_world_count_arg(parser)
         newton.examples.add_mujoco_contacts_arg(parser)
         parser.set_defaults(world_count=4)
+        parser.add_argument(
+            "--dynamics-backend",
+            choices=("mujoco", "lox"),
+            default="mujoco",
+            help="Rigid-body dynamics backend.",
+        )
         return parser
 
 

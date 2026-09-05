@@ -45,6 +45,8 @@ def _spin_roots_kernel(
     dt: float,
     body_q0: wp.array[wp.transform],
     body_q1: wp.array[wp.transform],
+    body_qd0: wp.array[wp.spatial_vector],
+    body_qd1: wp.array[wp.spatial_vector],
 ):
     tid = wp.tid()
     body_id = body_indices[tid]
@@ -55,8 +57,26 @@ def _spin_roots_kernel(
     axis_world = wp.quat_rotate(rot, wp.vec3(0.0, 0.0, 1.0))
     dq = wp.quat_from_axis_angle(axis_world, twist_rate[0] * dt)
     X_new = wp.transform(pos, wp.mul(dq, rot))
+    twist = wp.spatial_vector(wp.vec3(0.0), axis_world * twist_rate[0])
     body_q0[body_id] = X_new
     body_q1[body_id] = X_new
+    body_qd0[body_id] = twist
+    body_qd1[body_id] = twist
+
+
+@wp.kernel
+def _spin_roots_lox_kernel(
+    body_indices: wp.array[wp.int32],
+    twist_rate: wp.array[float],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Set prescribed root twists integrated by LOX."""
+    tid = wp.tid()
+    body_id = body_indices[tid]
+    rotation = wp.transform_get_rotation(body_q[body_id])
+    axis_world = wp.quat_rotate(rotation, wp.vec3(0.0, 0.0, 1.0))
+    body_qd[body_id] = wp.spatial_vector(wp.vec3(0.0), axis_world * twist_rate[0])
 
 
 class Example:
@@ -75,6 +95,7 @@ class Example:
     def __init__(self, viewer, args=None):
         self.viewer = viewer
         self.args = args
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
 
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -86,6 +107,8 @@ class Example:
         self.cases: list[dict] = []
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         path_builders = [
             ("straight", self._straight_points(1.3)),
@@ -116,6 +139,8 @@ class Example:
                 builder.body_inv_inertia[body] = wp.mat33(0.0)
 
             builder.add_articulation(list(joints), label=f"twist_transfer_{label}_articulation")
+            for body in (root_body, tip_body):
+                builder.body_flags[body] = int(newton.BodyFlags.KINEMATIC)
             self.cases.append(
                 {
                     "label": label,
@@ -126,7 +151,12 @@ class Example:
 
         builder.color()
         self.model = builder.finalize()
-        self.solver = newton.solvers.SolverVBD(self.model, iterations=self.sim_iterations, rigid_compliant_alm=True)
+        if self.solver_type == "vbd":
+            self.solver = newton.solvers.SolverVBD(self.model, iterations=self.sim_iterations, rigid_compliant_alm=True)
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.lox.max_iterations = self.sim_iterations
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -246,12 +276,25 @@ class Example:
     def _simulate_substeps(self) -> None:
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
-            wp.launch(
-                _spin_roots_kernel,
-                dim=len(self.cases),
-                inputs=[self._root_indices, self._twist_rate_wp, self.sim_dt],
-                outputs=[self.state_0.body_q, self.state_1.body_q],
-            )
+            if self.solver_type == "lox":
+                wp.launch(
+                    _spin_roots_lox_kernel,
+                    dim=len(self.cases),
+                    inputs=[self._root_indices, self._twist_rate_wp, self.state_0.body_q],
+                    outputs=[self.state_0.body_qd],
+                )
+            else:
+                wp.launch(
+                    _spin_roots_kernel,
+                    dim=len(self.cases),
+                    inputs=[self._root_indices, self._twist_rate_wp, self.sim_dt],
+                    outputs=[
+                        self.state_0.body_q,
+                        self.state_1.body_q,
+                        self.state_0.body_qd,
+                        self.state_1.body_qd,
+                    ],
+                )
             self.viewer.apply_forces(self.state_0)
             self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
@@ -392,6 +435,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd")
     parser.set_defaults(num_frames=int(60 * (Example.RAMP_TIME + Example.HOLD_TIME)) + 30)
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

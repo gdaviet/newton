@@ -33,6 +33,7 @@ import warp as wp
 import newton
 import newton.examples
 from newton.examples.vbd._viewer import node_xyz, set_viewer_camera
+from newton.math import quat_velocity
 
 
 @wp.kernel
@@ -44,18 +45,67 @@ def _drive_tip_twist_kernel(
     tip_rest_rot: wp.quat,
     twist_angles: wp.array[wp.float32],
     twist_index: int,
+    dt: float,
     body_q0: wp.array[wp.transform],
     body_q1: wp.array[wp.transform],
+    body_qd0: wp.array[wp.spatial_vector],
+    body_qd1: wp.array[wp.spatial_vector],
 ):
     twist_angle = twist_angles[twist_index]
     axis_world = wp.quat_rotate(tip_rest_rot, wp.vec3(0.0, 0.0, 1.0))
     twist_rot = wp.quat_from_axis_angle(axis_world, twist_angle)
     tip_pose = wp.transform(tip_pos, wp.mul(twist_rot, tip_rest_rot))
+    root_pose_prev = body_q0[root_body]
+    tip_pose_prev = body_q0[tip_body]
+    root_twist = wp.spatial_vector(
+        (wp.transform_get_translation(root_pose) - wp.transform_get_translation(root_pose_prev)) / dt,
+        quat_velocity(
+            wp.transform_get_rotation(root_pose),
+            wp.transform_get_rotation(root_pose_prev),
+            dt,
+        ),
+    )
+    tip_twist = wp.spatial_vector(
+        (tip_pos - wp.transform_get_translation(tip_pose_prev)) / dt,
+        quat_velocity(wp.transform_get_rotation(tip_pose), wp.transform_get_rotation(tip_pose_prev), dt),
+    )
 
     body_q0[root_body] = root_pose
     body_q1[root_body] = root_pose
     body_q0[tip_body] = tip_pose
     body_q1[tip_body] = tip_pose
+    body_qd0[root_body] = root_twist
+    body_qd1[root_body] = root_twist
+    body_qd0[tip_body] = tip_twist
+    body_qd1[tip_body] = tip_twist
+
+
+@wp.kernel
+def _drive_tip_twist_lox_kernel(
+    root_body: int,
+    tip_body: int,
+    root_pose: wp.transform,
+    tip_pos: wp.vec3,
+    tip_rest_rot: wp.quat,
+    twist_angles: wp.array[wp.float32],
+    twist_index: int,
+    dt: float,
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Set current endpoint poses and the twist LOX integrates to the next target."""
+    axis_world = wp.quat_rotate(tip_rest_rot, wp.vec3(0.0, 0.0, 1.0))
+    angle_now = twist_angles[twist_index]
+    angle_next = twist_angles[twist_index + 1]
+    rotation_now = wp.mul(wp.quat_from_axis_angle(axis_world, angle_now), tip_rest_rot)
+    rotation_next = wp.mul(wp.quat_from_axis_angle(axis_world, angle_next), tip_rest_rot)
+    body_q[root_body] = root_pose
+    body_q[tip_body] = wp.transform(tip_pos, rotation_now)
+    body_qd[root_body] = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
+    body_qd[tip_body] = wp.spatial_vector(
+        wp.vec3(0.0),
+        quat_velocity(rotation_next, rotation_now, dt),
+    )
 
 
 # The public example is fixed. Report scripts can still pass these attributes
@@ -118,6 +168,7 @@ class Example:
     def __init__(self, viewer, args=None):
         self.viewer = viewer
         self.args = args
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
 
         params = self._resolve_params(args)
         self.bend_stiffness = params["bend_stiffness"]
@@ -153,6 +204,8 @@ class Example:
         points = [wp.vec3(*p) for p in points_np]
 
         builder = newton.ModelBuilder(gravity=self.GRAVITY)
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         shape_cfg = None
         if self.contact_enabled:
             shape_cfg = newton.ModelBuilder.ShapeConfig(
@@ -189,6 +242,8 @@ class Example:
             builder.body_inertia[body] = wp.mat33(0.0)
             builder.body_inv_inertia[body] = wp.mat33(0.0)
         builder.add_articulation(self.joints, label="twist_buckling_articulation")
+        for body in (self.root_body, self.tip_body):
+            builder.body_flags[body] = int(newton.BodyFlags.KINEMATIC)
 
         builder.color()
         self.model = builder.finalize()
@@ -196,13 +251,20 @@ class Example:
         contact_matching = "latest" if contact_history else "disabled"
         self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching=contact_matching)
         self.contacts = self.collision_pipeline.contacts()
-        self.solver = newton.solvers.SolverVBD(
-            self.model,
-            iterations=self.sim_iterations,
-            rigid_compliant_alm=True,
-            rigid_contact_history=contact_history,
-            rigid_body_contact_buffer_size=256,
-        )
+        if self.solver_type == "vbd":
+            self.solver = newton.solvers.SolverVBD(
+                self.model,
+                iterations=self.sim_iterations,
+                rigid_compliant_alm=True,
+                rigid_contact_history=contact_history,
+                rigid_body_contact_buffer_size=256,
+            )
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = self.sim_iterations
+            config.lox.projection_iterations = 3
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -227,7 +289,7 @@ class Example:
         body_q_np[self.bodies[mid], 1] += self.seed_offset
         self.state_0.body_q.assign(body_q_np)
         self.state_1.body_q.assign(body_q_np)
-        self.twist_angles_np = np.zeros(self.sim_substeps, dtype=np.float32)
+        self.twist_angles_np = np.zeros(self.sim_substeps + 1, dtype=np.float32)
         self.twist_angles = wp.array(self.twist_angles_np, dtype=wp.float32, device=self.model.device)
 
         self.viewer.set_model(self.model)
@@ -299,7 +361,7 @@ class Example:
         return self.target_twist, "twist hold"
 
     def _update_twist_angles(self) -> None:
-        for i in range(self.sim_substeps):
+        for i in range(self.sim_substeps + 1):
             sub_t = self.sim_time + i * self.sim_dt
             self.twist_angles_np[i] = self._command(sub_t)[0]
         self.twist_angles.assign(self.twist_angles_np)
@@ -308,21 +370,45 @@ class Example:
         if twist_angle is not None:
             self.twist_angles_np[0] = twist_angle
             self.twist_angles.assign(self.twist_angles_np)
-        wp.launch(
-            _drive_tip_twist_kernel,
-            dim=1,
-            inputs=[
-                self.root_body,
-                self.tip_body,
-                self.root_pose,
-                wp.vec3(*self.tip_rest_pos),
-                self.tip_rest_rot,
-                self.twist_angles,
-                int(substep_index),
-            ],
-            outputs=[self.state_0.body_q, self.state_1.body_q],
-            device=self.model.device,
-        )
+        if self.solver_type == "lox":
+            wp.launch(
+                _drive_tip_twist_lox_kernel,
+                dim=1,
+                inputs=[
+                    self.root_body,
+                    self.tip_body,
+                    self.root_pose,
+                    wp.vec3(*self.tip_rest_pos),
+                    self.tip_rest_rot,
+                    self.twist_angles,
+                    int(substep_index),
+                    self.sim_dt,
+                ],
+                outputs=[self.state_0.body_q, self.state_0.body_qd],
+                device=self.model.device,
+            )
+        else:
+            wp.launch(
+                _drive_tip_twist_kernel,
+                dim=1,
+                inputs=[
+                    self.root_body,
+                    self.tip_body,
+                    self.root_pose,
+                    wp.vec3(*self.tip_rest_pos),
+                    self.tip_rest_rot,
+                    self.twist_angles,
+                    int(substep_index),
+                    self.sim_dt,
+                ],
+                outputs=[
+                    self.state_0.body_q,
+                    self.state_1.body_q,
+                    self.state_0.body_qd,
+                    self.state_1.body_qd,
+                ],
+                device=self.model.device,
+            )
 
     def simulate(self) -> None:
         for i in range(self.sim_substeps):
@@ -331,7 +417,8 @@ class Example:
             self.viewer.apply_forces(self.state_0)
             if self.contact_enabled:
                 self.collision_pipeline.collide(self.state_0, self.contacts)
-            self.solver.set_rigid_history_update(True)
+            if self.solver_type == "vbd":
+                self.solver.set_rigid_history_update(True)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
@@ -580,6 +667,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd")
     parser.set_defaults(num_frames=int(Example.FPS * Example.TOTAL_TIME))
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

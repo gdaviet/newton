@@ -32,6 +32,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.math import quat_velocity
 
 
 @wp.kernel
@@ -43,8 +44,11 @@ def _drive_endpoints_kernel(
     root_rest_rot: wp.quat,
     tip_rest_rot: wp.quat,
     twist_angle: wp.array[wp.float32],
+    dt: float,
     body_q0: wp.array[wp.transform],
     body_q1: wp.array[wp.transform],
+    body_qd0: wp.array[wp.spatial_vector],
+    body_qd1: wp.array[wp.spatial_vector],
 ):
     # Counter-twist: split the total end-to-end twist symmetrically. The angle
     # lives in a device array so the simulate() loop can be captured into a
@@ -56,11 +60,56 @@ def _drive_endpoints_kernel(
     tip_rot = wp.mul(wp.quat_from_axis_angle(tip_axis, 0.5 * angle), tip_rest_rot)
     root_pose = wp.transform(root_pos, root_rot)
     tip_pose = wp.transform(tip_pos, tip_rot)
+    root_pose_prev = body_q0[root_body]
+    tip_pose_prev = body_q0[tip_body]
+    root_twist = wp.spatial_vector(
+        (root_pos - wp.transform_get_translation(root_pose_prev)) / dt,
+        quat_velocity(root_rot, wp.transform_get_rotation(root_pose_prev), dt),
+    )
+    tip_twist = wp.spatial_vector(
+        (tip_pos - wp.transform_get_translation(tip_pose_prev)) / dt,
+        quat_velocity(tip_rot, wp.transform_get_rotation(tip_pose_prev), dt),
+    )
 
     body_q0[root_body] = root_pose
     body_q1[root_body] = root_pose
     body_q0[tip_body] = tip_pose
     body_q1[tip_body] = tip_pose
+    body_qd0[root_body] = root_twist
+    body_qd1[root_body] = root_twist
+    body_qd0[tip_body] = tip_twist
+    body_qd1[tip_body] = tip_twist
+
+
+@wp.kernel
+def _drive_endpoints_lox_kernel(
+    root_body: int,
+    tip_body: int,
+    root_pos: wp.vec3,
+    tip_pos: wp.vec3,
+    root_rest_rot: wp.quat,
+    tip_rest_rot: wp.quat,
+    twist_angle: wp.array[wp.float32],
+    dt: float,
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Set velocities that advance prescribed endpoints to their targets in one step."""
+    angle = twist_angle[0]
+    root_axis = wp.quat_rotate(root_rest_rot, wp.vec3(0.0, 0.0, 1.0))
+    tip_axis = wp.quat_rotate(tip_rest_rot, wp.vec3(0.0, 0.0, 1.0))
+    root_rot = wp.mul(wp.quat_from_axis_angle(root_axis, -0.5 * angle), root_rest_rot)
+    tip_rot = wp.mul(wp.quat_from_axis_angle(tip_axis, 0.5 * angle), tip_rest_rot)
+    root_pose = body_q[root_body]
+    tip_pose = body_q[tip_body]
+    body_qd[root_body] = wp.spatial_vector(
+        (root_pos - wp.transform_get_translation(root_pose)) / dt,
+        quat_velocity(root_rot, wp.transform_get_rotation(root_pose), dt),
+    )
+    body_qd[tip_body] = wp.spatial_vector(
+        (tip_pos - wp.transform_get_translation(tip_pose)) / dt,
+        quat_velocity(tip_rot, wp.transform_get_rotation(tip_pose), dt),
+    )
 
 
 class Example:
@@ -104,6 +153,7 @@ class Example:
     def __init__(self, viewer, args=None):
         self.viewer = viewer
         self.args = args
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
 
         self.fps = self.FPS
         self.frame_dt = 1.0 / self.fps
@@ -129,6 +179,8 @@ class Example:
 
         points = [wp.vec3(*p) for p in nodes]
         builder = newton.ModelBuilder(gravity=self.GRAVITY)
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         shape_cfg = newton.ModelBuilder.ShapeConfig(
             ke=self.CONTACT_STIFFNESS,
             kd=self.CONTACT_DAMPING,
@@ -161,19 +213,28 @@ class Example:
             builder.body_inertia[body] = wp.mat33(0.0)
             builder.body_inv_inertia[body] = wp.mat33(0.0)
         builder.add_articulation(self.joints, label="plectoneme_articulation")
+        for body in (self.root_body, self.tip_body):
+            builder.body_flags[body] = int(newton.BodyFlags.KINEMATIC)
 
         builder.color()
         self.model = builder.finalize()
 
         self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="latest")
         self.contacts = self.collision_pipeline.contacts()
-        self.solver = newton.solvers.SolverVBD(
-            self.model,
-            iterations=self.sim_iterations,
-            rigid_compliant_alm=True,
-            rigid_contact_history=True,
-            rigid_body_contact_buffer_size=1024,
-        )
+        if self.solver_type == "vbd":
+            self.solver = newton.solvers.SolverVBD(
+                self.model,
+                iterations=self.sim_iterations,
+                rigid_compliant_alm=True,
+                rigid_contact_history=True,
+                rigid_body_contact_buffer_size=1024,
+            )
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = self.sim_iterations
+            config.lox.projection_iterations = 3
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -242,21 +303,46 @@ class Example:
         return self.target_twist
 
     def _apply_command(self) -> None:
-        wp.launch(
-            _drive_endpoints_kernel,
-            dim=1,
-            inputs=[
-                self.root_body,
-                self.tip_body,
-                wp.vec3(*self.root_rest_pos),
-                wp.vec3(*self.tip_rest_pos),
-                self.root_rest_rot,
-                self.tip_rest_rot,
-                self.twist_angle,
-            ],
-            outputs=[self.state_0.body_q, self.state_1.body_q],
-            device=self.model.device,
-        )
+        if self.solver_type == "lox":
+            wp.launch(
+                _drive_endpoints_lox_kernel,
+                dim=1,
+                inputs=[
+                    self.root_body,
+                    self.tip_body,
+                    wp.vec3(*self.root_rest_pos),
+                    wp.vec3(*self.tip_rest_pos),
+                    self.root_rest_rot,
+                    self.tip_rest_rot,
+                    self.twist_angle,
+                    self.sim_dt,
+                    self.state_0.body_q,
+                ],
+                outputs=[self.state_0.body_qd],
+                device=self.model.device,
+            )
+        else:
+            wp.launch(
+                _drive_endpoints_kernel,
+                dim=1,
+                inputs=[
+                    self.root_body,
+                    self.tip_body,
+                    wp.vec3(*self.root_rest_pos),
+                    wp.vec3(*self.tip_rest_pos),
+                    self.root_rest_rot,
+                    self.tip_rest_rot,
+                    self.twist_angle,
+                    self.sim_dt,
+                ],
+                outputs=[
+                    self.state_0.body_q,
+                    self.state_1.body_q,
+                    self.state_0.body_qd,
+                    self.state_1.body_qd,
+                ],
+                device=self.model.device,
+            )
 
     # ------------------------------------------------------------------
     # Simulation loop
@@ -276,7 +362,8 @@ class Example:
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
             self.collision_pipeline.collide(self.state_0, self.contacts)
-            self.solver.set_rigid_history_update(True)
+            if self.solver_type == "vbd":
+                self.solver.set_rigid_history_update(True)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
@@ -313,6 +400,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd")
     parser.add_argument("--iterations", dest="iterations", type=int, default=None)
     parser.add_argument("--substeps", dest="substeps", type=int, default=None)
     parser.set_defaults(num_frames=int(Example.FPS * Example.TOTAL_TIME))

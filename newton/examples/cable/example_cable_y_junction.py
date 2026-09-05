@@ -9,9 +9,10 @@
 #
 # Run interactively:
 #   uv run --extra examples python -m newton.examples.cable.example_cable_y_junction
+#   uv run --extra examples python -m newton.examples.cable.example_cable_y_junction --solver lox
 #
 # Run as a test:
-#   uv run --extra examples python -m newton.examples.cable.example_cable_y_junction --test --viewer null
+#   uv run --extra examples python -m newton.examples.cable.example_cable_y_junction --solver lox --test --viewer null
 #
 ###########################################################################
 
@@ -40,12 +41,15 @@ class Example:
     def __init__(self, viewer, args):
         self.viewer = viewer
         self.args = args
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
 
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 20
-        self.sim_iterations = 5
+        default_substeps = 4 if self.solver_type == "lox" else 20
+        default_iterations = 40 if self.solver_type == "lox" else 5
+        self.sim_substeps = int(getattr(args, "substeps", None) or default_substeps)
+        self.sim_iterations = int(getattr(args, "iterations", None) or default_iterations)
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         # Cable parameters.
@@ -59,6 +63,8 @@ class Example:
         bend_damping = 1.0e3
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         builder.rigid_gap = contact_gap
         builder.default_shape_cfg.ke = 1.0e4
         builder.default_shape_cfg.kd = 0.0
@@ -102,10 +108,19 @@ class Example:
         tip_edge_idx = num_segments_per_branch - 1
         pinned_body = int(self.graph_bodies[tip_edge_idx])
         self.pinned_body = pinned_body
-        builder.body_mass[pinned_body] = 0.0
-        builder.body_inv_mass[pinned_body] = 0.0
-        builder.body_inertia[pinned_body] = wp.mat33(0.0)
-        builder.body_inv_inertia[pinned_body] = wp.mat33(0.0)
+        if self.solver_type == "lox":
+            builder.add_joint_fixed(
+                parent=-1,
+                child=pinned_body,
+                parent_xform=builder.body_q[pinned_body],
+                child_xform=wp.transform_identity(),
+                label="pinned_tip",
+            )
+        else:
+            builder.body_mass[pinned_body] = 0.0
+            builder.body_inv_mass[pinned_body] = 0.0
+            builder.body_inertia[pinned_body] = wp.mat33(0.0)
+            builder.body_inv_inertia[pinned_body] = wp.mat33(0.0)
 
         if getattr(args, "ground", True):
             builder.add_ground_plane()
@@ -116,11 +131,17 @@ class Example:
         self.model.set_gravity((0.0, 0.0, float(getattr(args, "gravity_z", -9.81))))
 
         self.collision_pipeline = newton.CollisionPipeline(self.model)
-        self.solver = newton.solvers.SolverVBD(
-            self.model,
-            iterations=self.sim_iterations,
-            rigid_compliant_alm=True,
-        )
+        if self.solver_type == "vbd":
+            self.solver = newton.solvers.SolverVBD(
+                self.model,
+                iterations=self.sim_iterations,
+                rigid_compliant_alm=True,
+            )
+        else:
+            config = newton.solvers.SolverKamino.Config(dynamics_solver="lox")
+            config.lox.max_iterations = self.sim_iterations
+            config.lox.projection_iterations = 5
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -227,7 +248,16 @@ class Example:
         if np.max(np.abs(q_now[0:3] - self.pinned_body_q0[0:3])) > 1.0e-4:
             raise ValueError("Pinned tip body moved unexpectedly.")
 
+    @staticmethod
+    def create_parser():
+        """Create the example command-line parser."""
+        parser = newton.examples.create_parser()
+        parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd", help="Cable dynamics solver.")
+        parser.add_argument("--iterations", type=int, default=None, help="Solver iterations per simulation substep.")
+        parser.add_argument("--substeps", type=int, default=None, help="Simulation substeps per rendered frame.")
+        return parser
+
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    viewer, args = newton.examples.init(Example.create_parser())
     newton.examples.run(Example(viewer, args), args)

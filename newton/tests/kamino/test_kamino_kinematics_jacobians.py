@@ -1113,6 +1113,30 @@ class TestKinematicsSparseSystemJacobians(unittest.TestCase):
         # Check that Jacobians match
         self._compare_row_col_major_jacobians(jacobians, jacobian_col_maj)
 
+    def test_19_build_sparse_with_dynamic_constraints_without_dofs(self):
+        """Match dense assembly when dynamic constraints outnumber joint DoFs."""
+        model, data, *_ = make_test_problem_fourbar(
+            device=self.default_device,
+            num_worlds=1,
+            with_limits=False,
+            with_contacts=False,
+            with_implicit_joints=True,
+            verbose=self.verbose,
+        )
+        num_dofs = model.joints.num_dofs.numpy()
+        # Forced implicit constraints may also be emitted for passive joints.
+        num_dofs[0] = 0
+        model.joints.num_dofs.assign(num_dofs)
+
+        jacobians_sparse = SparseSystemJacobians(model=model)
+        jacobians_dense = DenseSystemJacobians(model=model)
+        jacobians_sparse.build(model=model, data=data)
+        jacobians_dense.build(model=model, data=data)
+
+        jacobian_dense = extract_cts_jacobians(model=model, limits=None, contacts=None, jacobians=jacobians_dense)[0]
+        jacobian_sparse = jacobians_sparse._J_cts.bsm.numpy()[0]
+        np.testing.assert_allclose(jacobian_sparse, jacobian_dense, atol=self.epsilon, rtol=0.0)
+
 
 ###
 # Test execution

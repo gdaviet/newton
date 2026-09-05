@@ -27,7 +27,7 @@ import newton
 import newton.examples
 import newton.ik as ik
 import newton.utils
-from newton.solvers import SolverMuJoCo, SolverVBD, SolverXPBD
+from newton.solvers import SolverKamino, SolverMuJoCo, SolverVBD, SolverXPBD
 
 PAYLOAD_CENTER = wp.vec3(0.5, 0.0, 0.256)
 PAYLOAD_LENGTH = 0.42
@@ -120,12 +120,15 @@ class Example:
         self.payload_kind = str(args.payload_kind)
         self.payload_segments = max(2, int(args.payload_segments))
         self.payload_radius = float(args.payload_radius)
+        self.solver_type = str(getattr(args, "solver", "coupled")).lower()
         self.surface_z = float(PAYLOAD_CENTER[2]) - self.payload_radius
         self.grip_hold = min(GRIP_OPEN, max(GRIP_CLOSE, GRIP_HOLD_FACTOR * self.payload_radius))
 
         template = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         template.rigid_gap = 0.005
         SolverMuJoCo.register_custom_attributes(template)
+        if self.solver_type == "lox":
+            SolverKamino.register_custom_attributes(template)
         if self.payload_kind == "vbd-cable":
             SolverVBD.register_custom_attributes(template)
         self._emit_template(template)
@@ -135,6 +138,8 @@ class Example:
         shapes_per_world = template.shape_count
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        if self.solver_type == "lox":
+            SolverKamino.register_custom_attributes(builder)
         builder.replicate(template, world_count=self.world_count)
         self._expand_world_indices(bodies_per_world, joints_per_world, shapes_per_world)
         self.ground_shapes = [self._emit_ground_plane(builder)]
@@ -145,51 +150,58 @@ class Example:
         self.use_graph = self.use_graph and self.device.is_cuda
         self._count_admm_shape_pairs_per_world()
 
-        mujoco_contact_budget = max(64, 16 * self.world_count)
-        payload_name = "vbd" if self.payload_kind == "vbd-cable" else "xpbd"
-        payload_solver = self._make_payload_solver(args)
-        self.solver = SolverCoupledADMM(
-            model=self.model,
-            entries=[
-                SolverCoupled.Entry(
-                    name="mjc",
-                    solver=lambda v: SolverMuJoCo(
-                        model=v,
-                        solver="newton",
-                        integrator="implicitfast",
-                        iterations=int(args.mujoco_iterations),
-                        ls_iterations=int(args.mujoco_ls_iterations),
-                        use_mujoco_contacts=False,
-                        njmax=max(256, 64 * self.world_count),
-                        nconmax=mujoco_contact_budget,
+        if self.solver_type == "coupled":
+            mujoco_contact_budget = max(64, 16 * self.world_count)
+            payload_name = "vbd" if self.payload_kind == "vbd-cable" else "xpbd"
+            payload_solver = self._make_payload_solver(args)
+            self.solver = SolverCoupledADMM(
+                model=self.model,
+                entries=[
+                    SolverCoupled.Entry(
+                        name="mjc",
+                        solver=lambda v: SolverMuJoCo(
+                            model=v,
+                            solver="newton",
+                            integrator="implicitfast",
+                            iterations=int(args.mujoco_iterations),
+                            ls_iterations=int(args.mujoco_ls_iterations),
+                            use_mujoco_contacts=False,
+                            njmax=max(256, 64 * self.world_count),
+                            nconmax=mujoco_contact_budget,
+                        ),
+                        bodies=self.franka_bodies,
+                        joints=self.franka_joints,
                     ),
-                    bodies=self.franka_bodies,
-                    joints=self.franka_joints,
-                ),
-                SolverCoupled.Entry(
-                    name=payload_name,
-                    solver=payload_solver,
-                    bodies=self.payload_bodies,
-                    joints=self.payload_joints,
-                ),
-            ],
-            coupling=SolverCoupledADMM.Config(
-                iterations=int(args.admm_iterations),
-                rho=float(args.rho),
-                gamma=float(args.gamma),
-                baumgarte=float(args.baumgarte),
-                rigid_contact_matching=str(args.rigid_contact_matching),
-                contact_matching_pos_threshold=args.contact_matching_pos_threshold,
-                contact_matching_normal_dot_threshold=args.contact_matching_normal_dot_threshold,
-                contact_matching_force_scale=args.contact_matching_force_scale,
-                contact_pairs=[
-                    SolverCoupledADMM.ContactPair(
-                        source="mjc",
-                        destination=payload_name,
+                    SolverCoupled.Entry(
+                        name=payload_name,
+                        solver=payload_solver,
+                        bodies=self.payload_bodies,
+                        joints=self.payload_joints,
                     ),
                 ],
-            ),
-        )
+                coupling=SolverCoupledADMM.Config(
+                    iterations=int(args.admm_iterations),
+                    rho=float(args.rho),
+                    gamma=float(args.gamma),
+                    baumgarte=float(args.baumgarte),
+                    rigid_contact_matching=str(args.rigid_contact_matching),
+                    contact_matching_pos_threshold=args.contact_matching_pos_threshold,
+                    contact_matching_normal_dot_threshold=args.contact_matching_normal_dot_threshold,
+                    contact_matching_force_scale=args.contact_matching_force_scale,
+                    contact_pairs=[
+                        SolverCoupledADMM.ContactPair(
+                            source="mjc",
+                            destination=payload_name,
+                        ),
+                    ],
+                ),
+            )
+        else:
+            config = SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.use_fk_solver = False
+            config.lox.max_iterations = int(args.lox_iterations)
+            self.solver = SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -197,11 +209,14 @@ class Example:
             self.model,
         )
         self.contacts = self.collision_pipeline.contacts()
-        self.solver.prepare_contacts(self.contacts)
+        if self.solver_type == "coupled":
+            self.solver.prepare_contacts(self.contacts)
         self.control = self.model.control()
         self._build_keyframes()
         self._build_ik()
 
+        if self.solver_type == "lox":
+            args.coupled_view = "combined"
         newton.examples.configure_coupled_view(self, args)
         self.viewer.set_world_offsets((1.1, 1.1, 0.0))
         if isinstance(self.viewer, newton.viewer.ViewerGL):
@@ -603,6 +618,8 @@ class Example:
         newton.examples.add_coupled_view_args(parser)
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(world_count=8)
+        parser.add_argument("--solver", choices=("coupled", "lox"), default="coupled")
+        parser.add_argument("--lox-iterations", type=int, default=40, help="LOX iterations per substep.")
         parser.add_argument("--substeps", type=int, default=16, help="Coupled substeps per rendered frame.")
         parser.add_argument("--admm-iterations", type=int, default=5, help="ADMM iterations per coupled substep.")
         parser.add_argument("--rho", type=float, default=200.0, help="ADMM penalty parameter.")

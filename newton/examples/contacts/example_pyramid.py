@@ -8,6 +8,7 @@
 # to stress-test narrow-phase contact generation.
 #
 # Command: python -m newton.examples pyramid
+#          python -m newton.examples pyramid --dynamics-backend lox --num-pyramids 1 --pyramid-size 5
 #
 ###########################################################################
 
@@ -30,8 +31,64 @@ RAMP_LENGTH = 20.0
 RAMP_WIDTH = 5.0
 RAMP_THICKNESS = 0.5
 
-XPBD_ITERATIONS = 2
+XPBD_ITERATIONS = 75
 XPBD_CONTACT_RELAXATION = 0.8
+
+
+def add_pyramid(
+    builder: newton.ModelBuilder,
+    pyramid_size: int,
+    *,
+    xform: wp.transformf | None = None,
+    cube_half: float = CUBE_HALF,
+    cube_spacing: float | None = None,
+    color: wp.vec3f | None = None,
+    shape_cfg: newton.ModelBuilder.ShapeConfig | None = None,
+) -> tuple[list[int], list[int]]:
+    """Add one pyramid of dynamic cubes.
+
+    Args:
+        builder: Model builder that receives the cube bodies and shapes.
+        pyramid_size: Number of rows in the pyramid base.
+        xform: World transform of the pyramid's bottom-center frame.
+        cube_half: Cube half-extent [m].
+        cube_spacing: Center spacing between adjacent cubes [m]. Defaults to
+            ``2.1 * cube_half``.
+        color: Optional display color shared by the cubes.
+        shape_cfg: Optional physical properties shared by the cubes.
+
+    Returns:
+        A pair containing all cube body indices and the top-row body indices.
+    """
+    if xform is None:
+        xform = wp.transform_identity()
+    if cube_spacing is None:
+        cube_spacing = 2.1 * cube_half
+
+    body_indices = []
+    top_body_indices = []
+    for level in range(pyramid_size):
+        num_cubes_in_row = pyramid_size - level
+        row_width = (num_cubes_in_row - 1) * cube_spacing
+        for i in range(num_cubes_in_row):
+            local_xform = wp.transform(
+                p=wp.vec3(-row_width / 2 + i * cube_spacing, 0.0, level * cube_spacing + cube_half),
+                q=wp.quat_identity(),
+            )
+            body = builder.add_body(xform=wp.transform_multiply(xform, local_xform))
+            builder.add_shape_box(
+                body,
+                hx=cube_half,
+                hy=cube_half,
+                hz=cube_half,
+                color=color,
+                cfg=shape_cfg,
+            )
+            body_indices.append(body)
+            if level == pyramid_size - 1:
+                top_body_indices.append(body)
+
+    return body_indices, top_body_indices
 
 
 class Example:
@@ -46,37 +103,36 @@ class Example:
         self.viewer = viewer
         self.test_mode = args.test
         self.world_count = args.world_count
+        self.dynamics_backend = args.dynamics_backend
 
         num_pyramids = args.num_pyramids
         pyramid_size = args.pyramid_size
 
         builder = newton.ModelBuilder()
+
+        builder.default_shape_cfg.mu = 0.2
+
+        if self.dynamics_backend == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         builder.add_shape_plane(xform=wp.transform_identity(), width=0.0, length=0.0)
 
-        box_count = 0
+        box_body_indices = []
         top_body_indices = []
         pyramid_height = pyramid_size * CUBE_SPACING
 
         for pyramid in range(num_pyramids):
             y_offset = pyramid * PYRAMID_SPACING
-            for level in range(pyramid_size):
-                num_cubes_in_row = pyramid_size - level
-                row_width = (num_cubes_in_row - 1) * CUBE_SPACING
-                for i in range(num_cubes_in_row):
-                    x_pos = -row_width / 2 + i * CUBE_SPACING
-                    z_pos = level * CUBE_SPACING + CUBE_HALF
-                    y_pos = Y_STACK - y_offset
-                    body = builder.add_body(
-                        xform=wp.transform(p=wp.vec3(x_pos, y_pos, z_pos), q=wp.quat_identity()),
-                    )
-                    builder.add_shape_box(body, hx=CUBE_HALF, hy=CUBE_HALF, hz=CUBE_HALF)
-                    if level == pyramid_size - 1:
-                        top_body_indices.append(body)
-                    box_count += 1
+            pyramid_bodies, pyramid_top_bodies = add_pyramid(
+                builder,
+                pyramid_size,
+                xform=wp.transform(p=wp.vec3(0.0, Y_STACK - y_offset, 0.0), q=wp.quat_identity()),
+            )
+            box_body_indices.extend(pyramid_bodies)
+            top_body_indices.extend(pyramid_top_bodies)
 
-        self.box_count = box_count
+        self.box_count = len(box_body_indices)
         self.top_body_indices = top_body_indices
-        print(f"Built {num_pyramids} pyramids x {pyramid_size} rows = {box_count} boxes")
+        print(f"Built {num_pyramids} pyramids x {pyramid_size} rows = {self.box_count} boxes")
 
         if not self.test_mode:
             # Wrecking ball
@@ -118,11 +174,19 @@ class Example:
             broad_phase=args.broad_phase,
         )
 
-        self.solver = newton.solvers.SolverXPBD(
-            self.model,
-            iterations=XPBD_ITERATIONS,
-            rigid_contact_relaxation=XPBD_CONTACT_RELAXATION,
-        )
+        if self.dynamics_backend == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(
+                self.model,
+                dynamics_solver="lox",
+            )
+            solver_config.lox.max_iterations = args.admm_iterations
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        else:
+            self.solver = newton.solvers.SolverXPBD(
+                self.model,
+                iterations=XPBD_ITERATIONS,
+                rigid_contact_relaxation=XPBD_CONTACT_RELAXATION,
+            )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -146,6 +210,12 @@ class Example:
         self.capture()
 
     def capture(self):
+        self.graph = None
+        if self.dynamics_backend == "lox":
+            # Compile and allocate lazy solver data before APIC/CUDA capture.
+            self.simulate()
+            self.solver.reset(self.state_0)
+            self.state_1.assign(self.state_0)
         with wp.ScopedCapture() as capture:
             self.simulate()
         self.graph = capture.graph
@@ -169,7 +239,8 @@ class Example:
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
-        self.viewer.log_contacts(self.contacts, self.state_0)
+        if self.contacts is not None:
+            self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
     def test_final(self):
@@ -196,6 +267,18 @@ class Example:
         parser.set_defaults(world_count=1)
         newton.examples.add_broad_phase_arg(parser)
         parser.set_defaults(broad_phase="sap")
+        parser.add_argument(
+            "--dynamics-backend",
+            choices=("xpbd", "lox"),
+            default="xpbd",
+            help="Rigid-body dynamics backend.",
+        )
+        parser.add_argument(
+            "--admm-iterations",
+            type=int,
+            default=25,
+            help="Maximum LOX ADMM iterations per simulation substep.",
+        )
         parser.add_argument(
             "--num-pyramids",
             type=int,

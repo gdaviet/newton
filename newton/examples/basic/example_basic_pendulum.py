@@ -8,6 +8,7 @@
 # newton.ModelBuilder() class.
 #
 # Command: python -m newton.examples basic_pendulum
+#          python -m newton.examples basic_pendulum --solver lox
 #
 ###########################################################################
 
@@ -28,8 +29,11 @@ class Example:
 
         self.viewer = viewer
         self.args = args
+        self.solver_type = args.solver
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         hx = 1.0
         hy = 0.1
@@ -69,7 +73,12 @@ class Example:
         # finalize model
         self.model = builder.finalize()
 
-        self.solver = newton.solvers.SolverXPBD(self.model)
+        if self.solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
+        else:
+            self.solver = newton.solvers.SolverXPBD(self.model)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -145,7 +154,9 @@ class Example:
 
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
-    viewer, args = newton.examples.init()
+    parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("xpbd", "lox"), default="xpbd", help="Dynamics solver to use.")
+    viewer, args = newton.examples.init(parser)
 
     # Create viewer and run
     newton.examples.run(Example(viewer, args), args)

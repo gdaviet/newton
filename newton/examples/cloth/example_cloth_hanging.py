@@ -7,7 +7,7 @@
 # This simulation demonstrates a simple cloth hanging behavior. A planar cloth
 # mesh is fixed on one side and hangs under gravity, colliding with the ground.
 #
-# Command: python -m newton.examples cloth_hanging (--solver [semi_implicit, style3d, xpbd, vbd])
+# Command: python -m newton.examples cloth_hanging (--solver [semi_implicit, style3d, xpbd, vbd, lox])
 #
 ###########################################################################
 
@@ -36,6 +36,8 @@ class Example:
             self.sim_substeps = 32
         elif self.solver_type == "style3d":
             self.sim_substeps = 2
+        elif self.solver_type == "lox":
+            self.sim_substeps = 4
         else:
             self.sim_substeps = 10
 
@@ -108,7 +110,7 @@ class Example:
         else:
             builder.add_cloth_grid(**common_params, **solver_params)
 
-        if self.solver_type == "vbd":
+        if self.solver_type in ("vbd", "lox"):
             builder.color(include_bending=True)
 
         self.model = builder.finalize()
@@ -128,7 +130,7 @@ class Example:
                 model=self.model,
                 iterations=self.iterations,
             )
-        else:  # self.solver_type == "vbd"
+        elif self.solver_type == "vbd":
             self.solver = newton.solvers.SolverVBD(
                 model=self.model,
                 iterations=self.iterations,
@@ -136,6 +138,13 @@ class Example:
                 particle_self_contact_radius=0.02,
                 particle_self_contact_margin=0.03,
             )
+        else:  # self.solver_type == "lox"
+            config = newton.solvers.SolverKamino.Config(dynamics_solver="lox")
+            config.lox.max_iterations = 8
+            config.lox.projection_iterations = 2
+            config.lox.deformable_preconditioner = args.deformable_preconditioner
+            config.lox.deformable_cr_iterations = args.deformable_cr_iterations
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -208,8 +217,20 @@ class Example:
             "--solver",
             help="Type of solver",
             type=str,
-            choices=["semi_implicit", "style3d", "xpbd", "vbd"],
+            choices=["semi_implicit", "style3d", "xpbd", "vbd", "lox"],
             default="vbd",
+        )
+        parser.add_argument(
+            "--deformable-preconditioner",
+            choices=("incomplete_ldlt", "block_jacobi"),
+            default="incomplete_ldlt",
+            help="LOX cloth candidate preconditioner.",
+        )
+        parser.add_argument(
+            "--deformable-cr-iterations",
+            type=int,
+            default=4,
+            help="Fixed CR iterations per LOX cloth candidate solve.",
         )
         parser.add_argument("--width", type=int, default=64, help="Cloth resolution in x.")
         parser.add_argument("--height", type=int, default=32, help="Cloth resolution in y.")

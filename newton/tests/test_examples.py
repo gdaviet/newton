@@ -37,6 +37,7 @@ from newton.tests.unittest_utils import (
 )
 
 _HAS_ONNX_RUNTIME = importlib.util.find_spec("onnx") is not None and importlib.util.find_spec("warp_nn") is not None
+_HAS_TORCH = importlib.util.find_spec("torch") is not None
 _PXR_WORK_THREAD_LIMIT_OUTPUT_RE = (
     r"(?s)#+\n#  PXR_WORK_THREAD_LIMIT is overridden to '1'\.  Default is '0'\.  #\n#+\n?"
 )
@@ -167,9 +168,10 @@ def add_example_test(
         # Mark the test as skipped if ONNX policy inference is not installed but required.
         onnx_required = options.pop("onnx_required", False)
         torch_required = options.pop("torch_required", False)
-        onnx_required = onnx_required or torch_required
         if onnx_required and not _HAS_ONNX_RUNTIME:
             test.skipTest("onnx or warp-nn not installed")
+        if torch_required and not _HAS_TORCH:
+            test.skipTest("PyTorch not installed")
 
         # Mark the test as skipped if USD is not installed but required
         usd_required = options.pop("usd_required", False)
@@ -472,10 +474,26 @@ add_example_test(
 )
 add_example_test(
     TestCableExamples,
+    name="cable.example_cable_twist",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 20, "solver": "lox"},
+    test_suffix="lox",
+)
+add_example_test(
+    TestCableExamples,
     name="cable.example_cable_y_junction",
     devices=test_devices,
     use_viewer=True,
     test_options={"num-frames": 20},
+)
+add_example_test(
+    TestCableExamples,
+    name="cable.example_cable_y_junction",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 20, "solver": "lox"},
+    test_suffix="lox",
 )
 add_example_test(
     TestCableExamples,
@@ -513,6 +531,20 @@ add_example_test(
     devices=test_devices,
     use_viewer=True,
     test_options={"num-frames": 20},
+)
+add_example_test(
+    TestCableExamples,
+    name="cable.example_cable_pile",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={
+        "num-frames": 20,
+        "solver": "lox",
+        "layers": 1,
+        "lanes-per-layer": 2,
+        "segments": 8,
+    },
+    test_suffix="lox",
 )
 add_example_test(
     TestCableExamples,
@@ -665,6 +697,23 @@ add_example_test(
     name="robot.example_robot_omniwheel",
     devices=cuda_test_devices,
     test_options={"num-frames": 500},
+    use_viewer=True,
+)
+add_example_test(
+    TestRobotExamples,
+    name="robot.example_robot_franka",
+    devices=test_devices,
+    test_options={"usd_required": True, "num-frames": 500},
+    test_options_cpu={"num-frames": 10, "world-count": 2},
+    use_viewer=True,
+)
+add_example_test(
+    TestRobotExamples,
+    name="robot.example_robot_franka",
+    devices=test_devices,
+    test_options={"num-frames": 100, "world-count": 2, "dynamics-backend": "lox"},
+    test_options_cpu={"num-frames": 10},
+    test_suffix="lox",
     use_viewer=True,
 )
 add_example_test(
@@ -1097,6 +1146,20 @@ add_contact_example_test(
     use_viewer=True,
     expect_output_regexes=[(_PYRAMID_BUILD_OUTPUT_RE, "stdout")],
 )
+add_example_test(
+    TestContactsExamples,
+    name="contacts.example_pyramid",
+    devices=test_devices,
+    test_options={
+        "num-frames": 100,
+        "num-pyramids": 1,
+        "pyramid-size": 5,
+        "dynamics-backend": "lox",
+    },
+    test_options_cpu={"num-frames": 10},
+    test_suffix="lox",
+    use_viewer=True,
+)
 
 
 class TestMultiphysicsExamples(NewtonTestCase):
@@ -1244,6 +1307,14 @@ add_example_test(
 )
 add_example_test(
     TestMultiphysicsExamples,
+    name="multiphysics.example_proxy_joint_gripper",
+    devices=test_devices,
+    test_options={"num-frames": 120, "solver": "lox"},
+    test_suffix="lox",
+    use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
     name="multiphysics.example_vbd_mpm_coupled_solver",
     devices=cuda_test_devices,
     test_options={"num-frames": 2, "proxy-iterations": 1, "vbd-iterations": 2, "mpm-iterations": 1},
@@ -1283,9 +1354,51 @@ add_example_test(
 
 
 class TestKaminoExamples(unittest.TestCase):
-    pass
+    def test_dr_legs_policy_indices_with_free_root(self):
+        """Keep DR Legs coordinate and DOF actuator mappings distinct with a free root."""
+        from newton.examples.kamino.example_kamino_robot_dr_legs_pyramid import (  # noqa: PLC0415
+            POLICY_JOINT_NAMES,
+            _resolve_policy_joint_indices,
+        )
+
+        builder = type("Builder", (), {})()
+        reordered_names = tuple(reversed(POLICY_JOINT_NAMES))
+        builder.joint_label = ["/robot/root", *(f"/robot/{name}" for name in reordered_names)]
+        builder.joint_q_start = [0, *(7 + index for index in range(len(reordered_names)))]
+        builder.joint_qd_start = [0, *(6 + index for index in range(len(reordered_names)))]
+        builder.joint_target_ke = [0.0] * (6 + len(reordered_names))
+        actuated_names = set(POLICY_JOINT_NAMES[::3])
+        for index, name in enumerate(reordered_names):
+            if name in actuated_names:
+                builder.joint_target_ke[6 + index] = 1.0
+
+        policy_indices, dof_indices, target_indices = _resolve_policy_joint_indices(
+            builder,
+            target_coord_layout=True,
+        )
+
+        joint_index_by_name = {name: index + 1 for index, name in enumerate(reordered_names)}
+        expected_policy_indices = [builder.joint_q_start[joint_index_by_name[name]] for name in POLICY_JOINT_NAMES]
+        expected_dof_indices = [
+            builder.joint_qd_start[joint_index_by_name[name]] for name in POLICY_JOINT_NAMES if name in actuated_names
+        ]
+        expected_target_indices = [
+            builder.joint_q_start[joint_index_by_name[name]] for name in POLICY_JOINT_NAMES if name in actuated_names
+        ]
+        _, _, legacy_target_indices = _resolve_policy_joint_indices(builder, target_coord_layout=False)
+        self.assertEqual(policy_indices, expected_policy_indices)
+        self.assertEqual(dof_indices, expected_dof_indices)
+        self.assertEqual(target_indices, expected_target_indices)
+        self.assertEqual(legacy_target_indices, expected_dof_indices)
 
 
+add_example_test(
+    TestKaminoExamples,
+    name="kamino.example_kamino_joint_effort_limits",
+    devices=test_devices,
+    test_options={"num-frames": 100},
+    use_viewer=True,
+)
 add_example_test(
     TestKaminoExamples,
     name="kamino.example_kamino_basic_fourbar",
@@ -1299,6 +1412,34 @@ add_example_test(
     devices=cuda_test_devices,
     test_options={"num-frames": 120},
     use_viewer=True,
+)
+add_example_test(
+    TestKaminoExamples,
+    name="kamino.example_kamino_basic_heterogeneous",
+    devices=cuda_test_devices,
+    test_options={
+        "num-frames": 120,
+        "scenario": "box_on_plane",
+        "from-usd": False,
+        "z-offset": 0.5,
+        "dynamics-solver": "lox",
+    },
+    use_viewer=True,
+    test_suffix="lox_box_drop",
+)
+add_example_test(
+    TestKaminoExamples,
+    name="kamino.example_kamino_basic_heterogeneous",
+    devices=cuda_test_devices,
+    test_options={
+        "num-frames": 120,
+        "scenario": "boxes_hinged",
+        "from-usd": False,
+        "z-offset": 0.5,
+        "dynamics-solver": "lox",
+    },
+    use_viewer=True,
+    test_suffix="lox_hinged_drop",
 )
 add_example_test(
     TestKaminoExamples,
@@ -1316,10 +1457,33 @@ add_example_test(
 )
 add_example_test(
     TestKaminoExamples,
+    name="kamino.example_kamino_robot_dr_legs_pyramid",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 180, "torch_required": True, "world-count": 2},
+    use_viewer=True,
+)
+add_example_test(
+    TestKaminoExamples,
     name="kamino.example_kamino_robot_anymal_d",
     devices=cuda_test_devices,
     test_options={"num-frames": 500},
     use_viewer=True,
+)
+add_example_test(
+    TestKaminoExamples,
+    name="kamino.example_kamino_robot_anymal_d",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 120, "dynamics-solver": "lox"},
+    use_viewer=True,
+    test_suffix="lox",
+)
+add_example_test(
+    TestKaminoExamples,
+    name="kamino.example_kamino_robot_anymal_d",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 120, "dynamics-solver": "lox", "actuated": True},
+    use_viewer=True,
+    test_suffix="lox_actuated",
 )
 
 
