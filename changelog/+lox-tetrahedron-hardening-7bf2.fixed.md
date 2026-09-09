@@ -1,0 +1,1 @@
+Align LOX tetrahedral proximal updates with the assembled material model for tiny coefficients, detect unresolved local stationarity, and reject invalid nodal contributions before updating element state.

@@ -35,6 +35,18 @@ def tet_cofactor(deformation: wp.mat33) -> wp.mat33:
 
 
 @wp.func
+def tet_stable_neo_hookean_alpha(k_mu: float, k_lambda: float) -> float:
+    """Return the regularized stable Neo-Hookean volume offset."""
+    lambda_hat = k_lambda + k_mu
+    alpha = 1.0
+    if lambda_hat > 0.0:
+        alpha += k_mu / wp.max(lambda_hat, 1.0e-6)
+    elif lambda_hat < 0.0:
+        alpha -= k_mu / wp.max(-lambda_hat, 1.0e-6)
+    return alpha
+
+
+@wp.func
 def tet_vertex_coefficient(vertex_order: int, rest_pose: wp.mat33) -> wp.vec3:
     """Return the rest-coordinate coefficient for one tet vertex."""
     if vertex_order == 0:
@@ -83,11 +95,7 @@ def tet_stable_neo_hookean_differential(
         cofactor[2, 2],
     )
     lambda_hat = k_lambda + k_mu
-    alpha = 1.0
-    if lambda_hat > 0.0:
-        alpha = 1.0 + k_mu / wp.max(lambda_hat, 1.0e-6)
-    elif lambda_hat < 0.0:
-        alpha = 1.0 - k_mu / wp.max(-lambda_hat, 1.0e-6)
+    alpha = tet_stable_neo_hookean_alpha(k_mu, k_lambda)
     constraint = wp.determinant(deformation) - alpha + activation
     stress = rest_volume * (k_mu * deformation_vector + lambda_hat * constraint * cofactor_vector)
     tangent = rest_volume * (

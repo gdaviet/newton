@@ -10,6 +10,7 @@ import warp as wp
 from .deformable_energy import (
     mat99,
     tet_cofactor,
+    tet_stable_neo_hookean_alpha,
     tet_vertex_coefficient,
     vec9,
 )
@@ -48,6 +49,11 @@ def _matrix_is_finite(value: wp.mat33) -> bool:
         for column in range(3):
             finite = finite and wp.isfinite(value[row, column])
     return finite
+
+
+@wp.func
+def _vector_is_finite(value: wp.vec3) -> bool:
+    return wp.isfinite(value[0]) and wp.isfinite(value[1]) and wp.isfinite(value[2])
 
 
 @wp.func
@@ -115,6 +121,8 @@ def _tetrahedron_energy(
     alpha: float,
     activation: float,
 ) -> float:
+    # The stable Neo-Hookean polynomial is intentionally evaluable at singular
+    # and inverted deformations; orientation preservation is not a local barrier.
     volume_constraint = wp.determinant(deformation) - alpha + activation
     return rest_volume * (
         0.5 * mu * (_matrix_dot(deformation, deformation) - 3.0) + 0.5 * lmbd * volume_constraint * volume_constraint
@@ -281,9 +289,7 @@ def initialize_tetrahedron_proximal(
         multiplier[tetrahedron] = wp.mat33(0.0)
         return
 
-    alpha = 1.0
-    if lmbd > 1.0e-6:
-        alpha = 1.0 + mu / lmbd
+    alpha = tet_stable_neo_hookean_alpha(mu, k_lambda)
     constraint = wp.determinant(deformation) - alpha + tetrahedron_activations[tetrahedron]
     rest_volume = 1.0 / (6.0 * wp.determinant(tetrahedron_poses[tetrahedron]))
     gradient = rest_volume * (mu * deformation + lmbd * constraint * cofactor)
@@ -376,9 +382,7 @@ def update_tetrahedron_proximal(
     mu = tetrahedron_materials[tetrahedron, 0]
     k_lambda = tetrahedron_materials[tetrahedron, 1]
     lmbd = k_lambda + mu
-    alpha = 1.0
-    if lmbd > 1.0e-6:
-        alpha = 1.0 + mu / lmbd
+    alpha = tet_stable_neo_hookean_alpha(mu, k_lambda)
     activation = tetrahedron_activations[tetrahedron]
 
     failed = wp.bool(False)
@@ -456,6 +460,27 @@ def update_tetrahedron_proximal(
         wp.atomic_max(world_failed, world, 1)
         return
 
+    # Measure the stationarity of the local problem against the multiplier that
+    # defined it.  A finite stalled line search is not a hard failure, but must
+    # not appear converged merely because its local coordinate stopped moving.
+    stationarity_residual = (
+        rest_volume
+        * (mu * deformation + lmbd * (wp.determinant(deformation) - alpha + activation) * tet_cofactor(deformation))
+        - multiplier_value
+        + _apply_metric(deformation - center, frozen_metric_value)
+    )
+    stationarity_correction, stationarity_solve_succeeded = _solve_gauss_newton_step(
+        -stationarity_residual,
+        deformation,
+        frozen_factor_value,
+        rest_volume,
+        mu,
+        k_lambda,
+    )
+    if not stationarity_solve_succeeded:
+        wp.atomic_max(world_failed, world, 1)
+        return
+
     metric_primal = _apply_metric(center - deformation, frozen_metric_value)
     multiplier_new = multiplier_value + proximal_relaxation * metric_primal
     if not _matrix_is_finite(multiplier_new):
@@ -468,23 +493,54 @@ def update_tetrahedron_proximal(
         wp.atomic_max(world_failed, world, 1)
         return
 
-    for order in range(4):
-        vertex = vertices[order]
-        if _particle_is_dynamic(vertex, packed_to_newton, particle_mass, particle_flags):
-            wp.atomic_add(
-                nonlinear_rhs,
-                vertex,
-                dt * (correction * tet_vertex_coefficient(order, rest_pose)),
-            )
+    characteristic_length = wp.pow(rest_volume, 1.0 / 3.0)
+    primal_norm = wp.sqrt(_matrix_dot(center - deformation, center - deformation))
+    local_change_norm = wp.sqrt(_matrix_dot(deformation - previous, deformation - previous))
+    stationarity_correction_norm = wp.sqrt(_matrix_dot(stationarity_correction, stationarity_correction))
+    position_residual = characteristic_length * wp.max(primal_norm, stationarity_correction_norm)
+    velocity_residual = characteristic_length * local_change_norm / dt
+    if (
+        not wp.isfinite(characteristic_length)
+        or not wp.isfinite(primal_norm)
+        or not wp.isfinite(local_change_norm)
+        or not wp.isfinite(stationarity_correction_norm)
+        or not wp.isfinite(position_residual)
+        or not wp.isfinite(velocity_residual)
+    ):
+        wp.atomic_max(world_failed, world, 1)
+        return
+
+    dynamic_0 = _particle_is_dynamic(vertices[0], packed_to_newton, particle_mass, particle_flags)
+    dynamic_1 = _particle_is_dynamic(vertices[1], packed_to_newton, particle_mass, particle_flags)
+    dynamic_2 = _particle_is_dynamic(vertices[2], packed_to_newton, particle_mass, particle_flags)
+    dynamic_3 = _particle_is_dynamic(vertices[3], packed_to_newton, particle_mass, particle_flags)
+    scatter_0 = dt * (correction * tet_vertex_coefficient(0, rest_pose))
+    scatter_1 = dt * (correction * tet_vertex_coefficient(1, rest_pose))
+    scatter_2 = dt * (correction * tet_vertex_coefficient(2, rest_pose))
+    scatter_3 = dt * (correction * tet_vertex_coefficient(3, rest_pose))
+    if (
+        (dynamic_0 and not _vector_is_finite(scatter_0))
+        or (dynamic_1 and not _vector_is_finite(scatter_1))
+        or (dynamic_2 and not _vector_is_finite(scatter_2))
+        or (dynamic_3 and not _vector_is_finite(scatter_3))
+    ):
+        wp.atomic_max(world_failed, world, 1)
+        return
+
+    if dynamic_0:
+        wp.atomic_add(nonlinear_rhs, vertices[0], scatter_0)
+    if dynamic_1:
+        wp.atomic_add(nonlinear_rhs, vertices[1], scatter_1)
+    if dynamic_2:
+        wp.atomic_add(nonlinear_rhs, vertices[2], scatter_2)
+    if dynamic_3:
+        wp.atomic_add(nonlinear_rhs, vertices[3], scatter_3)
 
     proximal_coordinate[tetrahedron] = deformation
     multiplier[tetrahedron] = multiplier_new
 
-    characteristic_length = wp.pow(rest_volume, 1.0 / 3.0)
-    primal_norm = wp.sqrt(_matrix_dot(center - deformation, center - deformation))
-    local_change_norm = wp.sqrt(_matrix_dot(deformation - previous, deformation - previous))
-    wp.atomic_max(world_position_residual, world, characteristic_length * primal_norm)
-    wp.atomic_max(world_velocity_residual, world, characteristic_length * local_change_norm / dt)
+    wp.atomic_max(world_position_residual, world, position_residual)
+    wp.atomic_max(world_velocity_residual, world, velocity_residual)
 
 
 class DeformableTetrahedronProximal:

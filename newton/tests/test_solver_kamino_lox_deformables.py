@@ -6,6 +6,7 @@
 import unittest
 
 from newton._src.solvers.kamino.tests.test_lox_membrane_hardening import TestLOXMembraneHardening
+from newton._src.solvers.kamino.tests.test_lox_tetrahedron_proximal import TestLOXTetrahedronProximal
 from newton._src.solvers.kamino.tests.test_solvers_lox_deformable_integration import (
     TestLOXDeformableIntegration,
 )
@@ -59,6 +60,16 @@ def load_tests(loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: 
             "test_stationarity_correction_prevents_false_local_convergence",
             "test_invalid_proximal_scatter_is_transactional",
             "test_invalid_assembly_contribution_is_transactional",
+        )
+    )
+    suite.addTests(
+        TestLOXTetrahedronProximal(name)
+        for name in (
+            "test_spectral_majorizer_matches_dense_reference",
+            "test_tiny_coefficients_share_constitutive_alpha",
+            "test_fixed_point_is_finite_for_singular_and_inverted_tets",
+            "test_exhausted_local_budget_reports_stationarity",
+            "test_invalid_scatter_preserves_element_state",
         )
     )
     return suite
