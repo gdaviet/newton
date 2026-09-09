@@ -10,6 +10,7 @@ from newton._src.solvers.kamino.tests.test_solvers_lox_deformable_integration im
 )
 
 _FUNCTIONAL_TESTS = (
+    "test_rejected_outer_solve_preserves_particle_dual_warmstart",
     "test_step_hanging_stiff_cloth_preserves_pins",
     "test_step_static_contact_applies_isotropic_friction",
     "test_step_static_contact_with_alternative_projections",

@@ -354,8 +354,9 @@ def _accept_projected_velocity(
     packed_particle = wp.tid()
     particle = packed_to_newton[packed_particle]
     world = packed_world[packed_particle]
-    dual_impulse[packed_particle] = weight[packed_particle] * dual[packed_particle]
+    outer_accepted[world] = world_accepted[world]
     if world_accepted[world]:
+        dual_impulse[packed_particle] = weight[packed_particle] * dual[packed_particle]
         outer_accepted[world] = True
         if particle_mass[particle] > 0.0 and (particle_flags[particle] & PARTICLE_FLAG_ACTIVE) != 0:
             accepted_velocity[packed_particle] = projected_velocity[packed_particle]

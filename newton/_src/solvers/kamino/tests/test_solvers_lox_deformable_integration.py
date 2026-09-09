@@ -841,6 +841,24 @@ class TestLOXDeformableIntegration(unittest.TestCase):
         """Match ping-pong LOX stepping in place with persistent warm starts."""
         self._check_step_in_place_matches_ping_pong_with_nonzero_body_com(capture=False)
 
+    def test_rejected_outer_solve_preserves_particle_dual_warmstart(self):
+        """Keep the accepted particle impulse when an outer solve is rejected."""
+        model, shapes, _ = _build_contact_model(device=self.device, collider="dynamic")
+        state_in = model.state()
+        state_in.particle_qd.fill_((0.0, 0.0, -1.0))
+        state_out = model.state()
+        contacts = _make_particle_contact(model, state_in, shapes[0], gap=0.0)
+        solver = newton.solvers.SolverKamino(model, config=_make_lox_config(max_iterations=20))
+        solver.step(state_in, state_out, None, contacts, 0.01)
+
+        splitting = solver._solver_kamino._solver_fd.deformable_splitting
+        baseline_impulse = splitting.dual_impulse.numpy().copy()
+        splitting.dual.fill_((3.0, -2.0, 1.0))
+        splitting.accept_projected(wp.zeros(model.world_count, dtype=wp.bool, device=self.device))
+
+        np.testing.assert_array_equal(splitting.dual_impulse.numpy(), baseline_impulse)
+        np.testing.assert_array_equal(splitting.outer_accepted.numpy(), False)
+
     def test_capture_step_in_place_matches_ping_pong_with_nonzero_body_com(self):
         """Replay in-place LOX capture in origin coordinates with persistent warm starts."""
         if not self.device.is_cuda:
