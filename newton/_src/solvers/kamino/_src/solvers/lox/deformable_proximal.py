@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import warp as wp
 
+from .deformable_membrane import membrane_area_ratio_gradient
+
 PARTICLE_FLAG_ACTIVE = 1
 _PROXIMAL_EPSILON = 1.0e-8
 _LOCAL_SOLVE_REGULARIZATION = 1.0e-6
@@ -46,11 +48,16 @@ def _pair_dot(
 
 
 @wp.func
-def _pair_is_finite(first: wp.vec3, second: wp.vec3) -> bool:
+def _vector_is_finite(value: wp.vec3) -> bool:
     finite = True
     for axis in range(3):
-        finite = finite and wp.isfinite(first[axis]) and wp.isfinite(second[axis])
+        finite = finite and wp.isfinite(value[axis])
     return finite
+
+
+@wp.func
+def _pair_is_finite(first: wp.vec3, second: wp.vec3) -> bool:
+    return _vector_is_finite(first) and _vector_is_finite(second)
 
 
 @wp.func
@@ -65,18 +72,6 @@ def _deformation(
     deformation_0 = edge_10 * rest_pose[0, 0] + edge_20 * rest_pose[1, 0]
     deformation_1 = edge_10 * rest_pose[0, 1] + edge_20 * rest_pose[1, 1]
     return deformation_0, deformation_1
-
-
-@wp.func
-def _area_ratio_gradient(deformation_0: wp.vec3, deformation_1: wp.vec3):
-    f00 = wp.dot(deformation_0, deformation_0)
-    f11 = wp.dot(deformation_1, deformation_1)
-    f01 = wp.dot(deformation_0, deformation_1)
-    area_ratio = wp.sqrt(wp.max(f00 * f11 - f01 * f01, 1.0e-20))
-    inverse_area_ratio = 1.0 / area_ratio
-    gradient_0 = inverse_area_ratio * (f11 * deformation_0 - f01 * deformation_1)
-    gradient_1 = inverse_area_ratio * (f00 * deformation_1 - f01 * deformation_0)
-    return area_ratio, gradient_0, gradient_1
 
 
 @wp.func
@@ -104,7 +99,7 @@ def _membrane_energy(
     alpha: float,
     activation: float,
 ) -> float:
-    area_ratio, _, _ = _area_ratio_gradient(deformation_0, deformation_1)
+    area_ratio, _, _ = membrane_area_ratio_gradient(deformation_0, deformation_1)
     area_constraint = area_ratio - alpha + activation
     return rest_area * (
         0.5 * mu * (wp.dot(deformation_0, deformation_0) + wp.dot(deformation_1, deformation_1) - 2.0)
@@ -169,7 +164,7 @@ def _proximal_stationarity_norm_squared(
     alpha: float,
     activation: float,
 ) -> float:
-    area_ratio, area_gradient_0, area_gradient_1 = _area_ratio_gradient(
+    area_ratio, area_gradient_0, area_gradient_1 = membrane_area_ratio_gradient(
         deformation_0,
         deformation_1,
     )
@@ -274,7 +269,7 @@ def initialize_membrane_proximal(
         position_linearized[vertex_2],
         triangle_poses[triangle],
     )
-    area_ratio, area_gradient_0, area_gradient_1 = _area_ratio_gradient(
+    area_ratio, area_gradient_0, area_gradient_1 = membrane_area_ratio_gradient(
         deformation_0,
         deformation_1,
     )
@@ -343,6 +338,8 @@ def update_membrane_proximal(
     rest_area = triangle_areas[triangle]
     shear_scale = 2.0 * rest_area * mu
     area_scale = rest_area * lmbd
+    if mu == 0.0 and lmbd == 0.0:
+        return
 
     position_0 = position_linearized[vertex_0]
     position_1 = position_linearized[vertex_1]
@@ -375,7 +372,7 @@ def update_membrane_proximal(
 
     failed = wp.bool(False)
     for _iteration in range(proximal_iterations):
-        area_ratio, current_area_gradient_0, current_area_gradient_1 = _area_ratio_gradient(
+        area_ratio, current_area_gradient_0, current_area_gradient_1 = membrane_area_ratio_gradient(
             deformation_0, deformation_1
         )
         constraint = area_ratio - alpha + activation
@@ -486,6 +483,51 @@ def update_membrane_proximal(
         wp.atomic_max(world_failed, world, 1)
         return
 
+    area_ratio, current_area_gradient_0, current_area_gradient_1 = membrane_area_ratio_gradient(
+        deformation_0,
+        deformation_1,
+    )
+    constraint = area_ratio - alpha + activation
+    gradient_0 = rest_area * (mu * deformation_0 + lmbd * constraint * current_area_gradient_0)
+    gradient_1 = rest_area * (mu * deformation_1 + lmbd * constraint * current_area_gradient_1)
+    metric_delta_0, metric_delta_1 = _apply_metric(
+        deformation_0 - center_0,
+        deformation_1 - center_1,
+        frozen_area_gradient_0,
+        frozen_area_gradient_1,
+        rest_area * mu,
+        area_scale,
+    )
+    residual_0 = gradient_0 - multiplier_0 + metric_delta_0
+    residual_1 = gradient_1 - multiplier_1 + metric_delta_1
+    stationarity_correction_0, stationarity_correction_1, determinant, determinant_scale = _solve_gauss_newton_step(
+        -residual_0,
+        -residual_1,
+        current_area_gradient_0,
+        current_area_gradient_1,
+        frozen_area_gradient_0,
+        frozen_area_gradient_1,
+        shear_scale,
+        area_scale,
+    )
+    if (
+        not wp.isfinite(determinant)
+        or not wp.isfinite(determinant_scale)
+        or determinant <= _PROXIMAL_EPSILON * determinant_scale
+        or not _pair_is_finite(stationarity_correction_0, stationarity_correction_1)
+    ):
+        wp.atomic_max(world_failed, world, 1)
+        return
+    stationarity_correction_norm_0 = wp.length(stationarity_correction_0)
+    stationarity_correction_norm_1 = wp.length(stationarity_correction_1)
+    if not wp.isfinite(stationarity_correction_norm_0) or not wp.isfinite(stationarity_correction_norm_1):
+        wp.atomic_max(world_failed, world, 1)
+        return
+    stationarity_correction_norm = wp.max(
+        stationarity_correction_norm_0,
+        stationarity_correction_norm_1,
+    )
+
     metric_primal_0, metric_primal_1 = _apply_metric(
         center_0 - deformation_0,
         center_1 - deformation_1,
@@ -516,7 +558,40 @@ def update_membrane_proximal(
         wp.atomic_max(world_failed, world, 1)
         return
 
+    characteristic_length = wp.sqrt(rest_area)
+    primal_norm_0 = wp.length(center_0 - deformation_0)
+    primal_norm_1 = wp.length(center_1 - deformation_1)
+    local_change_norm_0 = wp.length(deformation_0 - previous_0)
+    local_change_norm_1 = wp.length(deformation_1 - previous_1)
+    if (
+        not wp.isfinite(characteristic_length)
+        or not wp.isfinite(primal_norm_0)
+        or not wp.isfinite(primal_norm_1)
+        or not wp.isfinite(local_change_norm_0)
+        or not wp.isfinite(local_change_norm_1)
+    ):
+        wp.atomic_max(world_failed, world, 1)
+        return
+    primal_norm = wp.max(primal_norm_0, primal_norm_1)
+    local_change_norm = wp.max(local_change_norm_0, local_change_norm_1)
+    position_residual_value = characteristic_length * wp.max(primal_norm, stationarity_correction_norm)
+    velocity_residual_value = characteristic_length * local_change_norm / dt
+    if not wp.isfinite(position_residual_value) or not wp.isfinite(velocity_residual_value):
+        wp.atomic_max(world_failed, world, 1)
+        return
+
     rest_pose = triangle_poses[triangle]
+    scatter_finite = wp.bool(True)
+    for order in range(3):
+        vertex = triangle_indices[triangle, order]
+        if _particle_is_dynamic(vertex, packed_to_newton, particle_mass, particle_flags):
+            coefficients = _triangle_coefficients(order, rest_pose)
+            contribution = dt * (coefficients[0] * correction_0 + coefficients[1] * correction_1)
+            scatter_finite = scatter_finite and _vector_is_finite(contribution)
+    if not scatter_finite:
+        wp.atomic_max(world_failed, world, 1)
+        return
+
     for order in range(3):
         vertex = triangle_indices[triangle, order]
         if _particle_is_dynamic(vertex, packed_to_newton, particle_mass, particle_flags):
@@ -532,24 +607,15 @@ def update_membrane_proximal(
     multiplier[triangle, 0] = multiplier_new_0
     multiplier[triangle, 1] = multiplier_new_1
 
-    characteristic_length = wp.sqrt(rest_area)
-    primal_norm = wp.max(
-        wp.length(center_0 - deformation_0),
-        wp.length(center_1 - deformation_1),
-    )
-    local_change_norm = wp.max(
-        wp.length(deformation_0 - previous_0),
-        wp.length(deformation_1 - previous_1),
-    )
     wp.atomic_max(
         world_position_residual,
         world,
-        characteristic_length * primal_norm,
+        position_residual_value,
     )
     wp.atomic_max(
         world_velocity_residual,
         world,
-        characteristic_length * local_change_norm / dt,
+        velocity_residual_value,
     )
 
 

@@ -13,6 +13,7 @@ from .deformable_energy import (
     tet_stable_neo_hookean_differential,
     tet_vertex_coefficient,
 )
+from .deformable_membrane import membrane_area_ratio_gradient
 from .deformable_tetrahedron_energy import tet_stable_neo_hookean_spectral_metrics
 
 # Keep nested 9-by-9 eigensolver loops from expanding into multi-megabyte kernels.
@@ -61,6 +62,89 @@ def _triangle_metric_derivatives(
     dc01 = coefficients[0] * deformation_1 + coefficients[1] * deformation_0
     dc11 = 2.0 * coefficients[1] * deformation_1
     return dc00, dc01, dc11
+
+
+@wp.func
+def _vector_is_finite(value: wp.vec3) -> bool:
+    finite = True
+    for axis in range(3):
+        finite = finite and wp.isfinite(value[axis])
+    return finite
+
+
+@wp.func
+def _matrix_is_finite(value: wp.mat33) -> bool:
+    finite = True
+    for row in range(3):
+        for column in range(3):
+            finite = finite and wp.isfinite(value[row, column])
+    return finite
+
+
+@wp.func
+def _triangle_internal_force(
+    coefficients: wp.vec2,
+    stress_0: wp.vec3,
+    stress_1: wp.vec3,
+    deformation_0: wp.vec3,
+    deformation_1: wp.vec3,
+    damping: float,
+    c00_rate: float,
+    c01_rate: float,
+    c11_rate: float,
+    rest_area: float,
+) -> wp.vec3:
+    force = -(stress_0 * coefficients[0] + stress_1 * coefficients[1])
+    if damping > 0.0:
+        dc00, dc01, dc11 = _triangle_metric_derivatives(
+            deformation_0,
+            deformation_1,
+            coefficients,
+        )
+        force -= damping * (c00_rate * dc00 + 2.0 * c01_rate * dc01 + c11_rate * dc11)
+    return rest_area * force
+
+
+@wp.func
+def _triangle_tangent_block(
+    row_coefficients: wp.vec2,
+    column_coefficients: wp.vec2,
+    area_gradient_0: wp.vec3,
+    area_gradient_1: wp.vec3,
+    deformation_0: wp.vec3,
+    deformation_1: wp.vec3,
+    mu: float,
+    lmbd: float,
+    damping: float,
+    inverse_dt: float,
+    rest_area_dt_squared: float,
+) -> wp.mat33:
+    area_derivative_row = area_gradient_0 * row_coefficients[0] + area_gradient_1 * row_coefficients[1]
+    area_derivative_column = area_gradient_0 * column_coefficients[0] + area_gradient_1 * column_coefficients[1]
+    identity_scale = mu * (row_coefficients[0] * column_coefficients[0] + row_coefficients[1] * column_coefficients[1])
+    block = identity_scale * wp.identity(n=3, dtype=float)
+    block += lmbd * wp.outer(area_derivative_row, area_derivative_column)
+    if damping > 0.0:
+        dc00_row, dc01_row, dc11_row = _triangle_metric_derivatives(
+            deformation_0,
+            deformation_1,
+            row_coefficients,
+        )
+        dc00_column, dc01_column, dc11_column = _triangle_metric_derivatives(
+            deformation_0,
+            deformation_1,
+            column_coefficients,
+        )
+        block += (
+            damping
+            * inverse_dt
+            * (
+                wp.outer(dc00_row, dc00_column)
+                + 2.0 * wp.outer(dc01_row, dc01_column)
+                + wp.outer(dc11_row, dc11_column)
+            )
+        )
+    return rest_area_dt_squared * block
 
 
 @wp.func
@@ -193,6 +277,7 @@ def assemble_triangle_system(
     triplet_offset: int,
     triplet_values: wp.array[wp.mat33],
     smooth_force: wp.array[wp.vec3],
+    world_failed: wp.array[wp.int32],
 ):
     """Assemble stable membrane forces and PSD pair-block tangents."""
     triangle = wp.tid()
@@ -214,11 +299,10 @@ def assemble_triangle_system(
     f00 = wp.dot(deformation_0, deformation_0)
     f11 = wp.dot(deformation_1, deformation_1)
     f01 = wp.dot(deformation_0, deformation_1)
-    area_ratio_squared = wp.max(f00 * f11 - f01 * f01, 1.0e-20)
-    area_ratio = wp.sqrt(area_ratio_squared)
-    inverse_area_ratio = 1.0 / area_ratio
-    area_gradient_0 = inverse_area_ratio * (f11 * deformation_0 - f01 * deformation_1)
-    area_gradient_1 = inverse_area_ratio * (f00 * deformation_1 - f01 * deformation_0)
+    area_ratio, area_gradient_0, area_gradient_1 = membrane_area_ratio_gradient(
+        deformation_0,
+        deformation_1,
+    )
 
     mu = triangle_materials[triangle, 0]
     lmbd = triangle_materials[triangle, 1] + mu
@@ -244,58 +328,6 @@ def assemble_triangle_system(
     c01_rate = (f01 - wp.dot(deformation_start_0, deformation_start_1)) * inverse_dt
     c11_rate = (f11 - wp.dot(deformation_start_1, deformation_start_1)) * inverse_dt
 
-    for row in range(3):
-        row_vertex = triangle_indices[triangle, row]
-        row_coefficients = _triangle_coefficients(row, rest_pose)
-        area_derivative = area_gradient_0 * row_coefficients[0] + area_gradient_1 * row_coefficients[1]
-        force = -(stress_0 * row_coefficients[0] + stress_1 * row_coefficients[1])
-
-        dc00_row, dc01_row, dc11_row = _triangle_metric_derivatives(
-            deformation_0,
-            deformation_1,
-            row_coefficients,
-        )
-        if damping > 0.0:
-            force -= damping * (c00_rate * dc00_row + 2.0 * c01_rate * dc01_row + c11_rate * dc11_row)
-
-        if _particle_is_dynamic(row_vertex, packed_to_newton, particle_mass, particle_flags):
-            wp.atomic_add(smooth_force, row_vertex, rest_area * force)
-
-        for column in range(3):
-            column_vertex = triangle_indices[triangle, column]
-            block = wp.mat33(0.0)
-            if _particle_is_dynamic(
-                row_vertex, packed_to_newton, particle_mass, particle_flags
-            ) and _particle_is_dynamic(column_vertex, packed_to_newton, particle_mass, particle_flags):
-                column_coefficients = _triangle_coefficients(column, rest_pose)
-                area_derivative_column = (
-                    area_gradient_0 * column_coefficients[0] + area_gradient_1 * column_coefficients[1]
-                )
-                identity_scale = mu * (
-                    row_coefficients[0] * column_coefficients[0] + row_coefficients[1] * column_coefficients[1]
-                )
-                block = identity_scale * wp.identity(n=3, dtype=float)
-                block += lmbd * wp.outer(area_derivative, area_derivative_column)
-
-                if damping > 0.0:
-                    dc00_column, dc01_column, dc11_column = _triangle_metric_derivatives(
-                        deformation_0,
-                        deformation_1,
-                        column_coefficients,
-                    )
-                    block += (
-                        damping
-                        * inverse_dt
-                        * (
-                            wp.outer(dc00_row, dc00_column)
-                            + 2.0 * wp.outer(dc01_row, dc01_column)
-                            + wp.outer(dc11_row, dc11_column)
-                        )
-                    )
-                block *= rest_area * dt * dt
-
-            triplet_values[triplet_offset + triangle * 9 + row * 3 + column] = block
-
     velocity_midpoint = (
         velocity_linearized[vertex_0] + velocity_linearized[vertex_1] + velocity_linearized[vertex_2]
     ) / 3.0
@@ -311,10 +343,106 @@ def assemble_triangle_system(
         triangle_materials[triangle, 4] * current_area * lift_angle * wp.dot(velocity_midpoint, velocity_midpoint)
     )
     aerodynamic_force = -(drag + lift)
-    for order in range(3):
-        vertex = triangle_indices[triangle, order]
-        if _particle_is_dynamic(vertex, packed_to_newton, particle_mass, particle_flags):
-            wp.atomic_add(smooth_force, vertex, aerodynamic_force)
+
+    # Preflight every contribution so a malformed element cannot partially
+    # update shared particles or its sparse blocks.
+    element_finite = wp.bool(True)
+    rest_area_dt_squared = rest_area * dt * dt
+    for row in range(3):
+        row_vertex = triangle_indices[triangle, row]
+        row_dynamic = _particle_is_dynamic(row_vertex, packed_to_newton, particle_mass, particle_flags)
+        row_coefficients = _triangle_coefficients(row, rest_pose)
+        if row_dynamic:
+            internal_force = _triangle_internal_force(
+                row_coefficients,
+                stress_0,
+                stress_1,
+                deformation_0,
+                deformation_1,
+                damping,
+                c00_rate,
+                c01_rate,
+                c11_rate,
+                rest_area,
+            )
+            element_finite = (
+                element_finite
+                and _vector_is_finite(internal_force)
+                and _vector_is_finite(aerodynamic_force)
+                and _vector_is_finite(internal_force + aerodynamic_force)
+            )
+        for column in range(3):
+            column_vertex = triangle_indices[triangle, column]
+            if row_dynamic and _particle_is_dynamic(
+                column_vertex,
+                packed_to_newton,
+                particle_mass,
+                particle_flags,
+            ):
+                block = _triangle_tangent_block(
+                    row_coefficients,
+                    _triangle_coefficients(column, rest_pose),
+                    area_gradient_0,
+                    area_gradient_1,
+                    deformation_0,
+                    deformation_1,
+                    mu,
+                    lmbd,
+                    damping,
+                    inverse_dt,
+                    rest_area_dt_squared,
+                )
+                element_finite = element_finite and _matrix_is_finite(block)
+
+    if not element_finite:
+        wp.atomic_max(world_failed, packed_world[vertex_0], 1)
+        return
+
+    for row in range(3):
+        row_vertex = triangle_indices[triangle, row]
+        row_dynamic = _particle_is_dynamic(row_vertex, packed_to_newton, particle_mass, particle_flags)
+        row_coefficients = _triangle_coefficients(row, rest_pose)
+        if row_dynamic:
+            internal_force = _triangle_internal_force(
+                row_coefficients,
+                stress_0,
+                stress_1,
+                deformation_0,
+                deformation_1,
+                damping,
+                c00_rate,
+                c01_rate,
+                c11_rate,
+                rest_area,
+            )
+            wp.atomic_add(
+                smooth_force,
+                row_vertex,
+                internal_force + aerodynamic_force,
+            )
+        for column in range(3):
+            column_vertex = triangle_indices[triangle, column]
+            block = wp.mat33(0.0)
+            if row_dynamic and _particle_is_dynamic(
+                column_vertex,
+                packed_to_newton,
+                particle_mass,
+                particle_flags,
+            ):
+                block = _triangle_tangent_block(
+                    row_coefficients,
+                    _triangle_coefficients(column, rest_pose),
+                    area_gradient_0,
+                    area_gradient_1,
+                    deformation_0,
+                    deformation_1,
+                    mu,
+                    lmbd,
+                    damping,
+                    inverse_dt,
+                    rest_area_dt_squared,
+                )
+            triplet_values[triplet_offset + triangle * 9 + row * 3 + column] = block
 
 
 @wp.kernel

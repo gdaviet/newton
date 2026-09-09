@@ -916,6 +916,7 @@ class DeformableFEMSystem:
         self.proximal_position_residual = wp.zeros(model.world_count, dtype=wp.float32, device=self.device)
         self.proximal_velocity_residual = wp.zeros(model.world_count, dtype=wp.float32, device=self.device)
         self.proximal_failed = wp.zeros(model.world_count, dtype=wp.int32, device=self.device)
+        self.assembly_failed = wp.zeros(model.world_count, dtype=wp.int32, device=self.device)
         self.candidate_linear_residual = wp.zeros(model.world_count, dtype=wp.float32, device=self.device)
         self.membrane_proximal = (
             DeformableMembraneProximal(self, proximal_iterations, proximal_relaxation)
@@ -1139,6 +1140,7 @@ class DeformableFEMSystem:
         finalize_consensus: bool = True,
     ) -> None:
         """Assemble and factor one deformable linearization with fixed step-start data."""
+        self.assembly_failed.zero_()
         wp.launch(
             set_particle_linearization,
             dim=self.particle_count,
@@ -1189,7 +1191,7 @@ class DeformableFEMSystem:
                     time_step,
                     self.triangle_triplet_offset,
                 ],
-                outputs=[self.triplet_values, self.smooth_force],
+                outputs=[self.triplet_values, self.smooth_force, self.assembly_failed],
                 device=self.device,
             )
         if self.bending_count > 0:
@@ -1293,7 +1295,7 @@ class DeformableFEMSystem:
         self.nonlinear_rhs.zero_()
         self.proximal_position_residual.zero_()
         self.proximal_velocity_residual.zero_()
-        self.proximal_failed.zero_()
+        wp.copy(self.proximal_failed, self.assembly_failed)
         if self.membrane_proximal is not None:
             self.membrane_proximal.initialize()
         if self.tetrahedron_proximal is not None:
@@ -1366,7 +1368,7 @@ class DeformableFEMSystem:
         self.nonlinear_rhs.zero_()
         self.proximal_position_residual.zero_()
         self.proximal_velocity_residual.zero_()
-        self.proximal_failed.zero_()
+        wp.copy(self.proximal_failed, self.assembly_failed)
         if self.membrane_proximal is not None:
             self.membrane_proximal.update(time_step)
         if self.tetrahedron_proximal is not None:

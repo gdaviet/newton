@@ -5,6 +5,7 @@
 
 import unittest
 
+from newton._src.solvers.kamino.tests.test_lox_membrane_hardening import TestLOXMembraneHardening
 from newton._src.solvers.kamino.tests.test_solvers_lox_deformable_integration import (
     TestLOXDeformableIntegration,
 )
@@ -46,7 +47,21 @@ _FUNCTIONAL_TESTS = (
 def load_tests(loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: str | None) -> unittest.TestSuite:
     """Load end-to-end deformable and mixed-contact regressions."""
     del loader, tests, pattern
-    return unittest.TestSuite(TestLOXDeformableIntegration(name) for name in _FUNCTIONAL_TESTS)
+    suite = unittest.TestSuite(TestLOXDeformableIntegration(name) for name in _FUNCTIONAL_TESTS)
+    suite.addTests(
+        TestLOXMembraneHardening(name)
+        for name in (
+            "test_sliver_area_gradient_and_force_avoid_gram_cancellation",
+            "test_area_gradient_and_assembly_rotate_covariantly",
+            "test_collapsed_membrane_is_finite_and_coherently_regularized",
+            "test_zero_elastic_coefficients_do_not_enter_proximal_consensus",
+            "test_ordinary_membrane_one_iteration_remains_finite",
+            "test_stationarity_correction_prevents_false_local_convergence",
+            "test_invalid_proximal_scatter_is_transactional",
+            "test_invalid_assembly_contribution_is_transactional",
+        )
+    )
+    return suite
 
 
 if __name__ == "__main__":
