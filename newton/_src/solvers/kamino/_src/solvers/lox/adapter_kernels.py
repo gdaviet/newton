@@ -12,7 +12,7 @@ from functools import cache
 
 import warp as wp
 
-from ...core.joints import JointActuationType, JointCorrectionMode
+from ...core.joints import JointActuationType, JointCorrectionMode, JointDoFType
 from ...core.math import compute_body_pose_update_with_logmap, contact_wrench_matrix_from_points
 from ...core.types import mat36f, mat66f, vec6f
 from ...geometry.contacts import ContactMode
@@ -490,6 +490,7 @@ def make_evaluate_candidate_structural_residual_kernel(correction: JointCorrecti
         joint_coords_offset: wp.array[wp.int32],
         joint_dofs_offset: wp.array[wp.int32],
         joint_kinematic_offset: wp.array[wp.int32],
+        joint_kinematic_count: wp.array[wp.int32],
         joint_body_first: wp.array[wp.int32],
         joint_body_second: wp.array[wp.int32],
         joint_first_position: wp.array[wp.vec3f],
@@ -501,7 +502,8 @@ def make_evaluate_candidate_structural_residual_kernel(correction: JointCorrecti
         linearization_twist: wp.array[vec6f],
         previous_joint_coordinate: wp.array[wp.float32],
         world_active: wp.array[wp.bool],
-        candidate_residual: wp.array[wp.float32],
+        candidate_physical_residual: wp.array[wp.float32],
+        candidate_feedback_residual: wp.array[wp.float32],
         scratch_residual_velocity: wp.array[wp.float32],
         scratch_joint_coordinate: wp.array[wp.float32],
         scratch_joint_velocity: wp.array[wp.float32],
@@ -531,15 +533,17 @@ def make_evaluate_candidate_structural_residual_kernel(correction: JointCorrecti
             wp.vec3f(second_delta[3], second_delta[4], second_delta[5]),
         )
 
-        _, relative_position, relative_orientation, relative_twist = compute_joint_pose_and_relative_motion(
-            first_pose,
-            second_pose,
-            wp.spatial_vectorf(0.0),
-            wp.spatial_vectorf(0.0),
-            joint_first_position[joint],
-            joint_second_position[joint],
-            joint_first_orientation[joint],
-            joint_second_orientation[joint],
+        candidate_joint_pose, relative_position, relative_orientation, relative_twist = (
+            compute_joint_pose_and_relative_motion(
+                first_pose,
+                second_pose,
+                wp.spatial_vectorf(0.0),
+                wp.spatial_vectorf(0.0),
+                joint_first_position[joint],
+                joint_second_position[joint],
+                joint_first_orientation[joint],
+                joint_second_orientation[joint],
+            )
         )
         wp.static(make_write_joint_data(correction))(
             joint_dof_type[joint],
@@ -550,11 +554,34 @@ def make_evaluate_candidate_structural_residual_kernel(correction: JointCorrecti
             relative_orientation,
             relative_twist,
             previous_joint_coordinate,
-            candidate_residual,
+            candidate_physical_residual,
             scratch_residual_velocity,
             scratch_joint_coordinate,
             scratch_joint_velocity,
         )
+
+        row_offset = joint_kinematic_offset[joint]
+        row_count = joint_kinematic_count[joint]
+        for local_row in range(row_count):
+            candidate_feedback_residual[row_offset + local_row] = candidate_physical_residual[row_offset + local_row]
+
+        dof_type = joint_dof_type[joint]
+        full_position_block = (
+            dof_type == JointDoFType.FIXED or dof_type == JointDoFType.REVOLUTE or dof_type == JointDoFType.SPHERICAL
+        )
+        if full_position_block:
+            # These three rows use the frozen parent-joint basis in the cached
+            # Jacobian. Keep nonlinear feedback in that same chart.
+            candidate_frame = wp.transform_get_rotation(candidate_joint_pose)
+            world_error = wp.quat_rotate(candidate_frame, relative_position)
+            frozen_body_orientation = wp.quat_identity(dtype=wp.float32)
+            if first >= 0:
+                frozen_body_orientation = wp.transform_get_rotation(body_pose[first])
+            frozen_frame = frozen_body_orientation * wp.quat_from_matrix(joint_first_orientation[joint])
+            frozen_error = wp.quat_rotate_inv(frozen_frame, world_error)
+            candidate_feedback_residual[row_offset] = frozen_error[0]
+            candidate_feedback_residual[row_offset + 1] = frozen_error[1]
+            candidate_feedback_residual[row_offset + 2] = frozen_error[2]
 
     return _evaluate_candidate_structural_residual
 
@@ -1132,7 +1159,9 @@ def _update_structural_multipliers_from_candidate_rows(
     body_second_global: wp.array[wp.int32],
     jacobian_first: wp.array[vec6f],
     jacobian_second: wp.array[vec6f],
-    candidate_residual: wp.array[wp.float32],
+    feedback_supported: wp.array[wp.bool],
+    feedback_world_enabled: wp.array[wp.bool],
+    candidate_feedback_residual: wp.array[wp.float32],
     proximal_defect: wp.array[wp.float32],
     frozen_residual: wp.array[wp.float32],
     penalty: wp.array[wp.float32],
@@ -1141,7 +1170,9 @@ def _update_structural_multipliers_from_candidate_rows(
     proximal_relaxation: wp.float32,
     body_vector_index: wp.array[wp.int32],
     reaction: wp.array[wp.float32],
+    update_residual_out: wp.array[wp.float32],
     world_residual: wp.array[wp.float32],
+    world_feedback_unsafe: wp.array[wp.int32],
     right_hand_side: wp.array[wp.float32],
 ):
     row = wp.tid()
@@ -1168,16 +1199,42 @@ def _update_structural_multipliers_from_candidate_rows(
 
     linear_residual = frozen_residual[row] + dt * (candidate_velocity - linearization_velocity)
     update_residual = linear_residual
-    if proximal_relaxation > 0.0:
+    feedback_enabled = proximal_relaxation > 0.0 and (not feedback_world_enabled or feedback_world_enabled[world])
+    next_defect = proximal_defect[row]
+    if feedback_enabled:
         defect = proximal_defect[row]
-        defect += proximal_relaxation * (candidate_residual[row] - linear_residual - defect)
-        proximal_defect[row] = defect
+        feedback_residual = linear_residual
+        if feedback_supported[row]:
+            feedback_residual = candidate_feedback_residual[row]
+        defect += proximal_relaxation * (feedback_residual - linear_residual - defect)
+        next_defect = defect
         update_residual += defect
-    candidate_residual[row] = update_residual
+    reaction_delta = -penalty[row] * update_residual
+    next_reaction = reaction[row] + reaction_delta
+    finite = (
+        wp.isfinite(linear_residual)
+        and wp.isfinite(update_residual)
+        and wp.isfinite(reaction_delta)
+        and wp.isfinite(next_reaction)
+    )
+    if feedback_enabled:
+        finite = finite and wp.isfinite(next_defect)
+        if feedback_supported[row]:
+            finite = finite and wp.isfinite(candidate_feedback_residual[row])
+    for axis in range(6):
+        if first_dynamic:
+            finite = finite and wp.isfinite(dt * reaction_delta * jacobian_first[row][axis])
+        if second_dynamic:
+            finite = finite and wp.isfinite(dt * reaction_delta * jacobian_second[row][axis])
+    if not finite:
+        wp.atomic_max(world_feedback_unsafe, world, 1)
+        return
+    if feedback_enabled:
+        proximal_defect[row] = next_defect
+    update_residual_out[row] = update_residual
     wp.atomic_max(world_residual, world, wp.abs(update_residual) / structural_tolerance)
 
-    reaction_delta = -penalty[row] * update_residual
-    reaction[row] += reaction_delta
+    reaction[row] = next_reaction
 
     for axis in range(6):
         if first_global >= 0 and body_vector_index[first_global] >= 0:
@@ -1217,7 +1274,35 @@ def _reduce_structural_candidate_residual(
     second_dynamic = second >= 0 and body_vector_index[second] >= 0
     if not first_dynamic and not second_dynamic:
         return
-    wp.atomic_max(world_residual, world, wp.abs(candidate_residual[row]) / structural_tolerance)
+    normalized = wp.abs(candidate_residual[row]) / structural_tolerance
+    wp.atomic_max(world_residual, world, normalized)
+
+
+@wp.kernel
+def _reduce_structural_feedback_metrics(
+    structural_tolerance: wp.float32,
+    row_world: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    projection_status: wp.array[wp.int32],
+    body_first_global: wp.array[wp.int32],
+    body_second_global: wp.array[wp.int32],
+    candidate_residual: wp.array[wp.float32],
+    feedback_supported: wp.array[wp.bool],
+    body_vector_index: wp.array[wp.int32],
+    world_feedback_residual: wp.array[wp.float32],
+):
+    row = wp.tid()
+    world = row_world[row]
+    if not feedback_supported[row] or not world_active[world] or projection_status[world] != PROJECTION_STATUS_VALID:
+        return
+    first = body_first_global[row]
+    second = body_second_global[row]
+    first_dynamic = first >= 0 and body_vector_index[first] >= 0
+    second_dynamic = second >= 0 and body_vector_index[second] >= 0
+    if not first_dynamic and not second_dynamic:
+        return
+    normalized = wp.abs(candidate_residual[row]) / structural_tolerance
+    wp.atomic_max(world_feedback_residual, world, normalized)
 
 
 @wp.kernel

@@ -1022,11 +1022,14 @@ class LOXSolverConfig:
     joint_proximal_relaxation: float = 0.0
     """Relaxation factor for exact candidate-pose structural joint residuals.
 
-    Zero retains the frozen linear residual. Positive values relax a stored
-    nonlinear residual correction toward the exact candidate-pose residual
-    while reusing the frozen Jacobian, primal matrix, and factorization. The
-    relaxation changes convergence speed without changing the nonlinear fixed
-    point.
+    Zero retains the frozen linear residual. Positive values correct the full
+    three-axis positional blocks of fixed, revolute, and ball joints while
+    reusing the frozen Jacobian, primal matrix, and factorization. Angular rows
+    and partial positional constraint blocks retain the frozen linear update.
+    Unsafe rigid-only feedback is rolled back once and retried without nonlinear
+    feedback using the remaining iteration budget. If no retry iteration remains,
+    or the solver contains deformables, the unsafe world is rejected without
+    exporting its trial velocity or warm starts.
     """
 
     rod_proximal_relaxation: float = 0.0
@@ -1036,7 +1039,10 @@ class LOXSolverConfig:
     exact candidate-pose bend and twist strains within the LOX splitting loop
     while reusing the frozen rigid-body factorization. Stretch and shear remain
     linearly implicit to avoid amplifying geometric defects by their typically
-    much larger stiffness.
+    much larger stiffness. Twist feedback follows a temporally lifted angle so
+    damping remains continuous across the principal-angle branch; ambiguous
+    twist increments and near-folded bend charts trigger the same bounded
+    rigid-only rollback or rejection policy as structural joint feedback.
     """
 
     deformable_cr_iterations: int = 4

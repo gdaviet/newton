@@ -5,6 +5,7 @@
 
 import unittest
 
+from newton._src.solvers.kamino.tests.test_lox_rod_feedback import TestLOXRodFeedback
 from newton._src.solvers.kamino.tests.test_solver_kamino_lox import TestSolverKaminoLOX
 from newton._src.solvers.kamino.tests.test_solvers_lox_deformable_integration import (
     TestLOXDeformableIntegration,
@@ -17,6 +18,8 @@ def load_tests(loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: 
     return unittest.TestSuite(
         (
             TestSolverKaminoLOX("test_cuda_graph_capture_uses_conditional_loop"),
+            TestSolverKaminoLOX("test_cuda_graph_capture_joint_proximal_transport"),
+            TestLOXRodFeedback("test_cuda_graph_replays_twist_branch_crossing"),
             TestLOXDeformableIntegration("test_capture_public_pure_cloth_step"),
             TestLOXDeformableIntegration("test_capture_step_in_place_matches_ping_pong_with_nonzero_body_com"),
             TestLOXDeformableIntegration("test_capture_public_dynamic_rigid_cloth_contact_step"),

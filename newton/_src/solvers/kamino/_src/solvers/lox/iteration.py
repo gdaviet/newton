@@ -331,7 +331,10 @@ def _finalize_residual_iteration(
     lagged_velocity = wp.float32(0.0)
     if lagged_velocity_residual:
         lagged_velocity = lagged_velocity_residual[world]
-    total = wp.max(wp.max(change, split), wp.max(wp.max(structural, cross_iterate), lagged_velocity))
+    total = wp.max(
+        wp.max(change, split),
+        wp.max(wp.max(wp.max(structural, projected_structural), cross_iterate), lagged_velocity),
+    )
     if effort_residual:
         total = wp.max(total, effort_residual[world])
     if proximal_residual:

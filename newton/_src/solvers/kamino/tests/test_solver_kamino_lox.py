@@ -24,6 +24,17 @@ from newton.tests.utils.basics import (
 )
 
 
+@wp.kernel
+def _inject_unsafe_on_iteration(
+    iteration_count: wp.array[wp.int32],
+    target_iteration: wp.int32,
+    unsafe: wp.array[wp.int32],
+):
+    world = wp.tid()
+    if iteration_count[world] == target_iteration:
+        unsafe[world] = 1
+
+
 def _build_revolute_dynamics_model(
     *,
     damping: float,
@@ -204,6 +215,166 @@ def _build_flagged_kinematic_model(*, device: wp.DeviceLike = None) -> tuple[new
     builder.add_articulation([joint])
     builder.end_world()
     return builder.finalize(device=device), body
+
+
+def _build_prescribed_rotating_joint_model(
+    *,
+    angle: float,
+    joint_kind: str = "ball",
+    nonidentity_frames: bool = False,
+    device: wp.DeviceLike = None,
+) -> tuple[newton.Model, int, int, wp.transformf, wp.transformf]:
+    """Build a rotating prescribed parent with an offset dynamic child."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    SolverKamino.register_custom_attributes(builder)
+    builder.begin_world()
+    inertia = wp.mat33f(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    parent = builder.add_link(mass=1.0, inertia=inertia, lock_inertia=True, is_kinematic=True)
+    child = builder.add_link(
+        xform=wp.transformf(wp.vec3f(1.0, 0.0, 0.0), wp.quat_identity(dtype=wp.float32)),
+        mass=1.0,
+        inertia=inertia,
+        lock_inertia=True,
+    )
+    root = builder.add_joint_free(parent=-1, child=parent)
+    frame_orientation = (
+        wp.quat_from_axis_angle(wp.normalize(wp.vec3f(1.0, 2.0, -1.0)), 0.7)
+        if nonidentity_frames
+        else wp.quat_identity(dtype=wp.float32)
+    )
+    parent_xform = wp.transformf(wp.vec3f(1.0, 0.0, 0.0), frame_orientation)
+    child_xform = wp.transformf(wp.vec3f(0.0), frame_orientation)
+    if joint_kind == "ball":
+        joint = builder.add_joint_ball(
+            parent=parent,
+            child=child,
+            parent_xform=parent_xform,
+            child_xform=child_xform,
+        )
+    elif joint_kind == "revolute":
+        joint = builder.add_joint_revolute(
+            parent=parent,
+            child=child,
+            parent_xform=parent_xform,
+            child_xform=child_xform,
+            axis=newton.Axis.X,
+        )
+    else:
+        raise ValueError(f"Unsupported joint kind: {joint_kind}")
+    builder.add_articulation([root, joint])
+    builder.body_qd[parent] = wp.spatial_vectorf(0.0, 0.0, 0.0, 0.0, 0.0, angle / 0.01)
+    builder.end_world()
+    return builder.finalize(device=device), parent, child, parent_xform, child_xform
+
+
+def _rotate_vector(quaternion: np.ndarray, vector: np.ndarray) -> np.ndarray:
+    """Rotate a vector by an xyzw quaternion."""
+    axis = quaternion[:3]
+    scalar = quaternion[3]
+    return vector + 2.0 * (scalar * np.cross(axis, vector) + np.cross(axis, np.cross(axis, vector)))
+
+
+def _joint_anchor_error(
+    body_pose: np.ndarray,
+    parent: int,
+    child: int,
+    parent_xform: wp.transformf,
+    child_xform: wp.transformf,
+) -> np.ndarray:
+    """Return child-minus-parent joint anchor separation in world coordinates [m]."""
+    parent_anchor = body_pose[parent, :3] + _rotate_vector(body_pose[parent, 3:], np.asarray(parent_xform.p))
+    child_anchor = body_pose[child, :3] + _rotate_vector(body_pose[child, 3:], np.asarray(child_xform.p))
+    return child_anchor - parent_anchor
+
+
+def _quaternion_product(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    """Multiply xyzw quaternions."""
+    first_axis = first[:3]
+    second_axis = second[:3]
+    return np.concatenate(
+        (
+            first[3] * second_axis + second[3] * first_axis + np.cross(first_axis, second_axis),
+            np.asarray([first[3] * second[3] - np.dot(first_axis, second_axis)]),
+        )
+    )
+
+
+def _joint_angular_error(
+    body_pose: np.ndarray,
+    parent: int,
+    child: int,
+    parent_xform: wp.transformf,
+    child_xform: wp.transformf,
+    joint_kind: str,
+) -> float:
+    """Return the constrained joint-frame angular error [rad]."""
+    parent_frame = _quaternion_product(body_pose[parent, 3:], np.asarray(parent_xform.q))
+    child_frame = _quaternion_product(body_pose[child, 3:], np.asarray(child_xform.q))
+    parent_inverse = parent_frame * np.asarray((-1.0, -1.0, -1.0, 1.0))
+    relative = _quaternion_product(parent_inverse, child_frame)
+    relative /= np.linalg.norm(relative)
+    if joint_kind == "fixed":
+        return float(2.0 * np.arccos(np.clip(abs(relative[3]), 0.0, 1.0)))
+    follower_axis = _rotate_vector(relative, np.asarray((1.0, 0.0, 0.0)))
+    return float(np.linalg.norm(np.cross(np.asarray((1.0, 0.0, 0.0)), follower_axis)))
+
+
+def _build_two_body_joint_model(
+    *,
+    joint_kind: str,
+    mass_ratio: float,
+    reverse_body_order: bool,
+    device: wp.DeviceLike = None,
+) -> tuple[newton.Model, int, int, wp.transformf, wp.transformf]:
+    """Build an offset two-body fixed or revolute joint stress fixture."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    SolverKamino.register_custom_attributes(builder)
+    builder.begin_world()
+    frame_orientation = wp.quat_from_axis_angle(wp.normalize(wp.vec3f(1.0, -2.0, 0.5)), 0.6)
+    parent_xform = wp.transformf(wp.vec3f(0.3, -0.2, 0.7), frame_orientation)
+    child_xform = wp.transformf(wp.vec3f(-0.1, 0.2, -0.3), frame_orientation)
+    child_position = wp.vec3f(0.4, -0.4, 1.0)
+    parent_inertia = wp.mat33f(0.2, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 0.4)
+    child_inertia = parent_inertia / mass_ratio
+
+    def add_parent() -> int:
+        return builder.add_link(mass=1.0, inertia=parent_inertia, lock_inertia=True)
+
+    def add_child() -> int:
+        return builder.add_link(
+            xform=wp.transformf(child_position, wp.quat_identity(dtype=wp.float32)),
+            mass=1.0 / mass_ratio,
+            inertia=child_inertia,
+            lock_inertia=True,
+        )
+
+    if reverse_body_order:
+        child = add_child()
+        parent = add_parent()
+    else:
+        parent = add_parent()
+        child = add_child()
+    root = builder.add_joint_revolute(parent=-1, child=parent, axis=newton.Axis.Y)
+    if joint_kind == "fixed":
+        joint = builder.add_joint_fixed(
+            parent=parent,
+            child=child,
+            parent_xform=parent_xform,
+            child_xform=child_xform,
+        )
+    elif joint_kind == "revolute":
+        joint = builder.add_joint_revolute(
+            parent=parent,
+            child=child,
+            parent_xform=parent_xform,
+            child_xform=child_xform,
+            axis=newton.Axis.X,
+        )
+    else:
+        raise ValueError(f"Unsupported joint kind: {joint_kind}")
+    builder.add_articulation([root, joint])
+    builder.end_world()
+    return builder.finalize(device=device), parent, child, parent_xform, child_xform
 
 
 def _build_rod_model(
@@ -685,6 +856,584 @@ class TestSolverKaminoLOX(unittest.TestCase):
         position_error = poses[child, :3] - parent_position - rotated_offset
         np.testing.assert_allclose(position_error, 0.0, atol=1.0e-5)
 
+    def test_joint_proximal_uses_frozen_frame_for_full_position_blocks(self):
+        """Constrain offset anchors while a prescribed parent rotates substantially."""
+        cases = (
+            ("ball", 0.1, False),
+            ("ball", 0.5, True),
+            ("ball", 1.2, True),
+            ("revolute", 0.5, True),
+        )
+        for joint_kind, angle, nonidentity_frames in cases:
+            with self.subTest(joint_kind=joint_kind, angle=angle, nonidentity_frames=nonidentity_frames):
+                model, parent, child, parent_xform, child_xform = _build_prescribed_rotating_joint_model(
+                    angle=angle,
+                    joint_kind=joint_kind,
+                    nonidentity_frames=nonidentity_frames,
+                    device=self.device,
+                )
+                config = self.make_config()
+                config.use_collision_detector = False
+                config.lox.fixed_iterations = True
+                config.lox.joint_proximal_relaxation = 1.0
+                solver = SolverKamino(model, config=config)
+                state_previous = model.state()
+                state_next = model.state()
+
+                solver.step(state_previous, state_next, model.control(), contacts=None, dt=0.01)
+
+                anchor_error = _joint_anchor_error(
+                    state_next.body_q.numpy(),
+                    parent,
+                    child,
+                    parent_xform,
+                    child_xform,
+                )
+                self.assertTrue(np.isfinite(anchor_error).all())
+                np.testing.assert_allclose(anchor_error, 0.0, rtol=0.0, atol=1.0e-6)
+
+    def test_joint_proximal_recovery_matches_remaining_frozen_budget(self):
+        """Rollback a late unsafe trial and consume only the remaining budget."""
+        model, _parent, _child, _parent_xform, _child_xform = _build_prescribed_rotating_joint_model(
+            angle=0.5,
+            nonidentity_frames=True,
+            device=self.device,
+        )
+        nonlinear_config = self.make_config()
+        nonlinear_config.use_collision_detector = False
+        nonlinear_config.lox.fixed_iterations = True
+        nonlinear_config.lox.max_iterations = 5
+        nonlinear_config.lox.projection_method = "apgd"
+        nonlinear_config.lox.joint_proximal_relaxation = 1.0
+        nonlinear_solver = SolverKamino(model, config=nonlinear_config)
+        nonlinear_state_in = model.state()
+        nonlinear_state_out = model.state()
+        solver_fd = nonlinear_solver._solver_kamino._solver_fd
+        original_guard = solver_fd._guard_nonlinear_recovery_iteration
+        guard_calls = 0
+
+        def inject_late_unsafe_feedback():
+            nonlocal guard_calls
+            guard_calls += 1
+            if guard_calls == 3:
+                solver_fd.rigid_adapter.world_structural_feedback_unsafe.fill_(1)
+            original_guard()
+
+        solver_fd._guard_nonlinear_recovery_iteration = inject_late_unsafe_feedback
+        nonlinear_solver.step(
+            nonlinear_state_in,
+            nonlinear_state_out,
+            model.control(),
+            contacts=None,
+            dt=0.01,
+        )
+
+        frozen_config = self.make_config()
+        frozen_config.use_collision_detector = False
+        frozen_config.lox.fixed_iterations = True
+        frozen_config.lox.max_iterations = 2
+        frozen_config.lox.projection_method = "apgd"
+        frozen_config.lox.joint_proximal_relaxation = 0.0
+        frozen_solver = SolverKamino(model, config=frozen_config)
+        frozen_state_in = model.state()
+        frozen_state_out = model.state()
+        frozen_solver.step(frozen_state_in, frozen_state_out, model.control(), contacts=None, dt=0.01)
+
+        self.assertEqual(guard_calls, 5)
+        self.assertTrue(solver_fd.world_nonlinear_fallback_used.numpy()[0])
+        self.assertEqual(solver_fd.status.numpy()[0]["accepted"], 1)
+        self.assertEqual(solver_fd.status.numpy()[0]["iterations"], 5)
+        np.testing.assert_allclose(
+            nonlinear_state_out.body_q.numpy(),
+            frozen_state_out.body_q.numpy(),
+            rtol=2.0e-6,
+            atol=2.0e-6,
+        )
+        np.testing.assert_allclose(
+            nonlinear_state_out.body_qd.numpy(),
+            frozen_state_out.body_qd.numpy(),
+            rtol=2.0e-6,
+            atol=2.0e-6,
+        )
+        frozen_fd = frozen_solver._solver_kamino._solver_fd
+        np.testing.assert_allclose(
+            solver_fd.rigid_adapter.structural_reaction.numpy(),
+            frozen_fd.rigid_adapter.structural_reaction.numpy(),
+            rtol=2.0e-6,
+            atol=2.0e-6,
+        )
+        np.testing.assert_allclose(
+            solver_fd.splitting.splitting_dual_impulse.numpy(),
+            frozen_fd.splitting.splitting_dual_impulse.numpy(),
+            rtol=2.0e-6,
+            atol=2.0e-6,
+        )
+
+    def test_joint_proximal_accepts_finite_root_translation_transient(self):
+        """Do not reject a large finite first trial solely for its absolute error."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        SolverKamino.register_custom_attributes(builder)
+        builder.begin_world()
+        inertia = wp.mat33f(0.2, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2)
+        parent = builder.add_link(mass=1.0, inertia=inertia, lock_inertia=True)
+        child = builder.add_link(
+            xform=wp.transformf(wp.vec3f(0.0, 0.0, 1.0), wp.quat_identity(dtype=wp.float32)),
+            mass=1.0,
+            inertia=inertia,
+            lock_inertia=True,
+        )
+        root = builder.add_joint_revolute(parent=-1, child=parent, axis=newton.Axis.Y)
+        parent_xform = wp.transformf(wp.vec3f(0.0, 0.0, 1.0), wp.quat_identity(dtype=wp.float32))
+        child_xform = wp.transformf(wp.vec3f(0.0), wp.quat_identity(dtype=wp.float32))
+        joint = builder.add_joint_fixed(
+            parent=parent,
+            child=child,
+            parent_xform=parent_xform,
+            child_xform=child_xform,
+        )
+        builder.add_articulation([root, joint])
+        builder.end_world()
+        model = builder.finalize(device=self.device)
+        state_in = model.state()
+        velocity = state_in.body_qd.numpy()
+        velocity[:] = np.random.default_rng(1).normal(size=(2, 6)) / 0.01
+        state_in.body_qd.assign(velocity)
+        state_out = model.state()
+        config = self.make_config(sparse_jacobian=True)
+        config.use_collision_detector = False
+        config.lox.fixed_iterations = True
+        config.lox.max_iterations = 80
+        config.lox.joint_proximal_relaxation = 1.0
+        solver = SolverKamino(model, config=config)
+
+        solver.step(state_in, state_out, model.control(), contacts=None, dt=0.01)
+
+        solver_fd = solver._solver_kamino._solver_fd
+        self.assertFalse(solver_fd.world_nonlinear_fallback_used.numpy()[0])
+        self.assertEqual(solver_fd.status.numpy()[0]["accepted"], 1)
+        anchor_error = _joint_anchor_error(
+            state_out.body_q.numpy(),
+            parent,
+            child,
+            parent_xform,
+            child_xform,
+        )
+        self.assertTrue(np.isfinite(anchor_error).all())
+        self.assertLess(float(np.linalg.norm(anchor_error)), 1.0e-5)
+
+    def test_joint_proximal_recovery_runs_in_conditional_loop(self):
+        """Execute the recovery guard and restart inside capture-while."""
+        model, _parent, _child, _parent_xform, _child_xform = _build_prescribed_rotating_joint_model(
+            angle=0.5,
+            nonidentity_frames=True,
+            device=self.device,
+        )
+        config = self.make_config()
+        config.use_collision_detector = False
+        config.lox.fixed_iterations = False
+        config.lox.use_graph_conditionals = True
+        config.lox.max_iterations = 5
+        config.lox.joint_proximal_relaxation = 1.0
+        solver = SolverKamino(model, config=config)
+        solver_fd = solver._solver_kamino._solver_fd
+        original_guard = solver_fd._guard_nonlinear_recovery_iteration
+
+        def inject_from_device_iteration():
+            wp.launch(
+                _inject_unsafe_on_iteration,
+                dim=solver_fd.num_worlds,
+                inputs=[solver_fd.iteration_count, 2],
+                outputs=[solver_fd.rigid_adapter.world_structural_feedback_unsafe],
+                device=self.device,
+            )
+            original_guard()
+
+        solver_fd._guard_nonlinear_recovery_iteration = inject_from_device_iteration
+        solver.step(model.state(), model.state(), model.control(), contacts=None, dt=0.01)
+
+        status = solver_fd.status.numpy()[0]
+        self.assertTrue(solver_fd.world_nonlinear_fallback_used.numpy()[0])
+        self.assertEqual(status["accepted"], 1)
+        self.assertEqual(status["converged"], 0)
+        self.assertEqual(status["iteration_limit"], 1)
+        self.assertEqual(status["iterations"], 5)
+
+    def test_joint_proximal_rejects_last_iteration_nonfinite_feedback(self):
+        """Reject a last-iteration NaN without leaking trial warm-start state."""
+        model, _parent, child, _parent_xform, _child_xform = _build_prescribed_rotating_joint_model(
+            angle=0.5,
+            nonidentity_frames=True,
+            device=self.device,
+        )
+        config = self.make_config()
+        config.use_collision_detector = False
+        config.lox.fixed_iterations = True
+        config.lox.max_iterations = 3
+        config.lox.joint_proximal_relaxation = 1.0
+        solver = SolverKamino(model, config=config)
+        state_in = model.state()
+        state_out = model.state()
+        solver_fd = solver._solver_kamino._solver_fd
+        original_guard = solver_fd._guard_nonlinear_recovery_iteration
+        guard_calls = 0
+
+        def inject_last_iteration_nan():
+            nonlocal guard_calls
+            guard_calls += 1
+            if guard_calls == 3:
+                solver_fd.world_nonlinear_feedback_enabled.fill_(True)
+                solver_fd.rigid_adapter.world_feedback_structural_residual.fill_(float("nan"))
+            original_guard()
+
+        solver_fd._guard_nonlinear_recovery_iteration = inject_last_iteration_nan
+        solver.step(state_in, state_out, model.control(), contacts=None, dt=0.01)
+
+        status = solver_fd.status.numpy()[0]
+        self.assertEqual(guard_calls, 3)
+        self.assertEqual(status["accepted"], 0)
+        self.assertEqual(status["failed"], 1)
+        self.assertFalse(solver_fd.world_nonlinear_fallback_used.numpy()[0])
+        np.testing.assert_allclose(
+            solver_fd.rigid_adapter.structural_reaction.numpy(),
+            solver_fd._recovery_structural_reaction.numpy(),
+            rtol=0.0,
+            atol=0.0,
+        )
+        np.testing.assert_allclose(
+            solver_fd.splitting.splitting_dual_impulse.numpy(),
+            solver_fd._recovery_splitting_dual_impulse.numpy(),
+            rtol=2.0e-6,
+            atol=2.0e-6,
+        )
+        self.assertTrue(np.isfinite(state_out.body_q.numpy()).all())
+        self.assertTrue(np.isfinite(state_out.body_qd.numpy()).all())
+        np.testing.assert_allclose(state_out.body_q.numpy()[child], state_in.body_q.numpy()[child], atol=0.0)
+        np.testing.assert_allclose(state_out.body_qd.numpy()[child], state_in.body_qd.numpy()[child], atol=0.0)
+
+    def test_joint_proximal_rejects_invalid_frozen_fallback(self):
+        """Do not accept a second unsafe event after the one allowed restart."""
+        model, _parent, child, _parent_xform, _child_xform = _build_prescribed_rotating_joint_model(
+            angle=0.5,
+            nonidentity_frames=True,
+            device=self.device,
+        )
+        config = self.make_config()
+        config.use_collision_detector = False
+        config.lox.fixed_iterations = True
+        config.lox.max_iterations = 5
+        config.lox.joint_proximal_relaxation = 1.0
+        solver = SolverKamino(model, config=config)
+        state_in = model.state()
+        state_out = model.state()
+        solver_fd = solver._solver_kamino._solver_fd
+        original_guard = solver_fd._guard_nonlinear_recovery_iteration
+        guard_calls = 0
+
+        def inject_trial_then_fallback_failure():
+            nonlocal guard_calls
+            guard_calls += 1
+            if guard_calls in (3, 4):
+                solver_fd.rigid_adapter.world_structural_feedback_unsafe.fill_(1)
+            original_guard()
+
+        solver_fd._guard_nonlinear_recovery_iteration = inject_trial_then_fallback_failure
+        solver.step(state_in, state_out, model.control(), contacts=None, dt=0.01)
+
+        status = solver_fd.status.numpy()[0]
+        self.assertTrue(solver_fd.world_nonlinear_fallback_used.numpy()[0])
+        self.assertEqual(status["accepted"], 0)
+        self.assertEqual(status["failed"], 1)
+        np.testing.assert_allclose(state_out.body_q.numpy()[child], state_in.body_q.numpy()[child], atol=0.0)
+        np.testing.assert_allclose(state_out.body_qd.numpy()[child], state_in.body_qd.numpy()[child], atol=0.0)
+
+    def test_joint_proximal_blocks_nonfinite_row_update(self):
+        """Detect a candidate NaN before it reaches reactions or the assembled RHS."""
+        model, _parent, child, _parent_xform, _child_xform = _build_prescribed_rotating_joint_model(
+            angle=0.5,
+            nonidentity_frames=True,
+            device=self.device,
+        )
+        config = self.make_config()
+        config.use_collision_detector = False
+        config.lox.fixed_iterations = True
+        config.lox.max_iterations = 3
+        config.lox.joint_multiplier_projected_fraction = 1.0
+        config.lox.joint_proximal_relaxation = 1.0
+        solver = SolverKamino(model, config=config)
+        state_in = model.state()
+        state_out = model.state()
+        solver_fd = solver._solver_kamino._solver_fd
+        adapter = solver_fd.rigid_adapter
+        original_evaluate = adapter._evaluate_structural_candidate_pose_residual
+        original_guard = solver_fd._guard_nonlinear_recovery_iteration
+        supported_row = int(np.flatnonzero(adapter.structural_feedback_supported.numpy())[0])
+        guard_calls = 0
+        row_reaction_after_second = None
+
+        def inject_candidate_nan(*args):
+            original_evaluate(*args)
+            if int(solver_fd.iteration_count.numpy()[0]) == 2:
+                feedback = args[-1].numpy()
+                feedback[supported_row] = np.nan
+                args[-1].assign(feedback)
+
+        def inspect_before_guard():
+            nonlocal guard_calls, row_reaction_after_second
+            guard_calls += 1
+            reaction = adapter.structural_reaction.numpy()
+            if guard_calls == 2:
+                row_reaction_after_second = reaction[supported_row]
+            elif guard_calls == 3:
+                self.assertTrue(np.isfinite(reaction).all())
+                self.assertTrue(np.isfinite(solver_fd.system.right_hand_side.numpy()).all())
+                self.assertEqual(reaction[supported_row], row_reaction_after_second)
+            original_guard()
+
+        adapter._evaluate_structural_candidate_pose_residual = inject_candidate_nan
+        solver_fd._guard_nonlinear_recovery_iteration = inspect_before_guard
+        solver.step(state_in, state_out, model.control(), contacts=None, dt=0.01)
+
+        status = solver_fd.status.numpy()[0]
+        self.assertEqual(status["accepted"], 0)
+        self.assertEqual(status["failed"], 1)
+        np.testing.assert_allclose(state_out.body_q.numpy()[child], state_in.body_q.numpy()[child], atol=0.0)
+        np.testing.assert_allclose(state_out.body_qd.numpy()[child], state_in.body_qd.numpy()[child], atol=0.0)
+
+    def test_joint_proximal_handles_two_body_frames_and_orderings(self):
+        """Keep fixed and revolute joint errors bounded across mass and storage order."""
+        cases = (
+            ("fixed", 1.0, False),
+            ("fixed", 100.0, True),
+            ("revolute", 100.0, False),
+            ("revolute", 1.0, True),
+        )
+        for joint_kind, mass_ratio, reverse_body_order in cases:
+            with self.subTest(
+                joint_kind=joint_kind,
+                mass_ratio=mass_ratio,
+                reverse_body_order=reverse_body_order,
+            ):
+                model, parent, child, parent_xform, child_xform = _build_two_body_joint_model(
+                    joint_kind=joint_kind,
+                    mass_ratio=mass_ratio,
+                    reverse_body_order=reverse_body_order,
+                    device=self.device,
+                )
+                config = self.make_config()
+                config.use_collision_detector = False
+                config.lox.fixed_iterations = True
+                config.lox.joint_proximal_relaxation = 1.0
+                solver = SolverKamino(model, config=config)
+                state_previous = model.state()
+                state_next = model.state()
+                velocity = np.zeros((model.body_count, 6), dtype=np.float32)
+                velocity[parent] = (2.0, -1.0, 0.5, 0.0, 50.0, 0.0)
+                velocity[child] = (-3.0, 2.0, -1.0, 20.0, -10.0, 15.0)
+                state_previous.body_qd.assign(velocity)
+
+                solver.step(state_previous, state_next, model.control(), contacts=None, dt=0.01)
+
+                poses = state_next.body_q.numpy()
+                position_error = np.linalg.norm(_joint_anchor_error(poses, parent, child, parent_xform, child_xform))
+                angular_error = _joint_angular_error(
+                    poses,
+                    parent,
+                    child,
+                    parent_xform,
+                    child_xform,
+                    joint_kind,
+                )
+                self.assertTrue(math.isfinite(position_error))
+                self.assertTrue(math.isfinite(angular_error))
+                self.assertLess(position_error, 1.0e-4)
+                self.assertLess(angular_error, 0.1)
+
+    def test_joint_proximal_relaxations_share_position_fixed_point(self):
+        """Reach the same physical anchor constraint across positive relaxations."""
+        child_poses = []
+        for relaxation in (0.25, 0.5, 1.0):
+            with self.subTest(relaxation=relaxation):
+                model, parent, child, parent_xform, child_xform = _build_prescribed_rotating_joint_model(
+                    angle=0.5,
+                    nonidentity_frames=True,
+                    device=self.device,
+                )
+                config = self.make_config()
+                config.use_collision_detector = False
+                config.lox.fixed_iterations = True
+                config.lox.max_iterations = 80
+                config.lox.joint_proximal_relaxation = relaxation
+                solver = SolverKamino(model, config=config)
+                state_previous = model.state()
+                state_next = model.state()
+
+                solver.step(state_previous, state_next, model.control(), contacts=None, dt=0.01)
+
+                poses = state_next.body_q.numpy()
+                anchor_error = _joint_anchor_error(poses, parent, child, parent_xform, child_xform)
+                np.testing.assert_allclose(anchor_error, 0.0, rtol=0.0, atol=1.0e-6)
+                child_poses.append(poses[child])
+        child_poses = np.asarray(child_poses)
+        np.testing.assert_allclose(
+            child_poses,
+            np.broadcast_to(child_poses[0], child_poses.shape),
+            rtol=0.0,
+            atol=2.0e-6,
+        )
+
+    def test_joint_proximal_convergence_uses_physical_residual(self):
+        """Converge only after the projected candidate satisfies the physical constraint."""
+        model, parent, child, parent_xform, child_xform = _build_prescribed_rotating_joint_model(
+            angle=0.5,
+            nonidentity_frames=True,
+            device=self.device,
+        )
+        config = self.make_config()
+        config.use_collision_detector = False
+        config.lox.joint_proximal_relaxation = 1.0
+        solver = SolverKamino(model, config=config)
+        state_previous = model.state()
+        state_next = model.state()
+
+        solver.step(state_previous, state_next, model.control(), contacts=None, dt=0.01)
+
+        solver_fd = solver._solver_kamino._solver_fd
+        np.testing.assert_array_equal(solver_fd.world_converged.numpy(), True)
+        anchor_error = _joint_anchor_error(
+            state_next.body_q.numpy(),
+            parent,
+            child,
+            parent_xform,
+            child_xform,
+        )
+        np.testing.assert_allclose(anchor_error, 0.0, rtol=0.0, atol=config.lox.position_tolerance)
+
+    def test_joint_proximal_support_uses_joint_row_semantics(self):
+        """Enable nonlinear feedback only for validated full positional blocks."""
+        fixed_model, _parent, _child, _parent_xform, _child_xform = _build_two_body_joint_model(
+            joint_kind="fixed",
+            mass_ratio=1.0,
+            reverse_body_order=False,
+            device=self.device,
+        )
+        fixed_solver = SolverKamino(fixed_model, config=self.make_config())
+        fixed_supported = fixed_solver._solver_kamino._solver_fd.rigid_adapter.structural_feedback_supported.numpy()
+        np.testing.assert_array_equal(
+            fixed_supported,
+            np.asarray((True, True, True, False, False, True, True, True, False, False, False)),
+        )
+
+        prismatic_model, _anchor, _child = _build_zero_mass_prismatic_anchor_model(device=self.device)
+        prismatic_solver = SolverKamino(prismatic_model, config=self.make_config())
+        prismatic_supported = (
+            prismatic_solver._solver_kamino._solver_fd.rigid_adapter.structural_feedback_supported.numpy()
+        )
+        np.testing.assert_array_equal(prismatic_supported[-5:], False)
+
+    def test_joint_proximal_keeps_physical_candidate_residual(self):
+        """Report unsmoothed geometry for the projected rather than blended candidate."""
+        model, parent, child, parent_xform, child_xform = _build_prescribed_rotating_joint_model(
+            angle=0.5,
+            nonidentity_frames=True,
+            device=self.device,
+        )
+        config = self.make_config()
+        config.use_collision_detector = False
+        config.lox.fixed_iterations = True
+        config.lox.max_iterations = 1
+        config.lox.joint_proximal_relaxation = 1.0
+        config.lox.joint_multiplier_projected_fraction = 0.0
+        solver = SolverKamino(model, config=config)
+        state_previous = model.state()
+        state_next = model.state()
+
+        solver.step(state_previous, state_next, model.control(), contacts=None, dt=0.01)
+
+        adapter = solver._solver_kamino._solver_fd.rigid_adapter
+        physical_residual = adapter.structural_candidate_residual.numpy()
+        update_residual = adapter.structural_update_residual.numpy()
+        anchor_error = _joint_anchor_error(
+            state_next.body_q.numpy(),
+            parent,
+            child,
+            parent_xform,
+            child_xform,
+        )
+        self.assertAlmostEqual(
+            float(np.linalg.norm(physical_residual)),
+            float(np.linalg.norm(anchor_error)),
+            places=6,
+        )
+        self.assertGreater(float(np.linalg.norm(physical_residual - update_residual)), 1.0e-7)
+
+    def test_joint_proximal_transport_matches_frozen_linearization_locally(self):
+        """Match the frozen structural residual and Jacobian at zero candidate increment."""
+        model, _parent, child, _parent_xform, _child_xform = _build_prescribed_rotating_joint_model(
+            angle=0.5,
+            nonidentity_frames=True,
+            device=self.device,
+        )
+        config = self.make_config()
+        config.use_collision_detector = False
+        config.lox.fixed_iterations = True
+        config.lox.max_iterations = 1
+        config.lox.joint_proximal_relaxation = 1.0
+        solver = SolverKamino(model, config=config)
+        state_previous = model.state()
+        state_next = model.state()
+        solver_fd = solver._solver_kamino._solver_fd
+        adapter = solver_fd.rigid_adapter
+        original_finish = solver_fd._finish_body_space_iteration
+        checked = []
+
+        def check_local_linearization(time_step, linearization):
+            active = wp.ones(1, dtype=wp.bool, device=self.device)
+            adapter._evaluate_structural_candidate_pose_residual(
+                time_step,
+                linearization,
+                linearization,
+                active,
+                adapter.structural_candidate_residual,
+                adapter.structural_feedback_residual,
+            )
+            np.testing.assert_allclose(
+                adapter.structural_feedback_residual.numpy(),
+                adapter.structural_residual.numpy(),
+                rtol=0.0,
+                atol=1.0e-7,
+            )
+
+            candidate = linearization.numpy().copy()
+            delta = np.zeros_like(candidate)
+            delta[child, :3] = (0.1, -0.2, 0.05)
+            candidate += delta
+            candidate = wp.array(candidate, dtype=wp.spatial_vectorf, device=self.device)
+            adapter._evaluate_structural_candidate_pose_residual(
+                time_step,
+                candidate,
+                linearization,
+                active,
+                adapter.structural_candidate_residual,
+                adapter.structural_feedback_residual,
+            )
+            expected = adapter.structural_residual.numpy() + 0.01 * np.einsum(
+                "ij,ij->i",
+                adapter.structural_jacobian_second.numpy(),
+                delta[adapter.structural_body_second_global.numpy()],
+            )
+            np.testing.assert_allclose(
+                adapter.structural_feedback_residual.numpy(),
+                expected,
+                rtol=1.0e-3,
+                atol=1.0e-8,
+            )
+            checked.append(True)
+            original_finish(time_step, linearization)
+
+        solver_fd._finish_body_space_iteration = check_local_linearization
+        solver.step(state_previous, state_next, model.control(), contacts=None, dt=0.01)
+        self.assertEqual(checked, [True])
+
     def test_position_drive_with_massless_fixed_child(self):
         """Track a target when the driven body has a massless fixed child."""
         cases = ((False, "euler"), (True, "euler"), (True, "moreau"))
@@ -959,6 +1708,113 @@ class TestSolverKaminoLOX(unittest.TestCase):
         self.assertLess(float(solver.metrics.data.r_cts_joints.numpy()[0]), 1.0e-3)
         self.assertLess(float(solver.metrics.data.r_eom.numpy()[0]), 1.0e-3)
 
+    def test_joint_proximal_recovery_restores_apgd_contact_state(self):
+        """Match a clean remaining-budget solve after rolling back APGD contact trials."""
+
+        def run(iterations, relaxation, inject_iteration=None):
+            model = ModelKamino.from_newton(build_boxes_hinged(z_offset=0.0, ground=True).finalize(device=self.device))
+            detector = CollisionDetector(
+                model,
+                config=kamino_config.CollisionDetectorConfig(pipeline="unified"),
+            )
+            config = self.make_config()
+            config.lox.fixed_iterations = True
+            config.lox.max_iterations = iterations
+            config.lox.projection_method = "apgd"
+            config.lox.projection_iterations = 3
+            config.lox.joint_proximal_relaxation = relaxation
+            solver = SolverKaminoImpl(model=model, contacts=detector.contacts, config=config)
+            if inject_iteration is not None:
+                original_guard = solver.solver_fd._guard_nonlinear_recovery_iteration
+                calls = 0
+
+                def inject_unsafe():
+                    nonlocal calls
+                    calls += 1
+                    if calls == inject_iteration:
+                        solver.solver_fd.rigid_adapter.world_structural_feedback_unsafe.fill_(1)
+                    original_guard()
+
+                solver.solver_fd._guard_nonlinear_recovery_iteration = inject_unsafe
+            state_out = model.state()
+            solver.step(
+                model.state(),
+                state_out,
+                model.control(),
+                contacts=detector.contacts,
+                detector=detector,
+                dt=0.01,
+            )
+            return solver, state_out, detector.contacts
+
+        recovered, recovered_state, recovered_contacts = run(5, 1.0, inject_iteration=3)
+        _frozen, frozen_state, frozen_contacts = run(2, 0.0)
+
+        self.assertGreater(int(recovered_contacts.model_active_contacts.numpy()[0]), 0)
+        self.assertTrue(recovered.solver_fd.world_nonlinear_fallback_used.numpy()[0])
+        np.testing.assert_allclose(recovered_state.u_i.numpy(), frozen_state.u_i.numpy(), rtol=2.0e-5, atol=2.0e-5)
+        np.testing.assert_allclose(recovered_state.q_i.numpy(), frozen_state.q_i.numpy(), rtol=2.0e-5, atol=2.0e-5)
+        np.testing.assert_allclose(
+            recovered_contacts.reaction.numpy(),
+            frozen_contacts.reaction.numpy(),
+            rtol=2.0e-5,
+            atol=2.0e-5,
+        )
+
+    def test_joint_proximal_recovery_is_per_world(self):
+        """Rollback one packed world without perturbing a safe nonlinear neighbor."""
+
+        def make_model():
+            builder = build_boxes_hinged(z_offset=0.5, ground=False)
+            build_boxes_hinged(builder=builder, z_offset=0.5, ground=False)
+            return ModelKamino.from_newton(builder.finalize(device=self.device))
+
+        def make_solver(model):
+            config = self.make_config()
+            config.lox.fixed_iterations = True
+            config.lox.max_iterations = 5
+            config.lox.joint_proximal_relaxation = 1.0
+            return SolverKaminoImpl(model=model, config=config)
+
+        recovered_model = make_model()
+        recovered = make_solver(recovered_model)
+        original_guard = recovered.solver_fd._guard_nonlinear_recovery_iteration
+        calls = 0
+
+        def inject_second_world_unsafe():
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                recovered.solver_fd.rigid_adapter.world_structural_feedback_unsafe.assign([0, 1])
+            original_guard()
+
+        recovered.solver_fd._guard_nonlinear_recovery_iteration = inject_second_world_unsafe
+        recovered_state = recovered_model.state()
+        recovered.step(recovered_model.state(), recovered_state, recovered_model.control(), dt=0.01)
+
+        reference_model = make_model()
+        reference = make_solver(reference_model)
+        reference_state = reference_model.state()
+        reference.step(reference_model.state(), reference_state, reference_model.control(), dt=0.01)
+
+        np.testing.assert_array_equal(
+            recovered.solver_fd.world_nonlinear_fallback_used.numpy(),
+            [False, True],
+        )
+        first_world_bodies = recovered_model.bodies.wid.numpy() == 0
+        np.testing.assert_allclose(
+            recovered_state.u_i.numpy()[first_world_bodies],
+            reference_state.u_i.numpy()[first_world_bodies],
+            rtol=2.0e-6,
+            atol=2.0e-6,
+        )
+        np.testing.assert_allclose(
+            recovered_state.q_i.numpy()[first_world_bodies],
+            reference_state.q_i.numpy()[first_world_bodies],
+            rtol=2.0e-6,
+            atol=2.0e-6,
+        )
+
     def test_cartpole_projects_detected_joint_limit(self):
         model = ModelKamino.from_newton(build_cartpole(ground=False, limits=True).finalize(device=self.device))
         solver = SolverKaminoImpl(
@@ -1054,6 +1910,37 @@ class TestSolverKaminoLOX(unittest.TestCase):
         capture_while.assert_not_called()
         wp.capture_launch(capture.graph)
         self.assertTrue(np.isfinite(state_next.u_i.numpy()).all())
+
+    def test_cuda_graph_capture_joint_proximal_transport(self):
+        """Replay transported structural feedback under CUDA graph capture."""
+        if not self.device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device.")
+        model, parent, child, parent_xform, child_xform = _build_prescribed_rotating_joint_model(
+            angle=0.5,
+            nonidentity_frames=True,
+            device=self.device,
+        )
+        config = self.make_config()
+        config.use_collision_detector = False
+        config.lox.fixed_iterations = True
+        config.lox.use_graph_conditionals = False
+        config.lox.joint_proximal_relaxation = 1.0
+        solver = SolverKamino(model, config=config)
+        state_previous = model.state()
+        state_next = model.state()
+
+        with wp.ScopedCapture() as capture:
+            solver.step(state_previous, state_next, model.control(), contacts=None, dt=0.01)
+
+        wp.capture_launch(capture.graph)
+        anchor_error = _joint_anchor_error(
+            state_next.body_q.numpy(),
+            parent,
+            child,
+            parent_xform,
+            child_xform,
+        )
+        np.testing.assert_allclose(anchor_error, 0.0, rtol=0.0, atol=1.0e-6)
 
 
 if __name__ == "__main__":

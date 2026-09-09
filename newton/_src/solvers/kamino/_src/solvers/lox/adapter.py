@@ -20,7 +20,7 @@ import warp as wp
 from ......sim import BodyFlags, JointType
 from ...core.bodies import update_body_inertias
 from ...core.data import DataKamino
-from ...core.joints import DofActuationPath, JointActuationType, JointCorrectionMode
+from ...core.joints import DofActuationPath, JointActuationType, JointCorrectionMode, JointDoFType
 from ...core.model import ModelKamino
 from ...core.types import mat36f, vec6f
 from ...geometry.contacts import ContactsKamino
@@ -47,6 +47,7 @@ from .adapter_kernels import (
     _prepare_structural_rows,
     _promote_effort_counters,
     _reduce_structural_candidate_residual,
+    _reduce_structural_feedback_metrics,
     _reset_effort_rows_masked,
     _reset_effort_worlds_masked,
     _reset_friction_reactions_masked,
@@ -437,6 +438,33 @@ class LOXKaminoAdapter:
         )
         structural_sparse_second_index = structural_sparse_start[structural_joint] + structural_local
         self.structural_row_world = self._device_array(structural_world, self.device)
+        joint_dof_type = model.joints.dof_type.numpy().astype(np.int32, copy=False)
+        full_position_joint = np.isin(
+            joint_dof_type,
+            (int(JointDoFType.FIXED), int(JointDoFType.REVOLUTE), int(JointDoFType.SPHERICAL)),
+        )
+        # Positional rows use vector components in the parent joint frame. The
+        # fixed log-quaternion and revolute cross-axis angular conventions are
+        # scalar row coordinates whose nonlinear transport is not yet validated.
+        structural_feedback_supported = full_position_joint[structural_joint] & (structural_local < 3)
+        self.structural_feedback_supported = wp.array(
+            structural_feedback_supported,
+            dtype=wp.bool,
+            device=self.device,
+        )
+        world_structural_feedback_available = (
+            np.bincount(
+                structural_world,
+                weights=structural_feedback_supported.astype(np.int32),
+                minlength=self.num_worlds,
+            )
+            > 0
+        )
+        self.world_structural_feedback_available = wp.array(
+            world_structural_feedback_available,
+            dtype=wp.bool,
+            device=self.device,
+        )
         self.structural_body_first_global = self._device_array(structural_first_global, self.device)
         self.structural_body_second_global = self._device_array(structural_second_global, self.device)
         self.structural_sparse_first_index = self._device_array(structural_sparse_first_index, self.device)
@@ -447,6 +475,15 @@ class LOXKaminoAdapter:
         self.structural_reaction = self.data.joints.lambda_kin_j
         self.structural_candidate_twist = wp.empty(model.size.sum_of_num_bodies, dtype=vec6f, device=self.device)
         self.structural_candidate_residual = wp.zeros(self.structural_row_count, dtype=wp.float32, device=self.device)
+        if self.joint_proximal_relaxation > 0.0:
+            self.structural_feedback_residual = wp.zeros(
+                self.structural_row_count, dtype=wp.float32, device=self.device
+            )
+            self.structural_update_residual = wp.zeros(self.structural_row_count, dtype=wp.float32, device=self.device)
+        else:
+            # Preserve the disabled path's original single residual buffer.
+            self.structural_feedback_residual = self.structural_candidate_residual
+            self.structural_update_residual = self.structural_candidate_residual
         self.structural_proximal_defect = wp.zeros(self.structural_row_count, dtype=wp.float32, device=self.device)
         self.structural_residual_velocity_scratch = wp.zeros(
             self.structural_row_count, dtype=wp.float32, device=self.device
@@ -457,6 +494,8 @@ class LOXKaminoAdapter:
         self.joint_velocity_scratch = wp.zeros(model.size.sum_of_num_joint_dofs, dtype=wp.float32, device=self.device)
         self.world_structural_residual = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
         self.world_projected_structural_residual = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
+        self.world_feedback_structural_residual = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
+        self.world_structural_feedback_unsafe = wp.zeros(self.num_worlds, dtype=wp.int32, device=self.device)
         self.structural_effective_mass = wp.zeros(self.structural_row_count, dtype=wp.float32, device=self.device)
         self.structural_penalty = wp.zeros(self.structural_row_count, dtype=wp.float32, device=self.device)
 
@@ -1161,7 +1200,8 @@ class LOXKaminoAdapter:
         candidate_twist: wp.array[vec6f],
         linearization_twist: wp.array[vec6f],
         world_active: wp.array[wp.bool],
-        candidate_residual: wp.array[wp.float32],
+        candidate_physical_residual: wp.array[wp.float32],
+        candidate_feedback_residual: wp.array[wp.float32],
     ) -> None:
         """Evaluate exact structural residuals after integrating a candidate twist."""
         wp.launch(
@@ -1174,6 +1214,7 @@ class LOXKaminoAdapter:
                 self.model.joints.coords_offset,
                 self.model.joints.dofs_offset,
                 self.model.joints.kinematic_cts_offset,
+                self.model.joints.num_kinematic_cts,
                 self.model.joints.bid_B,
                 self.model.joints.bid_F,
                 self.model.joints.B_r_Bj,
@@ -1187,7 +1228,8 @@ class LOXKaminoAdapter:
                 world_active,
             ],
             outputs=[
-                candidate_residual,
+                candidate_physical_residual,
+                candidate_feedback_residual,
                 self.structural_residual_velocity_scratch,
                 self.joint_coordinate_scratch,
                 self.joint_velocity_scratch,
@@ -1203,6 +1245,7 @@ class LOXKaminoAdapter:
         global_twist: wp.array[vec6f],
         projected_twist: wp.array[vec6f],
         world_active: wp.array[wp.bool],
+        feedback_world_enabled: wp.array[wp.bool] | None,
         projected_fraction: float = 0.0,
     ) -> None:
         """Update structural multipliers from exact candidate-pose residuals."""
@@ -1217,10 +1260,15 @@ class LOXKaminoAdapter:
             raise ValueError("projected_twist must contain one entry per body.")
         if world_active.shape[0] != self.num_worlds:
             raise ValueError("world_active must contain one entry per world.")
+        if feedback_world_enabled is not None and feedback_world_enabled.shape[0] != self.num_worlds:
+            raise ValueError("feedback_world_enabled must contain one entry per world.")
         if not 0.0 <= projected_fraction <= 1.0:
             raise ValueError("projected_fraction must be in [0, 1].")
         self.world_structural_residual.zero_()
         self.world_projected_structural_residual.zero_()
+        if self.joint_proximal_relaxation > 0.0:
+            self.world_feedback_structural_residual.zero_()
+            self.world_structural_feedback_unsafe.zero_()
         if self.structural_row_count == 0:
             return
         wp.launch(
@@ -1237,6 +1285,7 @@ class LOXKaminoAdapter:
                 linearization_twist,
                 world_active,
                 self.structural_candidate_residual,
+                self.structural_feedback_residual,
             )
         wp.launch(
             _update_structural_multipliers_from_candidate_rows,
@@ -1251,7 +1300,9 @@ class LOXKaminoAdapter:
                 self.structural_body_second_global,
                 self.structural_jacobian_first,
                 self.structural_jacobian_second,
-                self.structural_candidate_residual,
+                self.structural_feedback_supported,
+                feedback_world_enabled,
+                self.structural_feedback_residual,
                 self.structural_proximal_defect,
                 self.structural_residual,
                 self.structural_penalty,
@@ -1262,11 +1313,24 @@ class LOXKaminoAdapter:
                 self.structural_reaction,
             ],
             outputs=[
+                self.structural_update_residual,
                 self.world_structural_residual,
+                self.world_structural_feedback_unsafe,
                 self.system.right_hand_side,
             ],
             device=self.device,
         )
+        if self.joint_proximal_relaxation > 0.0 and projected_fraction != 1.0:
+            # Feedback may use a blended candidate, but accepted-state diagnostics
+            # describe the fully projected twist that integration consumes.
+            self._evaluate_structural_candidate_pose_residual(
+                time_step,
+                projected_twist,
+                linearization_twist,
+                world_active,
+                self.structural_candidate_residual,
+                self.structural_feedback_residual,
+            )
         wp.launch(
             _reduce_structural_candidate_residual,
             dim=self.structural_row_count,
@@ -1283,6 +1347,24 @@ class LOXKaminoAdapter:
             outputs=[self.world_projected_structural_residual],
             device=self.device,
         )
+        if self.joint_proximal_relaxation > 0.0:
+            wp.launch(
+                _reduce_structural_feedback_metrics,
+                dim=self.structural_row_count,
+                inputs=[
+                    structural_tolerance,
+                    self.structural_row_world,
+                    world_active,
+                    self.projection_status,
+                    self.structural_body_first_global,
+                    self.structural_body_second_global,
+                    self.structural_candidate_residual,
+                    self.structural_feedback_supported,
+                    self.system.body_vector_index,
+                ],
+                outputs=[self.world_feedback_structural_residual],
+                device=self.device,
+            )
 
     def evaluate_lagged_velocity_consistency(
         self,
