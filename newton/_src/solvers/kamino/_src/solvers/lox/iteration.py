@@ -247,7 +247,6 @@ def _update_bodies_and_reduce_residuals(
 @wp.kernel
 def _begin_fixed_iteration(
     projection_status: wp.array[wp.int32],
-    proximal_failed: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
     world_failed: wp.array[wp.bool],
     iteration_count: wp.array[wp.int32],
@@ -256,7 +255,7 @@ def _begin_fixed_iteration(
     if not world_active[world]:
         return
     iteration_count[world] += 1
-    if projection_status[world] != PROJECTION_STATUS_VALID or (proximal_failed and proximal_failed[world] != 0):
+    if projection_status[world] != PROJECTION_STATUS_VALID:
         world_active[world] = False
         world_failed[world] = True
 
@@ -292,8 +291,6 @@ def _finalize_residual_iteration(
     lagged_velocity_residual: wp.array[wp.float32],
     lagged_velocity_required: wp.array[wp.int32],
     effort_residual: wp.array[wp.float32],
-    proximal_residual: wp.array[wp.float32],
-    proximal_failed: wp.array[wp.int32],
     iteration_count: wp.array[wp.int32],
     iteration_failed: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
@@ -314,10 +311,6 @@ def _finalize_residual_iteration(
         world_active[world] = False
         world_failed[world] = True
         return
-    if proximal_failed and proximal_failed[world] != 0:
-        world_active[world] = False
-        world_failed[world] = True
-        return
 
     change = residual_change[world]
     split = residual_split[world]
@@ -334,8 +327,6 @@ def _finalize_residual_iteration(
     total = wp.max(wp.max(change, split), wp.max(wp.max(structural, cross_iterate), lagged_velocity))
     if effort_residual:
         total = wp.max(total, effort_residual[world])
-    if proximal_residual:
-        total = wp.max(total, proximal_residual[world])
     residual_structural[world] = structural
     residual_structural_projected[world] = projected_structural
     residual_lagged_velocity[world] = lagged_velocity
@@ -520,8 +511,6 @@ class SplittingState:
         projected_structural_residual: wp.array[wp.float32] | None = None,
         lagged_velocity_residual: wp.array[wp.float32] | None = None,
         lagged_velocity_required: wp.array[wp.int32] | None = None,
-        proximal_residual: wp.array[wp.float32] | None = None,
-        proximal_failed: wp.array[wp.int32] | None = None,
     ) -> None:
         """Update duals and residuals, then test per-world convergence."""
         if projection_status.shape[0] != self.num_worlds:
@@ -532,8 +521,6 @@ class SplittingState:
             ("projected_structural_residual", projected_structural_residual),
             ("lagged_velocity_residual", lagged_velocity_residual),
             ("lagged_velocity_required", lagged_velocity_required),
-            ("proximal_residual", proximal_residual),
-            ("proximal_failed", proximal_failed),
         )
         for name, array in optional_world_arrays:
             if array is not None and array.shape[0] != self.num_worlds:
@@ -591,8 +578,6 @@ class SplittingState:
                 lagged_velocity_residual,
                 lagged_velocity_required,
                 effort_residual,
-                proximal_residual,
-                proximal_failed,
                 self.iteration_count,
                 self._iteration_failed,
             ],
@@ -614,17 +599,14 @@ class SplittingState:
     def finish_fixed_iteration(
         self,
         projection_status: wp.array[wp.int32],
-        proximal_failed: wp.array[wp.int32] | None = None,
     ) -> None:
         """Update the dual state and failures for a fixed-count iteration."""
         if projection_status.shape[0] != self.num_worlds:
             raise ValueError("projection_status must contain one entry per world.")
-        if proximal_failed is not None and proximal_failed.shape[0] != self.num_worlds:
-            raise ValueError("proximal_failed must contain one entry per world.")
         wp.launch(
             _begin_fixed_iteration,
             dim=self.num_worlds,
-            inputs=[projection_status, proximal_failed],
+            inputs=[projection_status],
             outputs=[self.world_active, self.world_failed, self.iteration_count],
             device=self.device,
         )

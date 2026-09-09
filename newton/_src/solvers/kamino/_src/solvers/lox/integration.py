@@ -5,33 +5,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import warp as wp
 
 from ...core.types import vec6f
 
-if TYPE_CHECKING:
-    pass
-
 __all__ = []
 
 wp.set_module_options({"enable_backward": False})
-
-
-@wp.kernel
-def _reset_newton_body_dual_impulse(
-    body_world: wp.array[wp.int32],
-    source_world_mask: wp.array[wp.bool],
-    body_dual_impulse: wp.array[wp.spatial_vector],
-):
-    body = wp.tid()
-    world = wp.max(body_world[body], 0)
-    selected = source_world_mask[world]
-    if world == 0:
-        selected = selected or source_world_mask[source_world_mask.shape[0] - 1]
-    if selected:
-        body_dual_impulse[body] = wp.spatial_vectorf(0.0)
 
 
 @wp.kernel

@@ -10,7 +10,7 @@ kinematic loops, under- or overactuation, joint limits, hard frictional
 contacts, and restitutive impacts.
 
 Unlike the other maximal-coordinate solvers, Kamino focuses on constrained
-rigid mechanical assemblies.
+rigid mechanical assemblies rather than particle or deformable simulation.
 Kamino is currently in BETA 1, and Newton users are discouraged from depending
 on it. Evaluate it only when kinematic loops and hard contact constraints are
 primary requirements and an experimental solver is acceptable.
@@ -41,9 +41,9 @@ Kamino provides three forward-dynamics backends:
   less accurately than PADMM, particularly as the number of active inequalities
   grows. Dual preconditioning is not supported.
 * ``"lox"`` (opt-in): a primal splitting method with sparse Jacobians and
-  dense per-island dynamics. LOX supports hard rigid contact and selected rods.
-  It performs one frozen-linearization solve at the configuration supplied by
-  the selected Kamino integrator.
+  dense per-island dynamics. It performs one frozen-linearization solve at the
+  configuration supplied by the selected Kamino integrator. Unlike PADMM and
+  DVI, it supports singular-inertia frames. Rod joints are not supported.
 
 Select the backend when constructing the configuration so dependent defaults
 initialize consistently:
@@ -106,7 +106,7 @@ residual definitions are backend-specific:
   these three fields are NaN. LOX additionally reports ``accepted``, ``failed``,
   and ``iteration_limit``.
 
-These are absolute maxima: neither backend divides them by a reference norm,
+These are absolute maxima: no backend divides them by a reference norm,
 constraint count, or tolerance. Additional fields are not portable between
 backends.
 
@@ -123,21 +123,6 @@ backends.
 Terminal status is always maintained. ``collect_solver_info=True`` enables
 additional solver diagnostics and adds runtime and memory overhead; it is not
 required to access ``status``.
-
-Time integration
-----------------
-
-The ``integrator`` option is independent of the dynamics backend. ``"euler"``
-evaluates forward dynamics at the beginning of the step. ``"moreau"`` first
-advances to the midpoint, evaluates forward dynamics there, and finishes the
-step using the resulting reactions. Moreau requires
-``use_collision_detector=True`` so contacts are generated at the midpoint;
-otherwise Kamino warns and falls back to Euler.
-
-LOX uses the same Euler and Moreau implementations as PADMM and DVI. It does
-not run a separate nonlinear outer loop. LOX retains support for
-singular-inertia frames, including massless fixed attachments found in common
-robot models.
 
 Actuation and forward kinematics
 --------------------------------

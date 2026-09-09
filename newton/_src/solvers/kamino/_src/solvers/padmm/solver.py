@@ -284,8 +284,8 @@ class PADMMSolver:
     def notify_model_changed(self, flags: object) -> None:
         del flags
 
-    def validate_model_changed(self, *, use_fk_solver: bool) -> None:
-        del use_fk_solver
+    def validate_model_changed(self) -> None:
+        pass
 
     def reset(self, problem: DualProblem | None = None, world_mask: wp.array[wp.bool] | None = None):
         """

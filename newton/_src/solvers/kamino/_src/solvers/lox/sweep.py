@@ -15,7 +15,6 @@ from .contact import compute_contact_scaled_alart_curnier_residual, project_cont
 from .projection import (
     PROJECTION_STATUS_INVALID,
     PROJECTION_STATUS_VALID,
-    ContactProjectionData,
     _can_fuse_rigid_projection_by_world,
     _contact_projection_inputs_are_finite,
     compute_contact_delassus,
@@ -134,40 +133,6 @@ __syncthreads();
 #endif
 """)
 def _sync_threads(): ...
-
-
-@wp.func
-def _prepare_contact_projection(
-    contact: wp.int32,
-    contact_body_first: wp.array[wp.int32],
-    contact_body_second: wp.array[wp.int32],
-    contact_jacobian_first: wp.array[mat36f],
-    contact_jacobian_second: wp.array[mat36f],
-    contact_bias: wp.array[wp.vec3f],
-    contact_friction: wp.array[wp.float32],
-    inverse_weight: wp.array[mat66f],
-) -> ContactProjectionData:
-    inverse_weight_first = mat66f(0.0)
-    inverse_weight_second = mat66f(0.0)
-    first = contact_body_first[contact]
-    second = contact_body_second[contact]
-    if first < 0 and second < 0:
-        data = ContactProjectionData()
-        data.delassus = wp.mat33f(0.0)
-        data.status = PROJECTION_STATUS_VALID
-        return data
-    if first >= 0:
-        inverse_weight_first = inverse_weight[first]
-    if second >= 0:
-        inverse_weight_second = inverse_weight[second]
-    return prepare_contact_coulomb(
-        contact_jacobian_first[contact],
-        inverse_weight_first,
-        contact_jacobian_second[contact],
-        inverse_weight_second,
-        contact_bias[contact],
-        contact_friction[contact],
-    )
 
 
 @wp.kernel

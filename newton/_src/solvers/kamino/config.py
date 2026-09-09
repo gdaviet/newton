@@ -1028,16 +1028,6 @@ class LOXSolverConfig:
     point.
     """
 
-    rod_proximal_relaxation: float = 0.0
-    """Relaxation factor for nonlinear rod material proximal updates.
-
-    Zero retains the frozen rod strain linearization. Positive values update
-    exact candidate-pose bend and twist strains within the LOX splitting loop
-    while reusing the frozen rigid-body factorization. Stretch and shear remain
-    linearly implicit to avoid amplifying geometric defects by their typically
-    much larger stiffness.
-    """
-
     position_tolerance: float = 1.0e-5
     """Translational end-of-step convergence tolerance [m]."""
 
@@ -1157,14 +1147,6 @@ class LOXSolverConfig:
         ):
             raise ValueError(
                 f"Invalid joint_proximal_relaxation: {self.joint_proximal_relaxation}. Must be in range [0, 1]."
-            )
-        if (
-            not np.isfinite(self.rod_proximal_relaxation)
-            or self.rod_proximal_relaxation < 0.0
-            or self.rod_proximal_relaxation > 1.0
-        ):
-            raise ValueError(
-                f"Invalid rod_proximal_relaxation: {self.rod_proximal_relaxation}. Must be in range [0, 1]."
             )
         if self.projection_method not in ("jacobi", "gauss_seidel", "apgd"):
             raise ValueError(

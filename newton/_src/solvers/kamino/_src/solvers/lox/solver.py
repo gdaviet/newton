@@ -19,7 +19,6 @@ from .colored_gauss_seidel import ColoredGaussSeidelProjection
 from .integration import _write_integrator_body_inputs
 from .joint_delassus import BatchedStructuralDelassus
 from .projection import PROJECTION_STATUS_VALID
-from .rod import validate_rod_model
 from .sweep import (
     compute_projection_residuals,
     prepare_jacobi_projection_data,
@@ -29,7 +28,6 @@ from .sweep import (
 from .time import validate_world_time_steps
 
 if TYPE_CHECKING:
-    from ......sim import Model
     from ....config import ConstraintStabilizationConfig, LOXSolverConfig
     from ...core.data import DataKamino
     from ...core.joints import JointCorrectionMode
@@ -83,7 +81,7 @@ class LOXStatus:
     accepted: wp.int32
     """Whether LOX accepted the world's final projected iterate."""
     failed: wp.int32
-    """Whether a projection or proximal operation failed for the world."""
+    """Whether a projection failed for the world."""
     iteration_limit: wp.int32
     """Whether the world stopped at the configured iteration limit."""
 
@@ -269,7 +267,6 @@ class LOXSolver:
         limits: LimitsKamino | None,
         contacts: ContactsKamino | None,
         config: LOXSolverConfig,
-        source_model: Model,
         constraints: ConstraintStabilizationConfig,
         rotation_correction: JointCorrectionMode,
     ):
@@ -285,12 +282,10 @@ class LOXSolver:
                 projection_method=config.projection_method,
                 rotation_correction=rotation_correction,
                 joint_proximal_relaxation=config.joint_proximal_relaxation,
-                rod_proximal_relaxation=config.rod_proximal_relaxation,
             )
         if rigid_adapter is None:
             raise ValueError("LOX requires at least one rigid body.")
         self._config = config
-        self._newton_model = source_model
         self.model = model
         self._constraints = constraints
         self.rigid_adapter = rigid_adapter
@@ -576,18 +571,14 @@ class LOXSolver:
             return
         if flags & ModelFlags.BODY_PROPERTIES and rigid_adapter.dynamic_body_topology_changed():
             self.rebuild_rigid_topology()
-        else:
-            rigid_adapter.notify_model_changed()
 
-    def validate_model_changed(self, *, use_fk_solver: bool) -> None:
+    def validate_model_changed(self) -> None:
         """Validate LOX-specific values derived from the Newton model."""
         # Host-side validation cannot synchronize aliased Newton arrays while a
         # CUDA graph is being captured. The same topology was validated when the
         # solver was built; captured property updates retain that topology.
         if self.device.is_cuda and self.device.is_capturing:
             return
-        if self._newton_model is not None and self.rigid_adapter is not None and self.rigid_adapter.rods.count > 0:
-            validate_rod_model(self._newton_model, use_fk_solver=use_fk_solver)
         if self.rigid_adapter is not None:
             self.rigid_adapter.validate_model_changed()
 
@@ -608,7 +599,6 @@ class LOXSolver:
             self.rigid_adapter.reset_structural_multipliers(world_mask=world_mask)
             if self.has_bounded_effort:
                 self.rigid_adapter.reset_effort_counters(world_mask=world_mask)
-            self.rigid_adapter.rods.reset()
             self.rigid_adapter.projection_status.zero_()
             self.rigid_adapter.contact_residual.zero_()
             self.rigid_adapter.limit_residual.zero_()
@@ -916,11 +906,7 @@ class LOXSolver:
             device=self.device,
         )
 
-    def _prepare_body_space_candidate(
-        self,
-        time_step: wp.array[wp.float32],
-        linearization_twist: wp.array[vec6f],
-    ) -> None:
+    def _prepare_body_space_candidate(self) -> None:
         """Solve and prepare the rigid candidate without unilateral projection."""
         rigid_adapter = self.rigid_adapter
         system = self.system
@@ -945,16 +931,6 @@ class LOXSolver:
                 splitting.splitting_dual,
                 rigid_adapter.body_velocity_begin,
             )
-        rigid_adapter.rods.update_proximal(
-            system,
-            system.body_solution,
-            linearization_twist,
-            splitting.world_active,
-            time_step,
-            self.position_tolerance,
-            self.rotation_tolerance,
-            self.velocity_tolerance,
-        )
         splitting.prepare_projection(system.body_solution)
 
     def _finish_body_space_iteration(
@@ -997,13 +973,10 @@ class LOXSolver:
                 projected_structural_residual=rigid_adapter.world_projected_structural_residual,
                 lagged_velocity_residual=rigid_adapter.world_lagged_velocity_residual,
                 lagged_velocity_required=rigid_adapter.world_lagged_velocity_required,
-                proximal_residual=rigid_adapter.rods.world_proximal_residual,
-                proximal_failed=rigid_adapter.rods.world_proximal_failed,
             )
         else:
             splitting.finish_fixed_iteration(
                 rigid_adapter.projection_status,
-                proximal_failed=rigid_adapter.rods.world_proximal_failed,
             )
 
     def _body_space_iteration(
@@ -1012,7 +985,7 @@ class LOXSolver:
         linearization_twist: wp.array[vec6f],
         conditional: bool,
     ) -> None:
-        self._prepare_body_space_candidate(time_step, linearization_twist)
+        self._prepare_body_space_candidate()
         self._project_body_space_constraints()
         self._finish_body_space_iteration(time_step, linearization_twist)
         if conditional:

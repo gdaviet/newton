@@ -390,123 +390,6 @@ def _assemble_structural_joint_rows(
 
 
 @wp.kernel
-def _assemble_smooth_material_blocks(
-    body_world: wp.array[wp.int32],
-    dimensions: wp.array[wp.int32],
-    matrix_offsets: wp.array[wp.int32],
-    vector_offsets: wp.array[wp.int32],
-    body_first: wp.array[wp.int32],
-    body_second: wp.array[wp.int32],
-    body_component: wp.array[wp.int32],
-    body_local: wp.array[wp.int32],
-    jacobian_first: wp.array[vec6f],
-    jacobian_second: wp.array[vec6f],
-    stress: wp.array[wp.float32],
-    tangent_diagonal: wp.array[wp.float32],
-    linearization_twist: wp.array[vec6f],
-    prescribed_twist: wp.array[vec6f],
-    time_step: wp.array[wp.float32],
-    matrix: wp.array[wp.float32],
-    right_hand_side: wp.array[wp.float32],
-):
-    material = wp.tid()
-    first = body_first[material]
-    second = body_second[material]
-    body_count = body_component.shape[0]
-    if (first < 0 and second < 0) or first >= body_count or second >= body_count:
-        return
-    world = body_world[first] if first >= 0 else body_world[second]
-    dt = time_step[world]
-    if dt <= 0.0:
-        return
-
-    first_local = body_local[first] if first >= 0 else -1
-    second_local = body_local[second] if second >= 0 else -1
-    if first_local < 0 and second_local < 0:
-        return
-    component = body_component[first] if first_local >= 0 else body_component[second]
-    if component < 0 or component >= dimensions.shape[0] or (second_local >= 0 and body_component[second] != component):
-        return
-    dimension = dimensions[component]
-    matrix_offset = matrix_offsets[component]
-    vector_offset = vector_offsets[component]
-    time_step_squared = dt * dt
-    row_offset = 6 * material
-
-    for material_row in range(6):
-        row = row_offset + material_row
-        first_jacobian = jacobian_first[row]
-        second_jacobian = jacobian_second[row]
-        tangent = tangent_diagonal[row]
-        row_velocity = wp.float32(0.0)
-        if first >= 0:
-            row_velocity += wp.dot(first_jacobian, linearization_twist[first])
-        if second >= 0:
-            row_velocity += wp.dot(second_jacobian, linearization_twist[second])
-        if prescribed_twist and first >= 0 and first_local < 0:
-            row_velocity -= wp.dot(first_jacobian, prescribed_twist[first])
-        if prescribed_twist and second >= 0 and second_local < 0:
-            row_velocity -= wp.dot(second_jacobian, prescribed_twist[second])
-        right_hand_side_scale = -dt * stress[row] + time_step_squared * tangent * row_velocity
-
-        if first_local >= 0:
-            _atomic_add_body_outer_product(
-                matrix,
-                matrix_offset,
-                dimension,
-                first_local,
-                first_local,
-                first_jacobian,
-                first_jacobian,
-                time_step_squared * tangent,
-            )
-            _atomic_add_body_vector(
-                right_hand_side,
-                vector_offset,
-                first_local,
-                right_hand_side_scale * first_jacobian,
-            )
-        if second_local >= 0:
-            _atomic_add_body_outer_product(
-                matrix,
-                matrix_offset,
-                dimension,
-                second_local,
-                second_local,
-                second_jacobian,
-                second_jacobian,
-                time_step_squared * tangent,
-            )
-            _atomic_add_body_vector(
-                right_hand_side,
-                vector_offset,
-                second_local,
-                right_hand_side_scale * second_jacobian,
-            )
-        if first_local >= 0 and second_local >= 0:
-            _atomic_add_body_outer_product(
-                matrix,
-                matrix_offset,
-                dimension,
-                first_local,
-                second_local,
-                first_jacobian,
-                second_jacobian,
-                time_step_squared * tangent,
-            )
-            _atomic_add_body_outer_product(
-                matrix,
-                matrix_offset,
-                dimension,
-                second_local,
-                first_local,
-                second_jacobian,
-                first_jacobian,
-                time_step_squared * tangent,
-            )
-
-
-@wp.kernel
 def _compute_body_weights_and_add(
     body_component: wp.array[wp.int32],
     body_local: wp.array[wp.int32],
@@ -574,7 +457,6 @@ def _compute_body_weights_and_add(
 def _build_candidate_right_hand_side(
     body_vector_index: wp.array[wp.int32],
     smooth_right_hand_side: wp.array[wp.float32],
-    nonlinear_right_hand_side: wp.array[wp.float32],
     weight: wp.array[mat66f],
     projected_twist: wp.array[vec6f],
     splitting_dual: wp.array[vec6f],
@@ -586,18 +468,13 @@ def _build_candidate_right_hand_side(
         return
     weighted_target = weight[body] @ (projected_twist[body] + splitting_dual[body])
     for row in range(6):
-        candidate_right_hand_side[body_offset + row] = (
-            smooth_right_hand_side[body_offset + row]
-            + nonlinear_right_hand_side[body_offset + row]
-            + weighted_target[row]
-        )
+        candidate_right_hand_side[body_offset + row] = smooth_right_hand_side[body_offset + row] + weighted_target[row]
 
 
 @wp.kernel
 def _build_candidate_right_hand_side_with_effort(
     body_vector_index: wp.array[wp.int32],
     smooth_right_hand_side: wp.array[wp.float32],
-    nonlinear_right_hand_side: wp.array[wp.float32],
     weight: wp.array[mat66f],
     projected_twist: wp.array[vec6f],
     splitting_dual: wp.array[vec6f],
@@ -625,9 +502,7 @@ def _build_candidate_right_hand_side_with_effort(
             jacobian = dynamic_jacobian_second[dynamic_row]
         target += effort_counter_applied[effort] * jacobian
     for row in range(6):
-        candidate_right_hand_side[body_offset + row] = (
-            smooth_right_hand_side[body_offset + row] + nonlinear_right_hand_side[body_offset + row] + target[row]
-        )
+        candidate_right_hand_side[body_offset + row] = smooth_right_hand_side[body_offset + row] + target[row]
 
 
 class BatchedPrimalBodySystem:
@@ -722,7 +597,6 @@ class BatchedPrimalBodySystem:
         self.smooth_matrix = wp.zeros(self.info.total_mat_size, dtype=wp.float32, device=self.device)
         self.weighted_matrix = wp.zeros(self.info.total_mat_size, dtype=wp.float32, device=self.device)
         self.right_hand_side = wp.zeros(self.info.total_vec_size, dtype=wp.float32, device=self.device)
-        self.nonlinear_right_hand_side = wp.zeros(self.info.total_vec_size, dtype=wp.float32, device=self.device)
         self.candidate_right_hand_side = wp.zeros(self.info.total_vec_size, dtype=wp.float32, device=self.device)
         self._packed_solution = wp.zeros(self.info.total_vec_size, dtype=wp.float32, device=self.device)
         self.body_solution = wp.zeros(self.num_bodies, dtype=vec6f, device=self.device)
@@ -845,7 +719,6 @@ class BatchedPrimalBodySystem:
         self.smooth_matrix.zero_()
         self.weighted_matrix.zero_()
         self.right_hand_side.zero_()
-        self.nonlinear_right_hand_side.zero_()
         self.candidate_right_hand_side.zero_()
         self._packed_solution.zero_()
         self.body_solution.zero_()
@@ -1026,56 +899,6 @@ class BatchedPrimalBodySystem:
             device=self.device,
         )
 
-    def add_smooth_material_blocks(
-        self,
-        body_first: wp.array[wp.int32],
-        body_second: wp.array[wp.int32],
-        jacobian_first: wp.array[vec6f],
-        jacobian_second: wp.array[vec6f],
-        stress: wp.array[wp.float32],
-        tangent_diagonal: wp.array[wp.float32],
-        linearization_twist: wp.array[vec6f],
-        time_step: wp.array[wp.float32],
-        prescribed_twist: wp.array[vec6f] | None = None,
-    ) -> None:
-        """Add six-row diagonal-tangent material elements to the smooth system."""
-        material_count = body_first.shape[0]
-        if material_count == 0:
-            return
-        validate_world_time_step(time_step, self.num_worlds, self.device)
-        if body_second.shape[0] != material_count:
-            raise ValueError("Material endpoint arrays must have identical lengths.")
-        if linearization_twist.shape[0] != self.num_bodies:
-            raise ValueError("linearization_twist must contain one entry per packed body.")
-        if prescribed_twist is not None and prescribed_twist.shape[0] != self.num_bodies:
-            raise ValueError("prescribed_twist must contain one entry per packed body.")
-        row_count = 6 * material_count
-        if any(array.shape[0] != row_count for array in (jacobian_first, jacobian_second, stress, tangent_diagonal)):
-            raise ValueError("Material row arrays must contain six entries per material.")
-        wp.launch(
-            _assemble_smooth_material_blocks,
-            dim=material_count,
-            inputs=[
-                self.body_world,
-                self.info.dim,
-                self.info.mio,
-                self.info.vio,
-                body_first,
-                body_second,
-                self.body_block,
-                self.body_local,
-                jacobian_first,
-                jacobian_second,
-                stress,
-                tangent_diagonal,
-                linearization_twist,
-                prescribed_twist,
-                time_step,
-            ],
-            outputs=[self.smooth_matrix, self.right_hand_side],
-            device=self.device,
-        )
-
     def _mark_weighted_bodies(self, body_has_unilateral: wp.array[wp.int32] | None) -> None:
         if body_has_unilateral is None:
             self.body_weight_enabled.fill_(1)
@@ -1169,7 +992,6 @@ class BatchedPrimalBodySystem:
             inputs=[
                 self.body_vector_index,
                 self.right_hand_side,
-                self.nonlinear_right_hand_side,
                 self.weight,
                 projected_twist,
                 splitting_dual,
@@ -1201,7 +1023,6 @@ class BatchedPrimalBodySystem:
             inputs=[
                 self.body_vector_index,
                 self.right_hand_side,
-                self.nonlinear_right_hand_side,
                 self.weight,
                 projected_twist,
                 splitting_dual,

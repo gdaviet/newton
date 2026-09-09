@@ -11,12 +11,10 @@ from ...core.types import mat66f, vec6f
 
 __all__ = [
     "PrimalRowContribution",
-    "compute_augmented_joint_multiplier",
     "compute_augmented_joint_row",
     "compute_body_explicit_wrench",
     "compute_body_inertial_system",
     "compute_dynamic_joint_row",
-    "compute_velocity_distance",
     "make_spatial_mass_matrix",
 ]
 
@@ -183,53 +181,3 @@ def compute_augmented_joint_row(
         -time_step * (multiplier + penalty * residual) + time_step * time_step * penalty * linearization_velocity
     ) * jacobian
     return result
-
-
-@wp.func
-def compute_augmented_joint_multiplier(
-    multiplier: wp.float32,
-    penalty: wp.float32,
-    candidate_residual: wp.float32,
-) -> wp.float32:
-    """Update one accepted structural multiplier.
-
-    Args:
-        multiplier: Previous multiplier [N or N m].
-        penalty: Positive augmented penalty [N/m or N m/rad].
-        candidate_residual: Residual at the accepted candidate [m or rad].
-
-    Returns:
-        ``multiplier + penalty * candidate_residual``.
-    """
-    return multiplier + penalty * candidate_residual
-
-
-@wp.func
-def compute_velocity_distance(
-    first: vec6f,
-    second: vec6f,
-    time_step: wp.float32,
-    position_tolerance: wp.float32,
-    rotation_tolerance: wp.float32,
-) -> wp.float32:
-    """Compute the tolerance-normalized rigid-twist distance.
-
-    Args:
-        first: First linear-first body twist [m/s, rad/s].
-        second: Second linear-first body twist [m/s, rad/s].
-        time_step: Time step [s].
-        position_tolerance: Translational displacement tolerance [m].
-        rotation_tolerance: Rotational displacement tolerance [rad].
-
-    Returns:
-        Maximum normalized translational or rotational end-of-step change.
-    """
-    linear_max = wp.float32(0.0)
-    angular_max = wp.float32(0.0)
-    for index in range(3):
-        linear_max = wp.max(linear_max, wp.abs(first[index] - second[index]))
-        angular_max = wp.max(angular_max, wp.abs(first[index + 3] - second[index + 3]))
-    return wp.max(
-        time_step * linear_max / position_tolerance,
-        time_step * angular_max / rotation_tolerance,
-    )

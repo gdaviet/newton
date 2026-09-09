@@ -13,23 +13,19 @@ from .contact import (
 from .iteration import SplittingState
 from .problem import (
     PrimalRowContribution,
-    compute_augmented_joint_multiplier,
     compute_augmented_joint_row,
     compute_body_explicit_wrench,
     compute_body_inertial_system,
     compute_dynamic_joint_row,
-    compute_velocity_distance,
     make_spatial_mass_matrix,
 )
 from .projection import (
     PROJECTION_STATUS_INVALID,
     PROJECTION_STATUS_REGULARIZED,
     PROJECTION_STATUS_VALID,
-    apply_contact_desaxce_correction,
     compute_contact_delassus,
     compute_limit_delassus,
 )
-from .rod import validate_rod_model
 from .solver import (
     LOX_STATUS_ACTIVE,
     LOX_STATUS_CONVERGED,
@@ -74,8 +70,6 @@ __all__ = [
     "LOXStatus",
     "PrimalRowContribution",
     "SplittingState",
-    "apply_contact_desaxce_correction",
-    "compute_augmented_joint_multiplier",
     "compute_augmented_joint_row",
     "compute_body_explicit_wrench",
     "compute_body_inertial_system",
@@ -87,11 +81,9 @@ __all__ = [
     "compute_limit_delassus",
     "compute_limit_velocity_target",
     "compute_projection_residuals",
-    "compute_velocity_distance",
     "make_spatial_mass_matrix",
     "prepare_jacobi_projection_data",
     "project_constraints_jacobi",
     "project_contact_coulomb_cone",
     "solve_contact_coulomb_newton",
-    "validate_rod_model",
 ]

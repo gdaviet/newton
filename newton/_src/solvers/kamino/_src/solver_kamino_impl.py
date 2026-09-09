@@ -268,7 +268,6 @@ class SolverKaminoImpl(SolverBase):
                 limits=self._limits,
                 contacts=contacts,
                 config=self._config.lox,
-                source_model=self._model._model,
                 constraints=self._config.constraints,
                 rotation_correction=self._rotation_correction,
             )
@@ -803,6 +802,8 @@ class SolverKaminoImpl(SolverBase):
             detector=detector,
         )
 
+        # Update the internal joint states from the
+        # updated body states after time-integration
         self._update_joints_data()
 
         # Compute solver solution metrics if enabled
@@ -827,7 +828,7 @@ class SolverKaminoImpl(SolverBase):
         """Validate solver-specific structural invariants before model updates."""
         if self._solver_fk is not None:
             self._solver_fk.validate_model_changed(flags)
-        self._solver_fd.validate_model_changed(use_fk_solver=self._config.use_fk_solver)
+        self._solver_fd.validate_model_changed()
 
     @override
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
@@ -1146,7 +1147,7 @@ class SolverKaminoImpl(SolverBase):
         # Compute constraint reactions
         self._update_constraints(contacts=contacts)
 
-        # Assemble the final integrator body wrenches.
+        # Post-processing
         self._update_wrenches()
 
     def _prepare_forward_dynamics(

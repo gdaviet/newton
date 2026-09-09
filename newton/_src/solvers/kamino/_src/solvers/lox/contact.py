@@ -17,7 +17,6 @@ import warp as wp
 __all__ = [
     "compute_contact_scaled_alart_curnier_residual",
     "project_contact_coulomb_cone",
-    "solve_contact_coulomb_isotropic",
     "solve_contact_coulomb_newton",
 ]
 
@@ -191,28 +190,6 @@ def _solve_contact_coulomb_newton_components(
     tangent_reaction = -last_s
     normal_reaction = -(wp.dot(normal_tangent, tangent_reaction) + normal_rhs) * inverse_normal_delassus
     return wp.vec3f(tangent_reaction[0], tangent_reaction[1], normal_reaction)
-
-
-@wp.func
-def solve_contact_coulomb_isotropic(
-    delassus: wp.float32,
-    free_velocity: wp.vec3f,
-    normal: wp.vec3f,
-    friction: wp.float32,
-) -> wp.vec3f:
-    """Solve one Coulomb contact whose Delassus is ``delassus * I``."""
-    normal_velocity = wp.dot(normal, free_velocity)
-    if normal_velocity >= 0.0:
-        return wp.vec3f(0.0)
-
-    tangent_velocity = free_velocity - normal_velocity * normal
-    tangent_speed = wp.length(tangent_velocity)
-    normal_reaction = -normal_velocity / delassus
-    if tangent_speed <= -friction * normal_velocity:
-        return -free_velocity / delassus
-    if tangent_speed > 0.0:
-        return normal_reaction * normal - friction * normal_reaction * tangent_velocity / tangent_speed
-    return normal_reaction * normal
 
 
 @wp.func

@@ -62,7 +62,6 @@ from .adapter_kernels import (
     make_evaluate_candidate_structural_residual_kernel,
 )
 from .iteration import SplittingState
-from .rod import RodMaterialSystem
 from .system import BatchedPrimalBodySystem
 from .time import validate_world_time_step, validate_world_time_steps
 
@@ -122,7 +121,6 @@ class LOXKaminoAdapter:
         projection_method: str = "jacobi",
         rotation_correction: JointCorrectionMode = JointCorrectionMode.TWOPI,
         joint_proximal_relaxation: float = 0.0,
-        rod_proximal_relaxation: float = 0.0,
     ):
         if not isinstance(model, ModelKamino):
             raise TypeError("model must be a ModelKamino instance.")
@@ -155,7 +153,6 @@ class LOXKaminoAdapter:
             rotation_correction
         )
         self.joint_proximal_relaxation = joint_proximal_relaxation
-        self.rod_proximal_relaxation = rod_proximal_relaxation
         self._allocate_acceleration_storage = projection_method == "apgd"
 
         if jacobians._J_cts is None or jacobians._J_dofs is None:
@@ -289,17 +286,11 @@ class LOXKaminoAdapter:
         self._contact_recoverable_response = False
         self._uniform_joint_penalty_scale = wp.ones(self.num_worlds, dtype=wp.float32, device=self.device)
 
-        self.rods = RodMaterialSystem(
-            model,
-            self.data,
-            proximal_relaxation=self.rod_proximal_relaxation,
-        )
         self._allocate_joint_rows()
         self.system.validate_body_pairs("dynamic rows", self.dynamic_body_first_global, self.dynamic_body_second_global)
         self.system.validate_body_pairs(
             "structural rows", self.structural_body_first_global, self.structural_body_second_global
         )
-        self.system.validate_body_pairs("smooth rod materials", self.rods.body_first, self.rods.body_second)
         self._allocate_effort_rows()
         self._allocate_joint_frictions()
         self._allocate_unilaterals()
@@ -982,12 +973,6 @@ class LOXKaminoAdapter:
                     self.structural_penalty,
                     prescribed_twist=self.body_velocity_begin,
                 )
-        self.rods.assemble(
-            self.system,
-            linearization_twist,
-            time_step,
-            prescribed_twist=self.body_velocity_begin,
-        )
 
     def _update_unilaterals(
         self,
@@ -1696,11 +1681,6 @@ class LOXKaminoAdapter:
                 outputs=[joint_wrench],
                 device=self.device,
             )
-        self.rods.accumulate_wrenches(body_data.w_j_i, time_step, body_velocity)
-
-    def notify_model_changed(self) -> None:
-        """Refresh rod rest geometry after body or joint frame edits."""
-        self.rods.refresh_rest_state()
 
     def validate_model_changed(self) -> None:
         """Validate LOX constraint topology derived from aliased model values."""

@@ -15,17 +15,15 @@ from typing import Any
 import warp as wp
 
 from ...core.types import mat36f, mat66f, vec6f
-from .contact import solve_contact_coulomb_isotropic, solve_contact_coulomb_newton
+from .contact import solve_contact_coulomb_newton
 
 __all__ = [
     "PROJECTION_STATUS_INVALID",
     "PROJECTION_STATUS_REGULARIZED",
     "PROJECTION_STATUS_VALID",
-    "apply_contact_desaxce_correction",
     "compute_contact_delassus",
     "compute_limit_delassus",
     "prepare_contact_coulomb_delassus",
-    "project_contact_coulomb_isotropic_local",
     "project_contact_coulomb_local",
     "project_friction_local",
     "project_limit_local",
@@ -98,33 +96,6 @@ class ContactProjectionResult:
 @wp.func
 def _is_finite_vec3(value: wp.vec3f) -> wp.bool:
     return wp.isfinite(value[0]) and wp.isfinite(value[1]) and wp.isfinite(value[2])
-
-
-@wp.func
-def apply_contact_desaxce_correction(velocity: wp.vec3f, friction: wp.float32) -> wp.vec3f:
-    """Apply the de Saxce correction to a normal-last contact velocity.
-
-    Args:
-        velocity: Raw normal-last relative contact velocity.
-        friction: Nonnegative isotropic Coulomb friction coefficient.
-
-    Returns:
-        The corrected velocity. Invalid inputs are preserved for the caller's
-        projection-status check.
-    """
-    if not _is_finite_vec3(velocity) or not wp.isfinite(friction) or friction <= 0.0:
-        return velocity
-
-    tangent_norm = wp.sqrt(velocity[0] * velocity[0] + velocity[1] * velocity[1])
-    return wp.vec3f(velocity[0], velocity[1], velocity[2] + friction * tangent_norm)
-
-
-@wp.func
-def _is_finite_vec6(value: vec6f) -> wp.bool:
-    finite = wp.bool(True)
-    for index in range(6):
-        finite = finite and wp.isfinite(value[index])
-    return finite
 
 
 @wp.func
@@ -330,39 +301,6 @@ def project_friction_local(
     reaction_new = wp.clamp(-free_velocity / delassus, -impulse_bound, impulse_bound)
     reaction_delta = reaction_new - reaction_old
     if not wp.isfinite(reaction_new) or not wp.isfinite(reaction_delta):
-        return result
-    result.reaction = reaction_new
-    result.reaction_delta = reaction_delta
-    result.status = PROJECTION_STATUS_VALID
-    return result
-
-
-@wp.func
-def project_contact_coulomb_isotropic_local(
-    current_velocity: wp.vec3f,
-    reaction_old: wp.vec3f,
-    delassus: wp.float32,
-    friction: wp.float32,
-) -> ContactProjectionResult:
-    """Project one prepared normal-last contact with scalar Delassus."""
-    result = ContactProjectionResult()
-    result.reaction = reaction_old
-    result.reaction_delta = wp.vec3f(0.0)
-    result.status = PROJECTION_STATUS_INVALID
-    if not wp.isfinite(delassus) or delassus <= 0.0 or not wp.isfinite(friction) or friction < 0.0:
-        return result
-    free_velocity = current_velocity - delassus * reaction_old
-    if not _is_finite_vec3(free_velocity):
-        return result
-
-    reaction_new = solve_contact_coulomb_isotropic(
-        delassus,
-        free_velocity,
-        wp.vec3f(0.0, 0.0, 1.0),
-        friction,
-    )
-    reaction_delta = reaction_new - reaction_old
-    if not _is_finite_vec3(reaction_new) or not _is_finite_vec3(reaction_delta):
         return result
     result.reaction = reaction_new
     result.reaction_delta = reaction_delta

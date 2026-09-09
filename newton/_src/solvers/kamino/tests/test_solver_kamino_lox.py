@@ -206,53 +206,6 @@ def _build_flagged_kinematic_model(*, device: wp.DeviceLike = None) -> tuple[new
     return builder.finalize(device=device), body
 
 
-def _build_rod_model(
-    *,
-    binary: bool = False,
-    explicit_world: bool = True,
-    enabled: bool = True,
-    stretch_stiffness: float = 0.0,
-    stretch_damping: float = 0.0,
-    shear_stiffness: float = 0.0,
-    shear_damping: float = 0.0,
-    bend_stiffness: float = 0.0,
-    bend_damping: float = 0.0,
-    twist_stiffness: float = 0.0,
-    twist_damping: float = 0.0,
-    child_xform: wp.transformf | None = None,
-    device: wp.DeviceLike = None,
-) -> tuple[newton.Model, int, int]:
-    """Build a gravity-free world or binary rod with coincident rest anchors."""
-    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    SolverKamino.register_custom_attributes(builder)
-    if explicit_world:
-        builder.begin_world()
-    inertia = wp.mat33f(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-    parent = -1
-    if binary:
-        parent = builder.add_link(mass=1.0, inertia=inertia, lock_inertia=True)
-    if child_xform is None:
-        child_xform = wp.transform_identity(dtype=wp.float32)
-    child = builder.add_link(xform=child_xform, mass=1.0, inertia=inertia, lock_inertia=True)
-    joint = builder.add_joint_rod(
-        parent,
-        child,
-        stretch_stiffness=stretch_stiffness,
-        stretch_damping=stretch_damping,
-        shear_stiffness=shear_stiffness,
-        shear_damping=shear_damping,
-        bend_stiffness=bend_stiffness,
-        bend_damping=bend_damping,
-        twist_stiffness=twist_stiffness,
-        twist_damping=twist_damping,
-        enabled=enabled,
-    )
-    builder.add_articulation([joint])
-    if explicit_world:
-        builder.end_world()
-    return builder.finalize(device=device), parent, child
-
-
 class TestSolverKaminoLOX(unittest.TestCase):
     def setUp(self):
         if not test_context.setup_done:
@@ -464,159 +417,18 @@ class TestSolverKaminoLOX(unittest.TestCase):
             atol=0.0,
         )
 
-    def test_rod_world_parent_stretch_and_damping(self):
-        """Restore stretch and reduce axial speed through rod damping."""
-        model, _parent, child = _build_rod_model(stretch_stiffness=100.0, device=self.device)
-        config = self.make_config()
-        config.use_collision_detector = False
-        solver = SolverKamino(model, config=config)
-        state_previous = model.state()
-        state_next = model.state()
-        state_previous.body_q.assign([wp.transformf(wp.vec3f(0.0, 0.0, 0.1), wp.quat_identity(dtype=wp.float32))])
+    def test_rod_joints_are_unsupported(self):
+        """Reject rod joints before converting them into Kamino storage."""
+        builder = newton.ModelBuilder()
+        child = builder.add_link(mass=1.0, inertia=wp.mat33f(np.eye(3)))
+        joint = builder.add_joint_rod(parent=-1, child=child)
+        builder.add_articulation([joint])
+        model = builder.finalize(device=self.device)
 
-        solver.step(state_previous, state_next, model.control(), contacts=None, dt=0.01)
-
-        self.assertLess(float(state_next.body_qd.numpy()[child, 2]), 0.0)
-
-        speeds = []
-        for damping in (0.0, 10.0):
-            damped_model, _parent, damped_child = _build_rod_model(
-                stretch_damping=damping,
-                device=self.device,
-            )
-            damped_config = self.make_config()
-            damped_config.use_collision_detector = False
-            damped_solver = SolverKamino(damped_model, config=damped_config)
-            damped_state_previous = damped_model.state()
-            damped_state_next = damped_model.state()
-            damped_state_previous.body_qd.assign([wp.spatial_vectorf(0.0, 0.0, 1.0, 0.0, 0.0, 0.0)])
-            damped_solver.step(
-                damped_state_previous,
-                damped_state_next,
-                damped_model.control(),
-                contacts=None,
-                dt=0.01,
-            )
-            speeds.append(float(damped_state_next.body_qd.numpy()[damped_child, 2]))
-        self.assertLess(speeds[1], speeds[0])
-
-    def test_rod_accepts_implicit_single_world(self):
-        """Accept implicit ownership for a rod in a single-world model."""
-        model, _parent, child = _build_rod_model(
-            explicit_world=False,
-            stretch_stiffness=100.0,
-            device=self.device,
-        )
-        config = self.make_config()
-        config.use_collision_detector = False
-        solver = SolverKamino(model, config=config)
-        state_previous = model.state()
-        state_next = model.state()
-        state_previous.body_q.assign([wp.transformf(wp.vec3f(0.0, 0.0, 0.1), wp.quat_identity(dtype=wp.float32))])
-
-        solver.step(state_previous, state_next, model.control(), contacts=None, dt=0.01)
-
-        self.assertLess(float(state_next.body_qd.numpy()[child, 2]), 0.0)
-
-    def test_rod_bend_and_twist_restore_rotation(self):
-        """Restore isolated bend and twist rotations in their material modes."""
-        cases = (
-            ("bend", wp.vec3f(1.0, 0.0, 0.0), {"bend_stiffness": 20.0}, 3),
-            ("twist", wp.vec3f(0.0, 0.0, 1.0), {"twist_stiffness": 20.0}, 5),
-        )
-        for name, axis, coefficients, velocity_index in cases:
-            with self.subTest(mode=name):
-                model, _parent, child = _build_rod_model(device=self.device, **coefficients)
-                config = self.make_config()
-                config.use_collision_detector = False
-                solver = SolverKamino(model, config=config)
-                state_previous = model.state()
-                state_next = model.state()
-                state_previous.body_q.assign(
-                    [
-                        wp.transformf(
-                            wp.vec3f(0.0),
-                            wp.quat_from_axis_angle(axis, 0.1),
-                        )
-                    ]
-                )
-
-                solver.step(state_previous, state_next, model.control(), contacts=None, dt=0.01)
-
-                velocity = state_next.body_qd.numpy()[child]
-                self.assertLess(float(velocity[velocity_index]), 0.0)
-                self.assertTrue(np.isfinite(velocity).all())
-
-        precurved_model, _parent, child = _build_rod_model(
-            bend_stiffness=20.0,
-            twist_stiffness=10.0,
-            child_xform=wp.transformf(
-                wp.vec3f(0.0),
-                wp.quat_from_axis_angle(wp.vec3f(1.0, 0.0, 0.0), 0.2),
-            ),
-            device=self.device,
-        )
-        precurved_config = self.make_config()
-        precurved_config.use_collision_detector = False
-        precurved_solver = SolverKamino(precurved_model, config=precurved_config)
-        precurved_previous = precurved_model.state()
-        precurved_next = precurved_model.state()
-
-        precurved_solver.step(
-            precurved_previous,
-            precurved_next,
-            precurved_model.control(),
-            contacts=None,
-            dt=0.01,
-        )
-
-        np.testing.assert_allclose(precurved_next.body_qd.numpy()[child], 0.0, atol=1.0e-7)
-
-    def test_binary_rod_balances_wrenches_and_respects_enabled(self):
-        """Balance binary rod wrenches and suppress disabled material forces."""
-        model, parent, child = _build_rod_model(
-            binary=True,
-            shear_stiffness=50.0,
-            device=self.device,
-        )
-        config = self.make_config(sparse_jacobian=True)
-        config.use_collision_detector = False
-        solver = SolverKamino(model, config=config)
-        state_previous = model.state()
-        state_next = model.state()
-        state_previous.body_q.assign(
-            [
-                wp.transform_identity(dtype=wp.float32),
-                wp.transformf(wp.vec3f(0.1, 0.0, 0.0), wp.quat_identity(dtype=wp.float32)),
-            ]
-        )
-
-        solver.step(state_previous, state_next, model.control(), contacts=None, dt=0.01)
-
-        velocity = state_next.body_qd.numpy()
-        self.assertGreater(float(velocity[parent, 0]), 0.0)
-        self.assertLess(float(velocity[child, 0]), 0.0)
-        np.testing.assert_allclose(velocity[parent, :3] + velocity[child, :3], 0.0, atol=1.0e-6)
-
-        disabled_model, _parent, disabled_child = _build_rod_model(
-            enabled=False,
-            stretch_stiffness=100.0,
-            device=self.device,
-        )
-        disabled_config = self.make_config()
-        disabled_config.use_collision_detector = False
-        disabled_solver = SolverKamino(disabled_model, config=disabled_config)
-        disabled_previous = disabled_model.state()
-        disabled_next = disabled_model.state()
-        disabled_previous.body_q.assign([wp.transformf(wp.vec3f(0.0, 0.0, 0.1), wp.quat_identity(dtype=wp.float32))])
-        disabled_solver.step(
-            disabled_previous,
-            disabled_next,
-            disabled_model.control(),
-            contacts=None,
-            dt=0.01,
-        )
-        np.testing.assert_allclose(disabled_next.body_qd.numpy()[disabled_child], 0.0, atol=1.0e-7)
+        for backend in ("lox", "dvi", "padmm"):
+            with self.subTest(backend=backend):
+                with self.assertRaisesRegex(ValueError, "ROD"):
+                    SolverKamino(model, config=SolverKamino.Config(dynamics_solver=backend))
 
     def test_joint_damping_is_implicit_in_the_smooth_row(self):
         time_step = 0.1
