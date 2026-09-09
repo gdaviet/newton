@@ -5,6 +5,7 @@
 
 import unittest
 
+from newton._src.solvers.kamino.tests.test_lox_material_rejection import TestLOXMaterialRejection
 from newton._src.solvers.kamino.tests.test_lox_membrane_hardening import TestLOXMembraneHardening
 from newton._src.solvers.kamino.tests.test_lox_tetrahedron_proximal import TestLOXTetrahedronProximal
 from newton._src.solvers.kamino.tests.test_solvers_lox_deformable_integration import (
@@ -49,6 +50,14 @@ def load_tests(loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: 
     """Load end-to-end deformable and mixed-contact regressions."""
     del loader, tests, pattern
     suite = unittest.TestSuite(TestLOXDeformableIntegration(name) for name in _FUNCTIONAL_TESTS)
+    suite.addTests(
+        TestLOXMaterialRejection(name)
+        for name in (
+            "test_material_failure_preserves_coupled_rigid_warm_start",
+            "test_assembly_failure_survives_proximal_resets",
+            "test_public_tetrahedron_preserves_inversion_tolerant_behavior",
+        )
+    )
     suite.addTests(
         TestLOXMembraneHardening(name)
         for name in (

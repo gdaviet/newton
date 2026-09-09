@@ -633,7 +633,7 @@ class LOXSolver:
         self._initialize_nonlinear_recovery_storage()
 
     def _initialize_nonlinear_recovery_storage(self) -> None:
-        """Allocate rigid rollback state for nonlinear feedback."""
+        """Allocate rigid rollback state for nonlinear feedback or coupled materials."""
         adapter = self.rigid_adapter
         self._nonlinear_feedback_trials_enabled = bool(
             adapter is not None
@@ -642,7 +642,12 @@ class LOXSolver:
                 or (adapter.rods.count > 0 and adapter.rods.proximal_relaxation > 0.0)
             )
         )
-        self._nonlinear_recovery_enabled = self._nonlinear_feedback_trials_enabled
+        material_rejection = bool(
+            adapter is not None
+            and self.deformable_system is not None
+            and (self.deformable_system.triangle_count > 0 or self.deformable_system.tetrahedron_count > 0)
+        )
+        self._nonlinear_recovery_enabled = self._nonlinear_feedback_trials_enabled or material_rejection
         if not self._nonlinear_recovery_enabled:
             self.world_nonlinear_feedback_enabled = None
             self.world_nonlinear_fallback_used = None
