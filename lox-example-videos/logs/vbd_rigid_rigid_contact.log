@@ -1,0 +1,10 @@
+/home/gdaviet/Projects/worktrees/simple-scalable/newton/examples/vbd/example_vbd_rigid_rigid_contact.py:86: DeprecationWarning: Passing 'xform' positionally to ModelBuilder.add_shape_box() is deprecated. Pass these arguments as keyword arguments instead.
+  builder.add_shape_box(
+/home/gdaviet/Projects/worktrees/simple-scalable/newton/examples/vbd/example_vbd_rigid_rigid_contact.py:95: DeprecationWarning: Passing 'xform' positionally to ModelBuilder.add_shape_box() is deprecated. Pass these arguments as keyword arguments instead.
+  builder.add_shape_box(
+/home/gdaviet/Projects/worktrees/simple-scalable/newton/examples/vbd/example_vbd_rigid_rigid_contact.py:104: DeprecationWarning: Passing 'xform' positionally to ModelBuilder.add_shape_box() is deprecated. Pass these arguments as keyword arguments instead.
+  builder.add_shape_box(
+/home/gdaviet/Projects/worktrees/simple-scalable/newton/examples/vbd/example_vbd_rigid_rigid_contact.py:113: DeprecationWarning: Passing 'xform' positionally to ModelBuilder.add_shape_box() is deprecated. Pass these arguments as keyword arguments instead.
+  builder.add_shape_box(
+/home/gdaviet/Projects/worktrees/simple-scalable/newton/examples/vbd/example_vbd_rigid_rigid_contact.py:122: DeprecationWarning: Passing 'xform' positionally to ModelBuilder.add_shape_box() is deprecated. Pass these arguments as keyword arguments instead.
+  builder.add_shape_box(

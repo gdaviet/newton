@@ -1,0 +1,12 @@
+{
+  "name": "proxy_joint_gripper",
+  "title": "MuJoCo + VBD Proxy-Joint Gripper",
+  "screenshot": "proxy_joint_gripper.png",
+  "images": [],
+  "video": "proxy_joint_gripper.mp4",
+  "frames": 60,
+  "status": "ok",
+  "notes": [
+    "Prismatic proxy joints track the MuJoCo drive targets during the VBD grasp attempt."
+  ]
+}

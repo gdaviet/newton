@@ -1,0 +1,10 @@
+{
+  "name": "admm_rigid_contact_solver",
+  "title": "ADMM Rigid Contact, Tilting Plane",
+  "screenshot": "admm_rigid_contact_solver.png",
+  "images": [],
+  "video": "admm_rigid_contact_solver.mp4",
+  "frames": 120,
+  "status": "ok",
+  "notes": []
+}

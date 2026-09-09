@@ -1,0 +1,21 @@
+{
+  "name": "proxy_coupling_convergence",
+  "title": "Proxy Coupling Convergence",
+  "screenshot": null,
+  "images": [
+    {
+      "file": "proxy_coupling_convergence_plot.png",
+      "alt": "Proxy coupling convergence plot"
+    },
+    {
+      "file": "proxy_coupling_factor_map.png",
+      "alt": "Proxy coupling fixed-point factor map"
+    }
+  ],
+  "video": null,
+  "frames": 12,
+  "status": "ok",
+  "notes": [
+    "Also writes the convergence and fixed-point-factor plots."
+  ]
+}

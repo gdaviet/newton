@@ -1,0 +1,10 @@
+{
+  "name": "mujoco_xpbd_coupled_solver",
+  "title": "MuJoCo + XPBD Proxy Coupling",
+  "screenshot": "mujoco_xpbd_coupled_solver.png",
+  "images": [],
+  "video": "mujoco_xpbd_coupled_solver.mp4",
+  "frames": 90,
+  "status": "ok",
+  "notes": []
+}

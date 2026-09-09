@@ -1,0 +1,10 @@
+{
+  "name": "admm_contact_solver",
+  "title": "ADMM Contact, XPBD Particles In A Drawer",
+  "screenshot": "admm_contact_solver.png",
+  "images": [],
+  "video": "admm_contact_solver.mp4",
+  "frames": 90,
+  "status": "ok",
+  "notes": []
+}

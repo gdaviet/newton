@@ -1,0 +1,3 @@
+/home/gdaviet/Projects/worktrees/simple-scalable/newton/_src/utils/mesh.py:348: UserWarning: Detected non-manifold edge
+  self.edge_indices, self.edge_tri_indices, self.tri_edge_indices = self._compute_edge_adjacency(tri_indices)
+[38;5;13m[KAMINO][0m[33;20m[2026-08-04 08:55:34,220][conversions.py:1404][WARNING]: Model has articulations whose root is not a free joint attached to the world, disabling floating base resets for those worlds.[0m

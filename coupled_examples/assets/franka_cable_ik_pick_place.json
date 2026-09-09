@@ -1,0 +1,12 @@
+{
+  "name": "franka_cable_ik_pick_place",
+  "title": "Franka IK Pick-and-Place + VBD Cable Proxy Coupling",
+  "screenshot": "franka_cable_ik_pick_place.png",
+  "images": [],
+  "video": "franka_cable_ik_pick_place.mp4",
+  "frames": 300,
+  "status": "ok",
+  "notes": [
+    "Captures the proxy-coupled Franka/cable pick-and-place example through the later lift phase."
+  ]
+}

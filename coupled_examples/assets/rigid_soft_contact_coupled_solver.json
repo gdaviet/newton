@@ -1,0 +1,10 @@
+{
+  "name": "rigid_soft_contact_coupled_solver",
+  "title": "Rigid/Soft Contact, Coupled",
+  "screenshot": "rigid_soft_contact_coupled_solver.png",
+  "images": [],
+  "video": "rigid_soft_contact_coupled_solver.mp4",
+  "frames": 90,
+  "status": "ok",
+  "notes": []
+}

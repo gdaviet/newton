@@ -1,0 +1,12 @@
+{
+  "name": "franka_cloth_manipulation",
+  "title": "Franka Cloth Manipulation + VBD Proxy Coupling",
+  "screenshot": "franka_cloth_manipulation.png",
+  "images": [],
+  "video": "franka_cloth_manipulation.mp4",
+  "frames": 420,
+  "status": "ok",
+  "notes": [
+    "Captures the proxy-coupled Franka/cloth manipulation example through the grasp/lift/hold sequence."
+  ]
+}

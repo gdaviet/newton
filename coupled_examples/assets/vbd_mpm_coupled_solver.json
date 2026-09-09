@@ -1,0 +1,10 @@
+{
+  "name": "vbd_mpm_coupled_solver",
+  "title": "VBD Soft Body + MPM Proxy Coupling",
+  "screenshot": "vbd_mpm_coupled_solver.png",
+  "images": [],
+  "video": "vbd_mpm_coupled_solver.mp4",
+  "frames": 90,
+  "status": "ok",
+  "notes": []
+}

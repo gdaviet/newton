@@ -1,0 +1,625 @@
+{
+  "created_at": "2026-08-03T22:09:57.520968+00:00",
+  "device": "cuda:0",
+  "encoding_fps": "per-example simulation frame rate",
+  "examples": [
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "basic_conveyor"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "basic_dzhanibekov"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "basic_heightfield"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "basic_joints"
+    },
+    {
+      "args": [
+        "--include-lox"
+      ],
+      "name": "basic_multi_solver_overlay"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "basic_pendulum"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "basic_shapes"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "basic_urdf"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cable_cross_slide_table"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cable_pile"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cable_plectoneme"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cable_twist"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cable_y_junction"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cloth_bending"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cloth_franka"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cloth_hanging"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cloth_poker_cards"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cloth_rollers"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cloth_twist"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "balance_bird"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "brick_stacking"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "contacts_rj45_plug"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "domino_spiral"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "newton_cradle"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "nut_bolt_hydro"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "nut_bolt_sdf"
+    },
+    {
+      "args": [
+        "--dynamics-backend",
+        "lox"
+      ],
+      "name": "pyramid"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "ik_cube_stacking"
+    },
+    {
+      "args": [
+        "--dynamics-solver",
+        "lox"
+      ],
+      "name": "kamino_basic_dr_testmech"
+    },
+    {
+      "args": [
+        "--dynamics-solver",
+        "lox"
+      ],
+      "name": "kamino_basic_fourbar"
+    },
+    {
+      "args": [
+        "--dynamics-solver",
+        "lox"
+      ],
+      "name": "kamino_basic_heterogeneous"
+    },
+    {
+      "args": [],
+      "name": "kamino_joint_effort_limits"
+    },
+    {
+      "args": [
+        "--dynamics-solver",
+        "lox"
+      ],
+      "name": "kamino_robot_anymal_d"
+    },
+    {
+      "args": [
+        "--dynamics-solver",
+        "lox"
+      ],
+      "name": "kamino_robot_dr_legs"
+    },
+    {
+      "args": [
+        "--dynamics-solver",
+        "lox"
+      ],
+      "name": "kamino_robot_dr_legs_pyramid"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "franka_cable_ik_pick_place"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "kamino_mujoco_admm_solver"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "mujoco_franka_vbd_cable_admm_solver"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "mujoco_vbd_coupled_solver"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "proxy_joint_gripper"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "rigid_soft_contact"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "softbody_dropping_to_cloth"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "softbody_gift"
+    },
+    {
+      "args": [
+        "--dynamics-backend",
+        "lox"
+      ],
+      "name": "robot_allegro_hand"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "robot_anymal_c_walk"
+    },
+    {
+      "args": [
+        "--dynamics-backend",
+        "lox"
+      ],
+      "name": "robot_anymal_d"
+    },
+    {
+      "args": [
+        "--dynamics-backend",
+        "lox"
+      ],
+      "name": "robot_cartpole"
+    },
+    {
+      "args": [
+        "--dynamics-backend",
+        "lox"
+      ],
+      "name": "robot_franka"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "robot_g1"
+    },
+    {
+      "args": [
+        "--dynamics-backend",
+        "lox"
+      ],
+      "name": "robot_h1"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "robot_panda_hydro"
+    },
+    {
+      "args": [
+        "--dynamics-backend",
+        "lox"
+      ],
+      "name": "robot_policy"
+    },
+    {
+      "args": [
+        "--dynamics-backend",
+        "lox"
+      ],
+      "name": "robot_ur10"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "sensor_contact"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "softbody_franka"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "softbody_hanging"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cable_bend_stiffness"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cable_bend_twist_analytic"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cable_michell_threshold"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cable_torsion_material_mapping"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cable_twist_buckling"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cable_twist_transfer"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cloth_stiff_material_hanging"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "cloth_stiff_material_stretch"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "vbd_gripper_soft_grid"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "vbd_gripper_soft_triangle"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "vbd_rigid_rigid_contact"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "vbd_soft_rigid_contact"
+    },
+    {
+      "args": [
+        "--solver",
+        "lox"
+      ],
+      "name": "vbd_soft_rigid_mix_contact"
+    }
+  ],
+  "known_exclusions": {
+    "recording": "Uses D6/GIMBAL joints, which SolverKamino does not support."
+  },
+  "max_frames": 240,
+  "repo_root": "/home/gdaviet/Projects/worktrees/simple-scalable",
+  "resolution": [
+    640,
+    480
+  ],
+  "retries": [
+    {
+      "device": "cuda:0",
+      "examples": [
+        "rigid_soft_contact",
+        "vbd_soft_rigid_contact",
+        "vbd_soft_rigid_mix_contact"
+      ],
+      "max_frames": 240,
+      "started_at": "2026-08-03T22:42:42.311832+00:00"
+    },
+    {
+      "device": "cuda:0",
+      "examples": [
+        "contacts_rj45_plug",
+        "robot_allegro_hand",
+        "vbd_gripper_soft_grid",
+        "vbd_gripper_soft_triangle"
+      ],
+      "max_frames": 240,
+      "started_at": "2026-08-04T06:44:55.379771+00:00",
+      "startup_timeout_seconds": 600.0,
+      "timeout_after_first_frame_seconds": 120.0
+    },
+    {
+      "device": "cuda:0",
+      "examples": [
+        "cloth_franka",
+        "cloth_rollers",
+        "cloth_twist",
+        "softbody_franka"
+      ],
+      "max_frames": 480,
+      "started_at": "2026-08-04T06:48:11.977438+00:00",
+      "startup_timeout_seconds": 1200.0,
+      "timeout_after_first_frame_seconds": 240.0
+    },
+    {
+      "device": "cuda:0",
+      "examples": [
+        "cable_plectoneme",
+        "brick_stacking",
+        "pyramid"
+      ],
+      "max_frames": 480,
+      "started_at": "2026-08-04T07:05:45.271779+00:00",
+      "startup_timeout_seconds": 1200.0,
+      "timeout_after_first_frame_seconds": 240.0
+    },
+    {
+      "device": "cuda:0",
+      "examples": [
+        "cloth_franka"
+      ],
+      "max_frames": 960,
+      "started_at": "2026-08-04T07:08:01.722190+00:00",
+      "startup_timeout_seconds": 2400.0,
+      "timeout_after_first_frame_seconds": 480.0
+    },
+    {
+      "device": "cuda:0",
+      "examples": [
+        "pyramid"
+      ],
+      "max_frames": 960,
+      "started_at": "2026-08-04T07:11:03.680043+00:00",
+      "startup_timeout_seconds": 2400.0,
+      "timeout_after_first_frame_seconds": 480.0
+    },
+    {
+      "device": "cuda:0",
+      "examples": [
+        "vbd_gripper_soft_grid",
+        "vbd_gripper_soft_triangle"
+      ],
+      "max_frames": 240,
+      "started_at": "2026-08-04T07:50:56.802163+00:00",
+      "startup_timeout_seconds": 600.0,
+      "timeout_after_first_frame_seconds": 120.0
+    },
+    {
+      "device": "cuda:0",
+      "examples": [
+        "cloth_franka"
+      ],
+      "max_frames": 960,
+      "started_at": "2026-08-04T08:03:18.492064+00:00",
+      "startup_timeout_seconds": 2400.0,
+      "timeout_after_first_frame_seconds": 480.0
+    },
+    {
+      "device": "cuda:0",
+      "examples": [
+        "franka_cable_ik_pick_place",
+        "robot_panda_hydro"
+      ],
+      "max_frames": 480,
+      "started_at": "2026-08-04T08:11:24.825707+00:00",
+      "startup_timeout_seconds": 1200.0,
+      "timeout_after_first_frame_seconds": 240.0
+    },
+    {
+      "device": "cuda:0",
+      "examples": [
+        "sensor_contact"
+      ],
+      "max_frames": 240,
+      "started_at": "2026-08-04T08:19:13.430605+00:00",
+      "startup_timeout_seconds": 600.0,
+      "timeout_after_first_frame_seconds": 120.0
+    },
+    {
+      "device": "cuda:0",
+      "examples": [
+        "sensor_contact"
+      ],
+      "max_frames": 480,
+      "started_at": "2026-08-04T08:21:53.477047+00:00",
+      "startup_timeout_seconds": 1200.0,
+      "timeout_after_first_frame_seconds": 240.0
+    }
+  ],
+  "run_dir": "/home/gdaviet/Projects/worktrees/simple-scalable/artifacts/lox-example-videos/run-20260804-000957",
+  "selection_exclusions": [
+    "selection_cartpole",
+    "selection_materials",
+    "selection_multiple"
+  ],
+  "startup_timeout_seconds": 600.0,
+  "timeout_after_first_frame_seconds": 120.0
+}
