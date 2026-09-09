@@ -1,0 +1,1 @@
+Stabilize the soft-grid and soft-triangle gripper examples by assigning finite gantry inertia and giving the triangle a separate LOX coupling-iteration budget, with behavioral checks for joint drift and nonfinite states.

@@ -55,6 +55,8 @@ PARAMS = {
     "fps": 60,
     "sim_substeps": 20,
     "solver_iterations": 5,
+    # LOX needs more outer coupling iterations than VBD for the loaded joints.
+    "lox_solver_iterations": 20,
     "gravity": (0.0, 0.0, -9.8),
     "num_frames": 360,
     # water-tight rigid-soft contact. True = grip the triangle by its face (this feature);
@@ -161,7 +163,7 @@ class Example:
         if self.solver_type == "lox":
             config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
             config.use_collision_detector = False
-            config.lox.max_iterations = self.params["solver_iterations"]
+            config.lox.max_iterations = self.params["lox_solver_iterations"]
             self.solver = newton.solvers.SolverKamino(self.model, config=config)
         else:
             self.solver = newton.solvers.SolverVBD(
@@ -202,14 +204,22 @@ class Example:
         grab_z = p["grab_z"]
         h = p["finger_half"]
 
+        # These invisible links have no shapes from which to infer inertia. Use
+        # the inertia of a mass-equivalent cube matching a finger pad instead
+        # of relying on the near-zero inertia repair.
+        gantry_inertia = (2.0 / 3.0) * p["gantry_link_mass"] * h * h
+        gantry_inertia_tensor = wp.mat33(np.eye(3) * gantry_inertia)
+
         gantry_z = builder.add_link(
             xform=wp.transform(wp.vec3(0.0, 0.0, grab_z), wp.quat_identity()),
             mass=p["gantry_link_mass"],
+            inertia=gantry_inertia_tensor,
             label="gantry_z",
         )
         gantry_x = builder.add_link(
             xform=wp.transform(wp.vec3(0.0, 0.0, grab_z), wp.quat_identity()),
             mass=p["gantry_link_mass"],
+            inertia=gantry_inertia_tensor,
             label="gantry_x",
         )
         left_finger = builder.add_link(
@@ -359,6 +369,39 @@ class Example:
         self.viewer.log_state(self.state_0)
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
+
+    def test_post_step(self):
+        """Keep the state finite and the prismatic locks bounded."""
+        body_q = self.state_0.body_q.numpy()
+        arrays = (
+            body_q,
+            self.state_0.body_qd.numpy(),
+            self.state_0.particle_q.numpy(),
+            self.state_0.particle_qd.numpy(),
+        )
+        if not all(np.all(np.isfinite(values)) for values in arrays):
+            raise AssertionError("gripper simulation produced a non-finite body or particle state")
+
+        parents, children = self.model.joint_parent.numpy(), self.model.joint_child.numpy()
+        parent_frames, child_frames = self.model.joint_X_p.numpy(), self.model.joint_X_c.numpy()
+        axes = self.model.joint_axis.numpy()
+        for joint, (parent, child) in enumerate(zip(parents, children, strict=True)):
+            parent_pose = (
+                wp.transform_identity() if parent < 0 else wp.transform(body_q[parent, :3], body_q[parent, 3:])
+            )
+            child_pose = wp.transform(body_q[child, :3], body_q[child, 3:])
+            parent_frame = parent_pose * wp.transform(parent_frames[joint, :3], parent_frames[joint, 3:])
+            child_frame = child_pose * wp.transform(child_frames[joint, :3], child_frames[joint, 3:])
+            relative = wp.transform_inverse(parent_frame) * child_frame
+            position = np.asarray(wp.transform_get_translation(relative))
+            orientation = np.asarray(wp.transform_get_rotation(relative))
+            transverse_norm = float(np.linalg.norm(position - np.dot(position, axes[joint]) * axes[joint]))
+            orientation_error = 2.0 * np.arctan2(np.linalg.norm(orientation[:3]), abs(orientation[3]))
+            if transverse_norm > 0.01 or orientation_error > 0.1:
+                raise AssertionError(
+                    f"joint {joint} left its prismatic manifold "
+                    f"(transverse={transverse_norm:.6f} m, rotation={orientation_error:.6f} rad)"
+                )
 
     def test_final(self):
         """The gripped triangle must be held in the air, not dropped to the ground."""
