@@ -96,7 +96,7 @@ class Example:
             config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
             config.use_collision_detector = False
             config.lox.max_iterations = 4
-            config.lox.deformable_proximal_iterations = 1
+            config.lox.deformable_proximal_iterations = 4
             config.lox.deformable_enable_self_contact = False
             self.solver = newton.solvers.SolverKamino(self.model, config=config)
 

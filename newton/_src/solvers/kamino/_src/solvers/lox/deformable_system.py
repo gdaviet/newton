@@ -686,7 +686,7 @@ class DeformableFEMSystem:
         preconditioner: str = "two_level",
         preconditioner_regularization: float = 1.0e-6,
         direct_max_particles: int = 0,
-        proximal_iterations: int = 1,
+        proximal_iterations: int = 4,
         proximal_relaxation: float = 1.0,
         recycle_cr: bool = False,
     ):

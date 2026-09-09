@@ -1,0 +1,1 @@
+Increase the default LOX membrane and tetrahedron proximal iteration count from one to four to improve local solve convergence. Set `deformable_proximal_iterations=1` explicitly to retain the previous iteration budget; the outer iteration limit and relaxation defaults are unchanged.

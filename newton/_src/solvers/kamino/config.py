@@ -1064,12 +1064,15 @@ class LOXSolverConfig:
     tiles. Set to zero to solve every deformable component with CR.
     """
 
-    deformable_proximal_iterations: int = 1
+    deformable_proximal_iterations: int = 4
     """Fixed local Gauss-Newton iterations per nonlinear elastic-element prox.
 
     Zero retains the frozen membrane and tetrahedron linearizations. Positive
     values enable element-local nonlinear refinement within the LOX splitting
-    loop.
+    loop. Convergence additionally checks a metric-scaled local stationarity
+    correction; exhausting the local iteration budget does not itself reject
+    the world. Tetrahedral elasticity remains inversion-tolerant: finite
+    inverted elements can be evaluated, but positive volume is not guaranteed.
     """
 
     deformable_proximal_relaxation: float = 1.0
