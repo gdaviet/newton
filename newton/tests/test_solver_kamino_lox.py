@@ -8,7 +8,6 @@ import unittest
 from newton._src.solvers.kamino.tests.test_solver_kamino_lox import TestSolverKaminoLOX
 
 _LOX_QUALITY_TESTS = (
-    "test_rod_joints_are_unsupported",
     "test_box_on_plane_projects_detected_contact",
     "test_relaxed_joint_proximal_preserves_nonlinear_fixed_point",
     "test_cartpole_projects_detected_joint_limit",

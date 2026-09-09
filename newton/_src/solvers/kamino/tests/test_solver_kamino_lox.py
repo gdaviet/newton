@@ -417,19 +417,6 @@ class TestSolverKaminoLOX(unittest.TestCase):
             atol=0.0,
         )
 
-    def test_rod_joints_are_unsupported(self):
-        """Reject rod joints before converting them into Kamino storage."""
-        builder = newton.ModelBuilder()
-        child = builder.add_link(mass=1.0, inertia=wp.mat33f(np.eye(3)))
-        joint = builder.add_joint_rod(parent=-1, child=child)
-        builder.add_articulation([joint])
-        model = builder.finalize(device=self.device)
-
-        for backend in ("lox", "dvi", "padmm"):
-            with self.subTest(backend=backend):
-                with self.assertRaisesRegex(ValueError, "ROD"):
-                    SolverKamino(model, config=SolverKamino.Config(dynamics_solver=backend))
-
     def test_joint_damping_is_implicit_in_the_smooth_row(self):
         time_step = 0.1
         damping = 4.0

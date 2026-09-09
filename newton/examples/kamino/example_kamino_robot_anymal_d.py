@@ -200,7 +200,7 @@ class Example:
     def test_final(self):
         self._test_state_finite()
         if self.dynamics_solver == "lox":
-            structural_residual = self.solver._solver_kamino.solver_fd.rigid_adapter.structural_residual.numpy()
+            structural_residual = self.solver._solver_kamino.solver_fd.problem.structural_residual.numpy()
             assert np.max(np.abs(structural_residual), initial=0.0) < 0.02, (
                 "ANYmal structural joint residual must settle below 0.02 m or rad"
             )

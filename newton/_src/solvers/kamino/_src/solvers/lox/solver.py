@@ -14,18 +14,17 @@ import warp as wp
 from ......sim import ModelFlags
 from ...core.bodies import update_body_wrenches
 from ...core.types import vec6f
-from .adapter import LOXKaminoAdapter
+from .adapter import _write_integrator_body_inputs
 from .colored_gauss_seidel import ColoredGaussSeidelProjection
-from .integration import _write_integrator_body_inputs
+from .jacobi import project_constraints_jacobi
 from .joint_delassus import BatchedStructuralDelassus
-from .projection import PROJECTION_STATUS_VALID
-from .sweep import (
+from .problem import LOXProblem
+from .projection import (
+    PROJECTION_STATUS_VALID,
     compute_projection_residuals,
     prepare_jacobi_projection_data,
     prepare_physical_projection_data,
-    project_constraints_jacobi,
 )
-from .time import validate_world_time_steps
 
 if TYPE_CHECKING:
     from ....config import ConstraintStabilizationConfig, LOXSolverConfig
@@ -270,9 +269,9 @@ class LOXSolver:
         constraints: ConstraintStabilizationConfig,
         rotation_correction: JointCorrectionMode,
     ):
-        rigid_adapter = None
+        problem = None
         if model.size.sum_of_num_bodies > 0:
-            rigid_adapter = LOXKaminoAdapter(
+            problem = LOXProblem(
                 model=model,
                 data=data,
                 jacobians=jacobians,
@@ -283,12 +282,12 @@ class LOXSolver:
                 rotation_correction=rotation_correction,
                 joint_proximal_relaxation=config.joint_proximal_relaxation,
             )
-        if rigid_adapter is None:
+        if problem is None:
             raise ValueError("LOX requires at least one rigid body.")
         self._config = config
         self.model = model
         self._constraints = constraints
-        self.rigid_adapter = rigid_adapter
+        self.problem = problem
         self.device = model.device
         self.num_worlds = model.info.num_worlds
         self.max_iterations = config.max_iterations
@@ -330,19 +329,19 @@ class LOXSolver:
             if config.projection_method == "apgd"
             else None
         )
-        self.has_bounded_effort = rigid_adapter is not None and rigid_adapter.has_bounded_effort
+        self.has_bounded_effort = problem is not None and problem.has_bounded_effort
         self._time_step: wp.array[wp.float32] | None = None
         self._inverse_time_step: wp.array[wp.float32] | None = None
         self._time_step_prepared = False
 
     def _bind_rigid_topology(self) -> None:
         """Bind solver views and scratch arrays to the current rigid topology."""
-        rigid_adapter = self.rigid_adapter
-        self.system = rigid_adapter.system if rigid_adapter is not None else None
+        problem = self.problem
+        self.system = problem.system if problem is not None else None
         self._has_dynamic_rigid_bodies = self.system is not None and bool(self.system.dynamic_bodies)
         if self.system is not None:
             self.system.selective_body_weights = self._config.selective_weights
-        self.splitting = rigid_adapter.splitting if rigid_adapter is not None else None
+        self.splitting = problem.splitting if problem is not None else None
         self.projected_twist = (
             self.splitting.projected_twist
             if self.splitting is not None
@@ -374,42 +373,42 @@ class LOXSolver:
             else wp.zeros(self.num_worlds, dtype=wp.int32, device=self.device)
         )
         self.contact_residual_max = (
-            rigid_adapter.world_contact_residual_max
-            if rigid_adapter is not None
+            problem.world_contact_residual_max
+            if problem is not None
             else wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
         )
         self.limit_residual_max = (
-            rigid_adapter.world_limit_residual_max
-            if rigid_adapter is not None
+            problem.world_limit_residual_max
+            if problem is not None
             else wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
         )
         self.friction_residual_max = (
-            rigid_adapter.world_friction_residual_max
-            if rigid_adapter is not None
+            problem.world_friction_residual_max
+            if problem is not None
             else wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
         )
-        rigid_body_count = rigid_adapter.model.size.sum_of_num_bodies if rigid_adapter is not None else 0
+        rigid_body_count = problem.model.size.sum_of_num_bodies if problem is not None else 0
         self._initial_twist = wp.zeros(rigid_body_count, dtype=vec6f, device=self.device)
 
     def _make_structural_delassus(self) -> BatchedStructuralDelassus:
-        rigid_adapter = self.rigid_adapter
+        problem = self.problem
         return BatchedStructuralDelassus(
             body_system=self.system,
-            body_first_global=rigid_adapter.structural_body_first_global,
-            body_second_global=rigid_adapter.structural_body_second_global,
-            jacobian_first=rigid_adapter.structural_jacobian_first,
-            jacobian_second=rigid_adapter.structural_jacobian_second,
+            body_first_global=problem.structural_body_first_global,
+            body_second_global=problem.structural_body_second_global,
+            jacobian_first=problem.structural_jacobian_first,
+            jacobian_second=problem.structural_jacobian_second,
         )
 
     def rebuild_rigid_topology(self) -> None:
         """Rebuild rigid allocations after dynamic-body classification changes."""
-        rigid_adapter = self.rigid_adapter
-        if rigid_adapter is None:
+        problem = self.problem
+        if problem is None:
             return
-        rigid_adapter.rebuild_dynamic_body_topology()
+        problem.rebuild_dynamic_body_topology()
         self._colored_gauss_seidel = None
         self._bind_rigid_topology()
-        self.has_bounded_effort = rigid_adapter.has_bounded_effort
+        self.has_bounded_effort = problem.has_bounded_effort
         self.reset()
 
     def joint_penalty_scale_seed(
@@ -426,7 +425,7 @@ class LOXSolver:
         operator excludes the body contact-consensus metric, which is a
         separate splitting concern.
 
-        This operation prepares the rigid adapter from the initial rigid state and
+        This operation prepares the LOX problem from the initial rigid state and
         performs a one-time dense structural assembly and host eigensolve, so
         it is intended for initialization rather than the captured simulation
         loop.
@@ -438,24 +437,31 @@ class LOXSolver:
             The estimated dimensionless structural ALM penalty scale for each
             world.
         """
-        rigid_adapter = self.rigid_adapter
-        if rigid_adapter is None:
+        problem = self.problem
+        if problem is None:
             raise ValueError("joint penalty scale seeding requires a LOX rigid-body system.")
-        rigid_adapter.prepare_joint_penalty_scale_seed(time_step)
-        time_step_array = rigid_adapter.model.time.dt
-        inverse_time_step = rigid_adapter.model.time.inv_dt
-        validate_world_time_steps(time_step_array, inverse_time_step, self.num_worlds, self.device)
-        if rigid_adapter.structural_row_count == 0:
+        problem.prepare_joint_penalty_scale_seed(time_step)
+        time_step_array = problem.model.time.dt
+        inverse_time_step = problem.model.time.inv_dt
+        if problem.structural_row_count == 0:
             return self.joint_penalty_scale.numpy().tolist()
 
         self.reset()
-        rigid_adapter.begin_time_step(time_step_array, inverse_time_step)
+        problem.begin_time_step(
+            time_step_array,
+            inverse_time_step,
+            limit_stabilization_fraction=self._constraints.beta,
+            contact_stabilization_fraction=self._constraints.gamma,
+            contact_dead_zone=self._constraints.delta,
+            impact_velocity_threshold=self._config.impact_velocity_threshold,
+            contact_recoverable_response=self._config.contact_recoverable_response,
+        )
         try:
-            rigid_adapter.body_linearization_twist.zero_()
-            rigid_adapter.update(
+            problem.body_linearization_twist.zero_()
+            problem.update(
                 time_step_array,
                 joint_penalty_scale=1.0,
-                linearization_twist=rigid_adapter.body_linearization_twist,
+                linearization_twist=problem.body_linearization_twist,
                 assemble_structural_penalty=False,
             )
             wp.copy(self.system.weighted_matrix, self.system.smooth_matrix)
@@ -467,11 +473,11 @@ class LOXSolver:
             matrix_offsets = structural_delassus.info.mio.numpy()
             vector_offsets = structural_delassus.info.vio.numpy()
             vector_rows = structural_delassus.vector_row.numpy()
-            effective_mass = rigid_adapter.structural_effective_mass.numpy()
+            effective_mass = problem.structural_effective_mass.numpy()
             matrix_epsilon = np.finfo(matrix_values.dtype).eps
 
             seeds = self.joint_penalty_scale.numpy().astype(np.float64)
-            positive_by_world: list[list[np.ndarray]] = [[] for _ in range(rigid_adapter.num_worlds)]
+            positive_by_world: list[list[np.ndarray]] = [[] for _ in range(problem.num_worlds)]
             for component, row_count in enumerate(structural_delassus.component_row_counts):
                 if row_count == 0:
                     continue
@@ -519,7 +525,7 @@ class LOXSolver:
         constraints = self._constraints
         time_step = self.model.time.dt
         inverse_time_step = self.model.time.inv_dt
-        rigid_adapter = self.rigid_adapter
+        problem = self.problem
         self.begin_time_step(
             time_step,
             inverse_time_step,
@@ -531,16 +537,15 @@ class LOXSolver:
         )
 
         linearization_twist = None
-        if rigid_adapter is not None:
-            rigid_adapter.body_linearization_twist.zero_()
-            linearization_twist = rigid_adapter.body_linearization_twist
+        if problem is not None:
+            problem.body_linearization_twist.zero_()
+            linearization_twist = problem.body_linearization_twist
         self.solve(linearization_twist=linearization_twist, write_output=False)
 
-        if rigid_adapter is not None:
-            rigid_adapter.write_outputs(time_step, inverse_time_step, write_body_velocity=False)
-        if rigid_adapter is not None:
-            model = rigid_adapter.model
-            data = rigid_adapter.data
+        if problem is not None:
+            problem.write_outputs(time_step, inverse_time_step, write_body_velocity=False)
+            model = problem.model
+            data = problem.data
             update_body_wrenches(model.bodies, data.bodies)
             # Expose the accepted LOX velocity as equivalent inputs to the
             # selected Kamino integrator.
@@ -548,7 +553,7 @@ class LOXSolver:
                 _write_integrator_body_inputs,
                 dim=model.size.sum_of_num_bodies,
                 inputs=[
-                    rigid_adapter.system.body_vector_index,
+                    problem.system.body_vector_index,
                     model.bodies.wid,
                     self.world_accepted,
                     time_step,
@@ -557,7 +562,7 @@ class LOXSolver:
                     model.bodies.inv_m_i,
                     model.bodies.inv_i_I_i,
                     model.gravity.vector,
-                    rigid_adapter.body_velocity_begin,
+                    problem.body_velocity_begin,
                     self.projected_twist,
                 ],
                 outputs=[data.bodies.w_i, data.bodies.u_i],
@@ -565,11 +570,11 @@ class LOXSolver:
             )
 
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
-        """Refresh or rebuild the rigid adapter after model changes."""
-        rigid_adapter = self.rigid_adapter
-        if rigid_adapter is None:
+        """Refresh or rebuild the LOX problem after model changes."""
+        problem = self.problem
+        if problem is None:
             return
-        if flags & ModelFlags.BODY_PROPERTIES and rigid_adapter.dynamic_body_topology_changed():
+        if flags & ModelFlags.BODY_PROPERTIES and problem.dynamic_body_topology_changed():
             self.rebuild_rigid_topology()
 
     def validate_model_changed(self) -> None:
@@ -579,8 +584,8 @@ class LOXSolver:
         # solver was built; captured property updates retain that topology.
         if self.device.is_cuda and self.device.is_capturing:
             return
-        if self.rigid_adapter is not None:
-            self.rigid_adapter.validate_model_changed()
+        if self.problem is not None:
+            self.problem.validate_model_changed()
 
     def reset(
         self,
@@ -596,14 +601,14 @@ class LOXSolver:
                 raise ValueError(f"world_mask must be allocated on {self.device}, found {world_mask.device}.")
         if self.splitting is not None:
             self.splitting.reset(world_mask=world_mask)
-            self.rigid_adapter.reset_structural_multipliers(world_mask=world_mask)
+            self.problem.reset_structural_multipliers(world_mask=world_mask)
             if self.has_bounded_effort:
-                self.rigid_adapter.reset_effort_counters(world_mask=world_mask)
-            self.rigid_adapter.projection_status.zero_()
-            self.rigid_adapter.contact_residual.zero_()
-            self.rigid_adapter.limit_residual.zero_()
-            self.rigid_adapter.friction_residual.zero_()
-            self.rigid_adapter.reset_friction_reactions(world_mask=world_mask)
+                self.problem.reset_effort_counters(world_mask=world_mask)
+            self.problem.projection_status.zero_()
+            self.problem.contact_residual.zero_()
+            self.problem.limit_residual.zero_()
+            self.problem.friction_residual.zero_()
+            self.problem.reset_friction_reactions(world_mask=world_mask)
         elif world_mask is None:
             self.world_active.fill_(True)
             self.world_converged.zero_()
@@ -658,7 +663,7 @@ class LOXSolver:
         if self.splitting is not None:
             if body_dual_impulse is None:
                 raise ValueError("LOX rigid bodies require State.body_lox_dual_impulse.")
-            if body_dual_impulse.shape != (self.rigid_adapter.model.size.sum_of_num_bodies,):
+            if body_dual_impulse.shape != (self.problem.model.size.sum_of_num_bodies,):
                 raise ValueError("State.body_lox_dual_impulse must contain one entry per body.")
             if body_dual_impulse.dtype != wp.spatial_vectorf or body_dual_impulse.device != self.device:
                 raise ValueError("State.body_lox_dual_impulse has an incompatible dtype or device.")
@@ -672,7 +677,7 @@ class LOXSolver:
         if self.splitting is not None:
             if body_dual_impulse is None:
                 raise ValueError("LOX rigid bodies require State.body_lox_dual_impulse.")
-            if body_dual_impulse.shape != (self.rigid_adapter.model.size.sum_of_num_bodies,):
+            if body_dual_impulse.shape != (self.problem.model.size.sum_of_num_bodies,):
                 raise ValueError("State.body_lox_dual_impulse must contain one entry per body.")
             if body_dual_impulse.dtype != wp.spatial_vectorf or body_dual_impulse.device != self.device:
                 raise ValueError("State.body_lox_dual_impulse has an incompatible dtype or device.")
@@ -682,11 +687,12 @@ class LOXSolver:
         self,
         time_step: wp.array[wp.float32],
         inverse_time_step: wp.array[wp.float32],
-        limit_stabilization_fraction: float = 0.01,
-        contact_stabilization_fraction: float = 0.01,
-        contact_dead_zone: float = 1.0e-6,
-        impact_velocity_threshold: float = 1.0e-3,
-        contact_recoverable_response: bool = False,
+        *,
+        limit_stabilization_fraction: float,
+        contact_stabilization_fraction: float,
+        contact_dead_zone: float,
+        impact_velocity_threshold: float,
+        contact_recoverable_response: bool,
         reset_dual: bool = False,
     ) -> None:
         """Freeze inertial velocities and import damped constraint warm starts.
@@ -695,12 +701,11 @@ class LOXSolver:
         the generalized impulse ``W u`` and converted back to the scaled dual
         after the solve builds its current body weight.
         """
-        validate_world_time_steps(time_step, inverse_time_step, self.num_worlds, self.device)
         self._time_step = time_step
         self._inverse_time_step = inverse_time_step
-        if self.rigid_adapter is not None:
-            self.rigid_adapter.scale_structural_multipliers(self.joint_warmstart_factor)
-            self.rigid_adapter.begin_time_step(
+        if self.problem is not None:
+            self.problem.scale_structural_multipliers(self.joint_warmstart_factor)
+            self.problem.begin_time_step(
                 time_step,
                 inverse_time_step,
                 limit_stabilization_fraction=limit_stabilization_fraction,
@@ -711,15 +716,15 @@ class LOXSolver:
             )
             wp.launch(
                 _initialize_body_velocity_guess,
-                dim=self.rigid_adapter.model.size.sum_of_num_bodies,
+                dim=self.problem.model.size.sum_of_num_bodies,
                 inputs=[
                     self.system.body_block,
-                    self.rigid_adapter.model.bodies.wid,
-                    self.rigid_adapter.model.bodies.inv_m_i,
-                    self.rigid_adapter.data.bodies.inv_I_i,
-                    self.rigid_adapter.body_velocity_begin,
-                    self.rigid_adapter.data.bodies.w_e_i,
-                    self.rigid_adapter.model.gravity.vector,
+                    self.problem.model.bodies.wid,
+                    self.problem.model.bodies.inv_m_i,
+                    self.problem.data.bodies.inv_I_i,
+                    self.problem.body_velocity_begin,
+                    self.problem.data.bodies.w_e_i,
+                    self.problem.model.gravity.vector,
                     time_step,
                     self.inertial_warmstart_fraction,
                 ],
@@ -732,86 +737,86 @@ class LOXSolver:
         self._time_step_prepared = True
 
     def _prepare_colored_gauss_seidel_projection(self) -> None:
-        projection_adapter = self.rigid_adapter
-        if self._colored_gauss_seidel is None or self._colored_gauss_seidel.rigid_adapter is not projection_adapter:
+        projection_problem = self.problem
+        if self._colored_gauss_seidel is None or self._colored_gauss_seidel.problem is not projection_problem:
             self._colored_gauss_seidel = ColoredGaussSeidelProjection(
-                projection_adapter,
+                projection_problem,
                 self.gauss_seidel_max_colors,
             )
-        prepared_status = self.rigid_adapter.world_jacobi_projection_status
+        prepared_status = self.problem.world_jacobi_projection_status
         inverse_weight = self.system.inverse_weight
         self._colored_gauss_seidel.prepare(inverse_weight, prepared_status)
 
     def _prepare_body_space_projection(self) -> None:
-        rigid_adapter = self.rigid_adapter
+        problem = self.problem
         if not self._has_dynamic_rigid_bodies:
-            rigid_adapter.projection_status.fill_(PROJECTION_STATUS_VALID)
+            problem.projection_status.fill_(PROJECTION_STATUS_VALID)
             return
         prepare_physical_projection_data(
-            rigid_adapter.friction_world,
-            rigid_adapter.friction_local,
-            rigid_adapter.world_friction_count,
-            rigid_adapter.friction_body_first,
-            rigid_adapter.friction_body_second,
-            rigid_adapter.friction_jacobian_first,
-            rigid_adapter.friction_jacobian_second,
-            rigid_adapter.contact_world,
-            rigid_adapter.contact_local,
-            rigid_adapter.world_contact_count,
-            rigid_adapter.contact_body_first,
-            rigid_adapter.contact_body_second,
-            rigid_adapter.contact_jacobian_first,
-            rigid_adapter.contact_jacobian_second,
-            rigid_adapter.contact_bias,
-            rigid_adapter.contact_friction,
-            rigid_adapter.limit_world,
-            rigid_adapter.limit_local,
-            rigid_adapter.world_limit_count,
-            rigid_adapter.limit_body_first,
-            rigid_adapter.limit_body_second,
-            rigid_adapter.limit_jacobian_first,
-            rigid_adapter.limit_jacobian_second,
+            problem.friction_world,
+            problem.friction_local,
+            problem.world_friction_count,
+            problem.friction_body_first,
+            problem.friction_body_second,
+            problem.friction_jacobian_first,
+            problem.friction_jacobian_second,
+            problem.contact_world,
+            problem.contact_local,
+            problem.world_contact_count,
+            problem.contact_body_first,
+            problem.contact_body_second,
+            problem.contact_jacobian_first,
+            problem.contact_jacobian_second,
+            problem.contact_bias,
+            problem.contact_friction,
+            problem.limit_world,
+            problem.limit_local,
+            problem.world_limit_count,
+            problem.limit_body_first,
+            problem.limit_body_second,
+            problem.limit_jacobian_first,
+            problem.limit_jacobian_second,
             self.system.inverse_weight,
-            rigid_adapter.friction_physical_delassus,
-            rigid_adapter.contact_physical_delassus,
-            rigid_adapter.contact_prepared_delassus,
-            rigid_adapter.limit_physical_delassus,
-            rigid_adapter.world_physical_projection_status,
+            problem.friction_physical_delassus,
+            problem.contact_physical_delassus,
+            problem.contact_prepared_delassus,
+            problem.limit_physical_delassus,
+            problem.world_physical_projection_status,
         )
         if self.projection_method in ("jacobi", "apgd") or (
             self.projection_method == "gauss_seidel" and self.gauss_seidel_max_colors == 1
         ):
             prepare_jacobi_projection_data(
-                rigid_adapter.friction_world,
-                rigid_adapter.friction_local,
-                rigid_adapter.world_friction_count,
-                rigid_adapter.friction_body_first,
-                rigid_adapter.friction_body_second,
-                rigid_adapter.friction_jacobian_first,
-                rigid_adapter.friction_jacobian_second,
-                rigid_adapter.contact_world,
-                rigid_adapter.contact_local,
-                rigid_adapter.world_contact_count,
-                rigid_adapter.contact_body_first,
-                rigid_adapter.contact_body_second,
-                rigid_adapter.contact_jacobian_first,
-                rigid_adapter.contact_jacobian_second,
-                rigid_adapter.contact_bias,
-                rigid_adapter.contact_friction,
-                rigid_adapter.limit_world,
-                rigid_adapter.limit_local,
-                rigid_adapter.world_limit_count,
-                rigid_adapter.limit_body_first,
-                rigid_adapter.limit_body_second,
-                rigid_adapter.limit_jacobian_first,
-                rigid_adapter.limit_jacobian_second,
-                rigid_adapter.body_constraint_count,
-                rigid_adapter.static_body_constraint_count,
+                problem.friction_world,
+                problem.friction_local,
+                problem.world_friction_count,
+                problem.friction_body_first,
+                problem.friction_body_second,
+                problem.friction_jacobian_first,
+                problem.friction_jacobian_second,
+                problem.contact_world,
+                problem.contact_local,
+                problem.world_contact_count,
+                problem.contact_body_first,
+                problem.contact_body_second,
+                problem.contact_jacobian_first,
+                problem.contact_jacobian_second,
+                problem.contact_bias,
+                problem.contact_friction,
+                problem.limit_world,
+                problem.limit_local,
+                problem.world_limit_count,
+                problem.limit_body_first,
+                problem.limit_body_second,
+                problem.limit_jacobian_first,
+                problem.limit_jacobian_second,
+                problem.body_constraint_count,
+                problem.static_body_constraint_count,
                 self.system.inverse_weight,
-                rigid_adapter.friction_projection_delassus,
-                rigid_adapter.contact_projection_delassus,
-                rigid_adapter.limit_projection_delassus,
-                rigid_adapter.world_jacobi_projection_status,
+                problem.friction_projection_delassus,
+                problem.contact_projection_delassus,
+                problem.limit_projection_delassus,
+                problem.world_jacobi_projection_status,
             )
         elif self.projection_method == "gauss_seidel" and self.gauss_seidel_max_colors > 1:
             self._prepare_colored_gauss_seidel_projection()
@@ -819,7 +824,7 @@ class LOXSolver:
     def _project_body_space_constraints(self) -> None:
         if not self._has_dynamic_rigid_bodies:
             return
-        rigid_adapter = self.rigid_adapter
+        problem = self.problem
         splitting = self.splitting
         if self.projection_method in ("jacobi", "apgd") or (
             self.projection_method == "gauss_seidel" and self.gauss_seidel_max_colors == 1
@@ -828,57 +833,57 @@ class LOXSolver:
                 self.projection_iterations,
                 splitting.world_active,
                 splitting.body_world,
-                rigid_adapter.friction_world,
-                rigid_adapter.friction_local,
-                rigid_adapter.world_friction_count,
-                rigid_adapter.friction_body_first,
-                rigid_adapter.friction_body_second,
-                rigid_adapter.friction_jacobian_first,
-                rigid_adapter.friction_jacobian_second,
-                rigid_adapter.friction_impulse_bound,
-                rigid_adapter.friction_projection_delassus,
-                rigid_adapter.contact_world,
-                rigid_adapter.contact_local,
-                rigid_adapter.world_contact_count,
-                rigid_adapter.contact_body_first,
-                rigid_adapter.contact_body_second,
-                rigid_adapter.contact_jacobian_first,
-                rigid_adapter.contact_jacobian_second,
-                rigid_adapter.contact_bias,
-                rigid_adapter.contact_friction,
-                rigid_adapter.contact_projection_delassus,
-                rigid_adapter.limit_world,
-                rigid_adapter.limit_local,
-                rigid_adapter.world_limit_count,
-                rigid_adapter.limit_body_first,
-                rigid_adapter.limit_body_second,
-                rigid_adapter.limit_jacobian_first,
-                rigid_adapter.limit_jacobian_second,
-                rigid_adapter.limit_bias,
-                rigid_adapter.limit_projection_delassus,
+                problem.friction_world,
+                problem.friction_local,
+                problem.world_friction_count,
+                problem.friction_body_first,
+                problem.friction_body_second,
+                problem.friction_jacobian_first,
+                problem.friction_jacobian_second,
+                problem.friction_impulse_bound,
+                problem.friction_projection_delassus,
+                problem.contact_world,
+                problem.contact_local,
+                problem.world_contact_count,
+                problem.contact_body_first,
+                problem.contact_body_second,
+                problem.contact_jacobian_first,
+                problem.contact_jacobian_second,
+                problem.contact_bias,
+                problem.contact_friction,
+                problem.contact_projection_delassus,
+                problem.limit_world,
+                problem.limit_local,
+                problem.world_limit_count,
+                problem.limit_body_first,
+                problem.limit_body_second,
+                problem.limit_jacobian_first,
+                problem.limit_jacobian_second,
+                problem.limit_bias,
+                problem.limit_projection_delassus,
                 self.system.inverse_weight,
                 splitting.projected_twist,
-                rigid_adapter.projection_twist_delta,
-                rigid_adapter.contact_reaction,
-                rigid_adapter.limit_reaction,
-                rigid_adapter.friction_reaction,
-                rigid_adapter.world_jacobi_projection_status,
-                rigid_adapter.projection_status,
-                world_body_offset=rigid_adapter.model.info.bodies_offset,
-                world_body_count=rigid_adapter.model.info.num_bodies,
-                world_friction_offset=rigid_adapter.world_friction_offset,
-                world_contact_offset=rigid_adapter.world_contact_offset,
-                world_limit_offset=rigid_adapter.world_limit_offset,
+                problem.projection_twist_delta,
+                problem.contact_reaction,
+                problem.limit_reaction,
+                problem.friction_reaction,
+                problem.world_jacobi_projection_status,
+                problem.projection_status,
+                world_body_offset=problem.model.info.bodies_offset,
+                world_body_count=problem.model.info.num_bodies,
+                world_friction_offset=problem.world_friction_offset,
+                world_contact_offset=problem.world_contact_offset,
+                world_limit_offset=problem.world_limit_offset,
                 accelerated=self.projection_method == "apgd",
                 theta=self._projection_theta,
                 beta=self._projection_beta,
                 restart_dot=self._projection_restart_dot,
-                friction_trial=rigid_adapter.friction_acceleration_trial,
-                friction_previous=rigid_adapter.friction_acceleration_previous,
-                contact_trial=rigid_adapter.contact_acceleration_trial,
-                contact_previous=rigid_adapter.contact_acceleration_previous,
-                limit_trial=rigid_adapter.limit_acceleration_trial,
-                limit_previous=rigid_adapter.limit_acceleration_previous,
+                friction_trial=problem.friction_acceleration_trial,
+                friction_previous=problem.friction_acceleration_previous,
+                contact_trial=problem.contact_acceleration_trial,
+                contact_previous=problem.contact_acceleration_previous,
+                limit_trial=problem.limit_acceleration_trial,
+                limit_previous=problem.limit_acceleration_previous,
             )
         elif self.projection_method == "gauss_seidel" and self.gauss_seidel_max_colors > 1:
             self._colored_gauss_seidel.project(
@@ -887,9 +892,9 @@ class LOXSolver:
                 splitting.body_world,
                 self.system.inverse_weight,
                 splitting.projected_twist,
-                rigid_adapter.projection_twist_delta,
-                rigid_adapter.world_jacobi_projection_status,
-                rigid_adapter.projection_status,
+                problem.projection_twist_delta,
+                problem.world_jacobi_projection_status,
+                problem.projection_status,
             )
 
     def _update_conditional_iteration(self) -> None:
@@ -908,38 +913,34 @@ class LOXSolver:
 
     def _prepare_body_space_candidate(self) -> None:
         """Solve and prepare the rigid candidate without unilateral projection."""
-        rigid_adapter = self.rigid_adapter
+        problem = self.problem
         system = self.system
         splitting = self.splitting
         if self.has_bounded_effort:
-            rigid_adapter.promote_effort_counters(splitting.world_active)
-            system.solve_candidate_with_effort(
+            problem.promote_effort_counters(splitting.world_active)
+            system.build_candidate_right_hand_side_with_effort(
                 splitting.projected_twist,
                 splitting.splitting_dual,
-                rigid_adapter.body_effort_offset,
-                rigid_adapter.body_effort_index,
-                rigid_adapter.body_effort_side,
-                rigid_adapter.effort_dynamic_row_index,
-                rigid_adapter.dynamic_jacobian_first,
-                rigid_adapter.dynamic_jacobian_second,
-                rigid_adapter.effort_counter_applied,
-                rigid_adapter.body_velocity_begin,
+                problem.body_effort_offset,
+                problem.body_effort_index,
+                problem.body_effort_side,
+                problem.effort_dynamic_row_index,
+                problem.dynamic_jacobian_first,
+                problem.dynamic_jacobian_second,
+                problem.effort_counter_applied,
             )
         else:
-            system.solve_candidate(
-                splitting.projected_twist,
-                splitting.splitting_dual,
-                rigid_adapter.body_velocity_begin,
-            )
+            system.build_candidate_right_hand_side(splitting.projected_twist, splitting.splitting_dual)
+        system.solve_candidate(problem.body_velocity_begin)
         splitting.prepare_projection(system.body_solution)
 
     def _finish_body_space_iteration(
         self, time_step: wp.array[wp.float32], linearization_twist: wp.array[vec6f]
     ) -> None:
         """Update structural state and finish the rigid splitting iteration."""
-        rigid_adapter = self.rigid_adapter
+        problem = self.problem
         splitting = self.splitting
-        rigid_adapter.update_structural_multipliers_from_twist(
+        problem.update_structural_multipliers_from_twist(
             time_step,
             min(self.position_tolerance, self.rotation_tolerance),
             linearization_twist,
@@ -949,34 +950,34 @@ class LOXSolver:
             projected_fraction=self.joint_multiplier_projected_fraction,
         )
         if self.has_bounded_effort:
-            rigid_adapter.update_effort_counters(
+            problem.update_effort_counters(
                 time_step,
                 self.velocity_tolerance,
                 splitting.projected_twist,
                 splitting.world_active,
             )
         if not self.fixed_iterations:
-            rigid_adapter.evaluate_lagged_velocity_consistency(
+            problem.evaluate_lagged_velocity_consistency(
                 self.velocity_tolerance,
                 splitting.global_twist,
                 splitting.projected_twist_previous,
                 splitting.world_active,
             )
             splitting.finish_iteration(
-                rigid_adapter.projection_status,
+                problem.projection_status,
                 time_step,
                 self.position_tolerance,
                 self.rotation_tolerance,
                 self.velocity_tolerance,
-                effort_residual=(rigid_adapter.world_effort_residual_max if self.has_bounded_effort else None),
-                structural_residual=rigid_adapter.world_structural_residual,
-                projected_structural_residual=rigid_adapter.world_projected_structural_residual,
-                lagged_velocity_residual=rigid_adapter.world_lagged_velocity_residual,
-                lagged_velocity_required=rigid_adapter.world_lagged_velocity_required,
+                effort_residual=(problem.world_effort_residual_max if self.has_bounded_effort else None),
+                structural_residual=problem.world_structural_residual,
+                projected_structural_residual=problem.world_projected_structural_residual,
+                lagged_velocity_residual=problem.world_lagged_velocity_residual,
+                lagged_velocity_required=problem.world_lagged_velocity_required,
             )
         else:
             splitting.finish_fixed_iteration(
-                rigid_adapter.projection_status,
+                problem.projection_status,
             )
 
     def _body_space_iteration(
@@ -1017,31 +1018,31 @@ class LOXSolver:
             self.splitting.begin(initial_twist, reset_dual=False)
         self.world_accepted.zero_()
         self.world_status.fill_(LOX_STATUS_ACTIVE)
-        if self.rigid_adapter is not None:
-            self.rigid_adapter.contact_residual.zero_()
-            self.rigid_adapter.limit_residual.zero_()
-            self.rigid_adapter.friction_residual.zero_()
+        if self.problem is not None:
+            self.problem.contact_residual.zero_()
+            self.problem.limit_residual.zero_()
+            self.problem.friction_residual.zero_()
         self.contact_residual_max.zero_()
         self.limit_residual_max.zero_()
         self.friction_residual_max.zero_()
-        rigid_adapter = self.rigid_adapter
+        problem = self.problem
         system = self.system
         splitting = self.splitting
-        if rigid_adapter is not None:
-            rigid_adapter.update(
+        if problem is not None:
+            problem.update(
                 time_step,
                 joint_penalty_scale=self.joint_penalty_scale,
                 linearization_twist=linearization_twist,
                 assemble_structural_penalty=True,
             )
             if linearization_twist is None:
-                linearization_twist = rigid_adapter.body_linearization_twist
+                linearization_twist = problem.body_linearization_twist
             system.build_weighted_matrix(
-                body_has_unilateral=rigid_adapter.body_has_unilateral,
+                body_has_unilateral=problem.body_has_unilateral,
                 sigma=self.weight_sigma,
                 beta=self.weight_beta,
             )
-            splitting.restore_dual_from_impulse(system.inverse_weight, rigid_adapter.body_has_unilateral)
+            splitting.restore_dual_from_impulse(system.inverse_weight, problem.body_has_unilateral)
             system.factorize()
             self._prepare_body_space_projection()
 
@@ -1064,7 +1065,7 @@ class LOXSolver:
                 self._body_space_iteration(time_step, linearization_twist, conditional=False)
 
         if splitting is not None:
-            splitting.store_dual_impulse(system.weight, rigid_adapter.body_has_unilateral)
+            splitting.store_dual_impulse(system.weight, problem.body_has_unilateral)
             splitting.mark_iteration_limit()
         else:
             wp.launch(
@@ -1081,51 +1082,51 @@ class LOXSolver:
             outputs=[self.world_accepted, self.world_status, self.status],
             device=self.device,
         )
-        if rigid_adapter is not None:
+        if problem is not None:
             compute_projection_residuals(
                 self.world_accepted,
-                rigid_adapter.projection_status,
-                rigid_adapter.friction_world,
-                rigid_adapter.friction_local,
-                rigid_adapter.world_friction_count,
-                rigid_adapter.friction_body_first,
-                rigid_adapter.friction_body_second,
-                rigid_adapter.friction_jacobian_first,
-                rigid_adapter.friction_jacobian_second,
-                rigid_adapter.friction_impulse_bound,
-                rigid_adapter.friction_reaction,
-                rigid_adapter.friction_physical_delassus,
-                rigid_adapter.contact_world,
-                rigid_adapter.contact_local,
-                rigid_adapter.world_contact_count,
-                rigid_adapter.contact_body_first,
-                rigid_adapter.contact_body_second,
-                rigid_adapter.contact_jacobian_first,
-                rigid_adapter.contact_jacobian_second,
-                rigid_adapter.contact_bias,
-                rigid_adapter.contact_friction,
-                rigid_adapter.contact_reaction,
-                rigid_adapter.contact_physical_delassus,
-                rigid_adapter.limit_world,
-                rigid_adapter.limit_local,
-                rigid_adapter.world_limit_count,
-                rigid_adapter.limit_body_first,
-                rigid_adapter.limit_body_second,
-                rigid_adapter.limit_jacobian_first,
-                rigid_adapter.limit_jacobian_second,
-                rigid_adapter.limit_bias,
-                rigid_adapter.limit_reaction,
-                rigid_adapter.limit_physical_delassus,
+                problem.projection_status,
+                problem.friction_world,
+                problem.friction_local,
+                problem.world_friction_count,
+                problem.friction_body_first,
+                problem.friction_body_second,
+                problem.friction_jacobian_first,
+                problem.friction_jacobian_second,
+                problem.friction_impulse_bound,
+                problem.friction_reaction,
+                problem.friction_physical_delassus,
+                problem.contact_world,
+                problem.contact_local,
+                problem.world_contact_count,
+                problem.contact_body_first,
+                problem.contact_body_second,
+                problem.contact_jacobian_first,
+                problem.contact_jacobian_second,
+                problem.contact_bias,
+                problem.contact_friction,
+                problem.contact_reaction,
+                problem.contact_physical_delassus,
+                problem.limit_world,
+                problem.limit_local,
+                problem.world_limit_count,
+                problem.limit_body_first,
+                problem.limit_body_second,
+                problem.limit_jacobian_first,
+                problem.limit_jacobian_second,
+                problem.limit_bias,
+                problem.limit_reaction,
+                problem.limit_physical_delassus,
                 splitting.projected_twist,
-                rigid_adapter.friction_velocity,
-                rigid_adapter.contact_velocity,
-                rigid_adapter.limit_velocity,
-                rigid_adapter.contact_residual,
-                rigid_adapter.limit_residual,
-                rigid_adapter.friction_residual,
-                rigid_adapter.world_contact_residual_max,
-                rigid_adapter.world_limit_residual_max,
-                rigid_adapter.world_friction_residual_max,
+                problem.friction_velocity,
+                problem.contact_velocity,
+                problem.limit_velocity,
+                problem.contact_residual,
+                problem.limit_residual,
+                problem.friction_residual,
+                problem.world_contact_residual_max,
+                problem.world_limit_residual_max,
+                problem.world_friction_residual_max,
             )
             if write_output:
-                rigid_adapter.write_outputs(time_step, inverse_time_step, body_velocity=splitting.projected_twist)
+                problem.write_outputs(time_step, inverse_time_step, body_velocity=splitting.projected_twist)

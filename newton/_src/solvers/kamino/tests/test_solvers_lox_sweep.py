@@ -10,10 +10,10 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.kamino._src.core.types import mat36f, mat66f, vec6f
-from newton._src.solvers.kamino._src.solvers.lox.projection import PROJECTION_STATUS_VALID
-from newton._src.solvers.kamino._src.solvers.lox.sweep import (
+from newton._src.solvers.kamino._src.solvers.lox.jacobi import project_constraints_jacobi
+from newton._src.solvers.kamino._src.solvers.lox.projection import (
+    PROJECTION_STATUS_VALID,
     prepare_jacobi_projection_data,
-    project_constraints_jacobi,
 )
 from newton._src.solvers.kamino.tests import setup_tests, test_context
 

@@ -4,6 +4,7 @@
 """Unit tests for LOX colored Gauss--Seidel projection."""
 
 import unittest
+from itertools import product
 from types import SimpleNamespace
 
 import numpy as np
@@ -226,6 +227,56 @@ class TestLOXColoredGaussSeidel(unittest.TestCase):
         np.testing.assert_allclose(projected_twist.numpy()[:, 0], [1.0, 0.0], rtol=0.0, atol=2.0e-6)
         np.testing.assert_array_equal(projection_status.numpy(), [1, 0])
         np.testing.assert_array_equal(twist_delta.numpy(), np.zeros((2, 6), dtype=np.float32))
+
+    def test_projection_validates_unconstrained_body(self):
+        """Accept finite twists and reject NaN/Inf even on unconstrained bodies."""
+        devices = [wp.get_device("cpu")]
+        if wp.is_cuda_available():
+            devices.append(wp.get_device("cuda:0"))
+        for device in devices:
+            for fused, value in product([False, True] if device.is_cuda else [False], [2.0e38, np.inf, np.nan]):
+                with self.subTest(device=device.alias, fused=fused, value=value):
+                    adapter = _make_adapter(device, [(0, -1)])
+                    adapter.body_constraint_count = wp.zeros(2, dtype=wp.int32, device=device)
+                    adapter.static_body_constraint_count = wp.zeros(2, dtype=wp.int32, device=device)
+                    adapter.world_friction_count = wp.zeros(2, dtype=wp.int32, device=device)
+                    adapter.world_limit_count = wp.zeros(2, dtype=wp.int32, device=device)
+                    adapter.world_contact_count = wp.array([1, 0], dtype=wp.int32, device=device)
+                    adapter.contact_bias.assign([[0.0, 0.0, -1.0]])
+                    if fused:
+                        adapter.model = SimpleNamespace(
+                            info=SimpleNamespace(
+                                bodies_offset=wp.array([0, 1], dtype=wp.int32, device=device),
+                                num_bodies=wp.ones(2, dtype=wp.int32, device=device),
+                            )
+                        )
+                        adapter.world_friction_offset = wp.zeros(2, dtype=wp.int32, device=device)
+                        adapter.world_limit_offset = wp.zeros(2, dtype=wp.int32, device=device)
+                        adapter.world_contact_offset = wp.array([0, 1], dtype=wp.int32, device=device)
+                    projection = ColoredGaussSeidelProjection(adapter, 2)
+                    inverse_weight = wp.array([np.eye(6, dtype=np.float32)] * 2, dtype=mat66f, device=device)
+                    prepared_status = wp.zeros(2, dtype=wp.int32, device=device)
+                    projection.prepare(inverse_weight, prepared_status)
+                    velocity = np.zeros((2, 6), dtype=np.float32)
+                    velocity[1] = 2.0e38
+                    velocity[1, 5] = value
+                    projected_twist = wp.array(velocity, dtype=vec6f, device=device)
+                    projection_status = wp.zeros(2, dtype=wp.int32, device=device)
+                    twist_delta = wp.zeros(2, dtype=vec6f, device=device)
+                    projection.project(
+                        1,
+                        wp.ones(2, dtype=wp.bool, device=device),
+                        wp.array([0, 1], dtype=wp.int32, device=device),
+                        inverse_weight,
+                        projected_twist,
+                        twist_delta,
+                        prepared_status,
+                        projection_status,
+                    )
+                    np.testing.assert_array_equal(projection_status.numpy(), [1, int(np.isfinite(value))])
+                    np.testing.assert_array_equal(projected_twist.numpy()[1], velocity[1])
+                    self.assertAlmostEqual(float(projected_twist.numpy()[0, 0]), 1.0)
+                    np.testing.assert_array_equal(twist_delta.numpy(), np.zeros((2, 6), dtype=np.float32))
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA is required for block synchronization")
     def test_world_colored_matches_global_colored(self):

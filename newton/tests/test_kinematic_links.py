@@ -765,13 +765,15 @@ for device in devices:
             devices=[device],
             solver_fn=solver_fn,
         )
-        add_function_test(
-            TestKinematicLinksCanonical,
-            f"test_kinematic_runtime_toggle_{solver_name}",
-            test_kinematic_runtime_toggle,
-            devices=[device],
-            solver_fn=solver_fn,
-        )
+        # Kamino freezes body immovability when constructing the solver.
+        if solver_name != "lox":
+            add_function_test(
+                TestKinematicLinksCanonical,
+                f"test_kinematic_runtime_toggle_{solver_name}",
+                test_kinematic_runtime_toggle,
+                devices=[device],
+                solver_fn=solver_fn,
+            )
 
 
 if __name__ == "__main__":

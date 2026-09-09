@@ -19,16 +19,7 @@ import warp as wp
 
 from ...core.types import mat66f, vec6f
 from ...linalg import DenseLinearOperatorData, DenseSquareMultiLinearInfo, HybridLLTBlockedSolver
-from .problem import (
-    compute_augmented_joint_row,
-    compute_body_explicit_wrench,
-    compute_body_inertial_system,
-    compute_dynamic_joint_row,
-)
-from .time import validate_world_time_step
 from .weight import (
-    BODY_WEIGHT_BETA_DEFAULT,
-    BODY_WEIGHT_SIGMA_DEFAULT,
     BODY_WEIGHT_STATUS_VALID,
     compute_body_weight_mass_proportional,
 )
@@ -38,6 +29,159 @@ __all__ = ["BatchedPrimalBodySystem"]
 wp.set_module_options({"enable_backward": False})
 
 _RCM_MIN_DIMENSION = 256
+
+
+@wp.struct
+class PrimalRowContribution:
+    """Matrix and right-hand-side contribution of one body-space term."""
+
+    matrix: mat66f
+    """Symmetric contribution to the body-space operator."""
+    right_hand_side: vec6f
+    """Contribution to the body-space right-hand side."""
+
+
+@wp.func
+def make_spatial_mass_matrix(mass: wp.float32, inertia_world: wp.mat33f) -> mat66f:
+    """Construct a linear-first spatial mass matrix about the center of mass.
+
+    Args:
+        mass: Body mass [kg].
+        inertia_world: World-space inertia about the center of mass [kg m^2].
+
+    Returns:
+        ``diag(mass I_3, inertia_world)``.
+    """
+    matrix = mat66f(0.0)
+    for index in range(3):
+        matrix[index, index] = mass
+    for row in range(3):
+        for col in range(3):
+            matrix[row + 3, col + 3] = inertia_world[row, col]
+    return matrix
+
+
+@wp.func
+def compute_body_explicit_wrench(
+    mass: wp.float32,
+    inertia_world: wp.mat33f,
+    velocity_previous: vec6f,
+    external_wrench: vec6f,
+    actuation_wrench: vec6f,
+    gravity: wp.vec3f,
+) -> vec6f:
+    """Combine explicit body forces in world coordinates.
+
+    Args:
+        mass: Body mass [kg].
+        inertia_world: World-space inertia about the center of mass [kg m^2].
+        velocity_previous: Begin-of-step linear-first body twist [m/s, rad/s].
+        external_wrench: External body wrench excluding gravity [N, N m].
+        actuation_wrench: Joint-actuation body wrench [N, N m].
+        gravity: World-space gravitational acceleration [m/s^2].
+
+    Returns:
+        Explicit force and torque, including gravity and the gyroscopic torque [N, N m].
+    """
+    result = external_wrench + actuation_wrench
+    for index in range(3):
+        result[index] += mass * gravity[index]
+
+    angular_velocity = wp.vec3f(velocity_previous[3], velocity_previous[4], velocity_previous[5])
+    gyroscopic_torque = -wp.cross(angular_velocity, inertia_world @ angular_velocity)
+    for index in range(3):
+        result[index + 3] += gyroscopic_torque[index]
+    return result
+
+
+@wp.func
+def compute_body_inertial_system(
+    mass: wp.float32,
+    inertia_world: wp.mat33f,
+    velocity_previous: vec6f,
+    force_explicit: vec6f,
+    time_step: wp.float32,
+) -> PrimalRowContribution:
+    """Compute the inertial operator and explicit-force right-hand side.
+
+    Args:
+        mass: Body mass [kg].
+        inertia_world: World-space inertia about the center of mass [kg m^2].
+        velocity_previous: Begin-of-step linear-first body twist [m/s, rad/s].
+        force_explicit: Explicit body wrench [N, N m].
+        time_step: Time step [s].
+
+    Returns:
+        The mass matrix and ``M v_previous + h force_explicit``.
+    """
+    result = PrimalRowContribution()
+    result.matrix = make_spatial_mass_matrix(mass, inertia_world)
+    result.right_hand_side = result.matrix @ velocity_previous + time_step * force_explicit
+    return result
+
+
+@wp.func
+def compute_dynamic_joint_row(
+    jacobian: vec6f,
+    effective_inertia: wp.float32,
+    free_velocity: wp.float32,
+) -> PrimalRowContribution:
+    """Eliminate one implicit joint-dynamics coordinate into body space.
+
+    The joint equation is ``effective_inertia * dq = h_joint`` with
+    ``free_velocity = h_joint / effective_inertia`` and ``dq = J v``.
+
+    Args:
+        jacobian: Linear-first joint velocity Jacobian row.
+        effective_inertia: Positive implicit joint inertia.
+        free_velocity: Implicit joint free velocity.
+
+    Returns:
+        ``effective_inertia J^T J`` and
+        ``effective_inertia free_velocity J^T``.
+    """
+    result = PrimalRowContribution()
+    result.matrix = effective_inertia * wp.outer(jacobian, jacobian)
+    result.right_hand_side = effective_inertia * free_velocity * jacobian
+    return result
+
+
+@wp.func
+def compute_augmented_joint_row(
+    jacobian: vec6f,
+    residual: wp.float32,
+    multiplier: wp.float32,
+    penalty: wp.float32,
+    time_step: wp.float32,
+    linearization_velocity: wp.float32,
+) -> PrimalRowContribution:
+    """Linearize one structural joint row with augmented Lagrangian forces.
+
+    For ``C(q(v)) ~= residual + h J (v - v_k)``, this returns the terms in
+
+    ``(M + h^2 penalty J^T J) v``
+    ``= f - h J^T (multiplier + penalty residual)``
+    ``+ h^2 penalty J^T J v_k``.
+
+    Args:
+        jacobian: Linear-first structural joint Jacobian row.
+        residual: Current joint position residual [m or rad].
+        multiplier: Persistent structural multiplier [N or N m].
+        penalty: Positive augmented penalty [N/m or N m/rad].
+        time_step: Time step [s].
+        linearization_velocity: Row velocity ``J v_k`` at the linearization
+            twist [m/s or rad/s]. Pass zero for the first linearly implicit
+            assembly about the begin-step pose.
+
+    Returns:
+        The structural matrix and right-hand-side contributions.
+    """
+    result = PrimalRowContribution()
+    result.matrix = time_step * time_step * penalty * wp.outer(jacobian, jacobian)
+    result.right_hand_side = (
+        -time_step * (multiplier + penalty * residual) + time_step * time_step * penalty * linearization_velocity
+    ) * jacobian
+    return result
 
 
 @lru_cache(maxsize=32)
@@ -116,25 +260,6 @@ def _atomic_add_body_block(
         for col in range(6):
             index = _matrix_index(matrix_offset, dimension, row_offset + row, col_offset + col)
             wp.atomic_add(matrix, index, value[row, col])
-
-
-@wp.func
-def _atomic_add_body_outer_product(
-    matrix: wp.array[wp.float32],
-    matrix_offset: wp.int32,
-    dimension: wp.int32,
-    row_body: wp.int32,
-    col_body: wp.int32,
-    row_jacobian: vec6f,
-    col_jacobian: vec6f,
-    scale: wp.float32,
-):
-    row_offset = 6 * row_body
-    col_offset = 6 * col_body
-    for row in range(6):
-        for col in range(6):
-            index = _matrix_index(matrix_offset, dimension, row_offset + row, col_offset + col)
-            wp.atomic_add(matrix, index, scale * row_jacobian[row] * col_jacobian[col])
 
 
 @wp.kernel
@@ -257,25 +382,21 @@ def _assemble_dynamic_joint_rows(
         _atomic_add_body_block(matrix, matrix_offset, dimension, second_local, second_local, second_contribution.matrix)
         _atomic_add_body_vector(right_hand_side, vector_offset, second_local, second_contribution.right_hand_side)
     if first_local >= 0 and second_local >= 0:
-        _atomic_add_body_outer_product(
+        _atomic_add_body_block(
             matrix,
             matrix_offset,
             dimension,
             first_local,
             second_local,
-            first_jacobian,
-            second_jacobian,
-            inertia,
+            wp.outer(inertia * first_jacobian, second_jacobian),
         )
-        _atomic_add_body_outer_product(
+        _atomic_add_body_block(
             matrix,
             matrix_offset,
             dimension,
             second_local,
             first_local,
-            second_jacobian,
-            first_jacobian,
-            inertia,
+            wp.outer(inertia * second_jacobian, first_jacobian),
         )
 
 
@@ -367,25 +488,21 @@ def _assemble_structural_joint_rows(
         _atomic_add_body_vector(right_hand_side, vector_offset, second_local, second_contribution.right_hand_side)
     if first_local >= 0 and second_local >= 0:
         cross_scale = dt * dt * row_penalty
-        _atomic_add_body_outer_product(
+        _atomic_add_body_block(
             matrix,
             matrix_offset,
             dimension,
             first_local,
             second_local,
-            first_jacobian,
-            second_jacobian,
-            cross_scale,
+            wp.outer(cross_scale * first_jacobian, second_jacobian),
         )
-        _atomic_add_body_outer_product(
+        _atomic_add_body_block(
             matrix,
             matrix_offset,
             dimension,
             second_local,
             first_local,
-            second_jacobian,
-            first_jacobian,
-            cross_scale,
+            wp.outer(cross_scale * second_jacobian, first_jacobian),
         )
 
 
@@ -401,10 +518,6 @@ def _compute_body_weights_and_add(
     inertia_world: wp.array[wp.mat33f],
     sigma: wp.float32,
     beta: wp.float32,
-    mass_floor: wp.float32,
-    inertia_floor: wp.float32,
-    eta_floor: wp.float32,
-    symmetry_tolerance: wp.float32,
     weight: wp.array[mat66f],
     inverse_weight: wp.array[mat66f],
     eta: wp.array[wp.float32],
@@ -437,10 +550,6 @@ def _compute_body_weights_and_add(
         inertia_world[body],
         sigma,
         beta,
-        mass_floor,
-        inertia_floor,
-        eta_floor,
-        symmetry_tolerance,
     )
     weight[body] = result.weight
     inverse_weight[body] = result.inverse_weight
@@ -755,7 +864,6 @@ class BatchedPrimalBodySystem:
             )
         ):
             raise ValueError("Body input arrays must contain one entry per packed active body.")
-        validate_world_time_step(time_step, self.num_worlds, self.device)
         self.reset()
         self._mass = mass
         self._inertia_world = inertia_world
@@ -852,7 +960,6 @@ class BatchedPrimalBodySystem:
         row_count = row_world.shape[0]
         if row_count == 0:
             return
-        validate_world_time_step(time_step, self.num_worlds, self.device)
         if joint_penalty_scale.shape[0] != self.num_worlds:
             raise ValueError("joint_penalty_scale must contain one entry per world.")
         if linearization_twist.shape[0] != self.num_bodies:
@@ -926,14 +1033,11 @@ class BatchedPrimalBodySystem:
 
     def build_weighted_matrix(
         self,
+        *,
+        sigma: float,
+        beta: float,
         metric_matrix: wp.array[wp.float32] | None = None,
         body_has_unilateral: wp.array[wp.int32] | None = None,
-        sigma: float = BODY_WEIGHT_SIGMA_DEFAULT,
-        beta: float = BODY_WEIGHT_BETA_DEFAULT,
-        mass_floor: float = 1.0e-8,
-        inertia_floor: float = 1.0e-10,
-        eta_floor: float = 1.0e-6,
-        symmetry_tolerance: float = 1.0e-5,
     ) -> None:
         """Compute body weights and assemble ``A + W``."""
         if self._mass is None or self._inertia_world is None:
@@ -958,10 +1062,6 @@ class BatchedPrimalBodySystem:
                 self._inertia_world,
                 sigma,
                 beta,
-                mass_floor,
-                inertia_floor,
-                eta_floor,
-                symmetry_tolerance,
             ],
             outputs=[
                 self.weight,
@@ -1040,50 +1140,11 @@ class BatchedPrimalBodySystem:
 
     def solve_candidate(
         self,
-        projected_twist: wp.array[vec6f],
-        splitting_dual: wp.array[vec6f],
         prescribed_twist: wp.array[vec6f],
     ) -> None:
-        """Build and solve the weighted splitting candidate system."""
+        """Solve the prepared candidate right-hand side and unpack body velocities."""
         if prescribed_twist.shape[0] != self.num_bodies:
             raise ValueError("prescribed_twist must contain one entry per packed body.")
-        self.build_candidate_right_hand_side(projected_twist, splitting_dual)
-        self.linear_solver.solve(self.candidate_right_hand_side, self._packed_solution)
-        wp.launch(
-            _unpack_body_solution,
-            dim=self.num_bodies,
-            inputs=[self.body_vector_index, self._packed_solution, prescribed_twist],
-            outputs=[self.body_solution],
-            device=self.device,
-        )
-
-    def solve_candidate_with_effort(
-        self,
-        projected_twist: wp.array[vec6f],
-        splitting_dual: wp.array[vec6f],
-        body_effort_offset: wp.array[wp.int32],
-        body_effort_index: wp.array[wp.int32],
-        body_effort_side: wp.array[wp.int32],
-        effort_dynamic_row: wp.array[wp.int32],
-        dynamic_jacobian_first: wp.array[vec6f],
-        dynamic_jacobian_second: wp.array[vec6f],
-        effort_counter_applied: wp.array[wp.float32],
-        prescribed_twist: wp.array[vec6f],
-    ) -> None:
-        """Build and solve a candidate system with finite-drive corrections."""
-        if prescribed_twist.shape[0] != self.num_bodies:
-            raise ValueError("prescribed_twist must contain one entry per packed body.")
-        self.build_candidate_right_hand_side_with_effort(
-            projected_twist,
-            splitting_dual,
-            body_effort_offset,
-            body_effort_index,
-            body_effort_side,
-            effort_dynamic_row,
-            dynamic_jacobian_first,
-            dynamic_jacobian_second,
-            effort_counter_applied,
-        )
         self.linear_solver.solve(self.candidate_right_hand_side, self._packed_solution)
         wp.launch(
             _unpack_body_solution,

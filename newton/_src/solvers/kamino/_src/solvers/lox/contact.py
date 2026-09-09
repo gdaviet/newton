@@ -226,11 +226,6 @@ def solve_contact_coulomb_newton(
 
 
 @wp.func
-def _is_finite_vec3(value: wp.vec3f) -> wp.bool:
-    return wp.isfinite(value[0]) and wp.isfinite(value[1]) and wp.isfinite(value[2])
-
-
-@wp.func
 def project_contact_coulomb_cone(value: wp.vec3f, friction: wp.float32) -> wp.vec3f:
     """Project a normal-last vector onto an isotropic Coulomb cone.
 
@@ -243,12 +238,12 @@ def project_contact_coulomb_cone(value: wp.vec3f, friction: wp.float32) -> wp.ve
         contact and returns zero, while a non-finite vector is preserved for
         the caller's projection-status check.
     """
-    if not _is_finite_vec3(value):
+    if not wp.isfinite(value):
         return value
     if not wp.isfinite(friction) or friction < 0.0:
         return wp.vec3f(0.0)
 
-    tangent_norm = wp.sqrt(value[0] * value[0] + value[1] * value[1])
+    tangent_norm = wp.length(wp.vec2f(value[0], value[1]))
     normal = value[2]
     if normal + friction * tangent_norm <= 0.0:
         return wp.vec3f(0.0)
@@ -290,8 +285,7 @@ def compute_contact_scaled_alart_curnier_residual(
     modified_velocity = wp.vec3f(
         scaled_velocity[0],
         scaled_velocity[1],
-        scaled_velocity[2]
-        + friction * wp.sqrt(scaled_velocity[0] * scaled_velocity[0] + scaled_velocity[1] * scaled_velocity[1]),
+        scaled_velocity[2] + friction * wp.length(wp.vec2f(scaled_velocity[0], scaled_velocity[1])),
     )
     projected = project_contact_coulomb_cone(scaled_reaction - modified_velocity, friction)
     return scaled_reaction - projected

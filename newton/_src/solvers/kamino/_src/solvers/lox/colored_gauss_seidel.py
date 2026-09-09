@@ -5,39 +5,36 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import warp as wp
 
 from ...core.types import mat36f, mat66f, vec6f
+from .jacobi import project_constraints_jacobi
 from .projection import (
     PROJECTION_STATUS_INVALID,
     PROJECTION_STATUS_VALID,
-    _can_fuse_rigid_projection_by_world,
-    compute_limit_delassus,
-    prepare_contact_coulomb,
-    project_contact_coulomb_local,
-    project_friction_local,
-    project_limit_local,
-)
-from .sweep import (
     _atomic_add_twist,
+    _can_fuse_rigid_projection_by_world,
+    _check_projected_twist,
     _initialize_jacobi_projection_status,
-    _is_finite_twist,
     _make_colored_projection_index,
     _make_project_contacts_kernel,
     _make_project_scalar_kernel,
-    _make_projection_struct,
     _make_rigid_projection_state,
     _project_rigid_contact_colored,
-    _project_rigid_scalar_colored,
+    _project_rigid_contact_jacobi,
+    _project_rigid_friction_colored,
+    _project_rigid_friction_jacobi,
+    _project_rigid_limit_colored,
+    _project_rigid_limit_jacobi,
     _RigidContactProjectionData,
+    _RigidProjectionState,
     _sync_threads,
     _warmstart_contacts_jacobi,
     _warmstart_frictions_jacobi,
     _warmstart_limits_jacobi,
+    compute_limit_delassus,
+    prepare_contact_coulomb,
     prepare_jacobi_projection_data,
-    project_constraints_jacobi,
 )
 
 wp.set_module_options({"enable_backward": False})
@@ -93,18 +90,18 @@ def _bounded_worker_count(capacity: int, device) -> int:
 
 @wp.func
 def _mix_color_key(value: wp.uint32) -> wp.uint32:
-    value = (value ^ (value >> wp.uint32(16))) * wp.uint32(0x7FEB352D)
-    value = (value ^ (value >> wp.uint32(15))) * wp.uint32(0x846CA68B)
+    value = (value ^ (value >> wp.uint32(16))) * wp.static(wp.uint32(0x7FEB352D))
+    value = (value ^ (value >> wp.uint32(15))) * wp.static(wp.uint32(0x846CA68B))
     return value ^ (value >> wp.uint32(16))
 
 
 @wp.func
 def _initial_color(world: int, local: int, first: int, second: int, family: int, color_count: int) -> int:
-    key = wp.uint32(world + 1) * wp.uint32(0x9E3779B9)
-    key = key ^ (wp.uint32(local + 1) * wp.uint32(0x85EBCA6B))
-    key = key ^ (wp.uint32(first + 2) * wp.uint32(0xC2B2AE35))
-    key = key ^ (wp.uint32(second + 2) * wp.uint32(0x27D4EB2F))
-    key = key ^ wp.uint32(family * 0x165667B1)
+    key = wp.uint32(world + 1) * wp.static(wp.uint32(0x9E3779B9))
+    key = key ^ (wp.uint32(local + 1) * wp.static(wp.uint32(0x85EBCA6B)))
+    key = key ^ (wp.uint32(first + 2) * wp.static(wp.uint32(0xC2B2AE35)))
+    key = key ^ (wp.uint32(second + 2) * wp.static(wp.uint32(0x27D4EB2F)))
+    key = key ^ (wp.uint32(family) * wp.static(wp.uint32(0x165667B1)))
     return int(_mix_color_key(key) % wp.uint32(color_count))
 
 
@@ -526,7 +523,7 @@ def _project_rigid_colored(
     contact_offsets: wp.array[wp.int32],
     contact_order: wp.array[wp.int32],
     contact_world: wp.array[wp.int32],
-    contact_data: Any,
+    contact_data: _RigidContactProjectionData,
     limit_counts: wp.array[wp.int32],
     limit_offsets: wp.array[wp.int32],
     limit_order: wp.array[wp.int32],
@@ -537,7 +534,7 @@ def _project_rigid_colored(
     limit_jacobian_second: wp.array[vec6f],
     limit_bias: wp.array[wp.float32],
     limit_delassus: wp.array[wp.float32],
-    state: Any,
+    state: _RigidProjectionState,
     friction_reaction: wp.array[wp.float32],
     limit_reaction: wp.array[wp.float32],
 ):
@@ -549,7 +546,7 @@ def _project_rigid_colored(
         world = friction_world[constraint]
         if not state.world_active[world] or state.world_status[world] != PROJECTION_STATUS_VALID:
             continue
-        _project_rigid_scalar_colored(
+        _project_rigid_friction_colored(
             constraint,
             world,
             target_color,
@@ -562,7 +559,6 @@ def _project_rigid_colored(
             friction_delassus,
             friction_reaction,
             state,
-            False,
         )
 
     contact_begin = contact_offsets[target_color] + lane
@@ -571,7 +567,7 @@ def _project_rigid_colored(
         constraint = contact_order[ordered]
         world = contact_world[constraint]
         if state.world_active[world] and state.world_status[world] == PROJECTION_STATUS_VALID:
-            _project_rigid_contact_colored(constraint, world, target_color, contact_data, state)
+            _project_rigid_contact_colored(constraint, world, target_color, contact_data, contact_data.delassus, state)
 
     limit_begin = limit_offsets[target_color] + lane
     limit_end = limit_offsets[target_color] + limit_counts[target_color]
@@ -580,7 +576,7 @@ def _project_rigid_colored(
         world = limit_world[constraint]
         if not state.world_active[world] or state.world_status[world] != PROJECTION_STATUS_VALID:
             continue
-        _project_rigid_scalar_colored(
+        _project_rigid_limit_colored(
             constraint,
             world,
             target_color,
@@ -593,7 +589,6 @@ def _project_rigid_colored(
             limit_delassus,
             limit_reaction,
             state,
-            True,
         )
 
 
@@ -603,9 +598,9 @@ def _project_rigid_colored_by_world(
     color_count: wp.int32,
     world_body_offset: wp.array[wp.int32],
     world_body_count: wp.array[wp.int32],
-    data: Any,
-    contact_data: Any,
-    state: Any,
+    data: _RigidColoredWorldData,
+    contact_data: _RigidContactProjectionData,
+    state: _RigidProjectionState,
     prepared_status: wp.array[wp.int32],
 ):
     """Project one rigid world per block, including warm start and smoothing."""
@@ -635,11 +630,8 @@ def _project_rigid_colored_by_world(
             correction_first = data.friction_jacobian_first[constraint] * friction_reaction
         if second >= 0:
             correction_second = data.friction_jacobian_second[constraint] * friction_reaction
-        if _is_finite_twist(correction_first) and _is_finite_twist(correction_second):
-            _atomic_add_twist(state.twist_delta, first, correction_first)
-            _atomic_add_twist(state.twist_delta, second, correction_second)
-        else:
-            state.world_status[world] = PROJECTION_STATUS_INVALID
+        _atomic_add_twist(state.twist_delta, first, correction_first)
+        _atomic_add_twist(state.twist_delta, second, correction_second)
         local += thread_count
 
     local = lane
@@ -654,11 +646,8 @@ def _project_rigid_colored_by_world(
             correction_first = wp.transpose(contact_data.jacobian_first[constraint]) @ contact_reaction
         if second >= 0:
             correction_second = wp.transpose(contact_data.jacobian_second[constraint]) @ contact_reaction
-        if _is_finite_twist(correction_first) and _is_finite_twist(correction_second):
-            _atomic_add_twist(state.twist_delta, first, correction_first)
-            _atomic_add_twist(state.twist_delta, second, correction_second)
-        else:
-            state.world_status[world] = PROJECTION_STATUS_INVALID
+        _atomic_add_twist(state.twist_delta, first, correction_first)
+        _atomic_add_twist(state.twist_delta, second, correction_second)
         local += thread_count
 
     local = lane
@@ -673,11 +662,8 @@ def _project_rigid_colored_by_world(
             correction_first = data.limit_jacobian_first[constraint] * limit_reaction
         if second >= 0:
             correction_second = data.limit_jacobian_second[constraint] * limit_reaction
-        if _is_finite_twist(correction_first) and _is_finite_twist(correction_second):
-            _atomic_add_twist(state.twist_delta, first, correction_first)
-            _atomic_add_twist(state.twist_delta, second, correction_second)
-        else:
-            state.world_status[world] = PROJECTION_STATUS_INVALID
+        _atomic_add_twist(state.twist_delta, first, correction_first)
+        _atomic_add_twist(state.twist_delta, second, correction_second)
         local += thread_count
 
     _sync_threads()
@@ -686,10 +672,7 @@ def _project_rigid_colored_by_world(
         body = world_body_offset[world] + local
         if state.world_status[world] == PROJECTION_STATUS_VALID:
             correction = state.inverse_weight[body] @ state.twist_delta[body]
-            if _is_finite_twist(correction):
-                state.projected_twist[body] += correction
-            else:
-                state.world_status[world] = PROJECTION_STATUS_INVALID
+            state.projected_twist[body] += correction
         state.twist_delta[body] = vec6f(0.0)
         local += thread_count
     _sync_threads()
@@ -703,7 +686,7 @@ def _project_rigid_colored_by_world(
                     while local < data.world_friction_count[world]:
                         constraint = data.world_friction_offset[world] + local
                         if data.friction_colors[constraint] == color:
-                            _project_rigid_scalar_colored(
+                            _project_rigid_friction_colored(
                                 constraint,
                                 world,
                                 color,
@@ -716,7 +699,6 @@ def _project_rigid_colored_by_world(
                                 data.friction_colored_delassus,
                                 data.friction_reaction,
                                 state,
-                                False,
                             )
                         local += thread_count
 
@@ -724,14 +706,16 @@ def _project_rigid_colored_by_world(
                     while local < data.world_contact_count[world]:
                         constraint = data.world_contact_offset[world] + local
                         if data.contact_colors[constraint] == color:
-                            _project_rigid_contact_colored(constraint, world, color, contact_data, state)
+                            _project_rigid_contact_colored(
+                                constraint, world, color, contact_data, contact_data.delassus, state
+                            )
                         local += thread_count
 
                     local = lane
                     while local < data.world_limit_count[world]:
                         constraint = data.world_limit_offset[world] + local
                         if data.limit_colors[constraint] == color:
-                            _project_rigid_scalar_colored(
+                            _project_rigid_limit_colored(
                                 constraint,
                                 world,
                                 color,
@@ -744,7 +728,6 @@ def _project_rigid_colored_by_world(
                                 data.limit_colored_delassus,
                                 data.limit_reaction,
                                 state,
-                                True,
                             )
                         local += thread_count
 
@@ -758,118 +741,57 @@ def _project_rigid_colored_by_world(
                     local += thread_count
                 _sync_threads()
 
-    # Preserve the existing final mass-split Jacobi smoothing sweep. Accumulate
-    # raw wrenches and defer W^-1 until each body is visited once.
+    # Finish with the same mass-split Jacobi smoothing as the global path.
     if state.world_status[world] == PROJECTION_STATUS_VALID:
         local = lane
         while local < data.world_friction_count[world]:
             constraint = data.world_friction_offset[world] + local
-            first = data.friction_body_first[constraint]
-            second = data.friction_body_second[constraint]
-            friction_velocity = wp.float32(0.0)
-            if first >= 0:
-                friction_velocity += wp.dot(data.friction_jacobian_first[constraint], state.projected_twist[first])
-            if second >= 0:
-                friction_velocity += wp.dot(data.friction_jacobian_second[constraint], state.projected_twist[second])
-            friction_projection = project_friction_local(
-                friction_velocity,
-                data.friction_reaction[constraint],
-                data.friction_jacobi_delassus[constraint],
-                data.friction_bound[constraint],
+            _project_rigid_friction_jacobi(
+                constraint,
+                world,
+                0,
+                data.friction_body_first,
+                data.friction_body_second,
+                data.friction_jacobian_first,
+                data.friction_jacobian_second,
+                data.friction_bound,
+                data.friction_bound,
+                data.friction_jacobi_delassus,
+                data.friction_reaction,
+                state,
             )
-            correction_first = vec6f(0.0)
-            correction_second = vec6f(0.0)
-            if first >= 0:
-                correction_first = data.friction_jacobian_first[constraint] * friction_projection.reaction_delta
-            if second >= 0:
-                correction_second = data.friction_jacobian_second[constraint] * friction_projection.reaction_delta
-            if (
-                friction_projection.status == PROJECTION_STATUS_VALID
-                and _is_finite_twist(correction_first)
-                and _is_finite_twist(correction_second)
-            ):
-                data.friction_reaction[constraint] = friction_projection.reaction
-                _atomic_add_twist(state.twist_delta, first, correction_first)
-                _atomic_add_twist(state.twist_delta, second, correction_second)
-            else:
-                state.world_status[world] = PROJECTION_STATUS_INVALID
             local += thread_count
 
         local = lane
         while local < data.world_contact_count[world]:
             constraint = data.world_contact_offset[world] + local
-            first = contact_data.body_first[constraint]
-            second = contact_data.body_second[constraint]
-            if first < 0 and second < 0:
-                contact_data.reaction[constraint] = wp.vec3f(0.0)
-            else:
-                contact_velocity = contact_data.bias[constraint]
-                if first >= 0:
-                    contact_velocity += contact_data.jacobian_first[constraint] @ state.projected_twist[first]
-                if second >= 0:
-                    contact_velocity += contact_data.jacobian_second[constraint] @ state.projected_twist[second]
-                contact_projection = project_contact_coulomb_local(
-                    contact_velocity,
-                    contact_data.reaction[constraint],
-                    data.contact_jacobi_delassus[constraint],
-                    contact_data.friction[constraint],
-                )
-                correction_first = vec6f(0.0)
-                correction_second = vec6f(0.0)
-                if first >= 0:
-                    correction_first = (
-                        wp.transpose(contact_data.jacobian_first[constraint]) @ contact_projection.reaction_delta
-                    )
-                if second >= 0:
-                    correction_second = (
-                        wp.transpose(contact_data.jacobian_second[constraint]) @ contact_projection.reaction_delta
-                    )
-                if (
-                    contact_projection.status == PROJECTION_STATUS_VALID
-                    and _is_finite_twist(correction_first)
-                    and _is_finite_twist(correction_second)
-                ):
-                    contact_data.reaction[constraint] = contact_projection.reaction
-                    _atomic_add_twist(state.twist_delta, first, correction_first)
-                    _atomic_add_twist(state.twist_delta, second, correction_second)
-                else:
-                    state.world_status[world] = PROJECTION_STATUS_INVALID
+            _project_rigid_contact_jacobi(
+                constraint,
+                world,
+                0,
+                contact_data,
+                data.contact_jacobi_delassus,
+                state,
+            )
             local += thread_count
 
         local = lane
         while local < data.world_limit_count[world]:
             constraint = data.world_limit_offset[world] + local
-            first = data.limit_body_first[constraint]
-            second = data.limit_body_second[constraint]
-            if first < 0 and second < 0:
-                data.limit_reaction[constraint] = 0.0
-            else:
-                limit_velocity = data.limit_bias[constraint]
-                if first >= 0:
-                    limit_velocity += wp.dot(data.limit_jacobian_first[constraint], state.projected_twist[first])
-                if second >= 0:
-                    limit_velocity += wp.dot(data.limit_jacobian_second[constraint], state.projected_twist[second])
-                limit_projection = project_limit_local(
-                    limit_velocity,
-                    data.limit_reaction[constraint],
-                    data.limit_jacobi_delassus[constraint],
-                )
-                correction_first = vec6f(0.0)
-                correction_second = vec6f(0.0)
-                if first >= 0:
-                    correction_first = data.limit_jacobian_first[constraint] * limit_projection.reaction_delta
-                if second >= 0:
-                    correction_second = data.limit_jacobian_second[constraint] * limit_projection.reaction_delta
-                if (
-                    limit_projection.status == PROJECTION_STATUS_VALID
-                    and _is_finite_twist(correction_first)
-                    and _is_finite_twist(correction_second)
-                ):
-                    data.limit_reaction[constraint] = limit_projection.reaction
-                    _atomic_add_twist(state.twist_delta, first, correction_first)
-                    _atomic_add_twist(state.twist_delta, second, correction_second)
-                else:
-                    state.world_status[world] = PROJECTION_STATUS_INVALID
+            _project_rigid_limit_jacobi(
+                constraint,
+                world,
+                0,
+                data.limit_body_first,
+                data.limit_body_second,
+                data.limit_jacobian_first,
+                data.limit_jacobian_second,
+                data.limit_bias,
+                data.limit_bias,
+                data.limit_jacobi_delassus,
+                data.limit_reaction,
+                state,
+            )
             local += thread_count
 
     _sync_threads()
@@ -878,10 +800,8 @@ def _project_rigid_colored_by_world(
         body = world_body_offset[world] + local
         if state.world_status[world] == PROJECTION_STATUS_VALID:
             correction = state.inverse_weight[body] @ state.twist_delta[body]
-            if _is_finite_twist(correction):
-                state.projected_twist[body] += correction
-            else:
-                state.world_status[world] = PROJECTION_STATUS_INVALID
+            state.projected_twist[body] += correction
+        _check_projected_twist(body, world, state.projected_twist, state.world_status)
         state.twist_delta[body] = vec6f(0.0)
         local += thread_count
 
@@ -953,24 +873,24 @@ class ColoredGaussSeidelProjection:
     implementation directly.
     """
 
-    def __init__(self, rigid_adapter, color_count: int):
+    def __init__(self, problem, color_count: int):
         if color_count < 2:
             raise ValueError("Colored Gauss-Seidel requires at least two colors.")
-        self.rigid_adapter = rigid_adapter
-        rigid_capacity = rigid_adapter.friction_capacity + rigid_adapter.contact_capacity + rigid_adapter.limit_capacity
+        self.problem = problem
+        rigid_capacity = problem.friction_capacity + problem.contact_capacity + problem.limit_capacity
         self.color_count = max(1, min(color_count, rigid_capacity))
-        self.device = rigid_adapter.device
-        body_count = rigid_adapter.body_constraint_count.shape[0]
+        self.device = problem.device
+        body_count = problem.body_constraint_count.shape[0]
         self.body_occupancy = wp.zeros((body_count, self.color_count), dtype=wp.int32, device=self.device)
         self.rigid_world_color_count = wp.zeros(
-            (rigid_adapter.world_contact_count.shape[0], self.color_count),
+            (problem.world_contact_count.shape[0], self.color_count),
             dtype=wp.int32,
             device=self.device,
         )
         self.body_locks = wp.full(body_count, _LOCK_FREE, dtype=wp.int32, device=self.device)
-        self.friction = _ColorFamily(rigid_adapter.friction_capacity, self.color_count, self.device)
-        self.contact = _ColorFamily(rigid_adapter.contact_capacity, self.color_count, self.device)
-        self.limit = _ColorFamily(rigid_adapter.limit_capacity, self.color_count, self.device)
+        self.friction = _ColorFamily(problem.friction_capacity, self.color_count, self.device)
+        self.contact = _ColorFamily(problem.contact_capacity, self.color_count, self.device)
+        self.limit = _ColorFamily(problem.limit_capacity, self.color_count, self.device)
         self.friction_delassus = wp.zeros(self.friction.capacity, dtype=wp.float32, device=self.device)
         self.contact_delassus = wp.zeros(self.contact.capacity, dtype=wp.mat33f, device=self.device)
         self.limit_delassus = wp.zeros(self.limit.capacity, dtype=wp.float32, device=self.device)
@@ -979,35 +899,35 @@ class ColoredGaussSeidelProjection:
         self._fuse_rigid_families = sum(family.capacity > 0 for family in self._families) > 1
 
     def _launch_rigid_families(self, kernel, extra_inputs: tuple = ()) -> None:
-        rigid_adapter = self.rigid_adapter
-        if rigid_adapter is None:
+        problem = self.problem
+        if problem is None:
             return
         entries = (
             (
                 self.friction,
-                rigid_adapter.friction_world,
-                rigid_adapter.friction_local,
-                rigid_adapter.world_friction_count,
-                rigid_adapter.friction_body_first,
-                rigid_adapter.friction_body_second,
+                problem.friction_world,
+                problem.friction_local,
+                problem.world_friction_count,
+                problem.friction_body_first,
+                problem.friction_body_second,
                 0,
             ),
             (
                 self.contact,
-                rigid_adapter.contact_world,
-                rigid_adapter.contact_local,
-                rigid_adapter.world_contact_count,
-                rigid_adapter.contact_body_first,
-                rigid_adapter.contact_body_second,
+                problem.contact_world,
+                problem.contact_local,
+                problem.world_contact_count,
+                problem.contact_body_first,
+                problem.contact_body_second,
                 1,
             ),
             (
                 self.limit,
-                rigid_adapter.limit_world,
-                rigid_adapter.limit_local,
-                rigid_adapter.world_limit_count,
-                rigid_adapter.limit_body_first,
-                rigid_adapter.limit_body_second,
+                problem.limit_world,
+                problem.limit_local,
+                problem.world_limit_count,
+                problem.limit_body_first,
+                problem.limit_body_second,
                 2,
             ),
         )
@@ -1053,38 +973,38 @@ class ColoredGaussSeidelProjection:
 
     def prepare(self, inverse_weight: wp.array[mat66f] | None, prepared_status: wp.array[wp.int32]) -> None:
         self.build_colors()
-        rigid_adapter = self.rigid_adapter
-        if rigid_adapter is not None:
+        problem = self.problem
+        if problem is not None:
             prepare_jacobi_projection_data(
-                rigid_adapter.friction_world,
-                rigid_adapter.friction_local,
-                rigid_adapter.world_friction_count,
-                rigid_adapter.friction_body_first,
-                rigid_adapter.friction_body_second,
-                rigid_adapter.friction_jacobian_first,
-                rigid_adapter.friction_jacobian_second,
-                rigid_adapter.contact_world,
-                rigid_adapter.contact_local,
-                rigid_adapter.world_contact_count,
-                rigid_adapter.contact_body_first,
-                rigid_adapter.contact_body_second,
-                rigid_adapter.contact_jacobian_first,
-                rigid_adapter.contact_jacobian_second,
-                rigid_adapter.contact_bias,
-                rigid_adapter.contact_friction,
-                rigid_adapter.limit_world,
-                rigid_adapter.limit_local,
-                rigid_adapter.world_limit_count,
-                rigid_adapter.limit_body_first,
-                rigid_adapter.limit_body_second,
-                rigid_adapter.limit_jacobian_first,
-                rigid_adapter.limit_jacobian_second,
-                rigid_adapter.body_constraint_count,
-                rigid_adapter.static_body_constraint_count,
+                problem.friction_world,
+                problem.friction_local,
+                problem.world_friction_count,
+                problem.friction_body_first,
+                problem.friction_body_second,
+                problem.friction_jacobian_first,
+                problem.friction_jacobian_second,
+                problem.contact_world,
+                problem.contact_local,
+                problem.world_contact_count,
+                problem.contact_body_first,
+                problem.contact_body_second,
+                problem.contact_jacobian_first,
+                problem.contact_jacobian_second,
+                problem.contact_bias,
+                problem.contact_friction,
+                problem.limit_world,
+                problem.limit_local,
+                problem.world_limit_count,
+                problem.limit_body_first,
+                problem.limit_body_second,
+                problem.limit_jacobian_first,
+                problem.limit_jacobian_second,
+                problem.body_constraint_count,
+                problem.static_body_constraint_count,
                 inverse_weight,
-                rigid_adapter.friction_projection_delassus,
-                rigid_adapter.contact_projection_delassus,
-                rigid_adapter.limit_projection_delassus,
+                problem.friction_projection_delassus,
+                problem.contact_projection_delassus,
+                problem.limit_projection_delassus,
                 prepared_status,
             )
             if self.rigid_worker_count > 0:
@@ -1099,29 +1019,29 @@ class ColoredGaussSeidelProjection:
                                 self.friction.counts,
                                 self.friction.offsets,
                                 self.friction.order,
-                                rigid_adapter.friction_world,
-                                rigid_adapter.friction_body_first,
-                                rigid_adapter.friction_body_second,
-                                rigid_adapter.friction_jacobian_first,
-                                rigid_adapter.friction_jacobian_second,
+                                problem.friction_world,
+                                problem.friction_body_first,
+                                problem.friction_body_second,
+                                problem.friction_jacobian_first,
+                                problem.friction_jacobian_second,
                                 self.contact.counts,
                                 self.contact.offsets,
                                 self.contact.order,
-                                rigid_adapter.contact_world,
-                                rigid_adapter.contact_body_first,
-                                rigid_adapter.contact_body_second,
-                                rigid_adapter.contact_jacobian_first,
-                                rigid_adapter.contact_jacobian_second,
-                                rigid_adapter.contact_bias,
-                                rigid_adapter.contact_friction,
+                                problem.contact_world,
+                                problem.contact_body_first,
+                                problem.contact_body_second,
+                                problem.contact_jacobian_first,
+                                problem.contact_jacobian_second,
+                                problem.contact_bias,
+                                problem.contact_friction,
                                 self.limit.counts,
                                 self.limit.offsets,
                                 self.limit.order,
-                                rigid_adapter.limit_world,
-                                rigid_adapter.limit_body_first,
-                                rigid_adapter.limit_body_second,
-                                rigid_adapter.limit_jacobian_first,
-                                rigid_adapter.limit_jacobian_second,
+                                problem.limit_world,
+                                problem.limit_body_first,
+                                problem.limit_body_second,
+                                problem.limit_jacobian_first,
+                                problem.limit_jacobian_second,
                                 self.body_occupancy,
                                 inverse_weight,
                             ],
@@ -1145,11 +1065,11 @@ class ColoredGaussSeidelProjection:
                                     self.friction.counts,
                                     self.friction.offsets,
                                     self.friction.order,
-                                    rigid_adapter.friction_world,
-                                    rigid_adapter.friction_body_first,
-                                    rigid_adapter.friction_body_second,
-                                    rigid_adapter.friction_jacobian_first,
-                                    rigid_adapter.friction_jacobian_second,
+                                    problem.friction_world,
+                                    problem.friction_body_first,
+                                    problem.friction_body_second,
+                                    problem.friction_jacobian_first,
+                                    problem.friction_jacobian_second,
                                     self.body_occupancy,
                                     inverse_weight,
                                 ],
@@ -1167,13 +1087,13 @@ class ColoredGaussSeidelProjection:
                                     self.contact.counts,
                                     self.contact.offsets,
                                     self.contact.order,
-                                    rigid_adapter.contact_world,
-                                    rigid_adapter.contact_body_first,
-                                    rigid_adapter.contact_body_second,
-                                    rigid_adapter.contact_jacobian_first,
-                                    rigid_adapter.contact_jacobian_second,
-                                    rigid_adapter.contact_bias,
-                                    rigid_adapter.contact_friction,
+                                    problem.contact_world,
+                                    problem.contact_body_first,
+                                    problem.contact_body_second,
+                                    problem.contact_jacobian_first,
+                                    problem.contact_jacobian_second,
+                                    problem.contact_bias,
+                                    problem.contact_friction,
                                     self.body_occupancy,
                                     inverse_weight,
                                 ],
@@ -1191,11 +1111,11 @@ class ColoredGaussSeidelProjection:
                                     self.limit.counts,
                                     self.limit.offsets,
                                     self.limit.order,
-                                    rigid_adapter.limit_world,
-                                    rigid_adapter.limit_body_first,
-                                    rigid_adapter.limit_body_second,
-                                    rigid_adapter.limit_jacobian_first,
-                                    rigid_adapter.limit_jacobian_second,
+                                    problem.limit_world,
+                                    problem.limit_body_first,
+                                    problem.limit_body_second,
+                                    problem.limit_jacobian_first,
+                                    problem.limit_jacobian_second,
                                     self.body_occupancy,
                                     inverse_weight,
                                 ],
@@ -1217,21 +1137,21 @@ class ColoredGaussSeidelProjection:
         prepared_status: wp.array[wp.int32],
         projection_status: wp.array[wp.int32],
     ) -> None:
-        rigid_adapter = self.rigid_adapter
+        problem = self.problem
         world_count = world_active.shape[0]
         world_body_offset = None
         world_body_count = None
         world_friction_offset = None
         world_contact_offset = None
         world_limit_offset = None
-        if rigid_adapter is not None:
-            model_info = getattr(getattr(rigid_adapter, "model", None), "info", None)
+        if problem is not None:
+            model_info = getattr(getattr(problem, "model", None), "info", None)
             if model_info is not None:
                 world_body_offset = model_info.bodies_offset
                 world_body_count = model_info.num_bodies
-            world_friction_offset = getattr(rigid_adapter, "world_friction_offset", None)
-            world_contact_offset = getattr(rigid_adapter, "world_contact_offset", None)
-            world_limit_offset = getattr(rigid_adapter, "world_limit_offset", None)
+            world_friction_offset = getattr(problem, "world_friction_offset", None)
+            world_contact_offset = getattr(problem, "world_contact_offset", None)
+            world_limit_offset = getattr(problem, "world_limit_offset", None)
         use_world_projection = _can_fuse_rigid_projection_by_world(
             self.device,
             world_count,
@@ -1243,14 +1163,10 @@ class ColoredGaussSeidelProjection:
                 world_limit_offset,
             ),
             parallel_constraint_capacity=(
-                rigid_adapter.friction_capacity
-                + rigid_adapter.contact_capacity
-                + rigid_adapter.limit_capacity
-                + self.color_count
-                - 1
+                problem.friction_capacity + problem.contact_capacity + problem.limit_capacity + self.color_count - 1
             )
             // self.color_count
-            if rigid_adapter is not None
+            if problem is not None
             else None,
             world_block_dim=_WORLD_COLOR_BLOCK_DIM,
             minimum_blocks_per_sm=1,
@@ -1259,47 +1175,43 @@ class ColoredGaussSeidelProjection:
             state = _make_rigid_projection_state(
                 world_active, projected_twist, twist_delta, projection_status, self.body_occupancy, inverse_weight
             )
-            contact_data = _make_projection_struct(
-                _RigidContactProjectionData,
-                body_first=rigid_adapter.contact_body_first,
-                body_second=rigid_adapter.contact_body_second,
-                jacobian_first=rigid_adapter.contact_jacobian_first,
-                jacobian_second=rigid_adapter.contact_jacobian_second,
-                delassus=self.contact_delassus,
-                bias=rigid_adapter.contact_bias,
-                friction=rigid_adapter.contact_friction,
-                reaction=rigid_adapter.contact_reaction,
-            )
-            data = _make_projection_struct(
-                _RigidColoredWorldData,
-                world_color_count=self.rigid_world_color_count,
-                world_friction_offset=world_friction_offset,
-                world_friction_count=rigid_adapter.world_friction_count,
-                friction_colors=self.friction.colors,
-                friction_body_first=rigid_adapter.friction_body_first,
-                friction_body_second=rigid_adapter.friction_body_second,
-                friction_jacobian_first=rigid_adapter.friction_jacobian_first,
-                friction_jacobian_second=rigid_adapter.friction_jacobian_second,
-                friction_bound=rigid_adapter.friction_impulse_bound,
-                friction_colored_delassus=self.friction_delassus,
-                friction_jacobi_delassus=rigid_adapter.friction_projection_delassus,
-                friction_reaction=rigid_adapter.friction_reaction,
-                world_contact_offset=world_contact_offset,
-                world_contact_count=rigid_adapter.world_contact_count,
-                contact_colors=self.contact.colors,
-                contact_jacobi_delassus=rigid_adapter.contact_projection_delassus,
-                world_limit_offset=world_limit_offset,
-                world_limit_count=rigid_adapter.world_limit_count,
-                limit_colors=self.limit.colors,
-                limit_body_first=rigid_adapter.limit_body_first,
-                limit_body_second=rigid_adapter.limit_body_second,
-                limit_jacobian_first=rigid_adapter.limit_jacobian_first,
-                limit_jacobian_second=rigid_adapter.limit_jacobian_second,
-                limit_bias=rigid_adapter.limit_bias,
-                limit_colored_delassus=self.limit_delassus,
-                limit_jacobi_delassus=rigid_adapter.limit_projection_delassus,
-                limit_reaction=rigid_adapter.limit_reaction,
-            )
+            contact_data = _RigidContactProjectionData()
+            contact_data.body_first = problem.contact_body_first
+            contact_data.body_second = problem.contact_body_second
+            contact_data.jacobian_first = problem.contact_jacobian_first
+            contact_data.jacobian_second = problem.contact_jacobian_second
+            contact_data.delassus = self.contact_delassus
+            contact_data.bias = problem.contact_bias
+            contact_data.friction = problem.contact_friction
+            contact_data.reaction = problem.contact_reaction
+            data = _RigidColoredWorldData()
+            data.world_color_count = self.rigid_world_color_count
+            data.world_friction_offset = world_friction_offset
+            data.world_friction_count = problem.world_friction_count
+            data.friction_colors = self.friction.colors
+            data.friction_body_first = problem.friction_body_first
+            data.friction_body_second = problem.friction_body_second
+            data.friction_jacobian_first = problem.friction_jacobian_first
+            data.friction_jacobian_second = problem.friction_jacobian_second
+            data.friction_bound = problem.friction_impulse_bound
+            data.friction_colored_delassus = self.friction_delassus
+            data.friction_jacobi_delassus = problem.friction_projection_delassus
+            data.friction_reaction = problem.friction_reaction
+            data.world_contact_offset = world_contact_offset
+            data.world_contact_count = problem.world_contact_count
+            data.contact_colors = self.contact.colors
+            data.contact_jacobi_delassus = problem.contact_projection_delassus
+            data.world_limit_offset = world_limit_offset
+            data.world_limit_count = problem.world_limit_count
+            data.limit_colors = self.limit.colors
+            data.limit_body_first = problem.limit_body_first
+            data.limit_body_second = problem.limit_body_second
+            data.limit_jacobian_first = problem.limit_jacobian_first
+            data.limit_jacobian_second = problem.limit_jacobian_second
+            data.limit_bias = problem.limit_bias
+            data.limit_colored_delassus = self.limit_delassus
+            data.limit_jacobi_delassus = problem.limit_projection_delassus
+            data.limit_reaction = problem.limit_reaction
             wp.launch(
                 _project_rigid_colored_by_world,
                 dim=(world_count, _WORLD_COLOR_BLOCK_DIM),
@@ -1317,7 +1229,7 @@ class ColoredGaussSeidelProjection:
                 device=self.device,
             )
             return
-        if rigid_adapter is not None:
+        if problem is not None:
             wp.launch(
                 _initialize_jacobi_projection_status,
                 dim=world_active.shape[0],
@@ -1331,18 +1243,18 @@ class ColoredGaussSeidelProjection:
                     _warmstart_frictions_jacobi,
                     dim=self.friction.capacity,
                     inputs=[
-                        rigid_adapter.friction_world,
-                        rigid_adapter.friction_local,
+                        problem.friction_world,
+                        problem.friction_local,
                         world_active,
                         prepared_status,
-                        rigid_adapter.world_friction_count,
-                        rigid_adapter.friction_body_first,
-                        rigid_adapter.friction_body_second,
-                        rigid_adapter.friction_jacobian_first,
-                        rigid_adapter.friction_jacobian_second,
+                        problem.world_friction_count,
+                        problem.friction_body_first,
+                        problem.friction_body_second,
+                        problem.friction_jacobian_first,
+                        problem.friction_jacobian_second,
                         inverse_weight,
                         True,
-                        rigid_adapter.friction_reaction,
+                        problem.friction_reaction,
                     ],
                     outputs=[twist_delta],
                     device=self.device,
@@ -1352,18 +1264,18 @@ class ColoredGaussSeidelProjection:
                     _warmstart_contacts_jacobi,
                     dim=self.contact.capacity,
                     inputs=[
-                        rigid_adapter.contact_world,
-                        rigid_adapter.contact_local,
+                        problem.contact_world,
+                        problem.contact_local,
                         world_active,
                         prepared_status,
-                        rigid_adapter.world_contact_count,
-                        rigid_adapter.contact_body_first,
-                        rigid_adapter.contact_body_second,
-                        rigid_adapter.contact_jacobian_first,
-                        rigid_adapter.contact_jacobian_second,
+                        problem.world_contact_count,
+                        problem.contact_body_first,
+                        problem.contact_body_second,
+                        problem.contact_jacobian_first,
+                        problem.contact_jacobian_second,
                         inverse_weight,
                         True,
-                        rigid_adapter.contact_reaction,
+                        problem.contact_reaction,
                     ],
                     outputs=[twist_delta],
                     device=self.device,
@@ -1373,18 +1285,18 @@ class ColoredGaussSeidelProjection:
                     _warmstart_limits_jacobi,
                     dim=self.limit.capacity,
                     inputs=[
-                        rigid_adapter.limit_world,
-                        rigid_adapter.limit_local,
+                        problem.limit_world,
+                        problem.limit_local,
                         world_active,
                         prepared_status,
-                        rigid_adapter.world_limit_count,
-                        rigid_adapter.limit_body_first,
-                        rigid_adapter.limit_body_second,
-                        rigid_adapter.limit_jacobian_first,
-                        rigid_adapter.limit_jacobian_second,
+                        problem.world_limit_count,
+                        problem.limit_body_first,
+                        problem.limit_body_second,
+                        problem.limit_jacobian_first,
+                        problem.limit_jacobian_second,
                         inverse_weight,
                         True,
-                        rigid_adapter.limit_reaction,
+                        problem.limit_reaction,
                     ],
                     outputs=[twist_delta],
                     device=self.device,
@@ -1403,33 +1315,31 @@ class ColoredGaussSeidelProjection:
         friction_index = None
         contact_index = None
         limit_index = None
-        if rigid_adapter is not None:
+        if problem is not None:
             rigid_projection_state = _make_rigid_projection_state(
                 world_active, projected_twist, twist_delta, projection_status, self.body_occupancy, inverse_weight
             )
-            rigid_contact_data = _make_projection_struct(
-                _RigidContactProjectionData,
-                body_first=rigid_adapter.contact_body_first,
-                body_second=rigid_adapter.contact_body_second,
-                jacobian_first=rigid_adapter.contact_jacobian_first,
-                jacobian_second=rigid_adapter.contact_jacobian_second,
-                delassus=self.contact_delassus,
-                bias=rigid_adapter.contact_bias,
-                friction=rigid_adapter.contact_friction,
-                reaction=rigid_adapter.contact_reaction,
-            )
+            rigid_contact_data = _RigidContactProjectionData()
+            rigid_contact_data.body_first = problem.contact_body_first
+            rigid_contact_data.body_second = problem.contact_body_second
+            rigid_contact_data.jacobian_first = problem.contact_jacobian_first
+            rigid_contact_data.jacobian_second = problem.contact_jacobian_second
+            rigid_contact_data.delassus = self.contact_delassus
+            rigid_contact_data.bias = problem.contact_bias
+            rigid_contact_data.friction = problem.contact_friction
+            rigid_contact_data.reaction = problem.contact_reaction
             friction_index = _make_colored_projection_index(
-                rigid_adapter.friction_world, self.friction.counts, self.friction.offsets, self.friction.order
+                problem.friction_world, self.friction.counts, self.friction.offsets, self.friction.order
             )
             contact_index = _make_colored_projection_index(
-                rigid_adapter.contact_world, self.contact.counts, self.contact.offsets, self.contact.order
+                problem.contact_world, self.contact.counts, self.contact.offsets, self.contact.order
             )
             limit_index = _make_colored_projection_index(
-                rigid_adapter.limit_world, self.limit.counts, self.limit.offsets, self.limit.order
+                problem.limit_world, self.limit.counts, self.limit.offsets, self.limit.order
             )
         for _iteration in range(iterations):
             for color in range(self.color_count):
-                if rigid_adapter is not None:
+                if problem is not None:
                     if self.rigid_worker_count > 0:
                         if self._fuse_rigid_families:
                             wp.launch(
@@ -1441,31 +1351,31 @@ class ColoredGaussSeidelProjection:
                                     self.friction.counts,
                                     self.friction.offsets,
                                     self.friction.order,
-                                    rigid_adapter.friction_world,
-                                    rigid_adapter.friction_body_first,
-                                    rigid_adapter.friction_body_second,
-                                    rigid_adapter.friction_jacobian_first,
-                                    rigid_adapter.friction_jacobian_second,
-                                    rigid_adapter.friction_impulse_bound,
+                                    problem.friction_world,
+                                    problem.friction_body_first,
+                                    problem.friction_body_second,
+                                    problem.friction_jacobian_first,
+                                    problem.friction_jacobian_second,
+                                    problem.friction_impulse_bound,
                                     self.friction_delassus,
                                     self.contact.counts,
                                     self.contact.offsets,
                                     self.contact.order,
-                                    rigid_adapter.contact_world,
+                                    problem.contact_world,
                                     rigid_contact_data,
                                     self.limit.counts,
                                     self.limit.offsets,
                                     self.limit.order,
-                                    rigid_adapter.limit_world,
-                                    rigid_adapter.limit_body_first,
-                                    rigid_adapter.limit_body_second,
-                                    rigid_adapter.limit_jacobian_first,
-                                    rigid_adapter.limit_jacobian_second,
-                                    rigid_adapter.limit_bias,
+                                    problem.limit_world,
+                                    problem.limit_body_first,
+                                    problem.limit_body_second,
+                                    problem.limit_jacobian_first,
+                                    problem.limit_jacobian_second,
+                                    problem.limit_bias,
                                     self.limit_delassus,
                                     rigid_projection_state,
                                 ],
-                                outputs=[rigid_adapter.friction_reaction, rigid_adapter.limit_reaction],
+                                outputs=[problem.friction_reaction, problem.limit_reaction],
                                 device=self.device,
                                 block_dim=_COLOR_BLOCK_DIM,
                             )
@@ -1477,14 +1387,14 @@ class ColoredGaussSeidelProjection:
                                     self.friction.worker_count,
                                     color,
                                     friction_index,
-                                    rigid_adapter.friction_body_first,
-                                    rigid_adapter.friction_body_second,
-                                    rigid_adapter.friction_jacobian_first,
-                                    rigid_adapter.friction_jacobian_second,
-                                    rigid_adapter.friction_impulse_bound,
-                                    rigid_adapter.friction_impulse_bound,
+                                    problem.friction_body_first,
+                                    problem.friction_body_second,
+                                    problem.friction_jacobian_first,
+                                    problem.friction_jacobian_second,
+                                    problem.friction_impulse_bound,
+                                    problem.friction_impulse_bound,
                                     self.friction_delassus,
-                                    rigid_adapter.friction_reaction,
+                                    problem.friction_reaction,
                                     rigid_projection_state,
                                 ],
                                 device=self.device,
@@ -1512,20 +1422,20 @@ class ColoredGaussSeidelProjection:
                                     self.limit.worker_count,
                                     color,
                                     limit_index,
-                                    rigid_adapter.limit_body_first,
-                                    rigid_adapter.limit_body_second,
-                                    rigid_adapter.limit_jacobian_first,
-                                    rigid_adapter.limit_jacobian_second,
-                                    rigid_adapter.limit_bias,
-                                    rigid_adapter.limit_bias,
+                                    problem.limit_body_first,
+                                    problem.limit_body_second,
+                                    problem.limit_jacobian_first,
+                                    problem.limit_jacobian_second,
+                                    problem.limit_bias,
+                                    problem.limit_bias,
                                     self.limit_delassus,
-                                    rigid_adapter.limit_reaction,
+                                    problem.limit_reaction,
                                     rigid_projection_state,
                                 ],
                                 device=self.device,
                                 block_dim=_COLOR_BLOCK_DIM,
                             )
-                if rigid_adapter is not None:
+                if problem is not None:
                     wp.launch(
                         _apply_body_delta,
                         dim=projected_twist.shape[0],
@@ -1533,45 +1443,45 @@ class ColoredGaussSeidelProjection:
                         outputs=[twist_delta, projected_twist],
                         device=self.device,
                     )
-        if rigid_adapter is not None:
+        if problem is not None:
             project_constraints_jacobi(
                 1,
                 world_active,
                 body_world,
-                rigid_adapter.friction_world,
-                rigid_adapter.friction_local,
-                rigid_adapter.world_friction_count,
-                rigid_adapter.friction_body_first,
-                rigid_adapter.friction_body_second,
-                rigid_adapter.friction_jacobian_first,
-                rigid_adapter.friction_jacobian_second,
-                rigid_adapter.friction_impulse_bound,
-                rigid_adapter.friction_projection_delassus,
-                rigid_adapter.contact_world,
-                rigid_adapter.contact_local,
-                rigid_adapter.world_contact_count,
-                rigid_adapter.contact_body_first,
-                rigid_adapter.contact_body_second,
-                rigid_adapter.contact_jacobian_first,
-                rigid_adapter.contact_jacobian_second,
-                rigid_adapter.contact_bias,
-                rigid_adapter.contact_friction,
-                rigid_adapter.contact_projection_delassus,
-                rigid_adapter.limit_world,
-                rigid_adapter.limit_local,
-                rigid_adapter.world_limit_count,
-                rigid_adapter.limit_body_first,
-                rigid_adapter.limit_body_second,
-                rigid_adapter.limit_jacobian_first,
-                rigid_adapter.limit_jacobian_second,
-                rigid_adapter.limit_bias,
-                rigid_adapter.limit_projection_delassus,
+                problem.friction_world,
+                problem.friction_local,
+                problem.world_friction_count,
+                problem.friction_body_first,
+                problem.friction_body_second,
+                problem.friction_jacobian_first,
+                problem.friction_jacobian_second,
+                problem.friction_impulse_bound,
+                problem.friction_projection_delassus,
+                problem.contact_world,
+                problem.contact_local,
+                problem.world_contact_count,
+                problem.contact_body_first,
+                problem.contact_body_second,
+                problem.contact_jacobian_first,
+                problem.contact_jacobian_second,
+                problem.contact_bias,
+                problem.contact_friction,
+                problem.contact_projection_delassus,
+                problem.limit_world,
+                problem.limit_local,
+                problem.world_limit_count,
+                problem.limit_body_first,
+                problem.limit_body_second,
+                problem.limit_jacobian_first,
+                problem.limit_jacobian_second,
+                problem.limit_bias,
+                problem.limit_projection_delassus,
                 inverse_weight,
                 projected_twist,
                 twist_delta,
-                rigid_adapter.contact_reaction,
-                rigid_adapter.limit_reaction,
-                rigid_adapter.friction_reaction,
+                problem.contact_reaction,
+                problem.limit_reaction,
+                problem.friction_reaction,
                 prepared_status,
                 projection_status,
                 warm_start=False,

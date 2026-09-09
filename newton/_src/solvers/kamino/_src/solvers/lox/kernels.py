@@ -1,33 +1,342 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Warp kernels bridging Kamino containers with LOX solver storage.
-
-Preparation kernels materialize compact, coalesced row data once per nonlinear
-evaluation. LOX reuses those rows across its projection iterations; consumers
-therefore avoid repeated sparse-Jacobian indirection and contact preprocessing.
-"""
+"""LOX splitting updates and convergence reductions."""
 
 from functools import cache
 
 import warp as wp
 
-from ...core.joints import JointActuationType, JointCorrectionMode
-from ...core.math import compute_body_pose_update_with_logmap, contact_wrench_matrix_from_points
+from ...core.joints import JointCorrectionMode
+from ...core.math import compute_body_pose_update_with_logmap
 from ...core.types import mat36f, mat66f, vec6f
-from ...geometry.contacts import ContactMode
 from ...kinematics.joints import compute_joint_pose_and_relative_motion, make_write_joint_data
-from .bias import compute_contact_velocity_target, compute_limit_velocity_target
 from .projection import PROJECTION_STATUS_VALID
 
 wp.set_module_options({"enable_backward": False})
 
 
-@wp.func
-def _load_sparse_jacobian_row(index: wp.int32, jacobian_data: wp.array[vec6f]) -> vec6f:
-    if index >= 0:
-        return jacobian_data[index]
-    return vec6f(0.0)
+@wp.kernel
+def _initialize_bodies(
+    body_world: wp.array[wp.int32],
+    world_mask: wp.array[wp.bool],
+    initial_twist: wp.array[vec6f],
+    reset_dual: wp.bool,
+    projected_twist: wp.array[vec6f],
+    projected_twist_previous: wp.array[vec6f],
+    global_twist: wp.array[vec6f],
+    global_twist_previous: wp.array[vec6f],
+    splitting_dual: wp.array[vec6f],
+    splitting_dual_impulse: wp.array[vec6f],
+):
+    body = wp.tid()
+    if world_mask and not world_mask[body_world[body]]:
+        return
+    value = vec6f(0.0)
+    if initial_twist:
+        value = initial_twist[body]
+    projected_twist[body] = value
+    projected_twist_previous[body] = value
+    global_twist[body] = value
+    global_twist_previous[body] = value
+    if reset_dual:
+        splitting_dual[body] = vec6f(0.0)
+        splitting_dual_impulse[body] = vec6f(0.0)
+
+
+@wp.kernel
+def _initialize_worlds(
+    world_mask: wp.array[wp.bool],
+    world_active: wp.array[wp.bool],
+    world_converged: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    world_iteration_limit: wp.array[wp.bool],
+    iteration_count: wp.array[wp.int32],
+    residual_change: wp.array[wp.float32],
+    residual_split: wp.array[wp.float32],
+    residual_structural: wp.array[wp.float32],
+    residual_structural_projected: wp.array[wp.float32],
+    residual_cross_iterate: wp.array[wp.float32],
+    residual_lagged_velocity: wp.array[wp.float32],
+    residual_total: wp.array[wp.float32],
+    iteration_failed: wp.array[wp.int32],
+):
+    world = wp.tid()
+    if world_mask and not world_mask[world]:
+        return
+    world_active[world] = True
+    world_converged[world] = False
+    world_failed[world] = False
+    world_iteration_limit[world] = False
+    iteration_count[world] = 0
+    residual_change[world] = 0.0
+    residual_split[world] = 0.0
+    residual_structural[world] = 0.0
+    residual_structural_projected[world] = 0.0
+    residual_cross_iterate[world] = 0.0
+    residual_lagged_velocity[world] = 0.0
+    residual_total[world] = 0.0
+    iteration_failed[world] = 0
+
+
+@wp.kernel
+def _prepare_projection(
+    body_world: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    body_split_enabled: wp.array[wp.int32],
+    global_solution: wp.array[vec6f],
+    splitting_dual: wp.array[vec6f],
+    global_twist_previous: wp.array[vec6f],
+    global_twist: wp.array[vec6f],
+    projected_twist_previous: wp.array[vec6f],
+    projected_twist: wp.array[vec6f],
+):
+    body = wp.tid()
+    world = body_world[body]
+    if not world_active[world]:
+        return
+    global_twist_previous[body] = global_twist[body]
+    global_twist[body] = global_solution[body]
+    projected_twist_previous[body] = projected_twist[body]
+    if not body_split_enabled or body_split_enabled[body] != 0:
+        projected_twist[body] = global_solution[body] - splitting_dual[body]
+    else:
+        projected_twist[body] = global_solution[body]
+        splitting_dual[body] = vec6f(0.0)
+
+
+@wp.kernel
+def _store_dual_impulse(
+    body_has_unilateral: wp.array[wp.int32],
+    weight: wp.array[mat66f],
+    splitting_dual: wp.array[vec6f],
+    splitting_dual_impulse: wp.array[vec6f],
+):
+    body = wp.tid()
+    if body_has_unilateral[body] != 0:
+        splitting_dual_impulse[body] = weight[body] @ splitting_dual[body]
+    else:
+        splitting_dual[body] = vec6f(0.0)
+        splitting_dual_impulse[body] = vec6f(0.0)
+
+
+@wp.kernel
+def _restore_dual_from_impulse(
+    body_has_unilateral: wp.array[wp.int32],
+    inverse_weight: wp.array[mat66f],
+    splitting_dual_impulse: wp.array[vec6f],
+    splitting_dual: wp.array[vec6f],
+):
+    body = wp.tid()
+    if body_has_unilateral[body] != 0:
+        splitting_dual[body] = inverse_weight[body] @ splitting_dual_impulse[body]
+    else:
+        splitting_dual_impulse[body] = vec6f(0.0)
+        splitting_dual[body] = vec6f(0.0)
+
+
+@wp.kernel
+def _initialize_iteration_residuals(
+    projection_status: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    iteration_count: wp.array[wp.int32],
+    iteration_failed: wp.array[wp.int32],
+    residual_change: wp.array[wp.float32],
+    residual_split: wp.array[wp.float32],
+    residual_cross_iterate: wp.array[wp.float32],
+):
+    world = wp.tid()
+    if not world_active[world]:
+        return
+    iteration_count[world] += 1
+    iteration_failed[world] = 0
+    residual_change[world] = 0.0
+    residual_split[world] = 0.0
+    residual_cross_iterate[world] = 0.0
+    if projection_status[world] != PROJECTION_STATUS_VALID:
+        world_active[world] = False
+        world_failed[world] = True
+
+
+@wp.kernel
+def _update_bodies_and_reduce_residuals(
+    time_step: wp.array[wp.float32],
+    position_tolerance: wp.float32,
+    rotation_tolerance: wp.float32,
+    velocity_tolerance: wp.float32,
+    body_world: wp.array[wp.int32],
+    global_twist_previous: wp.array[vec6f],
+    global_twist: wp.array[vec6f],
+    projected_twist_previous: wp.array[vec6f],
+    projected_twist: wp.array[vec6f],
+    world_active: wp.array[wp.bool],
+    splitting_dual: wp.array[vec6f],
+    iteration_failed: wp.array[wp.int32],
+    residual_change: wp.array[wp.float32],
+    residual_split: wp.array[wp.float32],
+    residual_cross_iterate: wp.array[wp.float32],
+):
+    body = wp.tid()
+    world = body_world[body]
+    dt = time_step[world]
+    if not world_active[world]:
+        return
+
+    previous = global_twist_previous[body]
+    current = global_twist[body]
+    projected_previous = projected_twist_previous[body]
+    projected = projected_twist[body]
+    dual = splitting_dual[body]
+    finite = (
+        wp.isfinite(previous)
+        and wp.isfinite(current)
+        and wp.isfinite(projected_previous)
+        and wp.isfinite(projected)
+        and wp.isfinite(dual)
+    )
+    if not finite:
+        wp.atomic_max(iteration_failed, world, 1)
+        return
+
+    linear_change = wp.float32(0.0)
+    angular_change = wp.float32(0.0)
+    linear_split = wp.float32(0.0)
+    angular_split = wp.float32(0.0)
+    linear_cross_iterate = wp.float32(0.0)
+    angular_cross_iterate = wp.float32(0.0)
+    for axis in range(3):
+        linear_change = wp.max(linear_change, wp.abs(current[axis] - previous[axis]))
+        angular_change = wp.max(angular_change, wp.abs(current[axis + 3] - previous[axis + 3]))
+        linear_split = wp.max(linear_split, wp.abs(current[axis] - projected[axis]))
+        angular_split = wp.max(angular_split, wp.abs(current[axis + 3] - projected[axis + 3]))
+        linear_cross_iterate = wp.max(
+            linear_cross_iterate,
+            wp.abs(current[axis] - projected_previous[axis]),
+        )
+        angular_cross_iterate = wp.max(
+            angular_cross_iterate,
+            wp.abs(current[axis + 3] - projected_previous[axis + 3]),
+        )
+    change = wp.max(
+        dt * linear_change / position_tolerance,
+        dt * angular_change / rotation_tolerance,
+    )
+    split = wp.max(linear_split, angular_split) / velocity_tolerance
+    cross_iterate = wp.max(
+        dt * linear_cross_iterate / position_tolerance,
+        dt * angular_cross_iterate / rotation_tolerance,
+    )
+    wp.atomic_max(residual_change, world, change)
+    wp.atomic_max(residual_split, world, split)
+    wp.atomic_max(residual_cross_iterate, world, cross_iterate)
+    splitting_dual[body] += projected - current
+
+
+@wp.kernel
+def _initialize_fixed_iteration(
+    projection_status: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    iteration_count: wp.array[wp.int32],
+):
+    world = wp.tid()
+    if not world_active[world]:
+        return
+    iteration_count[world] += 1
+    if projection_status[world] != PROJECTION_STATUS_VALID:
+        world_active[world] = False
+        world_failed[world] = True
+
+
+@wp.kernel
+def _update_fixed_iteration_bodies(
+    body_world: wp.array[wp.int32],
+    global_twist: wp.array[vec6f],
+    projected_twist: wp.array[vec6f],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    splitting_dual: wp.array[vec6f],
+):
+    body = wp.tid()
+    world = body_world[body]
+    if not world_active[world]:
+        return
+    current = global_twist[body]
+    projected = projected_twist[body]
+    dual = splitting_dual[body]
+    finite = wp.isfinite(current) and wp.isfinite(projected) and wp.isfinite(dual)
+    if finite:
+        splitting_dual[body] = dual + projected - current
+    else:
+        world_active[world] = False
+        world_failed[world] = True
+
+
+@wp.kernel
+def _finalize_residual_iteration(
+    structural_residual: wp.array[wp.float32],
+    projected_structural_residual: wp.array[wp.float32],
+    lagged_velocity_residual: wp.array[wp.float32],
+    lagged_velocity_required: wp.array[wp.int32],
+    effort_residual: wp.array[wp.float32],
+    iteration_count: wp.array[wp.int32],
+    iteration_failed: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_converged: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    residual_change: wp.array[wp.float32],
+    residual_split: wp.array[wp.float32],
+    residual_structural: wp.array[wp.float32],
+    residual_structural_projected: wp.array[wp.float32],
+    residual_cross_iterate: wp.array[wp.float32],
+    residual_lagged_velocity: wp.array[wp.float32],
+    residual_total: wp.array[wp.float32],
+):
+    world = wp.tid()
+    if not world_active[world]:
+        return
+    if iteration_failed[world] != 0:
+        world_active[world] = False
+        world_failed[world] = True
+        return
+
+    change = residual_change[world]
+    split = residual_split[world]
+    cross_iterate = residual_cross_iterate[world]
+    structural = wp.float32(0.0)
+    if structural_residual:
+        structural = structural_residual[world]
+    projected_structural = wp.float32(0.0)
+    if projected_structural_residual:
+        projected_structural = projected_structural_residual[world]
+    lagged_velocity = wp.float32(0.0)
+    if lagged_velocity_residual:
+        lagged_velocity = lagged_velocity_residual[world]
+    total = wp.max(wp.max(change, split), wp.max(wp.max(structural, cross_iterate), lagged_velocity))
+    if effort_residual:
+        total = wp.max(total, effort_residual[world])
+    residual_structural[world] = structural
+    residual_structural_projected[world] = projected_structural
+    residual_lagged_velocity[world] = lagged_velocity
+    residual_total[world] = total
+    lagged_velocity_is_valid = (
+        not lagged_velocity_required or lagged_velocity_required[world] == 0 or iteration_count[world] >= 2
+    )
+    if total <= 1.0 and lagged_velocity_is_valid:
+        world_active[world] = False
+        world_converged[world] = True
+
+
+@wp.kernel
+def _mark_iteration_limit(
+    world_active: wp.array[wp.bool],
+    world_iteration_limit: wp.array[wp.bool],
+):
+    world = wp.tid()
+    if world_active[world]:
+        world_active[world] = False
+        world_iteration_limit[world] = True
 
 
 @wp.func
@@ -237,102 +546,6 @@ def _evaluate_lagged_contact_velocity_consistency(
 
 
 @wp.kernel
-def _prepare_dynamic_rows(
-    row_world: wp.array[wp.int32],
-    uses_dof_jacobian: wp.array[wp.bool],
-    body_first_global: wp.array[wp.int32],
-    body_second_global: wp.array[wp.int32],
-    value_index: wp.array[wp.int32],
-    dof_index: wp.array[wp.int32],
-    sparse_first_index: wp.array[wp.int32],
-    sparse_second_index: wp.array[wp.int32],
-    sparse_jacobian_data: wp.array[vec6f],
-    sparse_dof_jacobian_data: wp.array[vec6f],
-    joint_inertia: wp.array[wp.float32],
-    joint_free_velocity: wp.array[wp.float32],
-    dynamic_effort_index: wp.array[wp.int32],
-    effort_value_index: wp.array[wp.int32],
-    effort_inverse_inertia: wp.array[wp.float32],
-    effort_free_velocity: wp.array[wp.float32],
-    joint_armature: wp.array[wp.float32],
-    joint_position_stiffness: wp.array[wp.float32],
-    joint_actuation_type: wp.array[wp.int32],
-    joint_velocity: wp.array[wp.float32],
-    joint_velocity_begin: wp.array[wp.float32],
-    external_effort: wp.array[wp.float32],
-    velocity_stiffness: wp.array[wp.float32],
-    effort_limit: wp.array[wp.float32],
-    linearization_twist: wp.array[vec6f],
-    time_step: wp.array[wp.float32],
-    jacobian_first: wp.array[vec6f],
-    jacobian_second: wp.array[vec6f],
-    effective_inertia: wp.array[wp.float32],
-    free_velocity: wp.array[wp.float32],
-    effort_intercept: wp.array[wp.float32],
-    effort_slope: wp.array[wp.float32],
-    effort_impulse_bound: wp.array[wp.float32],
-):
-    row = wp.tid()
-    world = row_world[row]
-    dt = time_step[world]
-    if uses_dof_jacobian[row]:
-        jacobian_first[row] = _load_sparse_jacobian_row(sparse_first_index[row], sparse_dof_jacobian_data)
-        jacobian_second[row] = _load_sparse_jacobian_row(sparse_second_index[row], sparse_dof_jacobian_data)
-    else:
-        jacobian_first[row] = _load_sparse_jacobian_row(sparse_first_index[row], sparse_jacobian_data)
-        jacobian_second[row] = _load_sparse_jacobian_row(sparse_second_index[row], sparse_jacobian_data)
-    source = value_index[row]
-    dof = dof_index[row]
-    inertia = wp.float32(0.0)
-    velocity = wp.float32(0.0)
-    if source >= 0:
-        inertia = joint_inertia[source]
-        velocity = joint_free_velocity[source]
-    bounded = dynamic_effort_index[row]
-    if bounded >= 0:
-        effort_source = effort_value_index[bounded]
-        actuator_inverse_inertia = effort_inverse_inertia[effort_source]
-        if actuator_inverse_inertia > 0.0:
-            actuator_inertia = 1.0 / actuator_inverse_inertia
-            velocity = (inertia * velocity + actuator_inertia * effort_free_velocity[effort_source]) / (
-                inertia + actuator_inertia
-            )
-            inertia += actuator_inertia
-    effective_inertia[row] = inertia
-    mode = joint_actuation_type[dof]
-    if inertia > 0.0:
-        velocity += joint_armature[dof] * (joint_velocity_begin[dof] - joint_velocity[dof]) / inertia
-        if (
-            mode == JointActuationType.POSITION
-            or mode == JointActuationType.POSITION_VELOCITY
-            or mode == JointActuationType.POSITION_VELOCITY_FORCE
-        ):
-            linearization_velocity = wp.float32(0.0)
-            first = body_first_global[row]
-            second = body_second_global[row]
-            if first >= 0:
-                linearization_velocity += wp.dot(jacobian_first[row], linearization_twist[first])
-            if second >= 0:
-                linearization_velocity += wp.dot(jacobian_second[row], linearization_twist[second])
-            velocity += dt * dt * joint_position_stiffness[dof] * linearization_velocity / inertia
-    free_velocity[row] = velocity
-    if bounded >= 0:
-        gradient = wp.float32(0.0)
-        if mode == JointActuationType.VELOCITY:
-            gradient = velocity_stiffness[dof]
-        if (
-            mode == JointActuationType.POSITION
-            or mode == JointActuationType.POSITION_VELOCITY
-            or mode == JointActuationType.POSITION_VELOCITY_FORCE
-        ):
-            gradient = velocity_stiffness[dof] + dt * joint_position_stiffness[dof]
-        beta = inertia * velocity
-        effort_intercept[bounded] = (beta - joint_armature[dof] * joint_velocity_begin[dof]) / dt - external_effort[dof]
-        effort_slope[bounded] = gradient
-        effort_impulse_bound[bounded] = dt * effort_limit[dof]
-
-
-@wp.kernel
 def _promote_effort_counters(
     effort_world: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
@@ -412,70 +625,6 @@ def _update_effort_counters(
     residual[effort] = defect
     wp.atomic_max(world_residual_scaled, world, scaled_defect)
     wp.atomic_max(world_residual_unscaled, world, defect)
-
-
-@wp.kernel
-def _prepare_joint_frictions(
-    row_world: wp.array[wp.int32],
-    body_first_global: wp.array[wp.int32],
-    body_second_global: wp.array[wp.int32],
-    dof_index: wp.array[wp.int32],
-    sparse_first_index: wp.array[wp.int32],
-    sparse_second_index: wp.array[wp.int32],
-    sparse_jacobian_data: wp.array[vec6f],
-    friction_force: wp.array[wp.float32],
-    body_velocity_begin: wp.array[vec6f],
-    time_step: wp.array[wp.float32],
-    initialize: wp.bool,
-    jacobian_first: wp.array[vec6f],
-    jacobian_second: wp.array[vec6f],
-    impulse_bound: wp.array[wp.float32],
-    reaction: wp.array[wp.float32],
-    velocity: wp.array[wp.float32],
-):
-    row = wp.tid()
-    world = row_world[row]
-    first_jacobian = _load_sparse_jacobian_row(sparse_first_index[row], sparse_jacobian_data)
-    second_jacobian = _load_sparse_jacobian_row(sparse_second_index[row], sparse_jacobian_data)
-    bound = time_step[world] * friction_force[dof_index[row]]
-    jacobian_first[row] = first_jacobian
-    jacobian_second[row] = second_jacobian
-    impulse_bound[row] = bound
-    reaction[row] = wp.clamp(reaction[row], -bound, bound)
-    if initialize:
-        value = wp.float32(0.0)
-        first = body_first_global[row]
-        second = body_second_global[row]
-        if first >= 0:
-            value += wp.dot(first_jacobian, body_velocity_begin[first])
-        if second >= 0:
-            value += wp.dot(second_jacobian, body_velocity_begin[second])
-        velocity[row] = value
-
-
-@wp.kernel
-def _prepare_structural_rows(
-    body_first_global: wp.array[wp.int32],
-    body_second_global: wp.array[wp.int32],
-    sparse_first_index: wp.array[wp.int32],
-    sparse_second_index: wp.array[wp.int32],
-    sparse_jacobian_data: wp.array[vec6f],
-    inverse_mass: wp.array[wp.float32],
-    inverse_inertia_world: wp.array[wp.mat33f],
-    jacobian_first: wp.array[vec6f],
-    jacobian_second: wp.array[vec6f],
-    effective_mass: wp.array[wp.float32],
-):
-    row = wp.tid()
-    first_jacobian = _load_sparse_jacobian_row(sparse_first_index[row], sparse_jacobian_data)
-    second_jacobian = _load_sparse_jacobian_row(sparse_second_index[row], sparse_jacobian_data)
-    jacobian_first[row] = first_jacobian
-    jacobian_second[row] = second_jacobian
-
-    inverse_effective_mass = _inverse_mass_quadratic_form(
-        first_jacobian, body_first_global[row], inverse_mass, inverse_inertia_world
-    ) + _inverse_mass_quadratic_form(second_jacobian, body_second_global[row], inverse_mass, inverse_inertia_world)
-    effective_mass[row] = 1.0 / inverse_effective_mass if inverse_effective_mass > 1.0e-12 else 0.0
 
 
 @cache
@@ -677,258 +826,6 @@ def _include_dynamic_compliance_in_structural_effective_mass(
 
 
 @wp.kernel
-def _accumulate_constraint_incidence(
-    entity_world: wp.array[wp.int32],
-    entity_local: wp.array[wp.int32],
-    world_count: wp.array[wp.int32],
-    body_first: wp.array[wp.int32],
-    body_second: wp.array[wp.int32],
-    body_constraint_count: wp.array[wp.int32],
-    body_has_unilateral: wp.array[wp.int32],
-):
-    entity = wp.tid()
-    world = entity_world[entity]
-    if entity_local[entity] >= world_count[world]:
-        return
-    first = body_first[entity]
-    second = body_second[entity]
-    if first >= 0:
-        wp.atomic_add(body_constraint_count, first, 1)
-        wp.atomic_max(body_has_unilateral, first, 1)
-    if second >= 0 and second != first:
-        wp.atomic_add(body_constraint_count, second, 1)
-        wp.atomic_max(body_has_unilateral, second, 1)
-
-
-@wp.kernel
-def _clear_inactive_limits(
-    entity_world: wp.array[wp.int32],
-    entity_local: wp.array[wp.int32],
-    world_count: wp.array[wp.int32],
-    body_first: wp.array[wp.int32],
-    body_second: wp.array[wp.int32],
-    reaction: wp.array[wp.float32],
-    velocity: wp.array[wp.float32],
-):
-    limit = wp.tid()
-    if entity_local[limit] >= world_count[entity_world[limit]]:
-        body_first[limit] = -1
-        body_second[limit] = -1
-        reaction[limit] = 0.0
-        velocity[limit] = 0.0
-
-
-@wp.kernel
-def _clear_inactive_contacts(
-    entity_world: wp.array[wp.int32],
-    entity_local: wp.array[wp.int32],
-    world_count: wp.array[wp.int32],
-    body_first: wp.array[wp.int32],
-    body_second: wp.array[wp.int32],
-    reaction: wp.array[wp.vec3f],
-    velocity: wp.array[wp.vec3f],
-):
-    contact = wp.tid()
-    if entity_local[contact] >= world_count[entity_world[contact]]:
-        body_first[contact] = -1
-        body_second[contact] = -1
-        reaction[contact] = wp.vec3f(0.0)
-        velocity[contact] = wp.vec3f(0.0)
-
-
-@wp.kernel
-def _copy_clamped_world_counts(
-    source: wp.array[wp.int32],
-    capacity: wp.array[wp.int32],
-    destination: wp.array[wp.int32],
-):
-    world = wp.tid()
-    destination[world] = wp.min(wp.max(source[world], 0), capacity[world])
-
-
-@wp.kernel
-def _mark_worlds_with_unilaterals(
-    contact_count: wp.array[wp.int32],
-    limit_count: wp.array[wp.int32],
-    friction_count: wp.array[wp.int32],
-    world_has_unilateral: wp.array[wp.bool],
-):
-    world = wp.tid()
-    world_has_unilateral[world] = contact_count[world] > 0 or limit_count[world] > 0 or friction_count[world] > 0
-
-
-@wp.kernel
-def _prepare_limits(
-    source_active: wp.array[wp.int32],
-    source_capacity: wp.int32,
-    source_world: wp.array[wp.int32],
-    source_local: wp.array[wp.int32],
-    source_bodies: wp.array[wp.vec2i],
-    source_violation: wp.array[wp.float32],
-    source_reaction: wp.array[wp.float32],
-    body_velocity_begin: wp.array[vec6f],
-    world_capacity: wp.array[wp.int32],
-    world_offset: wp.array[wp.int32],
-    body_vector_index: wp.array[wp.int32],
-    sparse_jacobian_offsets: wp.array[wp.int32],
-    sparse_jacobian_data: wp.array[vec6f],
-    time_step: wp.array[wp.float32],
-    stabilization_fraction: wp.float32,
-    import_reactions: wp.bool,
-    body_first: wp.array[wp.int32],
-    body_second: wp.array[wp.int32],
-    jacobian_first: wp.array[vec6f],
-    jacobian_second: wp.array[vec6f],
-    bias: wp.array[wp.float32],
-    reaction: wp.array[wp.float32],
-    velocity: wp.array[wp.float32],
-):
-    source = wp.tid()
-    if source >= wp.min(source_active[0], source_capacity):
-        return
-    world = source_world[source]
-    local = source_local[source]
-    if world < 0 or world >= world_capacity.shape[0] or local < 0 or local >= world_capacity[world]:
-        return
-
-    destination = world_offset[world] + local
-    bodies = source_bodies[source]
-    first_global = bodies[0]
-    second_global = bodies[1]
-    first_dynamic = first_global >= 0 and body_vector_index[first_global] >= 0
-    second_dynamic = second_global >= 0 and body_vector_index[second_global] >= 0
-    if not first_dynamic and not second_dynamic:
-        body_first[destination] = -1
-        body_second[destination] = -1
-        jacobian_first[destination] = vec6f(0.0)
-        jacobian_second[destination] = vec6f(0.0)
-        bias[destination] = 0.0
-        reaction[destination] = 0.0
-        velocity[destination] = 0.0
-        return
-    sparse_offset = sparse_jacobian_offsets[source]
-    first_sparse_index = sparse_offset + 1 if first_global >= 0 else -1
-    first_jacobian = _load_sparse_jacobian_row(first_sparse_index, sparse_jacobian_data)
-    second_jacobian = _load_sparse_jacobian_row(sparse_offset, sparse_jacobian_data)
-    body_first[destination] = first_global
-    body_second[destination] = second_global
-    jacobian_first[destination] = first_jacobian
-    jacobian_second[destination] = second_jacobian
-    velocity_previous = wp.float32(0.0)
-    if first_global >= 0:
-        velocity_previous += wp.dot(first_jacobian, body_velocity_begin[first_global])
-    if second_global >= 0:
-        velocity_previous += wp.dot(second_jacobian, body_velocity_begin[second_global])
-    dt = time_step[world]
-    target = compute_limit_velocity_target(source_violation[source], dt, stabilization_fraction)
-    bias[destination] = -target
-    if import_reactions:
-        reaction[destination] = dt * source_reaction[source]
-        velocity[destination] = velocity_previous
-
-
-@wp.kernel
-def _prepare_contacts(
-    source_active: wp.array[wp.int32],
-    source_capacity: wp.int32,
-    source_world: wp.array[wp.int32],
-    source_local: wp.array[wp.int32],
-    source_bodies: wp.array[wp.vec2i],
-    source_position_a: wp.array[wp.vec3f],
-    source_position_b: wp.array[wp.vec3f],
-    source_frame: wp.array[wp.quatf],
-    source_gap: wp.array[wp.vec4f],
-    source_material: wp.array[wp.vec2f],
-    source_reaction: wp.array[wp.vec3f],
-    body_pose: wp.array[wp.transformf],
-    body_velocity_begin: wp.array[vec6f],
-    world_capacity: wp.array[wp.int32],
-    world_count: wp.array[wp.int32],
-    world_offset: wp.array[wp.int32],
-    body_vector_index: wp.array[wp.int32],
-    time_step: wp.array[wp.float32],
-    stabilization_fraction: wp.float32,
-    dead_zone: wp.float32,
-    impact_velocity_threshold: wp.float32,
-    recoverable_response: wp.bool,
-    import_reactions: wp.bool,
-    compact_contacts: wp.bool,
-    source_to_internal: wp.array[wp.int32],
-    body_first: wp.array[wp.int32],
-    body_second: wp.array[wp.int32],
-    jacobian_first: wp.array[mat36f],
-    jacobian_second: wp.array[mat36f],
-    bias: wp.array[wp.vec3f],
-    friction: wp.array[wp.float32],
-    reaction: wp.array[wp.vec3f],
-    velocity: wp.array[wp.vec3f],
-):
-    source = wp.tid()
-    if source >= wp.min(source_active[0], source_capacity):
-        return
-    world = source_world[source]
-    local = source_local[source]
-    if world < 0 or world >= world_capacity.shape[0] or local < 0 or local >= world_capacity[world]:
-        return
-
-    bodies = source_bodies[source]
-    first_global = bodies[0]
-    second_global = bodies[1]
-    first_dynamic = first_global >= 0 and body_vector_index[first_global] >= 0
-    second_dynamic = second_global >= 0 and body_vector_index[second_global] >= 0
-    if not first_dynamic and not second_dynamic:
-        source_to_internal[source] = -1
-        return
-    destination = source_to_internal[source]
-    if compact_contacts:
-        destination = world_offset[world] + wp.atomic_add(world_count, world, 1)
-        source_to_internal[source] = destination
-    first_jacobian = mat36f(0.0)
-    second_jacobian = mat36f(0.0)
-    rotation = wp.quat_to_matrix(source_frame[source])
-    body_position_b = wp.transform_get_translation(body_pose[second_global])
-    jacobian_transpose_b = contact_wrench_matrix_from_points(source_position_b[source], body_position_b) @ rotation
-    for component in range(3):
-        for dof in range(6):
-            second_jacobian[component, dof] = jacobian_transpose_b[dof, component]
-    if first_global >= 0:
-        body_position_a = wp.transform_get_translation(body_pose[first_global])
-        jacobian_transpose_a = -contact_wrench_matrix_from_points(source_position_a[source], body_position_a) @ rotation
-        for component in range(3):
-            for dof in range(6):
-                first_jacobian[component, dof] = jacobian_transpose_a[dof, component]
-
-    velocity_previous = wp.vec3f(0.0)
-    if first_global >= 0:
-        velocity_previous += first_jacobian @ body_velocity_begin[first_global]
-    if second_global >= 0:
-        velocity_previous += second_jacobian @ body_velocity_begin[second_global]
-    gap = source_gap[source]
-    material = source_material[source]
-    dt = time_step[world]
-    target = compute_contact_velocity_target(
-        gap[3],
-        velocity_previous[2],
-        material[1],
-        dt,
-        stabilization_fraction,
-        dead_zone,
-        impact_velocity_threshold,
-        recoverable_response,
-    )
-
-    body_first[destination] = first_global
-    body_second[destination] = second_global
-    jacobian_first[destination] = first_jacobian
-    jacobian_second[destination] = second_jacobian
-    bias[destination] = wp.vec3f(0.0, 0.0, -target)
-    friction[destination] = material[0]
-    if import_reactions:
-        reaction[destination] = dt * source_reaction[source]
-        velocity[destination] = velocity_previous
-
-
-@wp.kernel
 def _reset_structural_multipliers_masked(
     row_world: wp.array[wp.int32],
     world_mask: wp.array[wp.bool],
@@ -998,127 +895,6 @@ def _scale_structural_reactions(
 ):
     row = wp.tid()
     reaction[row] *= scale
-
-
-@wp.kernel
-def _write_dynamic_outputs(
-    inverse_time_step: wp.array[wp.float32],
-    row_world: wp.array[wp.int32],
-    multiplier_index: wp.array[wp.int32],
-    body_first: wp.array[wp.int32],
-    body_second: wp.array[wp.int32],
-    jacobian_first: wp.array[vec6f],
-    jacobian_second: wp.array[vec6f],
-    effective_inertia: wp.array[wp.float32],
-    free_velocity: wp.array[wp.float32],
-    body_velocity: wp.array[vec6f],
-    destination: wp.array[wp.float32],
-    destination_wrench: wp.array[vec6f],
-):
-    row = wp.tid()
-    velocity = wp.float32(0.0)
-    first = body_first[row]
-    second = body_second[row]
-    if first >= 0:
-        velocity += wp.dot(jacobian_first[row], body_velocity[first])
-    if second >= 0:
-        velocity += wp.dot(jacobian_second[row], body_velocity[second])
-    force = inverse_time_step[row_world[row]] * effective_inertia[row] * (free_velocity[row] - velocity)
-    destination[multiplier_index[row]] = force
-    if first >= 0:
-        wp.atomic_add(destination_wrench, first, force * jacobian_first[row])
-    if second >= 0:
-        wp.atomic_add(destination_wrench, second, force * jacobian_second[row])
-
-
-@wp.kernel
-def _write_dynamic_outputs_with_effort(
-    inverse_time_step: wp.array[wp.float32],
-    row_world: wp.array[wp.int32],
-    multiplier_index: wp.array[wp.int32],
-    effort_index: wp.array[wp.int32],
-    body_first: wp.array[wp.int32],
-    body_second: wp.array[wp.int32],
-    jacobian_first: wp.array[vec6f],
-    jacobian_second: wp.array[vec6f],
-    effective_inertia: wp.array[wp.float32],
-    free_velocity: wp.array[wp.float32],
-    effort_counter_applied: wp.array[wp.float32],
-    effort_net_applied: wp.array[wp.float32],
-    effort_value_index: wp.array[wp.int32],
-    body_velocity: wp.array[vec6f],
-    destination: wp.array[wp.float32],
-    effort_destination: wp.array[wp.float32],
-    destination_wrench: wp.array[vec6f],
-):
-    row = wp.tid()
-    velocity = wp.float32(0.0)
-    first = body_first[row]
-    second = body_second[row]
-    if first >= 0:
-        velocity += wp.dot(jacobian_first[row], body_velocity[first])
-    if second >= 0:
-        velocity += wp.dot(jacobian_second[row], body_velocity[second])
-    inv_dt = inverse_time_step[row_world[row]]
-    multiplier = inv_dt * effective_inertia[row] * (free_velocity[row] - velocity)
-    bounded = effort_index[row]
-    if bounded >= 0:
-        multiplier += inv_dt * effort_counter_applied[bounded]
-        effort_destination[effort_value_index[bounded]] = inv_dt * effort_net_applied[bounded]
-    destination_index = multiplier_index[row]
-    if destination_index >= 0:
-        destination[destination_index] = multiplier
-    elif bounded >= 0:
-        multiplier = inv_dt * effort_net_applied[bounded]
-    else:
-        return
-    if first >= 0:
-        wp.atomic_add(destination_wrench, first, multiplier * jacobian_first[row])
-    if second >= 0:
-        wp.atomic_add(destination_wrench, second, multiplier * jacobian_second[row])
-
-
-@wp.kernel
-def _write_friction_outputs(
-    inverse_time_step: wp.array[wp.float32],
-    row_world: wp.array[wp.int32],
-    multiplier_index: wp.array[wp.int32],
-    body_first: wp.array[wp.int32],
-    body_second: wp.array[wp.int32],
-    jacobian_first: wp.array[vec6f],
-    jacobian_second: wp.array[vec6f],
-    source: wp.array[wp.float32],
-    destination: wp.array[wp.float32],
-    destination_wrench: wp.array[vec6f],
-):
-    row = wp.tid()
-    force = inverse_time_step[row_world[row]] * source[row]
-    destination[multiplier_index[row]] = force
-    first = body_first[row]
-    second = body_second[row]
-    if first >= 0:
-        wp.atomic_add(destination_wrench, first, force * jacobian_first[row])
-    if second >= 0:
-        wp.atomic_add(destination_wrench, second, force * jacobian_second[row])
-
-
-@wp.kernel
-def _accumulate_aligned_joint_wrenches(
-    body_first: wp.array[wp.int32],
-    body_second: wp.array[wp.int32],
-    jacobian_first: wp.array[vec6f],
-    jacobian_second: wp.array[vec6f],
-    reaction: wp.array[wp.float32],
-    destination: wp.array[vec6f],
-):
-    row = wp.tid()
-    scale = reaction[row]
-    first = body_first[row]
-    second = body_second[row]
-    if first >= 0:
-        wp.atomic_add(destination, first, scale * jacobian_first[row])
-    if second >= 0:
-        wp.atomic_add(destination, second, scale * jacobian_second[row])
 
 
 @wp.kernel
@@ -1218,82 +994,3 @@ def _reduce_structural_candidate_residual(
     if not first_dynamic and not second_dynamic:
         return
     wp.atomic_max(world_residual, world, wp.abs(candidate_residual[row]) / structural_tolerance)
-
-
-@wp.kernel
-def _write_limit_outputs(
-    source_active: wp.array[wp.int32],
-    source_capacity: wp.int32,
-    source_world: wp.array[wp.int32],
-    source_local: wp.array[wp.int32],
-    world_capacity: wp.array[wp.int32],
-    world_offset: wp.array[wp.int32],
-    inverse_time_step: wp.array[wp.float32],
-    body_first: wp.array[wp.int32],
-    body_second: wp.array[wp.int32],
-    jacobian_first: wp.array[vec6f],
-    jacobian_second: wp.array[vec6f],
-    reaction: wp.array[wp.float32],
-    velocity: wp.array[wp.float32],
-    destination_reaction: wp.array[wp.float32],
-    destination_velocity: wp.array[wp.float32],
-    destination_wrench: wp.array[vec6f],
-):
-    source = wp.tid()
-    if source >= wp.min(source_active[0], source_capacity):
-        return
-    world = source_world[source]
-    local = source_local[source]
-    if world < 0 or world >= world_capacity.shape[0] or local < 0 or local >= world_capacity[world]:
-        return
-    internal = world_offset[world] + local
-    force = inverse_time_step[world] * reaction[internal]
-    destination_reaction[source] = force
-    destination_velocity[source] = velocity[internal]
-    first = body_first[internal]
-    second = body_second[internal]
-    if first >= 0:
-        wp.atomic_add(destination_wrench, first, force * jacobian_first[internal])
-    if second >= 0:
-        wp.atomic_add(destination_wrench, second, force * jacobian_second[internal])
-
-
-@wp.kernel
-def _write_contact_outputs(
-    source_active: wp.array[wp.int32],
-    source_capacity: wp.int32,
-    source_world: wp.array[wp.int32],
-    source_to_internal: wp.array[wp.int32],
-    inverse_time_step: wp.array[wp.float32],
-    body_first: wp.array[wp.int32],
-    body_second: wp.array[wp.int32],
-    jacobian_first: wp.array[mat36f],
-    jacobian_second: wp.array[mat36f],
-    reaction: wp.array[wp.vec3f],
-    velocity: wp.array[wp.vec3f],
-    destination_reaction: wp.array[wp.vec3f],
-    destination_velocity: wp.array[wp.vec3f],
-    destination_mode: wp.array[wp.int32],
-    destination_wrench: wp.array[vec6f],
-):
-    source = wp.tid()
-    if source >= wp.min(source_active[0], source_capacity):
-        return
-    internal = source_to_internal[source]
-    if internal < 0:
-        zero_velocity = wp.vec3f(0.0)
-        destination_reaction[source] = wp.vec3f(0.0)
-        destination_velocity[source] = zero_velocity
-        destination_mode[source] = wp.static(ContactMode.make_compute_mode_func())(zero_velocity)
-        return
-    world = source_world[source]
-    force = inverse_time_step[world] * reaction[internal]
-    destination_reaction[source] = force
-    destination_velocity[source] = velocity[internal]
-    destination_mode[source] = wp.static(ContactMode.make_compute_mode_func())(velocity[internal])
-    first = body_first[internal]
-    second = body_second[internal]
-    if first >= 0:
-        wp.atomic_add(destination_wrench, first, wp.transpose(jacobian_first[internal]) @ force)
-    if second >= 0:
-        wp.atomic_add(destination_wrench, second, wp.transpose(jacobian_second[internal]) @ force)

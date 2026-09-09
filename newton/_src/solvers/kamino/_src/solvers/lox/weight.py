@@ -16,29 +16,17 @@ import warp as wp
 from ...core.types import mat66f
 
 __all__ = [
-    "BODY_WEIGHT_BETA_DEFAULT",
-    "BODY_WEIGHT_SIGMA_DEFAULT",
     "BODY_WEIGHT_STATUS_INVALID",
-    "BODY_WEIGHT_STATUS_REGULARIZED",
     "BODY_WEIGHT_STATUS_VALID",
     "BodyWeightResult",
     "compute_body_weight_mass_proportional",
 ]
 
-BODY_WEIGHT_SIGMA_DEFAULT = 1.0e-3
-"""Default lower spectral fraction from Daviet (2020)."""
-
-BODY_WEIGHT_BETA_DEFAULT = 4.0
-"""Default normalized smooth-weight transition threshold."""
-
 BODY_WEIGHT_STATUS_INVALID = 0
 """The input contained a non-finite value or an invalid policy parameter."""
 
 BODY_WEIGHT_STATUS_VALID = 1
-"""The input was finite and required no spectral regularization."""
-
-BODY_WEIGHT_STATUS_REGULARIZED = 2
-"""At least one finite mass, inertia, symmetry, or smooth eigenvalue was floored."""
+"""The input yielded a usable weight, including any numerical regularization."""
 
 wp.set_module_options({"enable_backward": False})
 
@@ -71,24 +59,6 @@ def _make_invalid_body_weight_result() -> BodyWeightResult:
 
 
 @wp.func
-def _is_finite_mat33(value: wp.mat33f) -> wp.bool:
-    finite = wp.bool(True)
-    for row in range(3):
-        for col in range(3):
-            finite = finite and wp.isfinite(value[row, col])
-    return finite
-
-
-@wp.func
-def _is_finite_mat66(value: mat66f) -> wp.bool:
-    finite = wp.bool(True)
-    for row in range(6):
-        for col in range(6):
-            finite = finite and wp.isfinite(value[row, col])
-    return finite
-
-
-@wp.func
 def _symmetrize_mat33(value: wp.mat33f) -> wp.mat33f:
     return 0.5 * (value + wp.transpose(value))
 
@@ -96,28 +66,6 @@ def _symmetrize_mat33(value: wp.mat33f) -> wp.mat33f:
 @wp.func
 def _symmetrize_mat66(value: mat66f) -> mat66f:
     return 0.5 * (value + wp.transpose(value))
-
-
-@wp.func
-def _requires_symmetry_regularization_mat33(value: wp.mat33f, tolerance: wp.float32) -> wp.bool:
-    scale = wp.float32(1.0)
-    asymmetry = wp.float32(0.0)
-    for row in range(3):
-        for col in range(3):
-            scale = wp.max(scale, wp.abs(value[row, col]))
-            asymmetry = wp.max(asymmetry, wp.abs(value[row, col] - value[col, row]))
-    return asymmetry > tolerance * scale
-
-
-@wp.func
-def _requires_symmetry_regularization_mat66(value: mat66f, tolerance: wp.float32) -> wp.bool:
-    scale = wp.float32(1.0)
-    asymmetry = wp.float32(0.0)
-    for row in range(6):
-        for col in range(6):
-            scale = wp.max(scale, wp.abs(value[row, col]))
-            asymmetry = wp.max(asymmetry, wp.abs(value[row, col] - value[col, row]))
-    return asymmetry > tolerance * scale
 
 
 @wp.func
@@ -170,10 +118,7 @@ def _compute_symmetric_eigenvalue_min_fixed(matrix: mat66f) -> wp.float32:
             first += 1
         sweep += 1
 
-    eigenvalue_min = diagonalized[0, 0]
-    for index in range(1, 6):
-        eigenvalue_min = wp.min(eigenvalue_min, diagonalized[index, index])
-    return eigenvalue_min
+    return wp.min(wp.get_diag(diagonalized))
 
 
 @wp.func
@@ -181,12 +126,11 @@ def compute_body_weight_mass_proportional(
     smooth_diagonal: mat66f,
     mass: wp.float32,
     inertia_world: wp.mat33f,
-    sigma: wp.float32 = BODY_WEIGHT_SIGMA_DEFAULT,
-    beta: wp.float32 = BODY_WEIGHT_BETA_DEFAULT,
+    sigma: wp.float32,
+    beta: wp.float32,
     mass_floor: wp.float32 = 1.0e-8,
     inertia_floor: wp.float32 = 1.0e-10,
     eta_floor: wp.float32 = 1.0e-6,
-    symmetry_tolerance: wp.float32 = 1.0e-5,
 ) -> BodyWeightResult:
     """Compute a mass-proportional rigid-body weight and its inverse.
 
@@ -198,10 +142,9 @@ def compute_body_weight_mass_proportional(
 
     Finite asymmetric matrices are symmetrized. Positive mass below
     ``mass_floor``, inertia eigenvalues below ``inertia_floor``, and normalized
-    smooth eigenvalues below ``eta_floor`` are clamped and reported with
-    ``BODY_WEIGHT_STATUS_REGULARIZED``. Non-finite input, nonpositive mass, or
-    invalid policy parameters return ``BODY_WEIGHT_STATUS_INVALID`` and zero
-    matrices.
+    smooth eigenvalues below ``eta_floor`` are clamped. Non-finite input,
+    nonpositive mass, or invalid policy parameters return
+    ``BODY_WEIGHT_STATUS_INVALID`` and zero matrices.
 
     Args:
         smooth_diagonal: Symmetric ``6 x 6`` body block ``A_ii`` in
@@ -215,22 +158,19 @@ def compute_body_weight_mass_proportional(
         mass_floor: Minimum accepted positive mass [kg].
         inertia_floor: Minimum principal moment [kg m^2].
         eta_floor: Minimum dimensionless normalized smooth eigenvalue.
-        symmetry_tolerance: Relative tolerance before symmetrization is
-            reported as regularization.
 
     Returns:
         The weight, inverse weight, spectral values, and validation status.
     """
     if (
         not wp.isfinite(mass)
-        or not _is_finite_mat33(inertia_world)
-        or not _is_finite_mat66(smooth_diagonal)
+        or not wp.isfinite(inertia_world)
+        or not wp.isfinite(smooth_diagonal)
         or not wp.isfinite(sigma)
         or not wp.isfinite(beta)
         or not wp.isfinite(mass_floor)
         or not wp.isfinite(inertia_floor)
         or not wp.isfinite(eta_floor)
-        or not wp.isfinite(symmetry_tolerance)
         or mass <= 0.0
         or sigma <= 0.0
         or sigma > 1.0
@@ -238,34 +178,20 @@ def compute_body_weight_mass_proportional(
         or mass_floor <= 0.0
         or inertia_floor <= 0.0
         or eta_floor <= 0.0
-        or symmetry_tolerance < 0.0
     ):
         return _make_invalid_body_weight_result()
 
-    status = wp.int32(BODY_WEIGHT_STATUS_VALID)
     regularized_mass = mass
     if regularized_mass < mass_floor:
         regularized_mass = mass_floor
-        status = BODY_WEIGHT_STATUS_REGULARIZED
 
-    if _requires_symmetry_regularization_mat33(inertia_world, symmetry_tolerance):
-        status = BODY_WEIGHT_STATUS_REGULARIZED
-    if _requires_symmetry_regularization_mat66(smooth_diagonal, symmetry_tolerance):
-        status = BODY_WEIGHT_STATUS_REGULARIZED
     symmetric_inertia = _symmetrize_mat33(inertia_world)
     symmetric_smooth = _symmetrize_mat66(smooth_diagonal)
 
     inertia_axes, inertia_eigenvalues = wp.eig3(symmetric_inertia)
-    regularized_inertia_eigenvalues = inertia_eigenvalues
-    for index in range(3):
-        if not wp.isfinite(regularized_inertia_eigenvalues[index]):
-            return _make_invalid_body_weight_result()
-        for row in range(3):
-            if not wp.isfinite(inertia_axes[row, index]):
-                return _make_invalid_body_weight_result()
-        if regularized_inertia_eigenvalues[index] < inertia_floor:
-            regularized_inertia_eigenvalues[index] = inertia_floor
-            status = BODY_WEIGHT_STATUS_REGULARIZED
+    if not wp.isfinite(inertia_eigenvalues) or not wp.isfinite(inertia_axes):
+        return _make_invalid_body_weight_result()
+    regularized_inertia_eigenvalues = wp.max(inertia_eigenvalues, wp.vec3f(inertia_floor))
 
     regularized_inertia = wp.mat33f(0.0)
     inverse_inertia = wp.mat33f(0.0)
@@ -294,7 +220,6 @@ def compute_body_weight_mass_proportional(
         return _make_invalid_body_weight_result()
     if eta < eta_floor:
         eta = eta_floor
-        status = BODY_WEIGHT_STATUS_REGULARIZED
 
     alpha = wp.max(sigma * eta, wp.min(beta, eta))
     if not wp.isfinite(alpha) or alpha <= 0.0:
@@ -315,5 +240,5 @@ def compute_body_weight_mass_proportional(
     result.inverse_weight = inverse_weight
     result.eta = eta
     result.alpha = alpha
-    result.status = status
+    result.status = BODY_WEIGHT_STATUS_VALID
     return result

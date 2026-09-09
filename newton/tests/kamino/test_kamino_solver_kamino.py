@@ -890,8 +890,8 @@ class TestSolverKaminoImpl(unittest.TestCase):
     def test_joint_penalty_scale_seed(self):
         """Seed each world's LOX joint penalty from its structural spectrum."""
         builder = newton.ModelBuilder()
-        builder.add_builder(build_box_on_plane(ground=False))
-        builder.add_builder(build_boxes_hinged(ground=False))
+        builder.add_world(build_box_on_plane(ground=False))
+        builder.add_world(build_boxes_hinged(ground=False))
         model = ModelKamino.from_newton(builder.finalize(device=self.default_device))
         config = SolverKaminoImpl.Config(dynamics_solver="lox")
         config.lox.joint_penalty_scale = 123.0
