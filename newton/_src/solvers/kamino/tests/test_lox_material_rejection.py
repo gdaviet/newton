@@ -24,7 +24,7 @@ class TestLOXMaterialRejection(unittest.TestCase):
             setup_tests()
         cls.device = test_context.device
 
-    def test_material_failure_preserves_coupled_rigid_warm_start(self):
+    def test_material_failure_discards_coupled_rigid_warm_start(self):
         """Reject material failure without retaining coupled rigid trial state."""
         model, shapes, _ = build_contact_model(device=self.device, collider="dynamic")
         config = newton.solvers.SolverKamino.Config(dynamics_solver="lox", use_collision_detector=False)
@@ -40,15 +40,15 @@ class TestLOXMaterialRejection(unittest.TestCase):
         impulse[0] = (0.02, -0.01, 0.03)
         state_in.particle_lox_dual_impulse = wp.array(impulse, dtype=wp.vec3, device=self.device)
         contacts = _make_particle_contact(model, state_in, shapes[0], gap=-0.005)
-        baseline = {}
         original_prepare = lox._prepare_body_space_projection
 
-        def capture_prepared():
+        def seed_prepared_warm_start():
             original_prepare()
-            for name in ("splitting_dual_impulse", "splitting_dual", "projected_twist"):
-                baseline[name] = getattr(lox.splitting, name).numpy().copy()
+            # Seed after step-start initialization, which may clear warm starts.
+            for name in ("splitting_dual_impulse", "splitting_dual"):
+                getattr(lox.splitting, name).assign(np.full((model.body_count, 6), 0.02, dtype=np.float32))
 
-        lox._prepare_body_space_projection = capture_prepared
+        lox._prepare_body_space_projection = seed_prepared_warm_start
         original_update = lox.deformable_system.update_proximal
         calls = 0
 
@@ -68,8 +68,19 @@ class TestLOXMaterialRejection(unittest.TestCase):
         np.testing.assert_array_equal(state_out.particle_q.numpy(), state_in.particle_q.numpy())
         np.testing.assert_array_equal(state_out.particle_qd.numpy(), velocity)
         np.testing.assert_array_equal(state_out.particle_lox_dual_impulse.numpy(), impulse)
-        for name, expected in baseline.items():
-            np.testing.assert_allclose(getattr(lox.splitting, name).numpy(), expected, atol=1e-6, rtol=1e-6)
+        for name in ("splitting_dual_impulse", "splitting_dual"):
+            np.testing.assert_array_equal(getattr(lox.splitting, name).numpy(), 0.0)
+        np.testing.assert_array_equal(
+            lox.splitting.projected_twist.numpy(), lox.rigid_adapter.body_velocity_begin.numpy()
+        )
+        np.testing.assert_array_equal(state_out.body_qd.numpy(), state_in.body_qd.numpy())
+
+        # The discarded trial must not poison a subsequent healthy step.
+        lox._prepare_body_space_projection = original_prepare
+        lox.deformable_system.update_proximal = original_update
+        solver.step(model.state(), state_out, None, None, 0.01)
+        self.assertFalse(bool(lox.world_failed.numpy()[0]))
+        self.assertTrue(np.isfinite(state_out.body_qd.numpy()).all())
 
     def test_assembly_failure_survives_proximal_resets(self):
         """Keep an assembly rejection terminal with both enabled and disabled proxes."""

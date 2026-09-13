@@ -32,6 +32,7 @@ from .deformable_assembly import (
     select_consensus_weight,
     set_particle_linearization,
 )
+from .deformable_cudss import DeformableCuDSS
 from .deformable_direct import DeformableBlockLLT
 from .deformable_energy import mat99
 from .deformable_jacobi import DeformableJacobi
@@ -58,6 +59,7 @@ _PARTICLE_FLAG_ACTIVE = 1
 _PARTICLE_FLAG_PROXY = 2
 _RECYCLED_CR_DIRECTION_COUNT = 4
 _RECYCLED_CR_REDUCTION_COUNT = 3 + 2 * _RECYCLED_CR_DIRECTION_COUNT
+_RECYCLED_CR_PROJECTION_REDUCTION_COUNT = 2
 _SYSTEM_MATVEC_BLOCK_DIM = 64
 
 
@@ -78,6 +80,8 @@ class _RecyclingCR(wpl.CR):
         reductions: wp.array,
         orthogonalization: wp.array,
         projection: wp.array,
+        projection_reductions: wp.array,
+        projection_accepted: wp.array,
         packed_component: wp.array,
         packed_world: wp.array,
         packed_iterative: wp.array,
@@ -95,6 +99,8 @@ class _RecyclingCR(wpl.CR):
         self._recycled_reductions = reductions
         self._recycled_orthogonalization = orthogonalization
         self._recycled_projection = projection
+        self._recycled_projection_reductions = projection_reductions
+        self._recycled_projection_accepted = projection_accepted
         self._packed_component = packed_component
         self._packed_world = packed_world
         self._packed_iterative = packed_iterative
@@ -152,6 +158,7 @@ class _RecyclingCR(wpl.CR):
             outputs=[self._recycled_orthogonalization, self._recycled_projection],
             device=self._device,
         )
+        self._recycled_projection_reductions.zero_()
         wp.launch(
             _apply_recycled_cr_basis,
             dim=x.shape[0],
@@ -170,7 +177,45 @@ class _RecyclingCR(wpl.CR):
                 self._world_active,
                 self._recycling_started,
             ],
-            outputs=[x, r, self._previous_velocity, self._previous_matrix_velocity],
+            outputs=[
+                x,
+                r,
+                self._previous_velocity,
+                self._previous_matrix_velocity,
+                self._recycled_projection_reductions,
+            ],
+            device=self._device,
+        )
+        wp.launch(
+            _validate_and_restart_recycled_cr_projection,
+            dim=batch_offsets.shape[0] - 1,
+            inputs=[
+                self._recycled_projection_reductions,
+                self._recycling_started,
+            ],
+            outputs=[
+                self._recycled_basis_denominator,
+                self._recycled_orthogonalization,
+                self._recycled_projection,
+                self._recycled_projection_accepted,
+            ],
+            device=self._device,
+        )
+        wp.launch(
+            _rollback_unsafe_recycled_cr_projection,
+            dim=x.shape[0],
+            inputs=[
+                b,
+                self._previous_velocity,
+                self._previous_matrix_velocity,
+                self._packed_component,
+                self._packed_world,
+                self._packed_iterative,
+                self._world_active,
+                self._recycling_started,
+                self._recycled_projection_accepted,
+            ],
+            outputs=[x, r],
             device=self._device,
         )
         self._y_and_Ap_buf.zero_()
@@ -317,6 +362,19 @@ def _reduce_recycled_cr_basis(
         wp.atomic_add(reductions, 2, component, wp.dot(raw_direction - previous_correction, raw_direction))
 
 
+@wp.func
+def _restart_recycled_cr_component(
+    component: wp.int32,
+    basis_denominator: wp.array2d[wp.float32],
+    orthogonalization: wp.array2d[wp.float32],
+    projection: wp.array2d[wp.float32],
+):
+    for slot in range(_RECYCLED_CR_DIRECTION_COUNT):
+        basis_denominator[slot, component] = 0.0
+        orthogonalization[slot, component] = 0.0
+        projection[slot, component] = 0.0
+
+
 @wp.kernel
 def _compute_recycled_cr_coefficients(
     reductions: wp.array2d[wp.float32],
@@ -349,10 +407,7 @@ def _compute_recycled_cr_coefficients(
     restart_dot = reductions[2, component]
     restart = not wp.isfinite(restart_dot) or restart_dot <= 0.0
     if restart:
-        for slot in range(_RECYCLED_CR_DIRECTION_COUNT):
-            basis_denominator[slot, component] = 0.0
-            orthogonalization[slot, component] = 0.0
-            projection[slot, component] = 0.0
+        _restart_recycled_cr_component(component, basis_denominator, orthogonalization, projection)
     elif new_denominator > minimum_denominator:
         coefficient = new_numerator / new_denominator
         if wp.isfinite(coefficient):
@@ -379,12 +434,14 @@ def _apply_recycled_cr_basis(
     residual: wp.array[wp.vec3],
     previous_velocity: wp.array[wp.vec3],
     previous_matrix_velocity: wp.array[wp.vec3],
+    projection_reductions: wp.array2d[wp.float32],
 ):
     particle = wp.tid()
     if packed_iterative[particle] != 0 and world_active[packed_world[particle]] != 0:
         component = packed_component[particle]
         current_velocity = velocity[particle]
-        current_matrix_velocity = right_hand_side[particle] - residual[particle]
+        particle_residual = residual[particle]
+        current_matrix_velocity = right_hand_side[particle] - particle_residual
         raw_direction = current_velocity - previous_velocity[particle]
         raw_matrix_direction = current_matrix_velocity - previous_matrix_velocity[particle]
         previous_velocity[particle] = current_velocity
@@ -413,6 +470,62 @@ def _apply_recycled_cr_basis(
             matrix_basis[replacement_slot, particle] = new_matrix_direction
             velocity[particle] = current_velocity + correction
             residual[particle] -= matrix_correction
+            wp.atomic_add(projection_reductions, 0, component, wp.dot(particle_residual, correction))
+            wp.atomic_add(projection_reductions, 1, component, wp.dot(correction, matrix_correction))
+
+
+@wp.kernel
+def _validate_and_restart_recycled_cr_projection(
+    projection_reductions: wp.array2d[wp.float32],
+    recycling_started: wp.array[wp.int32],
+    basis_denominator: wp.array2d[wp.float32],
+    orthogonalization: wp.array2d[wp.float32],
+    projection: wp.array2d[wp.float32],
+    projection_accepted: wp.array[wp.int32],
+):
+    """Reject a recycled projection that increases the linear quadratic."""
+    component = wp.tid()
+    accepted = wp.int32(1)
+    if recycling_started[0] != 0:
+        residual_dot_correction = projection_reductions[0, component]
+        correction_energy = projection_reductions[1, component]
+        scale = wp.max(wp.abs(residual_dot_correction), wp.abs(correction_energy))
+        tolerance = wp.max(1.0e-5 * scale, 1.0e-30)
+        accepted = wp.int32(
+            wp.isfinite(residual_dot_correction)
+            and wp.isfinite(correction_energy)
+            and correction_energy >= -tolerance
+            and residual_dot_correction + tolerance >= 0.5 * correction_energy
+        )
+        if accepted == 0:
+            _restart_recycled_cr_component(component, basis_denominator, orthogonalization, projection)
+    projection_accepted[component] = accepted
+
+
+@wp.kernel
+def _rollback_unsafe_recycled_cr_projection(
+    right_hand_side: wp.array[wp.vec3],
+    previous_velocity: wp.array[wp.vec3],
+    previous_matrix_velocity: wp.array[wp.vec3],
+    packed_component: wp.array[wp.int32],
+    packed_world: wp.array[wp.int32],
+    packed_iterative: wp.array[wp.int32],
+    world_active: wp.array[wp.int32],
+    recycling_started: wp.array[wp.int32],
+    projection_accepted: wp.array[wp.int32],
+    velocity: wp.array[wp.vec3],
+    residual: wp.array[wp.vec3],
+):
+    particle = wp.tid()
+    component = packed_component[particle]
+    if (
+        recycling_started[0] != 0
+        and packed_iterative[particle] != 0
+        and world_active[packed_world[particle]] != 0
+        and projection_accepted[component] == 0
+    ):
+        velocity[particle] = previous_velocity[particle]
+        residual[particle] = right_hand_side[particle] - previous_matrix_velocity[particle]
 
 
 @wp.kernel
@@ -686,6 +799,7 @@ class DeformableFEMSystem:
         preconditioner: str = "two_level",
         preconditioner_regularization: float = 1.0e-6,
         direct_max_particles: int = 0,
+        linear_solver: str = "cr",
         proximal_iterations: int = 4,
         proximal_relaxation: float = 1.0,
         recycle_cr: bool = False,
@@ -700,6 +814,7 @@ class DeformableFEMSystem:
             preconditioner: Deformable preconditioner type.
             preconditioner_regularization: Relative incomplete-factor pivot floor.
             direct_max_particles: Largest component solved with blocked Cholesky.
+            linear_solver: Deformable global linear solver type.
             proximal_iterations: Fixed local Gauss-Newton iterations per elastic element prox.
             proximal_relaxation: Relaxation factor for the local multiplier update.
             recycle_cr: Whether to augment CR with recent candidate-solve corrections.
@@ -726,6 +841,10 @@ class DeformableFEMSystem:
             raise ValueError(
                 f"LOX deformable direct-solve particle limit must be a non-negative integer, got {direct_max_particles}."
             )
+        if linear_solver not in ("cr", "cudss", "cudss_then_cr"):
+            raise ValueError(
+                f"LOX deformable linear solver must be 'cr', 'cudss', or 'cudss_then_cr', got {linear_solver!r}."
+            )
         if not isinstance(proximal_iterations, int) or isinstance(proximal_iterations, bool) or proximal_iterations < 0:
             raise ValueError(
                 f"LOX deformable proximal iterations must be a non-negative integer, got {proximal_iterations}."
@@ -743,6 +862,7 @@ class DeformableFEMSystem:
         self.weight_sigma = float(weight_sigma)
         self.weight_beta = float(weight_beta)
         self.recycle_cr = recycle_cr
+        self.linear_solver = linear_solver
         particle_source_world = model.particle_world.numpy().astype(np.int32, copy=False)
         particle_solve_world = _particle_solve_worlds(model, particle_source_world)
         triangle_indices_np = (
@@ -772,9 +892,14 @@ class DeformableFEMSystem:
         )
         component_count = int(np.max(particle_component)) + 1
         component_particle_counts_np = np.bincount(particle_component, minlength=component_count).astype(np.int32)
-        component_direct_np = component_particle_counts_np <= direct_max_particles
-        if direct_max_particles == 0:
-            component_direct_np[:] = False
+        if linear_solver == "cudss":
+            component_direct_np = np.ones(component_count, dtype=bool)
+        elif linear_solver == "cudss_then_cr":
+            component_direct_np = np.zeros(component_count, dtype=bool)
+        else:
+            component_direct_np = component_particle_counts_np <= direct_max_particles
+            if direct_max_particles == 0:
+                component_direct_np[:] = False
         has_direct_components = bool(np.any(component_direct_np))
         self.has_iterative_components = bool(np.any(~component_direct_np))
 
@@ -970,6 +1095,16 @@ class DeformableFEMSystem:
                 device=self.device,
             )
             self.recycled_projection = wp.zeros_like(self.recycled_orthogonalization)
+            self.recycled_projection_reductions = wp.zeros(
+                (_RECYCLED_CR_PROJECTION_REDUCTION_COUNT, component_count),
+                dtype=wp.float32,
+                device=self.device,
+            )
+            self.recycled_projection_accepted = wp.ones(
+                component_count,
+                dtype=wp.int32,
+                device=self.device,
+            )
         else:
             self.recycled_previous_velocity = None
             self.recycled_previous_matrix_velocity = None
@@ -982,8 +1117,21 @@ class DeformableFEMSystem:
             self.recycled_reductions = None
             self.recycled_orthogonalization = None
             self.recycled_projection = None
-        self.direct_solver = (
-            DeformableBlockLLT(
+            self.recycled_projection_reductions = None
+            self.recycled_projection_accepted = None
+        self.cudss_solver = (
+            DeformableCuDSS(
+                self.system_matrix,
+                self.topology.packed_solve_world,
+                self.world_active,
+            )
+            if linear_solver in ("cudss", "cudss_then_cr")
+            else None
+        )
+        if linear_solver == "cudss":
+            self.direct_solver = self.cudss_solver
+        elif has_direct_components:
+            self.direct_solver = DeformableBlockLLT(
                 self.system_matrix,
                 packed_component_np,
                 packed_iterative_np,
@@ -991,9 +1139,8 @@ class DeformableFEMSystem:
                 self.world_active,
                 component_count,
             )
-            if has_direct_components
-            else None
-        )
+        else:
+            self.direct_solver = None
         if self.has_iterative_components and preconditioner == "incomplete_ldlt":
             self.preconditioner = DeformableIncompleteLDLT(
                 self.preconditioner_matrix,
@@ -1042,6 +1189,8 @@ class DeformableFEMSystem:
             assert self.recycled_reductions is not None
             assert self.recycled_orthogonalization is not None
             assert self.recycled_projection is not None
+            assert self.recycled_projection_reductions is not None
+            assert self.recycled_projection_accepted is not None
             self.cr_state = _RecyclingCR(
                 self.system_operator,
                 self.candidate_rhs,
@@ -1063,6 +1212,8 @@ class DeformableFEMSystem:
                 reductions=self.recycled_reductions,
                 orthogonalization=self.recycled_orthogonalization,
                 projection=self.recycled_projection,
+                projection_reductions=self.recycled_projection_reductions,
+                projection_accepted=self.recycled_projection_accepted,
                 packed_component=self.packed_component,
                 packed_world=self.topology.packed_solve_world,
                 packed_iterative=self.packed_iterative,
@@ -1344,7 +1495,9 @@ class DeformableFEMSystem:
             outputs=[self.preconditioner_matrix.values],
             device=self.device,
         )
-        if self.direct_solver is not None:
+        if self.cudss_solver is not None:
+            self.cudss_solver.factorize()
+        if self.direct_solver is not None and self.direct_solver is not self.cudss_solver:
             self.direct_solver.factorize()
         if self.has_iterative_components:
             self.preconditioner.factorize()
@@ -1419,12 +1572,16 @@ class DeformableFEMSystem:
         self,
         consensus_center: wp.array[wp.vec3],
         world_active: wp.array[wp.int32] | None = None,
+        use_cudss: bool | None = None,
     ) -> None:
         """Run the fixed-count warm-started preconditioned CR candidate solve.
 
         Args:
             consensus_center: Current ``p + lambda`` nodal center [m/s].
             world_active: Optional per-world active mask copied into stable storage.
+            use_cudss: Whether to use the retained cuDSS factorization for this
+                candidate. Defaults to true for the pure cuDSS mode and false
+                otherwise.
 
         """
         if consensus_center.shape != (self.particle_count,) or consensus_center.dtype != wp.vec3:
@@ -1459,6 +1616,14 @@ class DeformableFEMSystem:
             outputs=[self.candidate_rhs],
             device=self.device,
         )
+        if use_cudss is None:
+            use_cudss = self.linear_solver == "cudss"
+        if use_cudss:
+            if self.cudss_solver is None:
+                raise RuntimeError("LOX deformable cuDSS candidate solve was not initialized.")
+            self.cudss_solver.solve(self.candidate_rhs, self.smooth_velocity)
+            self.candidate_linear_residual.zero_()
+            return
         if self.direct_solver is not None:
             self.direct_solver.solve(self.candidate_rhs, self.smooth_velocity)
             wp.launch(

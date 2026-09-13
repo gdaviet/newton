@@ -1,1 +1,1 @@
-Prevent experimental LOX rod feedback from selecting discontinuous twist-damping branches or accepting unsafe near-fold bend corrections.
+Keep experimental LOX rod twist damping continuous across principal-angle branches and reject nonfinite proximal updates.

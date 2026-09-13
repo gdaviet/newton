@@ -209,6 +209,7 @@ def _finish_particles(
     projected_velocity_previous: wp.array[wp.vec3],
     consensus_enabled: wp.array[wp.int32],
     time_step: wp.array[wp.float32],
+    measure_residual: bool,
     dual: wp.array[wp.vec3],
     iteration_failed: wp.array[wp.int32],
     consensus_residual: wp.array[float],
@@ -238,18 +239,19 @@ def _finish_particles(
         wp.atomic_max(iteration_failed, world, 1)
         return
 
-    consensus = wp.vec3(global_current - projected_current)
-    iterate = wp.vec3(projected_current - projected_previous)
-    global_change = wp.vec3(global_current - global_previous)
-    consensus_norm = wp.max(wp.abs(consensus[0]), wp.abs(consensus[1]))
-    consensus_norm = wp.max(consensus_norm, wp.abs(consensus[2]))
-    iterate_norm = wp.max(wp.abs(iterate[0]), wp.abs(iterate[1]))
-    iterate_norm = wp.max(iterate_norm, wp.abs(iterate[2]))
-    global_change_norm = wp.max(wp.abs(global_change[0]), wp.abs(global_change[1]))
-    global_change_norm = wp.max(global_change_norm, wp.abs(global_change[2]))
-    wp.atomic_max(consensus_residual, world, consensus_norm)
-    wp.atomic_max(iterate_residual, world, iterate_norm)
-    wp.atomic_max(displacement_residual, world, time_step[world] * (global_change_norm + consensus_norm))
+    if measure_residual:
+        consensus = wp.vec3(global_current - projected_current)
+        iterate = wp.vec3(projected_current - projected_previous)
+        global_change = wp.vec3(global_current - global_previous)
+        consensus_norm = wp.max(wp.abs(consensus[0]), wp.abs(consensus[1]))
+        consensus_norm = wp.max(consensus_norm, wp.abs(consensus[2]))
+        iterate_norm = wp.max(wp.abs(iterate[0]), wp.abs(iterate[1]))
+        iterate_norm = wp.max(iterate_norm, wp.abs(iterate[2]))
+        global_change_norm = wp.max(wp.abs(global_change[0]), wp.abs(global_change[1]))
+        global_change_norm = wp.max(global_change_norm, wp.abs(global_change[2]))
+        wp.atomic_max(consensus_residual, world, consensus_norm)
+        wp.atomic_max(iterate_residual, world, iterate_norm)
+        wp.atomic_max(displacement_residual, world, time_step[world] * (global_change_norm + consensus_norm))
     if consensus_enabled[particle] != 0:
         dual[particle] += projected_current - global_current
     else:
@@ -272,6 +274,7 @@ def _finalize_worlds(
     displacement_residual: wp.array[float],
     position_tolerance: float,
     velocity_tolerance: float,
+    fixed_iterations: bool,
     iteration_failed: wp.array[wp.int32],
     cloth_converged: wp.array[wp.bool],
     cloth_failed: wp.array[wp.bool],
@@ -296,6 +299,8 @@ def _finalize_worlds(
             or contact_failed
         )
         if deformable_failed:
+            deformable_converged = False
+        elif fixed_iterations:
             deformable_converged = False
         else:
             deformable_residual = wp.max(
@@ -639,8 +644,9 @@ class DeformableSplittingState:
         contact_system=None,
         rigid_projected_twist=None,
         increment_iteration_count: bool = False,
+        fixed_iterations: bool = False,
     ) -> None:
-        """Update the nodal dual and merge cloth status into shared worlds."""
+        """Update the nodal dual and merge deformable status into shared worlds."""
         wp.launch(
             _initialize_residuals,
             dim=self.num_worlds,
@@ -666,6 +672,7 @@ class DeformableSplittingState:
                 self.projected_velocity_previous,
                 self.cloth_system.consensus_enabled,
                 time_step,
+                not fixed_iterations,
             ],
             outputs=[
                 self.dual,
@@ -676,10 +683,10 @@ class DeformableSplittingState:
             ],
             device=self.device,
         )
-        if contact_system is None:
+        if contact_system is None or fixed_iterations:
             contact_residual = None
-            contact_world_status = None
-            contact_global_status = None
+            contact_world_status = None if contact_system is None else contact_system.world_status
+            contact_global_status = None if contact_system is None else contact_system.global_status
         else:
             contact_system.compute_contact_residuals(
                 self.projected_velocity,
@@ -707,6 +714,7 @@ class DeformableSplittingState:
                 self.displacement_residual,
                 position_tolerance,
                 velocity_tolerance,
+                fixed_iterations,
                 self.iteration_failed,
             ],
             outputs=[

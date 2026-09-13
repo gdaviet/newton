@@ -892,83 +892,6 @@ class TestSolverKaminoLOX(unittest.TestCase):
                 self.assertTrue(np.isfinite(anchor_error).all())
                 np.testing.assert_allclose(anchor_error, 0.0, rtol=0.0, atol=1.0e-6)
 
-    def test_joint_proximal_recovery_matches_remaining_frozen_budget(self):
-        """Rollback a late unsafe trial and consume only the remaining budget."""
-        model, _parent, _child, _parent_xform, _child_xform = _build_prescribed_rotating_joint_model(
-            angle=0.5,
-            nonidentity_frames=True,
-            device=self.device,
-        )
-        nonlinear_config = self.make_config()
-        nonlinear_config.use_collision_detector = False
-        nonlinear_config.lox.fixed_iterations = True
-        nonlinear_config.lox.max_iterations = 5
-        nonlinear_config.lox.projection_method = "apgd"
-        nonlinear_config.lox.joint_proximal_relaxation = 1.0
-        nonlinear_solver = SolverKamino(model, config=nonlinear_config)
-        nonlinear_state_in = model.state()
-        nonlinear_state_out = model.state()
-        solver_fd = nonlinear_solver._solver_kamino._solver_fd
-        original_guard = solver_fd._guard_nonlinear_recovery_iteration
-        guard_calls = 0
-
-        def inject_late_unsafe_feedback():
-            nonlocal guard_calls
-            guard_calls += 1
-            if guard_calls == 3:
-                solver_fd.rigid_adapter.world_structural_feedback_unsafe.fill_(1)
-            original_guard()
-
-        solver_fd._guard_nonlinear_recovery_iteration = inject_late_unsafe_feedback
-        nonlinear_solver.step(
-            nonlinear_state_in,
-            nonlinear_state_out,
-            model.control(),
-            contacts=None,
-            dt=0.01,
-        )
-
-        frozen_config = self.make_config()
-        frozen_config.use_collision_detector = False
-        frozen_config.lox.fixed_iterations = True
-        frozen_config.lox.max_iterations = 2
-        frozen_config.lox.projection_method = "apgd"
-        frozen_config.lox.joint_proximal_relaxation = 0.0
-        frozen_solver = SolverKamino(model, config=frozen_config)
-        frozen_state_in = model.state()
-        frozen_state_out = model.state()
-        frozen_solver.step(frozen_state_in, frozen_state_out, model.control(), contacts=None, dt=0.01)
-
-        self.assertEqual(guard_calls, 5)
-        self.assertTrue(solver_fd.world_nonlinear_fallback_used.numpy()[0])
-        self.assertEqual(solver_fd.status.numpy()[0]["accepted"], 1)
-        self.assertEqual(solver_fd.status.numpy()[0]["iterations"], 5)
-        np.testing.assert_allclose(
-            nonlinear_state_out.body_q.numpy(),
-            frozen_state_out.body_q.numpy(),
-            rtol=2.0e-6,
-            atol=2.0e-6,
-        )
-        np.testing.assert_allclose(
-            nonlinear_state_out.body_qd.numpy(),
-            frozen_state_out.body_qd.numpy(),
-            rtol=2.0e-6,
-            atol=2.0e-6,
-        )
-        frozen_fd = frozen_solver._solver_kamino._solver_fd
-        np.testing.assert_allclose(
-            solver_fd.rigid_adapter.structural_reaction.numpy(),
-            frozen_fd.rigid_adapter.structural_reaction.numpy(),
-            rtol=2.0e-6,
-            atol=2.0e-6,
-        )
-        np.testing.assert_allclose(
-            solver_fd.splitting.splitting_dual_impulse.numpy(),
-            frozen_fd.splitting.splitting_dual_impulse.numpy(),
-            rtol=2.0e-6,
-            atol=2.0e-6,
-        )
-
     def test_joint_proximal_accepts_finite_root_translation_transient(self):
         """Do not reject a large finite first trial solely for its absolute error."""
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -1009,7 +932,6 @@ class TestSolverKaminoLOX(unittest.TestCase):
         solver.step(state_in, state_out, model.control(), contacts=None, dt=0.01)
 
         solver_fd = solver._solver_kamino._solver_fd
-        self.assertFalse(solver_fd.world_nonlinear_fallback_used.numpy()[0])
         self.assertEqual(solver_fd.status.numpy()[0]["accepted"], 1)
         anchor_error = _joint_anchor_error(
             state_out.body_q.numpy(),
@@ -1021,8 +943,8 @@ class TestSolverKaminoLOX(unittest.TestCase):
         self.assertTrue(np.isfinite(anchor_error).all())
         self.assertLess(float(np.linalg.norm(anchor_error)), 1.0e-5)
 
-    def test_joint_proximal_recovery_runs_in_conditional_loop(self):
-        """Execute the recovery guard and restart inside capture-while."""
+    def test_joint_proximal_rejection_runs_in_conditional_loop(self):
+        """Reject unsafe feedback inside capture-while without restarting."""
         model, _parent, _child, _parent_xform, _child_xform = _build_prescribed_rotating_joint_model(
             angle=0.5,
             nonidentity_frames=True,
@@ -1036,115 +958,28 @@ class TestSolverKaminoLOX(unittest.TestCase):
         config.lox.joint_proximal_relaxation = 1.0
         solver = SolverKamino(model, config=config)
         solver_fd = solver._solver_kamino._solver_fd
-        original_guard = solver_fd._guard_nonlinear_recovery_iteration
+        adapter = solver_fd.rigid_adapter
+        original_update = adapter.update_structural_multipliers_from_twist
 
-        def inject_from_device_iteration():
+        def inject_from_device_iteration(*args, **kwargs):
+            original_update(*args, **kwargs)
             wp.launch(
                 _inject_unsafe_on_iteration,
                 dim=solver_fd.num_worlds,
                 inputs=[solver_fd.iteration_count, 2],
-                outputs=[solver_fd.rigid_adapter.world_structural_feedback_unsafe],
+                outputs=[solver_fd.rigid_adapter.world_structural_failed],
                 device=self.device,
             )
-            original_guard()
 
-        solver_fd._guard_nonlinear_recovery_iteration = inject_from_device_iteration
+        adapter.update_structural_multipliers_from_twist = inject_from_device_iteration
         solver.step(model.state(), model.state(), model.control(), contacts=None, dt=0.01)
 
         status = solver_fd.status.numpy()[0]
-        self.assertTrue(solver_fd.world_nonlinear_fallback_used.numpy()[0])
-        self.assertEqual(status["accepted"], 1)
+        self.assertEqual(status["accepted"], 0)
+        self.assertEqual(status["failed"], 1)
         self.assertEqual(status["converged"], 0)
-        self.assertEqual(status["iteration_limit"], 1)
-        self.assertEqual(status["iterations"], 5)
-
-    def test_joint_proximal_rejects_last_iteration_nonfinite_feedback(self):
-        """Reject a last-iteration NaN without leaking trial warm-start state."""
-        model, _parent, child, _parent_xform, _child_xform = _build_prescribed_rotating_joint_model(
-            angle=0.5,
-            nonidentity_frames=True,
-            device=self.device,
-        )
-        config = self.make_config()
-        config.use_collision_detector = False
-        config.lox.fixed_iterations = True
-        config.lox.max_iterations = 3
-        config.lox.joint_proximal_relaxation = 1.0
-        solver = SolverKamino(model, config=config)
-        state_in = model.state()
-        state_out = model.state()
-        solver_fd = solver._solver_kamino._solver_fd
-        original_guard = solver_fd._guard_nonlinear_recovery_iteration
-        guard_calls = 0
-
-        def inject_last_iteration_nan():
-            nonlocal guard_calls
-            guard_calls += 1
-            if guard_calls == 3:
-                solver_fd.world_nonlinear_feedback_enabled.fill_(True)
-                solver_fd.rigid_adapter.world_feedback_structural_residual.fill_(float("nan"))
-            original_guard()
-
-        solver_fd._guard_nonlinear_recovery_iteration = inject_last_iteration_nan
-        solver.step(state_in, state_out, model.control(), contacts=None, dt=0.01)
-
-        status = solver_fd.status.numpy()[0]
-        self.assertEqual(guard_calls, 3)
-        self.assertEqual(status["accepted"], 0)
-        self.assertEqual(status["failed"], 1)
-        self.assertFalse(solver_fd.world_nonlinear_fallback_used.numpy()[0])
-        np.testing.assert_allclose(
-            solver_fd.rigid_adapter.structural_reaction.numpy(),
-            solver_fd._recovery_structural_reaction.numpy(),
-            rtol=0.0,
-            atol=0.0,
-        )
-        np.testing.assert_allclose(
-            solver_fd.splitting.splitting_dual_impulse.numpy(),
-            solver_fd._recovery_splitting_dual_impulse.numpy(),
-            rtol=2.0e-6,
-            atol=2.0e-6,
-        )
-        self.assertTrue(np.isfinite(state_out.body_q.numpy()).all())
-        self.assertTrue(np.isfinite(state_out.body_qd.numpy()).all())
-        np.testing.assert_allclose(state_out.body_q.numpy()[child], state_in.body_q.numpy()[child], atol=0.0)
-        np.testing.assert_allclose(state_out.body_qd.numpy()[child], state_in.body_qd.numpy()[child], atol=0.0)
-
-    def test_joint_proximal_rejects_invalid_frozen_fallback(self):
-        """Do not accept a second unsafe event after the one allowed restart."""
-        model, _parent, child, _parent_xform, _child_xform = _build_prescribed_rotating_joint_model(
-            angle=0.5,
-            nonidentity_frames=True,
-            device=self.device,
-        )
-        config = self.make_config()
-        config.use_collision_detector = False
-        config.lox.fixed_iterations = True
-        config.lox.max_iterations = 5
-        config.lox.joint_proximal_relaxation = 1.0
-        solver = SolverKamino(model, config=config)
-        state_in = model.state()
-        state_out = model.state()
-        solver_fd = solver._solver_kamino._solver_fd
-        original_guard = solver_fd._guard_nonlinear_recovery_iteration
-        guard_calls = 0
-
-        def inject_trial_then_fallback_failure():
-            nonlocal guard_calls
-            guard_calls += 1
-            if guard_calls in (3, 4):
-                solver_fd.rigid_adapter.world_structural_feedback_unsafe.fill_(1)
-            original_guard()
-
-        solver_fd._guard_nonlinear_recovery_iteration = inject_trial_then_fallback_failure
-        solver.step(state_in, state_out, model.control(), contacts=None, dt=0.01)
-
-        status = solver_fd.status.numpy()[0]
-        self.assertTrue(solver_fd.world_nonlinear_fallback_used.numpy()[0])
-        self.assertEqual(status["accepted"], 0)
-        self.assertEqual(status["failed"], 1)
-        np.testing.assert_allclose(state_out.body_q.numpy()[child], state_in.body_q.numpy()[child], atol=0.0)
-        np.testing.assert_allclose(state_out.body_qd.numpy()[child], state_in.body_qd.numpy()[child], atol=0.0)
+        self.assertEqual(status["iteration_limit"], 0)
+        self.assertEqual(status["iterations"], 3)
 
     def test_joint_proximal_blocks_nonfinite_row_update(self):
         """Detect a candidate NaN before it reaches reactions or the assembled RHS."""
@@ -1165,9 +1000,9 @@ class TestSolverKaminoLOX(unittest.TestCase):
         solver_fd = solver._solver_kamino._solver_fd
         adapter = solver_fd.rigid_adapter
         original_evaluate = adapter._evaluate_structural_candidate_pose_residual
-        original_guard = solver_fd._guard_nonlinear_recovery_iteration
+        original_update = adapter.update_structural_multipliers_from_twist
         supported_row = int(np.flatnonzero(adapter.structural_feedback_supported.numpy())[0])
-        guard_calls = 0
+        update_calls = 0
         row_reaction_after_second = None
 
         def inject_candidate_nan(*args):
@@ -1177,23 +1012,27 @@ class TestSolverKaminoLOX(unittest.TestCase):
                 feedback[supported_row] = np.nan
                 args[-1].assign(feedback)
 
-        def inspect_before_guard():
-            nonlocal guard_calls, row_reaction_after_second
-            guard_calls += 1
+        def inspect_row_update(*args, **kwargs):
+            nonlocal update_calls, row_reaction_after_second
+            original_update(*args, **kwargs)
+            update_calls += 1
             reaction = adapter.structural_reaction.numpy()
-            if guard_calls == 2:
+            if update_calls == 2:
                 row_reaction_after_second = reaction[supported_row]
-            elif guard_calls == 3:
+            elif update_calls == 3:
                 self.assertTrue(np.isfinite(reaction).all())
                 self.assertTrue(np.isfinite(solver_fd.system.right_hand_side.numpy()).all())
                 self.assertEqual(reaction[supported_row], row_reaction_after_second)
-            original_guard()
 
         adapter._evaluate_structural_candidate_pose_residual = inject_candidate_nan
-        solver_fd._guard_nonlinear_recovery_iteration = inspect_before_guard
+        adapter.update_structural_multipliers_from_twist = inspect_row_update
         solver.step(state_in, state_out, model.control(), contacts=None, dt=0.01)
 
         status = solver_fd.status.numpy()[0]
+        self.assertEqual(update_calls, 3)
+        self.assertEqual(status["iterations"], 3)
+        np.testing.assert_array_equal(adapter.structural_reaction.numpy(), 0.0)
+        np.testing.assert_array_equal(solver_fd.splitting.splitting_dual_impulse.numpy(), 0.0)
         self.assertEqual(status["accepted"], 0)
         self.assertEqual(status["failed"], 1)
         np.testing.assert_allclose(state_out.body_q.numpy()[child], state_in.body_q.numpy()[child], atol=0.0)
@@ -1708,61 +1547,54 @@ class TestSolverKaminoLOX(unittest.TestCase):
         self.assertLess(float(solver.metrics.data.r_cts_joints.numpy()[0]), 1.0e-3)
         self.assertLess(float(solver.metrics.data.r_eom.numpy()[0]), 1.0e-3)
 
-    def test_joint_proximal_recovery_restores_apgd_contact_state(self):
-        """Match a clean remaining-budget solve after rolling back APGD contact trials."""
+    def test_joint_proximal_rejection_clears_apgd_contact_state(self):
+        """Reject unsafe APGD trials without exporting contact warm starts."""
+        model = ModelKamino.from_newton(build_boxes_hinged(z_offset=0.0, ground=True).finalize(device=self.device))
+        detector = CollisionDetector(
+            model,
+            config=kamino_config.CollisionDetectorConfig(pipeline="unified"),
+        )
+        config = self.make_config()
+        config.lox.fixed_iterations = True
+        config.lox.max_iterations = 5
+        config.lox.projection_method = "apgd"
+        config.lox.projection_iterations = 3
+        config.lox.joint_proximal_relaxation = 1.0
+        solver = SolverKaminoImpl(model=model, contacts=detector.contacts, config=config)
+        adapter = solver.solver_fd.rigid_adapter
+        original_update = adapter.update_structural_multipliers_from_twist
+        calls = 0
 
-        def run(iterations, relaxation, inject_iteration=None):
-            model = ModelKamino.from_newton(build_boxes_hinged(z_offset=0.0, ground=True).finalize(device=self.device))
-            detector = CollisionDetector(
-                model,
-                config=kamino_config.CollisionDetectorConfig(pipeline="unified"),
-            )
-            config = self.make_config()
-            config.lox.fixed_iterations = True
-            config.lox.max_iterations = iterations
-            config.lox.projection_method = "apgd"
-            config.lox.projection_iterations = 3
-            config.lox.joint_proximal_relaxation = relaxation
-            solver = SolverKaminoImpl(model=model, contacts=detector.contacts, config=config)
-            if inject_iteration is not None:
-                original_guard = solver.solver_fd._guard_nonlinear_recovery_iteration
-                calls = 0
+        def inject_unsafe(*args, **kwargs):
+            nonlocal calls
+            original_update(*args, **kwargs)
+            calls += 1
+            if calls == 3:
+                adapter.world_structural_failed.fill_(1)
 
-                def inject_unsafe():
-                    nonlocal calls
-                    calls += 1
-                    if calls == inject_iteration:
-                        solver.solver_fd.rigid_adapter.world_structural_feedback_unsafe.fill_(1)
-                    original_guard()
-
-                solver.solver_fd._guard_nonlinear_recovery_iteration = inject_unsafe
-            state_out = model.state()
-            solver.step(
-                model.state(),
-                state_out,
-                model.control(),
-                contacts=detector.contacts,
-                detector=detector,
-                dt=0.01,
-            )
-            return solver, state_out, detector.contacts
-
-        recovered, recovered_state, recovered_contacts = run(5, 1.0, inject_iteration=3)
-        _frozen, frozen_state, frozen_contacts = run(2, 0.0)
-
-        self.assertGreater(int(recovered_contacts.model_active_contacts.numpy()[0]), 0)
-        self.assertTrue(recovered.solver_fd.world_nonlinear_fallback_used.numpy()[0])
-        np.testing.assert_allclose(recovered_state.u_i.numpy(), frozen_state.u_i.numpy(), rtol=2.0e-5, atol=2.0e-5)
-        np.testing.assert_allclose(recovered_state.q_i.numpy(), frozen_state.q_i.numpy(), rtol=2.0e-5, atol=2.0e-5)
-        np.testing.assert_allclose(
-            recovered_contacts.reaction.numpy(),
-            frozen_contacts.reaction.numpy(),
-            rtol=2.0e-5,
-            atol=2.0e-5,
+        adapter.update_structural_multipliers_from_twist = inject_unsafe
+        state_in = model.state()
+        state_out = model.state()
+        solver.step(
+            state_in,
+            state_out,
+            model.control(),
+            contacts=detector.contacts,
+            detector=detector,
+            dt=0.01,
         )
 
-    def test_joint_proximal_recovery_is_per_world(self):
-        """Rollback one packed world without perturbing a safe nonlinear neighbor."""
+        self.assertGreater(int(detector.contacts.model_active_contacts.numpy()[0]), 0)
+        np.testing.assert_array_equal(solver.solver_fd.world_failed.numpy(), [True])
+        np.testing.assert_array_equal(solver.solver_fd.iteration_count.numpy(), [3])
+        np.testing.assert_array_equal(state_out.u_i.numpy(), state_in.u_i.numpy())
+        np.testing.assert_array_equal(state_out.q_i.numpy(), state_in.q_i.numpy())
+        np.testing.assert_array_equal(adapter.contact_reaction.numpy(), 0.0)
+        np.testing.assert_array_equal(adapter.structural_reaction.numpy(), 0.0)
+        np.testing.assert_array_equal(solver.solver_fd.splitting.splitting_dual_impulse.numpy(), 0.0)
+
+    def test_joint_proximal_rejection_is_per_world(self):
+        """Reject one packed world without perturbing a safe nonlinear neighbor."""
 
         def make_model():
             builder = build_boxes_hinged(z_offset=0.5, ground=False)
@@ -1776,21 +1608,22 @@ class TestSolverKaminoLOX(unittest.TestCase):
             config.lox.joint_proximal_relaxation = 1.0
             return SolverKaminoImpl(model=model, config=config)
 
-        recovered_model = make_model()
-        recovered = make_solver(recovered_model)
-        original_guard = recovered.solver_fd._guard_nonlinear_recovery_iteration
+        rejected_model = make_model()
+        rejected = make_solver(rejected_model)
+        adapter = rejected.solver_fd.rigid_adapter
+        original_update = adapter.update_structural_multipliers_from_twist
         calls = 0
 
-        def inject_second_world_unsafe():
+        def inject_second_world_unsafe(*args, **kwargs):
             nonlocal calls
+            original_update(*args, **kwargs)
             calls += 1
             if calls == 3:
-                recovered.solver_fd.rigid_adapter.world_structural_feedback_unsafe.assign([0, 1])
-            original_guard()
+                rejected.solver_fd.rigid_adapter.world_structural_failed.assign([0, 1])
 
-        recovered.solver_fd._guard_nonlinear_recovery_iteration = inject_second_world_unsafe
-        recovered_state = recovered_model.state()
-        recovered.step(recovered_model.state(), recovered_state, recovered_model.control(), dt=0.01)
+        adapter.update_structural_multipliers_from_twist = inject_second_world_unsafe
+        rejected_state = rejected_model.state()
+        rejected.step(rejected_model.state(), rejected_state, rejected_model.control(), dt=0.01)
 
         reference_model = make_model()
         reference = make_solver(reference_model)
@@ -1798,18 +1631,22 @@ class TestSolverKaminoLOX(unittest.TestCase):
         reference.step(reference_model.state(), reference_state, reference_model.control(), dt=0.01)
 
         np.testing.assert_array_equal(
-            recovered.solver_fd.world_nonlinear_fallback_used.numpy(),
+            rejected.solver_fd.world_failed.numpy(),
             [False, True],
         )
-        first_world_bodies = recovered_model.bodies.wid.numpy() == 0
+        np.testing.assert_array_equal(rejected.solver_fd.iteration_count.numpy(), [5, 3])
+        first_world_bodies = rejected_model.bodies.wid.numpy() == 0
+        np.testing.assert_array_equal(
+            rejected.solver_fd.splitting.splitting_dual_impulse.numpy()[~first_world_bodies], 0.0
+        )
         np.testing.assert_allclose(
-            recovered_state.u_i.numpy()[first_world_bodies],
+            rejected_state.u_i.numpy()[first_world_bodies],
             reference_state.u_i.numpy()[first_world_bodies],
             rtol=2.0e-6,
             atol=2.0e-6,
         )
         np.testing.assert_allclose(
-            recovered_state.q_i.numpy()[first_world_bodies],
+            rejected_state.q_i.numpy()[first_world_bodies],
             reference_state.q_i.numpy()[first_world_bodies],
             rtol=2.0e-6,
             atol=2.0e-6,

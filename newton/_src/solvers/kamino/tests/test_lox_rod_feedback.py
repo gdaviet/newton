@@ -115,7 +115,7 @@ def _run_rod_cases(
 
 
 class TestLOXRodFeedback(unittest.TestCase):
-    """Verify continuous twist damping and conservative bend recovery."""
+    """Verify continuous twist damping without preemptive geometry rejection."""
 
     @classmethod
     def setUpClass(cls):
@@ -169,7 +169,7 @@ class TestLOXRodFeedback(unittest.TestCase):
             for case in cases
         ]
         np.testing.assert_allclose(velocity[:, 5], expected, rtol=0.0, atol=2.0e-4)
-        np.testing.assert_array_equal(lox.world_nonlinear_fallback_used.numpy(), [False, False, False])
+        np.testing.assert_array_equal(lox.world_failed.numpy(), [False, False, False])
 
     def test_twist_proximal_keeps_nonzero_linearization_rate(self):
         """Retain the temporal reference rate when the linearization velocity is nonzero."""
@@ -219,7 +219,6 @@ class TestLOXRodFeedback(unittest.TestCase):
                 candidate,
                 linearization,
                 world_mask,
-                world_mask,
                 time_step,
                 1.0e-5,
                 1.0e-5,
@@ -229,7 +228,7 @@ class TestLOXRodFeedback(unittest.TestCase):
         candidate_angle = frozen_angle + _TIME_STEP * (candidate_speed - linearization_speed)
         expected_stress = stiffness * _principal_angle(candidate_angle - rest_angle) + damping * candidate_speed
         self.assertAlmostEqual(float(adapter.rods.multiplier.numpy()[5]), expected_stress, delta=2.0e-4)
-        np.testing.assert_array_equal(adapter.rods.world_proximal_unsafe.numpy(), [0])
+        np.testing.assert_array_equal(adapter.rods.world_proximal_failed.numpy(), [0])
 
     def test_zero_twist_coefficients_leave_velocity_unchanged(self):
         """Leave twist velocity unchanged when elastic and damping coefficients vanish."""
@@ -238,7 +237,7 @@ class TestLOXRodFeedback(unittest.TestCase):
         feedback, _ = _run_rod_cases([case], self.device, relaxation=1.0)
         np.testing.assert_allclose(feedback, baseline, rtol=0.0, atol=1.0e-7)
 
-    def test_bend_guard_allows_common_rigid_rotation(self):
+    def test_bend_feedback_allows_common_rigid_rotation(self):
         """Allow a large common rotation that leaves binary rod geometry unchanged."""
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         SolverKamino.register_custom_attributes(builder)
@@ -269,27 +268,28 @@ class TestLOXRodFeedback(unittest.TestCase):
             candidate,
             linearization,
             world_mask,
-            world_mask,
             time_step,
             1.0e-5,
             1.0e-5,
             1.0e-5,
         )
 
-        np.testing.assert_array_equal(adapter.rods.world_proximal_unsafe.numpy(), [0])
+        np.testing.assert_array_equal(adapter.rods.world_proximal_failed.numpy(), [0])
 
-    def test_unsafe_bend_geometry_recovers_to_frozen_solution(self):
-        """Recover near-fold and large-path bend trials without accepting energy injection."""
+    def test_finite_large_rod_updates_are_not_preemptively_rejected(self):
+        """Run finite near-fold and large angular updates without predicting failure."""
         cases = [
             {"mode": "bend", "initial_strain": 3.1, "initial_speed": 10.0, "damping": 10000.0},
             {"mode": "bend", "initial_strain": 0.5, "initial_speed": 600.0, "damping": 100.0},
+            {"mode": "twist", "initial_strain": 0.5, "initial_speed": 600.0, "damping": 1.0},
         ]
-        baseline, _ = _run_rod_cases(cases, self.device, relaxation=0.0)
-        feedback, lox = _run_rod_cases(cases, self.device, relaxation=1.0)
+        feedback, lox = _run_rod_cases(cases, self.device, relaxation=1.0, iterations=1)
 
-        np.testing.assert_allclose(feedback, baseline, rtol=0.0, atol=2.0e-4)
-        self.assertTrue(np.all(feedback[:, 3] * feedback[:, 3] <= np.asarray([100.0, 360000.0]) + 1.0e-3))
-        np.testing.assert_array_equal(lox.world_nonlinear_fallback_used.numpy(), [True, True])
+        self.assertTrue(np.isfinite(feedback).all())
+        self.assertTrue(np.isfinite(lox.rigid_adapter.rods.multiplier.numpy()).all())
+        np.testing.assert_array_equal(lox.world_failed.numpy(), [False, False, False])
+        np.testing.assert_array_equal(lox.world_accepted.numpy(), [True, True, True])
+        np.testing.assert_array_equal(lox.iteration_count.numpy(), [1, 1, 1])
 
     def test_cuda_graph_replays_twist_branch_crossing(self):
         """Replay continuous twist feedback under CUDA graph capture."""

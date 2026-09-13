@@ -1160,7 +1160,6 @@ def _update_structural_multipliers_from_candidate_rows(
     jacobian_first: wp.array[vec6f],
     jacobian_second: wp.array[vec6f],
     feedback_supported: wp.array[wp.bool],
-    feedback_world_enabled: wp.array[wp.bool],
     candidate_feedback_residual: wp.array[wp.float32],
     proximal_defect: wp.array[wp.float32],
     frozen_residual: wp.array[wp.float32],
@@ -1172,7 +1171,7 @@ def _update_structural_multipliers_from_candidate_rows(
     reaction: wp.array[wp.float32],
     update_residual_out: wp.array[wp.float32],
     world_residual: wp.array[wp.float32],
-    world_feedback_unsafe: wp.array[wp.int32],
+    world_failed: wp.array[wp.int32],
     right_hand_side: wp.array[wp.float32],
 ):
     row = wp.tid()
@@ -1199,7 +1198,7 @@ def _update_structural_multipliers_from_candidate_rows(
 
     linear_residual = frozen_residual[row] + dt * (candidate_velocity - linearization_velocity)
     update_residual = linear_residual
-    feedback_enabled = proximal_relaxation > 0.0 and (not feedback_world_enabled or feedback_world_enabled[world])
+    feedback_enabled = proximal_relaxation > 0.0
     next_defect = proximal_defect[row]
     if feedback_enabled:
         defect = proximal_defect[row]
@@ -1227,7 +1226,7 @@ def _update_structural_multipliers_from_candidate_rows(
         if second_dynamic:
             finite = finite and wp.isfinite(dt * reaction_delta * jacobian_second[row][axis])
     if not finite:
-        wp.atomic_max(world_feedback_unsafe, world, 1)
+        wp.atomic_max(world_failed, world, 1)
         return
     if feedback_enabled:
         proximal_defect[row] = next_defect
@@ -1276,33 +1275,6 @@ def _reduce_structural_candidate_residual(
         return
     normalized = wp.abs(candidate_residual[row]) / structural_tolerance
     wp.atomic_max(world_residual, world, normalized)
-
-
-@wp.kernel
-def _reduce_structural_feedback_metrics(
-    structural_tolerance: wp.float32,
-    row_world: wp.array[wp.int32],
-    world_active: wp.array[wp.bool],
-    projection_status: wp.array[wp.int32],
-    body_first_global: wp.array[wp.int32],
-    body_second_global: wp.array[wp.int32],
-    candidate_residual: wp.array[wp.float32],
-    feedback_supported: wp.array[wp.bool],
-    body_vector_index: wp.array[wp.int32],
-    world_feedback_residual: wp.array[wp.float32],
-):
-    row = wp.tid()
-    world = row_world[row]
-    if not feedback_supported[row] or not world_active[world] or projection_status[world] != PROJECTION_STATUS_VALID:
-        return
-    first = body_first_global[row]
-    second = body_second_global[row]
-    first_dynamic = first >= 0 and body_vector_index[first] >= 0
-    second_dynamic = second >= 0 and body_vector_index[second] >= 0
-    if not first_dynamic and not second_dynamic:
-        return
-    normalized = wp.abs(candidate_residual[row]) / structural_tolerance
-    wp.atomic_max(world_feedback_residual, world, normalized)
 
 
 @wp.kernel

@@ -983,8 +983,9 @@ class LOXSolverConfig:
     """Whether to skip convergence checks and run exactly :attr:`max_iterations`.
 
     This reduces per-iteration synchronization for throughput-oriented rigid
-    simulations. Failed projections still deactivate their worlds. Deformable
-    simulations do not currently support this mode.
+    and deformable simulations. Failed projections still deactivate their
+    worlds. The cuDSS deformable linear solver requires this mode because cuDSS
+    solve graphs cannot be instantiated inside CUDA conditional loops.
     """
 
     eliminate_fixed_world_islands: bool = True
@@ -1026,10 +1027,9 @@ class LOXSolverConfig:
     three-axis positional blocks of fixed, revolute, and ball joints while
     reusing the frozen Jacobian, primal matrix, and factorization. Angular rows
     and partial positional constraint blocks retain the frozen linear update.
-    Unsafe rigid-only feedback is rolled back once and retried without nonlinear
-    feedback using the remaining iteration budget. If no retry iteration remains,
-    or the solver contains deformables, the unsafe world is rejected without
-    exporting its trial velocity or warm starts.
+    Nonfinite feedback rejects the affected world without retrying or exporting
+    its trial velocity. Failed rigid warm starts are discarded rather than
+    snapshotted and restored.
     """
 
     rod_proximal_relaxation: float = 0.0
@@ -1040,9 +1040,9 @@ class LOXSolverConfig:
     while reusing the frozen rigid-body factorization. Stretch and shear remain
     linearly implicit to avoid amplifying geometric defects by their typically
     much larger stiffness. Twist feedback follows a temporally lifted angle so
-    damping remains continuous across the principal-angle branch; ambiguous
-    twist increments and near-folded bend charts trigger the same bounded
-    rigid-only rollback or rejection policy as structural joint feedback.
+    damping remains continuous across the principal-angle branch. Nonfinite
+    updates reject the affected world without retrying. Large finite angular
+    increments or near-folded bends do not themselves mark a world as failed.
     """
 
     deformable_cr_iterations: int = 4
@@ -1062,6 +1062,26 @@ class LOXSolverConfig:
 
     The default gives 384 scalar unknowns, exactly six 64-wide factorization
     tiles. Set to zero to solve every deformable component with CR.
+    """
+
+    deformable_linear_solver: Literal["cr", "cudss", "cudss_then_cr"] = "cr"
+    """Linear solver used by the deformable candidate update.
+
+    ``"cr"`` uses the preconditioned iterative and small-component direct
+    paths. ``"cudss"`` uses a global sparse direct solve on CUDA, analyzing
+    the fixed matrix structure once, factoring its values once per time step,
+    and reusing that factorization for every LOX iteration.
+    ``"cudss_then_cr"`` uses cuDSS for the first candidate of each time step,
+    then uses warm-started CR for the remaining LOX iterations. Both cuDSS
+    modes require the ``nvmath-python[cu12]`` or ``nvmath-python[cu13]`` extra
+    for the CUDA major version in use. Numerical factorization and solves support
+    CUDA graph capture when CUDA memory pools are available; analysis remains
+    an initialization-time host operation outside capture. The pure cuDSS
+    backend requires :attr:`fixed_iterations` because cuDSS execution is not
+    compatible with conditional-loop child graphs. The hybrid mode executes its
+    cuDSS candidate before entering the conditional CR loop. Deformable
+    candidates remain on the main stream rather than LOX's auxiliary candidate
+    stream in both modes.
     """
 
     deformable_proximal_iterations: int = 4
@@ -1273,6 +1293,13 @@ class LOXSolverConfig:
                 "Invalid deformable_direct_max_particles: "
                 f"{self.deformable_direct_max_particles}. Must be a non-negative integer."
             )
+        if self.deformable_linear_solver not in ("cr", "cudss", "cudss_then_cr"):
+            raise ValueError(
+                f"Invalid deformable_linear_solver: {self.deformable_linear_solver!r}. "
+                "Must be 'cr', 'cudss', or 'cudss_then_cr'."
+            )
+        if self.deformable_linear_solver == "cudss" and not self.fixed_iterations:
+            raise ValueError("deformable_linear_solver='cudss' requires fixed_iterations=True.")
         if (
             not isinstance(self.deformable_proximal_iterations, int)
             or isinstance(self.deformable_proximal_iterations, bool)

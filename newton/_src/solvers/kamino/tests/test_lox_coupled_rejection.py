@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Verify safe output when coupled nonlinear feedback cannot be retried."""
+"""Verify safe output after a nonlinear update fails in a coupled world."""
 
 import unittest
 
@@ -24,8 +24,8 @@ class TestLOXCoupledRejection(unittest.TestCase):
             setup_tests()
         cls.device = test_context.device
 
-    def test_unsafe_rod_rejects_coupled_trial_without_particle_warmstart_leak(self):
-        """Preserve particle state and warm starts when rod chart safety rejects a coupled world."""
+    def test_nonfinite_rod_rejects_coupled_trial_without_particle_warmstart_leak(self):
+        """Reject an actual nonfinite rod update without leaking particle trial state."""
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         SolverKamino.register_custom_attributes(builder)
         builder.begin_world()
@@ -56,10 +56,11 @@ class TestLOXCoupledRejection(unittest.TestCase):
         config = SolverKamino.Config(dynamics_solver="lox", sparse_jacobian=True, use_collision_detector=False)
         config.lox.rod_proximal_relaxation = 1.0
         config.lox.use_graph_conditionals = False
+        config.lox.max_iterations = 5
         solver = SolverKamino(model, config=config)
         state_in, state_out = model.state(), model.state()
         poses = state_in.body_q.numpy()
-        poses[body, 3:] = np.asarray(wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 3.1))
+        poses[body, 3:] = np.asarray(wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5))
         state_in.body_q.assign(poses)
         state_in.body_qd.assign([[0.0, 0.0, 0.0, 10.0, 0.0, 0.0]])
         # Only the contacted node has an active consensus warm start.
@@ -69,11 +70,27 @@ class TestLOXCoupledRejection(unittest.TestCase):
         contacts = _make_particle_contact(model, state_in, shape, gap=-0.005)
         initial_particles = state_in.particle_q.numpy()
         initial_velocities = state_in.particle_qd.numpy()
-        solver.step(state_in, state_out, model.control(), contacts, 0.01)
         lox = solver._solver_kamino._solver_fd
+        rods = lox.rigid_adapter.rods
+        original_update = rods.update_proximal
+        calls = 0
+
+        def inject_nonfinite_multiplier(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                self.assertFalse(bool(lox.world_failed.numpy()[0]))
+                multiplier = rods.multiplier.numpy()
+                multiplier[3] = np.nan
+                rods.multiplier.assign(multiplier)
+            original_update(*args)
+
+        rods.update_proximal = inject_nonfinite_multiplier
+        solver.step(state_in, state_out, model.control(), contacts, 0.01)
 
         self.assertFalse(bool(lox.world_accepted.numpy()[0]))
         self.assertTrue(bool(lox.world_failed.numpy()[0]))
+        np.testing.assert_array_equal(lox.iteration_count.numpy(), [3])
         np.testing.assert_array_equal(state_out.particle_q.numpy(), initial_particles)
         np.testing.assert_array_equal(state_out.particle_qd.numpy(), initial_velocities)
         np.testing.assert_array_equal(state_out.particle_lox_dual_impulse.numpy(), impulse)

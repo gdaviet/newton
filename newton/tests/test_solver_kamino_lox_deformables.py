@@ -53,7 +53,7 @@ def load_tests(loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: 
     suite.addTests(
         TestLOXMaterialRejection(name)
         for name in (
-            "test_material_failure_preserves_coupled_rigid_warm_start",
+            "test_material_failure_discards_coupled_rigid_warm_start",
             "test_assembly_failure_survives_proximal_resets",
             "test_public_tetrahedron_preserves_inversion_tolerant_behavior",
         )

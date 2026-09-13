@@ -82,6 +82,44 @@ def test_damped_candidate_recycles_cr_subspace(test, device):
     test.assertLess(recycled[-1], 0.2 * baseline[-1])
 
 
+def test_recycled_candidate_rejects_non_descent_projection(test, device):
+    """A corrupted or roundoff-damaged recycle basis cannot increase the quadratic."""
+    with wp.ScopedDevice(device):
+        model = _build_damped_beam(device)
+        system = DeformableFEMSystem(
+            model,
+            cr_iterations=4,
+            preconditioner="two_level",
+            direct_max_particles=0,
+            proximal_iterations=0,
+            recycle_cr=True,
+        )
+        time_step = wp.array([1.0 / 480.0], dtype=wp.float32, device=model.device)
+        center = wp.zeros(model.particle_count, dtype=wp.vec3, device=model.device)
+        system.assemble(model.state(), time_step)
+        system.solve_candidate(center)
+        system.solve_candidate(center)
+
+        # Make the retained matrix image point opposite to its direction. This
+        # models the loss of A-orthogonality that finite-precision recycling
+        # must handle without exporting a harmful candidate correction.
+        basis = system.recycled_basis.numpy()
+        matrix_basis = system.recycled_matrix_basis.numpy()
+        denominator = system.recycled_basis_denominator.numpy()
+        basis[1, system.packed_iterative.numpy() != 0] = 1.0
+        matrix_basis[1, system.packed_iterative.numpy() != 0] = -1.0
+        denominator[1, :] = 1.0
+        system.recycled_basis.assign(basis)
+        system.recycled_matrix_basis.assign(matrix_basis)
+        system.recycled_basis_denominator.assign(denominator)
+
+        system.solve_candidate(center)
+
+    test.assertEqual(int(system.recycled_projection_accepted.numpy()[0]), 0)
+    test.assertTrue(np.all(np.isfinite(system.smooth_velocity.numpy())))
+    test.assertTrue(np.all(system.recycled_basis_denominator.numpy()[:, 0] == 0.0))
+
+
 def test_damped_candidate_multilevel_is_finite(test, device):
     """The component-global third level remains stable for strong damping."""
     with wp.ScopedDevice(device):
@@ -106,6 +144,12 @@ add_function_test(
     TestLOXDeformableConvergence,
     "test_damped_candidate_recycles_cr_subspace",
     test_damped_candidate_recycles_cr_subspace,
+    devices=devices,
+)
+add_function_test(
+    TestLOXDeformableConvergence,
+    "test_recycled_candidate_rejects_non_descent_projection",
+    test_recycled_candidate_rejects_non_descent_projection,
     devices=devices,
 )
 add_function_test(

@@ -62,7 +62,7 @@ LOX_STATUS_CONVERGED = 1
 """The world met the configured splitting tolerances."""
 
 LOX_STATUS_FAILED = 2
-"""A projection, proximal operation, or guarded nonlinear trial failed for the world."""
+"""A projection or proximal operation failed for the world."""
 
 LOX_STATUS_ITERATION_LIMIT = 3
 """The world reached the configured splitting iteration limit."""
@@ -70,9 +70,6 @@ LOX_STATUS_ITERATION_LIMIT = 3
 wp.set_module_options({"enable_backward": False})
 
 _JOINT_PENALTY_SEED_PERCENTILE = 0.02
-_NONLINEAR_FEEDBACK_AMPLIFICATION_FACTOR = 4.0
-_NONLINEAR_FEEDBACK_TRUST_FACTOR = 64.0
-_NONLINEAR_FEEDBACK_MIN_NORMALIZED_RESIDUAL = 8.0
 
 
 @wp.struct
@@ -222,209 +219,43 @@ def _update_iteration_condition(
 
 
 @wp.kernel
-def _initialize_nonlinear_recovery(
-    feedback_available: wp.array[wp.bool],
-    feedback_enabled: wp.array[wp.bool],
-    restart_pending: wp.array[wp.bool],
-    fallback_used: wp.array[wp.bool],
-    feedback_unsafe: wp.array[wp.int32],
-    amplification_count: wp.array[wp.int32],
-    trusted_residual: wp.array[wp.float32],
-    previous_residual: wp.array[wp.float32],
-):
-    world = wp.tid()
-    feedback_enabled[world] = feedback_available[world]
-    restart_pending[world] = False
-    fallback_used[world] = False
-    feedback_unsafe[world] = 0
-    amplification_count[world] = 0
-    trusted_residual[world] = -1.0
-    previous_residual[world] = -1.0
-
-
-@wp.kernel
-def _guard_nonlinear_feedback(
-    max_iterations: wp.int32,
-    joint_feedback_residual: wp.array[wp.float32],
-    rod_feedback_residual: wp.array[wp.float32],
-    joint_unsafe: wp.array[wp.int32],
-    rod_unsafe: wp.array[wp.int32],
-    joint_feedback_configured: wp.bool,
-    fallback_allowed: wp.bool,
-    feedback_enabled: wp.array[wp.bool],
-    restart_pending: wp.array[wp.bool],
-    fallback_used: wp.array[wp.bool],
-    feedback_unsafe: wp.array[wp.int32],
-    amplification_count: wp.array[wp.int32],
-    trusted_residual: wp.array[wp.float32],
-    previous_residual: wp.array[wp.float32],
-    world_active: wp.array[wp.bool],
-    world_converged: wp.array[wp.bool],
-    world_failed: wp.array[wp.bool],
-    world_iteration_limit: wp.array[wp.bool],
-    iteration_count: wp.array[wp.int32],
-):
-    world = wp.tid()
-    joint_residual = joint_feedback_residual[world]
-    rod_residual = rod_feedback_residual[world]
-    residual = wp.max(joint_residual, rod_residual)
-    unsafe_reason = wp.int32(0)
-    if not wp.isfinite(joint_residual) or not wp.isfinite(rod_residual):
-        unsafe_reason = wp.int32(1)
-    if joint_feedback_configured and joint_unsafe[world] != 0:
-        unsafe_reason = wp.int32(1)
-    if rod_unsafe and rod_unsafe[world] != 0:
-        unsafe_reason = wp.int32(2)
-    if world_failed[world]:
-        unsafe_reason = wp.int32(3)
-
-    if fallback_used[world]:
-        if unsafe_reason != 0:
-            feedback_unsafe[world] = unsafe_reason
-            world_active[world] = False
-            world_converged[world] = False
-            world_failed[world] = True
-        elif world_converged[world]:
-            # Existing public status has no fallback terminal.  Consume the
-            # bounded remainder and report an accepted iteration-limit result,
-            # never nonlinear convergence after feedback has been disabled.
-            world_active[world] = True
-            world_converged[world] = False
-        return
-    if not feedback_enabled[world]:
-        return
-
-    trusted = trusted_residual[world]
-    previous = previous_residual[world]
-    if trusted < 0.0:
-        trusted = residual
-        trusted_residual[world] = residual
-    if previous >= 0.0 and residual > _NONLINEAR_FEEDBACK_MIN_NORMALIZED_RESIDUAL:
-        if residual > _NONLINEAR_FEEDBACK_AMPLIFICATION_FACTOR * wp.max(previous, 1.0):
-            amplification_count[world] += 1
-        else:
-            amplification_count[world] = 0
-    if amplification_count[world] >= 2:
-        unsafe_reason = wp.int32(4)
-    if residual > _NONLINEAR_FEEDBACK_MIN_NORMALIZED_RESIDUAL and residual > _NONLINEAR_FEEDBACK_TRUST_FACTOR * wp.max(
-        trusted, 1.0
-    ):
-        unsafe_reason = wp.int32(5)
-    previous_residual[world] = residual
-
-    if unsafe_reason != 0:
-        feedback_unsafe[world] = unsafe_reason
-        feedback_enabled[world] = False
-        if fallback_allowed and not fallback_used[world] and iteration_count[world] < max_iterations:
-            fallback_used[world] = True
-            restart_pending[world] = True
-            world_active[world] = True
-            world_converged[world] = False
-            world_failed[world] = False
-            world_iteration_limit[world] = False
-        else:
-            world_active[world] = False
-            world_converged[world] = False
-            world_failed[world] = True
-        return
-
-
-@wp.kernel
-def _restore_recovery_bodies(
+def _discard_failed_body_trials(
     body_world: wp.array[wp.int32],
-    body_vector_index: wp.array[wp.int32],
-    world_mask: wp.array[wp.bool],
-    baseline_projected: wp.array[vec6f],
-    baseline_projected_previous: wp.array[vec6f],
-    baseline_global: wp.array[vec6f],
-    baseline_global_previous: wp.array[vec6f],
-    baseline_dual: wp.array[vec6f],
-    baseline_dual_impulse: wp.array[vec6f],
-    baseline_right_hand_side: wp.array[wp.float32],
-    projected: wp.array[vec6f],
-    projected_previous: wp.array[vec6f],
-    global_twist: wp.array[vec6f],
-    global_previous: wp.array[vec6f],
-    dual: wp.array[vec6f],
+    world_failed: wp.array[wp.bool],
+    velocity_begin: wp.array[vec6f],
+    projected_twist: wp.array[vec6f],
+    splitting_dual: wp.array[vec6f],
     dual_impulse: wp.array[vec6f],
-    right_hand_side: wp.array[wp.float32],
-    nonlinear_right_hand_side: wp.array[wp.float32],
-    candidate_right_hand_side: wp.array[wp.float32],
 ):
     body = wp.tid()
-    if not world_mask[body_world[body]]:
-        return
-    projected[body] = baseline_projected[body]
-    projected_previous[body] = baseline_projected_previous[body]
-    global_twist[body] = baseline_global[body]
-    global_previous[body] = baseline_global_previous[body]
-    dual[body] = baseline_dual[body]
-    dual_impulse[body] = baseline_dual_impulse[body]
-    vector_index = body_vector_index[body]
-    if vector_index >= 0:
-        for axis in range(6):
-            index = vector_index + axis
-            right_hand_side[index] = baseline_right_hand_side[index]
-            nonlinear_right_hand_side[index] = 0.0
-            candidate_right_hand_side[index] = baseline_right_hand_side[index]
+    if world_failed[body_world[body]]:
+        projected_twist[body] = velocity_begin[body]
+        splitting_dual[body] = vec6f(0.0)
+        dual_impulse[body] = vec6f(0.0)
 
 
 @wp.kernel
-def _restore_recovery_rows_float(
+def _clear_failed_rows_float(
     row_world: wp.array[wp.int32],
-    world_mask: wp.array[wp.bool],
-    baseline: wp.array[wp.float32],
+    world_failed: wp.array[wp.bool],
     value: wp.array[wp.float32],
 ):
     row = wp.tid()
     world = row_world[row]
-    if world >= 0 and world < world_mask.shape[0] and world_mask[world]:
-        value[row] = baseline[row]
+    if world >= 0 and world < world_failed.shape[0] and world_failed[world]:
+        value[row] = 0.0
 
 
 @wp.kernel
-def _restore_recovery_rows_vec3(
+def _clear_failed_rows_vec3(
     row_world: wp.array[wp.int32],
-    world_mask: wp.array[wp.bool],
-    baseline: wp.array[wp.vec3f],
+    world_failed: wp.array[wp.bool],
     value: wp.array[wp.vec3f],
 ):
     row = wp.tid()
     world = row_world[row]
-    if world >= 0 and world < world_mask.shape[0] and world_mask[world]:
-        value[row] = baseline[row]
-
-
-@wp.kernel
-def _activate_recovery_restart(
-    restart_pending: wp.array[wp.bool],
-    projection_status: wp.array[wp.int32],
-    world_converged: wp.array[wp.bool],
-    world_failed: wp.array[wp.bool],
-    world_iteration_limit: wp.array[wp.bool],
-    residual_change: wp.array[wp.float32],
-    residual_split: wp.array[wp.float32],
-    residual_structural: wp.array[wp.float32],
-    residual_structural_projected: wp.array[wp.float32],
-    residual_cross_iterate: wp.array[wp.float32],
-    residual_lagged_velocity: wp.array[wp.float32],
-    residual_total: wp.array[wp.float32],
-):
-    world = wp.tid()
-    if not restart_pending[world]:
-        return
-    restart_pending[world] = False
-    projection_status[world] = PROJECTION_STATUS_VALID
-    world_converged[world] = False
-    world_failed[world] = False
-    world_iteration_limit[world] = False
-    residual_change[world] = 0.0
-    residual_split[world] = 0.0
-    residual_structural[world] = 0.0
-    residual_structural_projected[world] = 0.0
-    residual_cross_iterate[world] = 0.0
-    residual_lagged_velocity[world] = 0.0
-    residual_total[world] = 0.0
+    if world >= 0 and world < world_failed.shape[0] and world_failed[world]:
+        value[row] = wp.vec3f(0.0)
 
 
 @wp.kernel
@@ -523,6 +354,9 @@ class LOXSolver:
             raise ValueError("Rigid and deformable LOX systems must contain the same number of worlds.")
         self.max_iterations = config.max_iterations
         self.use_graph_conditionals = config.use_graph_conditionals
+        self._deformable_uses_cudss_then_cr = (
+            config.deformable_linear_solver == "cudss_then_cr" and deformable_model is not None
+        )
         self.fixed_iterations = config.fixed_iterations
         self.projection_iterations = config.projection_iterations
         self.projection_method = config.projection_method
@@ -574,12 +408,11 @@ class LOXSolver:
             config.deformable_normal_cone_filtering_min_distance
         )
         if deformable_model is not None and deformable_model.particle_count > 0:
-            if config.fixed_iterations:
-                raise ValueError("fixed_iterations is not supported for deformable LOX simulations.")
             self.deformable_system = DeformableFEMSystem(
                 deformable_model,
                 cr_iterations=config.deformable_cr_iterations,
                 direct_max_particles=config.deformable_direct_max_particles,
+                linear_solver=config.deformable_linear_solver,
                 weight_sigma=config.weight_sigma,
                 weight_beta=config.deformable_weight_beta,
                 preconditioner=config.deformable_preconditioner,
@@ -618,7 +451,10 @@ class LOXSolver:
                     config.deformable_penetration_free_contact_relaxation,
                 )
         use_parallel_candidates = (
-            self.device.is_cuda and rigid_adapter is not None and self.deformable_system is not None
+            self.device.is_cuda
+            and rigid_adapter is not None
+            and self.deformable_system is not None
+            and config.deformable_linear_solver not in ("cudss", "cudss_then_cr")
         )
         self._deformable_stream = wp.Stream(self.device) if use_parallel_candidates else None
         self._deformable_start_event = wp.Event(self.device) if use_parallel_candidates else None
@@ -630,249 +466,41 @@ class LOXSolver:
         self._time_step: wp.array[wp.float32] | None = None
         self._inverse_time_step: wp.array[wp.float32] | None = None
         self._time_step_prepared = False
-        self._initialize_nonlinear_recovery_storage()
 
-    def _initialize_nonlinear_recovery_storage(self) -> None:
-        """Allocate rigid rollback state for nonlinear feedback or coupled materials."""
-        adapter = self.rigid_adapter
-        self._nonlinear_feedback_trials_enabled = bool(
-            adapter is not None
-            and (
-                adapter.joint_proximal_relaxation > 0.0
-                or (adapter.rods.count > 0 and adapter.rods.proximal_relaxation > 0.0)
-            )
-        )
-        material_rejection = bool(
-            adapter is not None
-            and self.deformable_system is not None
-            and (self.deformable_system.triangle_count > 0 or self.deformable_system.tetrahedron_count > 0)
-        )
-        self._nonlinear_recovery_enabled = self._nonlinear_feedback_trials_enabled or material_rejection
-        if not self._nonlinear_recovery_enabled:
-            self.world_nonlinear_feedback_enabled = None
-            self.world_nonlinear_fallback_used = None
-            self.world_nonlinear_feedback_unsafe = None
-            return
-
-        joint_available = adapter.world_structural_feedback_available.numpy().astype(bool, copy=False)
-        feedback_available = joint_available & (adapter.joint_proximal_relaxation > 0.0)
-        if adapter.rods.count > 0 and adapter.rods.proximal_relaxation > 0.0:
-            rod_body = adapter.rods.body_second.numpy().astype(np.int32, copy=False)
-            body_world = adapter.model.bodies.wid.numpy().astype(np.int32, copy=False)
-            feedback_available = feedback_available.copy()
-            feedback_available[np.unique(body_world[rod_body])] = True
-        self._nonlinear_feedback_available = wp.array(feedback_available, dtype=wp.bool, device=self.device)
-        self.world_nonlinear_feedback_enabled = wp.zeros(self.num_worlds, dtype=wp.bool, device=self.device)
-        self._nonlinear_restart_pending = wp.zeros(self.num_worlds, dtype=wp.bool, device=self.device)
-        self.world_nonlinear_fallback_used = wp.zeros(self.num_worlds, dtype=wp.bool, device=self.device)
-        self.world_nonlinear_feedback_unsafe = wp.zeros(self.num_worlds, dtype=wp.int32, device=self.device)
-        self._nonlinear_amplification_count = wp.zeros(self.num_worlds, dtype=wp.int32, device=self.device)
-        self._nonlinear_trusted_residual = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
-        self._nonlinear_previous_residual = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
-
-        splitting = self.splitting
-        system = self.system
-        self._recovery_projected_twist = wp.empty_like(splitting.projected_twist)
-        self._recovery_projected_twist_previous = wp.empty_like(splitting.projected_twist_previous)
-        self._recovery_global_twist = wp.empty_like(splitting.global_twist)
-        self._recovery_global_twist_previous = wp.empty_like(splitting.global_twist_previous)
-        self._recovery_splitting_dual = wp.empty_like(splitting.splitting_dual)
-        self._recovery_splitting_dual_impulse = wp.empty_like(splitting.splitting_dual_impulse)
-        self._recovery_right_hand_side = wp.empty_like(system.right_hand_side)
-        self._recovery_structural_reaction = wp.empty_like(adapter.structural_reaction)
-        self._recovery_structural_defect = wp.empty_like(adapter.structural_proximal_defect)
-        self._recovery_friction_reaction = wp.empty_like(adapter.friction_reaction)
-        self._recovery_contact_reaction = wp.empty_like(adapter.contact_reaction)
-        self._recovery_contact_velocity = wp.empty_like(adapter.contact_velocity)
-        self._recovery_limit_reaction = wp.empty_like(adapter.limit_reaction)
-        self._recovery_limit_velocity = wp.empty_like(adapter.limit_velocity)
-        self._recovery_effort_state = {}
-        if self.has_bounded_effort:
-            for name in (
-                "effort_counter_applied",
-                "effort_counter_next",
-                "effort_raw_impulse",
-                "effort_net_applied",
-                "effort_net_target",
-                "effort_velocity",
-                "effort_residual",
-            ):
-                self._recovery_effort_state[name] = wp.empty_like(getattr(adapter, name))
-
-    def _capture_nonlinear_recovery_baseline(self) -> None:
-        """Capture the fully prepared frozen solve state before any trial."""
-        if not self._nonlinear_recovery_enabled:
-            return
+    def _discard_failed_rigid_trials(self) -> None:
+        """Discard rejected outputs and cold-start failed worlds without snapshots."""
         adapter = self.rigid_adapter
         splitting = self.splitting
-        system = self.system
-        for destination, source in (
-            (self._recovery_projected_twist, splitting.projected_twist),
-            (self._recovery_projected_twist_previous, splitting.projected_twist_previous),
-            (self._recovery_global_twist, splitting.global_twist),
-            (self._recovery_global_twist_previous, splitting.global_twist_previous),
-            (self._recovery_splitting_dual, splitting.splitting_dual),
-            (self._recovery_splitting_dual_impulse, splitting.splitting_dual_impulse),
-            (self._recovery_right_hand_side, system.right_hand_side),
-            (self._recovery_structural_reaction, adapter.structural_reaction),
-            (self._recovery_structural_defect, adapter.structural_proximal_defect),
-            (self._recovery_friction_reaction, adapter.friction_reaction),
-            (self._recovery_contact_reaction, adapter.contact_reaction),
-            (self._recovery_contact_velocity, adapter.contact_velocity),
-            (self._recovery_limit_reaction, adapter.limit_reaction),
-            (self._recovery_limit_velocity, adapter.limit_velocity),
-        ):
-            wp.copy(destination, source)
-        for name, baseline in self._recovery_effort_state.items():
-            wp.copy(baseline, getattr(adapter, name))
         wp.launch(
-            _initialize_nonlinear_recovery,
-            dim=self.num_worlds,
-            inputs=[self._nonlinear_feedback_available],
-            outputs=[
-                self.world_nonlinear_feedback_enabled,
-                self._nonlinear_restart_pending,
-                self.world_nonlinear_fallback_used,
-                self.world_nonlinear_feedback_unsafe,
-                self._nonlinear_amplification_count,
-                self._nonlinear_trusted_residual,
-                self._nonlinear_previous_residual,
-            ],
+            _discard_failed_body_trials,
+            dim=self.system.num_bodies,
+            inputs=[splitting.body_world, self.world_failed, adapter.body_velocity_begin],
+            outputs=[splitting.projected_twist, splitting.splitting_dual, splitting.splitting_dual_impulse],
             device=self.device,
         )
-
-    def _restore_nonlinear_recovery_state(
-        self,
-        world_mask: wp.array[wp.bool],
-        *,
-        activate_restart: bool,
-    ) -> None:
-        """Restore selected worlds to the prepared frozen baseline."""
-        adapter = self.rigid_adapter
-        splitting = self.splitting
-        system = self.system
-        wp.launch(
-            _restore_recovery_bodies,
-            dim=system.num_bodies,
-            inputs=[
-                splitting.body_world,
-                system.body_vector_index,
-                world_mask,
-                self._recovery_projected_twist,
-                self._recovery_projected_twist_previous,
-                self._recovery_global_twist,
-                self._recovery_global_twist_previous,
-                self._recovery_splitting_dual,
-                self._recovery_splitting_dual_impulse,
-                self._recovery_right_hand_side,
-            ],
-            outputs=[
-                splitting.projected_twist,
-                splitting.projected_twist_previous,
-                splitting.global_twist,
-                splitting.global_twist_previous,
-                splitting.splitting_dual,
-                splitting.splitting_dual_impulse,
-                system.right_hand_side,
-                system.nonlinear_right_hand_side,
-                system.candidate_right_hand_side,
-            ],
-            device=self.device,
-        )
-        for row_world, baseline, value in (
-            (adapter.structural_row_world, self._recovery_structural_reaction, adapter.structural_reaction),
-            (adapter.structural_row_world, self._recovery_structural_defect, adapter.structural_proximal_defect),
-            (adapter.friction_world, self._recovery_friction_reaction, adapter.friction_reaction),
-            (adapter.limit_world, self._recovery_limit_reaction, adapter.limit_reaction),
-            (adapter.limit_world, self._recovery_limit_velocity, adapter.limit_velocity),
+        adapter.reset_structural_multipliers(self.world_failed)
+        adapter.reset_friction_reactions(self.world_failed)
+        adapter.reset_effort_counters(self.world_failed)
+        adapter.rods.reset_proximal(self.world_failed)
+        for worlds, value in (
+            (adapter.limit_world, adapter.limit_reaction),
+            (adapter.limit_world, adapter.limit_velocity),
         ):
-            if value.shape[0] > 0:
+            if value.shape[0]:
                 wp.launch(
-                    _restore_recovery_rows_float,
+                    _clear_failed_rows_float,
                     dim=value.shape[0],
-                    inputs=[row_world, world_mask, baseline],
-                    outputs=[value],
+                    inputs=[worlds, self.world_failed, value],
                     device=self.device,
                 )
-        for baseline, value in (
-            (self._recovery_contact_reaction, adapter.contact_reaction),
-            (self._recovery_contact_velocity, adapter.contact_velocity),
-        ):
-            if value.shape[0] > 0:
+        for value in (adapter.contact_reaction, adapter.contact_velocity):
+            if value.shape[0]:
                 wp.launch(
-                    _restore_recovery_rows_vec3,
+                    _clear_failed_rows_vec3,
                     dim=value.shape[0],
-                    inputs=[adapter.contact_world, world_mask, baseline],
-                    outputs=[value],
+                    inputs=[adapter.contact_world, self.world_failed, value],
                     device=self.device,
                 )
-        for name, baseline in self._recovery_effort_state.items():
-            value = getattr(adapter, name)
-            wp.launch(
-                _restore_recovery_rows_float,
-                dim=value.shape[0],
-                inputs=[adapter.effort_world, world_mask, baseline],
-                outputs=[value],
-                device=self.device,
-            )
-        adapter.rods.restore_proximal(world_mask)
-        if activate_restart:
-            wp.launch(
-                _activate_recovery_restart,
-                dim=self.num_worlds,
-                inputs=[self._nonlinear_restart_pending],
-                outputs=[
-                    adapter.projection_status,
-                    splitting.world_converged,
-                    splitting.world_failed,
-                    splitting.world_iteration_limit,
-                    splitting.residual_change,
-                    splitting.residual_split,
-                    splitting.residual_structural,
-                    splitting.residual_structural_projected,
-                    splitting.residual_cross_iterate,
-                    splitting.residual_lagged_velocity,
-                    splitting.residual_total,
-                ],
-                device=self.device,
-            )
-
-    def _prepare_nonlinear_recovery_iteration(self) -> None:
-        if self._nonlinear_feedback_trials_enabled:
-            self._restore_nonlinear_recovery_state(self._nonlinear_restart_pending, activate_restart=True)
-
-    def _guard_nonlinear_recovery_iteration(self) -> None:
-        if not self._nonlinear_feedback_trials_enabled:
-            return
-        adapter = self.rigid_adapter
-        wp.launch(
-            _guard_nonlinear_feedback,
-            dim=self.num_worlds,
-            inputs=[
-                self.max_iterations,
-                adapter.world_feedback_structural_residual,
-                adapter.rods.world_proximal_residual,
-                adapter.world_structural_feedback_unsafe,
-                adapter.rods.world_proximal_unsafe,
-                adapter.joint_proximal_relaxation > 0.0,
-                self.deformable_system is None,
-            ],
-            outputs=[
-                self.world_nonlinear_feedback_enabled,
-                self._nonlinear_restart_pending,
-                self.world_nonlinear_fallback_used,
-                self.world_nonlinear_feedback_unsafe,
-                self._nonlinear_amplification_count,
-                self._nonlinear_trusted_residual,
-                self._nonlinear_previous_residual,
-                self.world_active,
-                self.world_converged,
-                self.world_failed,
-                self.world_iteration_limit,
-                self.iteration_count,
-            ],
-            device=self.device,
-        )
 
     def _bind_rigid_topology(self) -> None:
         """Bind solver views and scratch arrays to the current rigid topology."""
@@ -949,7 +577,6 @@ class LOXSolver:
         self._colored_gauss_seidel = None
         self._bind_rigid_topology()
         self.has_bounded_effort = rigid_adapter.has_bounded_effort
-        self._initialize_nonlinear_recovery_storage()
         self.reset()
 
     def joint_penalty_scale_seed(
@@ -1612,13 +1239,17 @@ class LOXSolver:
             device=self.device,
         )
 
-    def _deformable_candidate_projection(self, time_step: wp.array[wp.float32]) -> None:
+    def _deformable_candidate_projection(
+        self,
+        time_step: wp.array[wp.float32],
+        use_cudss: bool = False,
+    ) -> None:
         deformable_system = self.deformable_system
         deformable_splitting = self.deformable_splitting
         if deformable_system is None or deformable_splitting is None:
             return
         center = deformable_splitting.build_consensus_center(self.world_active)
-        deformable_system.solve_candidate(center)
+        deformable_system.solve_candidate(center, use_cudss=use_cudss)
         deformable_system.update_proximal(time_step)
         deformable_splitting.prepare_projection(deformable_system.smooth_velocity)
         contact_system = self.deformable_contacts if self._deformable_contacts_active else None
@@ -1678,6 +1309,7 @@ class LOXSolver:
             contact_system=contact_system,
             rigid_projected_twist=(self.splitting.projected_twist if self._has_dynamic_rigid_bodies else None),
             increment_iteration_count=self.splitting is None,
+            fixed_iterations=self.fixed_iterations,
         )
 
     def _truncate_deformable_projection(self, time_step: wp.array[wp.float32]) -> None:
@@ -1695,10 +1327,10 @@ class LOXSolver:
         time_step: wp.array[wp.float32],
         linearization_twist: wp.array[vec6f] | None,
         conditional: bool,
+        deformable_use_cudss: bool = False,
     ) -> None:
-        self._prepare_nonlinear_recovery_iteration()
         if self._deformable_stream is None:
-            self._deformable_candidate_projection(time_step)
+            self._deformable_candidate_projection(time_step, use_cudss=deformable_use_cudss)
             if self.rigid_adapter is not None:
                 assert linearization_twist is not None
                 self._prepare_body_space_candidate(time_step, linearization_twist)
@@ -1708,7 +1340,7 @@ class LOXSolver:
             main_stream.record_event(self._deformable_start_event)
             self._deformable_stream.wait_event(self._deformable_start_event)
             with wp.ScopedStream(self._deformable_stream):
-                self._deformable_candidate_projection(time_step)
+                self._deformable_candidate_projection(time_step, use_cudss=deformable_use_cudss)
             self._deformable_stream.record_event(self._deformable_complete_event)
             assert linearization_twist is not None
             self._prepare_body_space_candidate(time_step, linearization_twist)
@@ -1719,7 +1351,6 @@ class LOXSolver:
         if self.rigid_adapter is not None:
             self._finish_body_space_iteration(time_step, linearization_twist)
         self._finish_deformable_iteration(time_step)
-        self._guard_nonlinear_recovery_iteration()
         if conditional:
             self._update_conditional_iteration()
 
@@ -1757,7 +1388,6 @@ class LOXSolver:
             system.body_solution,
             linearization_twist,
             splitting.world_active,
-            self.world_nonlinear_feedback_enabled,
             time_step,
             self.position_tolerance,
             self.rotation_tolerance,
@@ -1778,7 +1408,6 @@ class LOXSolver:
             splitting.global_twist,
             splitting.projected_twist,
             splitting.world_active,
-            self.world_nonlinear_feedback_enabled,
             projected_fraction=self.joint_multiplier_projected_fraction,
         )
         if self.has_bounded_effort:
@@ -1811,12 +1440,14 @@ class LOXSolver:
                 lagged_velocity_residual=rigid_adapter.world_lagged_velocity_residual,
                 lagged_velocity_required=rigid_adapter.world_lagged_velocity_required,
                 proximal_residual=rigid_adapter.rods.world_proximal_residual,
-                proximal_failed=rigid_adapter.rods.world_proximal_unsafe,
+                proximal_failed=rigid_adapter.rods.world_proximal_failed,
+                structural_failed=rigid_adapter.world_structural_failed,
             )
         else:
             splitting.finish_fixed_iteration(
                 rigid_adapter.projection_status,
-                proximal_failed=rigid_adapter.rods.world_proximal_unsafe,
+                proximal_failed=rigid_adapter.rods.world_proximal_failed,
+                structural_failed=rigid_adapter.world_structural_failed,
             )
 
     def _body_space_iteration(
@@ -1825,11 +1456,9 @@ class LOXSolver:
         linearization_twist: wp.array[vec6f],
         conditional: bool,
     ) -> None:
-        self._prepare_nonlinear_recovery_iteration()
         self._prepare_body_space_candidate(time_step, linearization_twist)
         self._project_body_space_constraints()
         self._finish_body_space_iteration(time_step, linearization_twist)
-        self._guard_nonlinear_recovery_iteration()
         if conditional:
             self._update_conditional_iteration()
 
@@ -1896,15 +1525,28 @@ class LOXSolver:
             splitting.restore_dual_from_impulse(system.inverse_weight, rigid_adapter.body_has_unilateral)
             system.factorize()
             self._prepare_body_space_projection()
-            self._capture_nonlinear_recovery_baseline()
+
+        remaining_iterations = self.max_iterations
+        if self._deformable_uses_cudss_then_cr:
+            self._combined_iteration(
+                time_step,
+                linearization_twist,
+                conditional=False,
+                deformable_use_cudss=True,
+            )
+            remaining_iterations -= 1
 
         use_conditional_loop = (
-            not self.fixed_iterations
+            remaining_iterations > 0
+            and not self.fixed_iterations
             and self.use_graph_conditionals
             and (not self.device.is_cuda or not self.device.is_capturing or wp.is_conditional_graph_supported())
         )
         if use_conditional_loop:
-            self._iteration_condition.fill_(1)
+            if self._deformable_uses_cudss_then_cr:
+                self._update_conditional_iteration()
+            else:
+                self._iteration_condition.fill_(1)
             if self.deformable_system is None:
                 wp.capture_while(
                     self._iteration_condition,
@@ -1922,7 +1564,7 @@ class LOXSolver:
                     conditional=True,
                 )
         else:
-            for _iteration in range(self.max_iterations):
+            for _iteration in range(remaining_iterations):
                 if self.deformable_system is None:
                     self._body_space_iteration(time_step, linearization_twist, conditional=False)
                 else:
@@ -1945,11 +1587,8 @@ class LOXSolver:
             outputs=[self.world_accepted, self.world_status, self.status],
             device=self.device,
         )
-        if splitting is not None and self._nonlinear_recovery_enabled:
-            # A rejected nonlinear trial must not become either solver output or
-            # the next step's multiplier/consensus warm start.
-            self._restore_nonlinear_recovery_state(self.world_failed, activate_restart=False)
         if splitting is not None:
+            self._discard_failed_rigid_trials()
             splitting.store_dual_impulse(system.weight, rigid_adapter.body_has_unilateral)
         if self.deformable_splitting is not None:
             self.deformable_splitting.accept_projected(self.world_accepted)

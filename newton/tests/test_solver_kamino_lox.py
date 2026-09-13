@@ -24,11 +24,11 @@ _LOX_QUALITY_TESTS = (
     "test_joint_proximal_uses_frozen_frame_for_full_position_blocks",
     "test_joint_proximal_handles_two_body_frames_and_orderings",
     "test_joint_proximal_relaxations_share_position_fixed_point",
-    "test_joint_proximal_recovery_matches_remaining_frozen_budget",
     "test_joint_proximal_accepts_finite_root_translation_transient",
-    "test_joint_proximal_rejects_last_iteration_nonfinite_feedback",
-    "test_joint_proximal_recovery_is_per_world",
-    "test_joint_proximal_recovery_restores_apgd_contact_state",
+    "test_joint_proximal_blocks_nonfinite_row_update",
+    "test_joint_proximal_rejection_is_per_world",
+    "test_joint_proximal_rejection_runs_in_conditional_loop",
+    "test_joint_proximal_rejection_clears_apgd_contact_state",
     "test_product_space_structural_split_hinged_contact",
 )
 
@@ -38,13 +38,13 @@ def load_tests(loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: 
     del loader, tests, pattern
     suite = unittest.TestSuite(TestSolverKaminoLOX(name) for name in _LOX_QUALITY_TESTS)
     suite.addTest(TestLOXJointCovariance("test_joint_feedback_rotates_poses_velocities_and_wrenches"))
-    suite.addTest(TestLOXCoupledRejection("test_unsafe_rod_rejects_coupled_trial_without_particle_warmstart_leak"))
+    suite.addTest(TestLOXCoupledRejection("test_nonfinite_rod_rejects_coupled_trial_without_particle_warmstart_leak"))
     suite.addTests(
         TestLOXRodFeedback(name)
         for name in (
             "test_twist_damping_crosses_both_principal_branches",
             "test_mixed_twist_matches_independent_implicit_reference",
-            "test_unsafe_bend_geometry_recovers_to_frozen_solution",
+            "test_finite_large_rod_updates_are_not_preemptively_rejected",
         )
     )
     return suite

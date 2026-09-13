@@ -1,0 +1,1 @@
+Add CUDA-graph-compatible cuDSS linear-solve modes for LOX deformables that reuse symbolic analysis across time steps and numerical factorization across solver iterations, including a hybrid mode that uses cuDSS for the first candidate and CR thereafter.

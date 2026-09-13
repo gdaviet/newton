@@ -28,17 +28,6 @@ __all__ = ["RodMaterialSystem", "validate_rod_model"]
 
 wp.set_module_options({"enable_backward": False})
 
-# The shared rod curvature is capped at 20. Keeping nonlinear feedback below
-# 95% of that cap leaves a finite angular margin before its radial derivative
-# vanishes. Motion that could consume the margin is retried on the frozen path.
-_ROD_FEEDBACK_CURVATURE_LIMIT = wp.constant(19.0)
-_ROD_FEEDBACK_BEND_ANGLE_LIMIT = wp.constant(2.9318388)  # 2*atan(19/2)
-_ROD_FEEDBACK_ANGLE_INCREMENT_LIMIT = wp.constant(2.9845130)  # 0.95*pi
-
-_ROD_PROXIMAL_UNSAFE_NONFINITE = wp.constant(1)
-_ROD_PROXIMAL_UNSAFE_TWIST_CHART = wp.constant(2)
-_ROD_PROXIMAL_UNSAFE_BEND_CHART = wp.constant(3)
-
 
 def validate_rod_model(model: Model, *, use_fk_solver: bool) -> None:
     """Validate the model subset supported by LOX rod materials."""
@@ -420,17 +409,15 @@ def _update_rod_proximal(
     frozen_jacobian_second: wp.array[vec6f],
     body_vector_index: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
-    world_feedback_enabled: wp.array[wp.bool],
     time_step: wp.array[wp.float32],
     rotation_tolerance: wp.float32,
     velocity_tolerance: wp.float32,
     proximal_relaxation: wp.float32,
-    temporal_twist_increment: wp.array[wp.float32],
     proximal_coordinate: wp.array[wp.float32],
     multiplier: wp.array[wp.float32],
     nonlinear_right_hand_side: wp.array[wp.float32],
     world_residual: wp.array[wp.float32],
-    world_unsafe: wp.array[wp.int32],
+    world_failed: wp.array[wp.int32],
 ):
     """Update one fixed-metric bend/twist prox and scatter its next RHS correction."""
     rod = wp.tid()
@@ -441,7 +428,7 @@ def _update_rod_proximal(
     first = rod_body_first[rod]
     second = rod_body_second[rod]
     world = body_world[second]
-    if not world_active[world] or not world_feedback_enabled[world]:
+    if not world_active[world]:
         return
     dt = time_step[world]
 
@@ -465,23 +452,8 @@ def _update_rod_proximal(
     )
     first_orientation = wp.transform_get_rotation(first_pose)
     second_orientation = wp.transform_get_rotation(second_pose)
-    frozen_first_pose = _joint_pose(
-        first,
-        body_pose,
-        joint_first_position[joint],
-        joint_first_orientation[joint],
-    )
-    frozen_second_pose = _joint_pose(
-        second,
-        body_pose,
-        joint_second_position[joint],
-        joint_second_orientation[joint],
-    )
-    frozen_first_orientation = wp.transform_get_rotation(frozen_first_pose)
-    frozen_second_orientation = wp.transform_get_rotation(frozen_second_pose)
     linear_strain = _linear_rod_strain(first_pose, second_pose)
     measure = _measure_rod_bend_twist_z(first_orientation, second_orientation)
-    frozen_measure = _measure_rod_bend_twist_z(frozen_first_orientation, frozen_second_orientation)
     angular_strain = _assemble_geometric_rod_kappa_z(
         first_orientation,
         measure.kb_world,
@@ -497,21 +469,6 @@ def _update_rod_proximal(
         angular_strain[1],
         angular_strain[2],
     )
-
-    # The relative endpoint angular increment bounds tangent motion without
-    # treating a common rigid rotation as bend deformation.
-    first_angular_increment = wp.vec3f(0.0)
-    if first >= 0:
-        first_delta = candidate_velocity[first] - linearization_velocity[first]
-        first_angular_increment = dt * wp.vec3f(first_delta[3], first_delta[4], first_delta[5])
-    second_angular_increment = wp.vec3f(0.0)
-    if second >= 0:
-        second_delta = candidate_velocity[second] - linearization_velocity[second]
-        second_angular_increment = dt * wp.vec3f(second_delta[3], second_delta[4], second_delta[5])
-    relative_angular_increment = wp.length(second_angular_increment - first_angular_increment)
-    frozen_bend = wp.length(frozen_measure.kb_world)
-    candidate_bend = wp.length(measure.kb_world)
-    frozen_bend_angle = wp.acos(wp.clamp(wp.dot(frozen_measure.t0, frozen_measure.t1), -1.0, 1.0))
 
     row_offset = 6 * rod
     twist_row = row_offset + 5
@@ -531,29 +488,8 @@ def _update_rod_proximal(
         (predicted_twist_increment - principal_twist_change) / wp.tau
     )
 
-    finite_geometry = (
-        wp.isfinite(frozen_bend)
-        and wp.isfinite(candidate_bend)
-        and wp.isfinite(relative_angular_increment)
-        and wp.isfinite(predicted_twist_increment)
-        and wp.isfinite(lifted_twist_increment)
-    )
-    if not finite_geometry:
-        wp.atomic_max(world_unsafe, world, _ROD_PROXIMAL_UNSAFE_NONFINITE)
-        return
-    if (
-        wp.abs(predicted_twist_increment) >= _ROD_FEEDBACK_ANGLE_INCREMENT_LIMIT
-        or wp.abs(lifted_twist_increment) >= _ROD_FEEDBACK_ANGLE_INCREMENT_LIMIT
-        or wp.abs(lifted_twist_increment - temporal_twist_increment[rod]) >= _ROD_FEEDBACK_ANGLE_INCREMENT_LIMIT
-    ):
-        wp.atomic_max(world_unsafe, world, _ROD_PROXIMAL_UNSAFE_TWIST_CHART)
-        return
-    if (
-        frozen_bend >= _ROD_FEEDBACK_CURVATURE_LIMIT
-        or candidate_bend >= _ROD_FEEDBACK_CURVATURE_LIMIT
-        or frozen_bend_angle + relative_angular_increment >= _ROD_FEEDBACK_BEND_ANGLE_LIMIT
-    ):
-        wp.atomic_max(world_unsafe, world, _ROD_PROXIMAL_UNSAFE_BEND_CHART)
+    if not wp.isfinite(predicted_twist_increment) or not wp.isfinite(lifted_twist_increment):
+        wp.atomic_max(world_failed, world, 1)
         return
 
     coordinate_new = vec6f(0.0)
@@ -616,7 +552,7 @@ def _update_rod_proximal(
         )
 
     if not finite or not wp.isfinite(residual):
-        wp.atomic_max(world_unsafe, world, _ROD_PROXIMAL_UNSAFE_NONFINITE)
+        wp.atomic_max(world_failed, world, 1)
         return
 
     first_vector_offset = -1
@@ -646,18 +582,16 @@ def _update_rod_proximal(
                 )
         proximal_coordinate[row] = coordinate_new[local_row]
         multiplier[row] = multiplier_new[local_row]
-    temporal_twist_increment[rod] = lifted_twist_increment
     wp.atomic_max(world_residual, world, residual)
 
 
 @wp.kernel
-def _restore_rod_proximal(
+def _reset_rod_proximal(
     rod_body_second: wp.array[wp.int32],
     body_world: wp.array[wp.int32],
     world_mask: wp.array[wp.bool],
     frozen_strain: wp.array[wp.float32],
     frozen_stress: wp.array[wp.float32],
-    temporal_twist_increment: wp.array[wp.float32],
     proximal_coordinate: wp.array[wp.float32],
     multiplier: wp.array[wp.float32],
 ):
@@ -670,19 +604,6 @@ def _restore_rod_proximal(
         row = row_offset + local_row
         proximal_coordinate[row] = frozen_strain[row]
         multiplier[row] = frozen_stress[row]
-    temporal_twist_increment[rod] = 0.0
-
-
-@wp.kernel
-def _clear_selected_rod_diagnostics(
-    world_mask: wp.array[wp.bool],
-    world_residual: wp.array[wp.float32],
-    world_unsafe: wp.array[wp.int32],
-):
-    world = wp.tid()
-    if world_mask[world]:
-        world_residual[world] = 0.0
-        world_unsafe[world] = 0
 
 
 class RodMaterialSystem:
@@ -720,11 +641,10 @@ class RodMaterialSystem:
         self.tangent_diagonal = wp.zeros(row_count, dtype=wp.float32, device=self.device)
         self.jacobian_first = wp.zeros(row_count, dtype=vec6f, device=self.device)
         self.jacobian_second = wp.zeros(row_count, dtype=vec6f, device=self.device)
-        self.temporal_twist_increment = wp.zeros(self.count, dtype=wp.float32, device=self.device)
         self.proximal_coordinate = wp.zeros(row_count, dtype=wp.float32, device=self.device)
         self.multiplier = wp.zeros(row_count, dtype=wp.float32, device=self.device)
         self.world_proximal_residual = wp.zeros(model.size.num_worlds, dtype=wp.float32, device=self.device)
-        self.world_proximal_unsafe = wp.zeros(model.size.num_worlds, dtype=wp.int32, device=self.device)
+        self.world_proximal_failed = wp.zeros(model.size.num_worlds, dtype=wp.int32, device=self.device)
         self.refresh_rest_state()
 
     def refresh_rest_state(self) -> None:
@@ -810,9 +730,8 @@ class RodMaterialSystem:
         if self.proximal_relaxation > 0.0:
             wp.copy(self.proximal_coordinate, self.strain)
             wp.copy(self.multiplier, self.stress)
-            self.temporal_twist_increment.zero_()
             self.world_proximal_residual.zero_()
-            self.world_proximal_unsafe.zero_()
+            self.world_proximal_failed.zero_()
 
     def update_proximal(
         self,
@@ -820,7 +739,6 @@ class RodMaterialSystem:
         candidate_velocity: wp.array[vec6f],
         linearization_velocity: wp.array[vec6f],
         world_active: wp.array[wp.bool],
-        world_feedback_enabled: wp.array[wp.bool],
         time_step: wp.array[wp.float32],
         position_tolerance: float,
         rotation_tolerance: float,
@@ -834,15 +752,13 @@ class RodMaterialSystem:
             raise ValueError("Rod proximal velocities must contain one entry per body.")
         if world_active.shape[0] != self.model.size.num_worlds:
             raise ValueError("Rod proximal world mask must contain one entry per world.")
-        if world_feedback_enabled.shape[0] != self.model.size.num_worlds:
-            raise ValueError("Rod proximal feedback mask must contain one entry per world.")
         validate_world_time_step(time_step, self.model.size.num_worlds, self.device)
         if position_tolerance <= 0.0 or rotation_tolerance <= 0.0 or velocity_tolerance <= 0.0:
             raise ValueError("Rod proximal convergence tolerances must be positive.")
 
         system.nonlinear_right_hand_side.zero_()
         self.world_proximal_residual.zero_()
-        self.world_proximal_unsafe.zero_()
+        self.world_proximal_failed.zero_()
         wp.launch(
             _update_rod_proximal,
             dim=self.count,
@@ -870,31 +786,29 @@ class RodMaterialSystem:
                 self.jacobian_second,
                 system.body_vector_index,
                 world_active,
-                world_feedback_enabled,
                 time_step,
                 rotation_tolerance,
                 velocity_tolerance,
                 self.proximal_relaxation,
             ],
             outputs=[
-                self.temporal_twist_increment,
                 self.proximal_coordinate,
                 self.multiplier,
                 system.nonlinear_right_hand_side,
                 self.world_proximal_residual,
-                self.world_proximal_unsafe,
+                self.world_proximal_failed,
             ],
             device=self.device,
         )
 
-    def restore_proximal(self, world_mask: wp.array[wp.bool]) -> None:
-        """Restore selected worlds to their prepared frozen rod state."""
+    def reset_proximal(self, world_mask: wp.array[wp.bool]) -> None:
+        """Discard selected worlds' local corrections using the frozen material state."""
         if self.count == 0 or self.proximal_relaxation <= 0.0:
             return
         if world_mask.shape[0] != self.model.size.num_worlds:
-            raise ValueError("Rod proximal restore mask must contain one entry per world.")
+            raise ValueError("Rod proximal reset mask must contain one entry per world.")
         wp.launch(
-            _restore_rod_proximal,
+            _reset_rod_proximal,
             dim=self.count,
             inputs=[
                 self.body_second,
@@ -904,17 +818,9 @@ class RodMaterialSystem:
                 self.stress,
             ],
             outputs=[
-                self.temporal_twist_increment,
                 self.proximal_coordinate,
                 self.multiplier,
             ],
-            device=self.device,
-        )
-        wp.launch(
-            _clear_selected_rod_diagnostics,
-            dim=self.model.size.num_worlds,
-            inputs=[world_mask],
-            outputs=[self.world_proximal_residual, self.world_proximal_unsafe],
             device=self.device,
         )
 
@@ -949,8 +855,7 @@ class RodMaterialSystem:
         self.tangent_diagonal.zero_()
         self.jacobian_first.zero_()
         self.jacobian_second.zero_()
-        self.temporal_twist_increment.zero_()
         self.proximal_coordinate.zero_()
         self.multiplier.zero_()
         self.world_proximal_residual.zero_()
-        self.world_proximal_unsafe.zero_()
+        self.world_proximal_failed.zero_()
