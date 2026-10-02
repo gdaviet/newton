@@ -648,7 +648,7 @@ def test_rheology_residual_inactive_strain_nodes(test, device):
         nv = operator.momentum.velocity.shape[0]
         velocity = np.linspace(-0.01, 0.01, 3 * nv, dtype=np.float32).reshape(nv, 3)
         tolerance_scale = np.sqrt(1 + operator.size)
-        for mode in ("gs", "jacobi"):
+        for mode in ("gs", "gs-soa", "gs-batched", "jacobi"):
             with test.subTest(solver=mode):
                 # The fresh store's only stress-sized buffer becomes the solver's stress delta.
                 store = fem.TemporaryStore()

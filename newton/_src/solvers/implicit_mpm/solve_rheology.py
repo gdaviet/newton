@@ -842,7 +842,7 @@ class _ReorderedGaussSeidelSolver(_RheologySolver):
             device=self.device,
         )
 
-        # Expand color blocks into flat constraint IDs (fully written by kernel)
+        # Expand color blocks into flat constraint IDs (kernel writes the colored prefix)
         self._flat_constraint_ids = fem.borrow_temporary(
             temporary_store, shape=(n_total,), dtype=int, device=self.device
         )
@@ -880,6 +880,7 @@ class _ReorderedGaussSeidelSolver(_RheologySolver):
             kernel=reorder_strain_mat,
             dim=n_total,
             inputs=[
+                self._flat_color_offsets,
                 self._flat_constraint_ids,
                 self.rheology.strain_mat.offsets,
                 self.rheology.strain_mat.columns,
@@ -1084,6 +1085,7 @@ class _BatchedGaussSeidelSolver(_RheologySolver):
             kernel=reorder_strain_mat,
             dim=n_total,
             inputs=[
+                self._flat_color_offsets,
                 self._flat_constraint_ids,
                 self.rheology.strain_mat.offsets,
                 self.rheology.strain_mat.columns,
