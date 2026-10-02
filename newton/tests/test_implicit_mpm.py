@@ -300,7 +300,7 @@ def test_assembled_elastic_stiffness(test, device):
 
 
 @contextmanager
-def _coupled_rheology(device):
+def _coupled_rheology(device, grid_type="dense", max_active_cell_count=-1):
     with wp.ScopedDevice(device):
         builder = _make_mpm_particle_builder(gravity=(0, 0, 0), dimensions=(4, 2, 2))
         model = builder.finalize(device=device)
@@ -309,8 +309,9 @@ def _coupled_rheology(device):
         model.mpm.tensile_yield_ratio.fill_(1.0)
         config = SolverImplicitMPM.Config(
             voxel_size=0.1,
-            grid_type="dense",
+            grid_type=grid_type,
             grid_padding=0,
+            max_active_cell_count=max_active_cell_count,
             velocity_basis="Q1",
             strain_basis="P0",
             collider_basis="Q1",
@@ -632,6 +633,41 @@ def test_majorizer_capture(test, device):
             wp.capture_launch(capture.graph)
             for field, reference in zip(fields, expected, strict=True):
                 np.testing.assert_allclose(field.numpy(), reference, rtol=3e-6, atol=1e-9, equal_nan=False)
+
+
+def test_rheology_residual_inactive_strain_nodes(test, device):
+    """Converge when strain arrays reserve inactive nodes and borrow stale memory.
+
+    Sparse grids with reserved capacity size the strain arrays beyond the active
+    nodes, and colored solvers update only the active ones. The residual reads
+    every stress-delta entry, so the borrowed buffer is poisoned with NaN.
+    """
+    with _coupled_rheology(device, grid_type="sparse", max_active_cell_count=16) as (operator, _store):
+        offsets = operator.rheology.strain_mat.offsets.numpy()
+        test.assertTrue(np.any(offsets[1:] == offsets[:-1]), msg="expected inactive strain nodes")
+        nv = operator.momentum.velocity.shape[0]
+        velocity = np.linspace(-0.01, 0.01, 3 * nv, dtype=np.float32).reshape(nv, 3)
+        tolerance_scale = np.sqrt(1 + operator.size)
+        for mode in ("gs", "jacobi"):
+            with test.subTest(solver=mode):
+                # The fresh store's only stress-sized buffer becomes the solver's stress delta.
+                store = fem.TemporaryStore()
+                stale = fem.borrow_temporary(store, shape=operator.size, dtype=vec6)
+                stale.fill_(vec6(float("nan")))
+                stale.release()
+                operator.rheology.stress.zero_()
+                operator.momentum.velocity.assign(velocity)
+                solver = _RHEOLOGY_SOLVERS[mode](operator, store)
+                try:
+                    solver.apply_initial_guess()
+                    for _ in range(solver.solve_granularity):
+                        solver.solve()
+                    residual = solver.eval_residual().numpy()
+                finally:
+                    solver.release()
+                res_l2, res_linf = _nonlinear_solver_result_norms(residual, tolerance_scale)
+                test.assertLess(res_l2, 1e-5)
+                test.assertLess(res_linf, 1e-5)
 
 
 def _make_mpm_particle_builder(
@@ -2088,6 +2124,12 @@ add_function_test(
 )
 add_function_test(TestImplicitMPM, "test_majorized_rheology_solve", test_majorized_rheology_solve, devices=devices)
 add_function_test(TestImplicitMPM, "test_majorizer_capture", test_majorizer_capture, devices=get_cuda_test_devices())
+add_function_test(
+    TestImplicitMPM,
+    "test_rheology_residual_inactive_strain_nodes",
+    test_rheology_residual_inactive_strain_nodes,
+    devices=devices,
+)
 add_function_test(
     TestImplicitMPM,
     "test_majorized_rheology_capture",
