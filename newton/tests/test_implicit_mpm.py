@@ -1788,6 +1788,35 @@ def test_shared_solver_globalizes_external_multiworld_colliders(test, device):
     test.assertEqual(np.unique(collider.face_material_index.numpy()).shape[0], 2)
 
 
+def test_pic_strain_basis_empty_cells(test, device):
+    """Construct and step a particle-based strain basis on grids with empty cells.
+
+    Cell-based Gauss-Seidel coloring covers every partition cell, including
+    padding cells that hold no particles, so the colored cells outnumber the
+    particle-based strain nodes. Both grid types use the same partition type
+    as the other particle-based strain basis tests in this process.
+    """
+    for grid_type in ("dense", "fixed"):
+        with test.subTest(grid_type=grid_type):
+            model = _make_mpm_particle_builder().finalize(device=device)
+            config = SolverImplicitMPM.Config(
+                voxel_size=0.1,
+                grid_type=grid_type,
+                grid_padding=2,
+                max_active_cell_count=256,
+                strain_basis="pic8",
+                solver="gs",
+                max_iterations=50,
+            )
+            solver, state = _step_mpm(model, config, step_count=2)
+            scratch = solver._scratchpad
+            cell_count = scratch._strain_space_restriction.space_partition.geo_partition.cell_count()
+            test.assertGreater(cell_count, scratch.strain_node_count)
+            positions = state.particle_q.numpy()
+            test.assertTrue(np.isfinite(positions).all())
+            test.assertLess(np.max(positions[:, 1]), 0.075)
+
+
 def test_sand_cube_on_plane(test, device):
     # Emits a cube of particles on the ground
 
@@ -2376,6 +2405,13 @@ add_function_test(
     "test_shared_solver_globalizes_external_multiworld_colliders",
     test_shared_solver_globalizes_external_multiworld_colliders,
     devices=basic_devices,
+)
+
+add_function_test(
+    TestImplicitMPM,
+    "test_pic_strain_basis_empty_cells",
+    test_pic_strain_basis_empty_cells,
+    devices=devices,
 )
 
 add_function_test(
