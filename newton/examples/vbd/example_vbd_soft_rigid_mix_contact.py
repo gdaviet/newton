@@ -9,7 +9,7 @@
 # cylinder, cone, mesh bear) are placed inside.  After settling, the
 # pinned vertices are raised upward, lifting the contents with the bag.
 #
-# Command: python -m newton.examples vbd_soft_rigid_mix_contact
+# Command: python -m newton.examples vbd_soft_rigid_mix_contact (--solver [vbd, lox])
 #
 ###########################################################################
 
@@ -294,7 +294,7 @@ def build_model(builder, params, seed=42):
     }
 
 
-def setup_sim(builder, info, params):
+def setup_sim(builder, info, params, solver_type):
     model = builder.finalize()
     model.soft_contact_ke = params["soft_contact_ke"]
     model.soft_contact_kd = params["soft_contact_kd"]
@@ -311,17 +311,24 @@ def setup_sim(builder, info, params):
     pinned_original = wp.array(pq[top_idx].copy(), dtype=wp.vec3)
 
     pr = info["particle_radius"]
-    solver = newton.solvers.SolverVBD(
-        model=model,
-        iterations=params["solver_iterations"],
-        rigid_compliant_alm=True,
-        rigid_body_particle_contact_buffer_size=params["rigid_body_particle_contact_buffer_size"],
-        rigid_body_contact_buffer_size=512,
-        particle_enable_self_contact=False,
-        particle_self_contact_margin=pr * params["particle_self_contact_margin_scale"],
-        particle_self_contact_gap=pr * params["particle_self_contact_gap_scale"],
-        particle_topological_contact_filter_threshold=params["particle_topological_contact_filter_threshold"],
-    )
+    if solver_type == "lox":
+        config = newton.solvers.SolverKamino.Config.from_model(model, dynamics_solver="lox")
+        config.use_collision_detector = False
+        config.lox.max_iterations = params["solver_iterations"]
+        config.lox.deformable_enable_self_contact = False
+        solver = newton.solvers.SolverKamino(model, config=config)
+    else:
+        solver = newton.solvers.SolverVBD(
+            model=model,
+            iterations=params["solver_iterations"],
+            rigid_compliant_alm=True,
+            rigid_body_particle_contact_buffer_size=params["rigid_body_particle_contact_buffer_size"],
+            rigid_body_contact_buffer_size=512,
+            particle_enable_self_contact=False,
+            particle_self_contact_margin=pr * params["particle_self_contact_margin_scale"],
+            particle_self_contact_gap=pr * params["particle_self_contact_gap_scale"],
+            particle_topological_contact_filter_threshold=params["particle_topological_contact_filter_threshold"],
+        )
 
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_gap=params["soft_contact_gap"])
 
@@ -331,6 +338,7 @@ def setup_sim(builder, info, params):
 class Example:
     def __init__(self, viewer, args):
         self.viewer = viewer
+        self.solver_type = getattr(args, "solver", "vbd")
         self.params = PARAMS
         self.sim_time = 0.0
         self.fps = self.params["fps"]
@@ -342,9 +350,11 @@ class Example:
 
         seed = getattr(args, "seed", 42)
         builder = newton.ModelBuilder(gravity=self.params["gravity"])
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         self.info = build_model(builder, self.params, seed=seed)
         self.model, self.solver, self.pipeline, self.pinned_indices, self.pinned_original = setup_sim(
-            builder, self.info, self.params
+            builder, self.info, self.params, self.solver_type
         )
 
         self.state_0 = self.model.state()
@@ -406,6 +416,7 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--seed", type=int, default=42)
+        parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd", help="Dynamics solver to use.")
         # Default to the full settle + lift sequence so --test exercises the lift.
         parser.set_defaults(num_frames=PARAMS["settle_frames"] + PARAMS["lift_frames"])
         return parser

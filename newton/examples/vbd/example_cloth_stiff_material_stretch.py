@@ -21,7 +21,7 @@
 # The example validates the Neo-Hookean membrane against the StableNH
 # closed-form prediction.
 #
-# Command: python -m newton.examples cloth_stiff_material_stretch
+# Command: python -m newton.examples cloth_stiff_material_stretch (--solver [vbd, lox])
 #
 ###########################################################################
 
@@ -80,6 +80,7 @@ class Example:
 
     def __init__(self, viewer, args=None):
         self.viewer = viewer
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_substeps = 10
@@ -88,6 +89,8 @@ class Example:
         self.sim_time = 0.0
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         builder.add_ground_plane()
 
         checker_indices = np.indices((self.DIM, self.DIM)).sum(axis=0) % 2
@@ -132,11 +135,18 @@ class Example:
         # Disable gravity — pure stretch experiment.
         self.model.set_gravity((0.0, 0.0, 0.0))
 
-        self.solver = newton.solvers.SolverVBD(
-            model=self.model,
-            iterations=self.iterations,
-            particle_enable_self_contact=False,
-        )
+        if self.solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = self.iterations
+            config.lox.deformable_enable_self_contact = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
+        else:
+            self.solver = newton.solvers.SolverVBD(
+                model=self.model,
+                iterations=self.iterations,
+                particle_enable_self_contact=False,
+            )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -254,6 +264,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd", help="Dynamics solver to use.")
     viewer, args = newton.examples.init(parser)
     example = Example(viewer=viewer, args=args)
     newton.examples.run(example, args)

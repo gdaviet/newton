@@ -7,7 +7,7 @@
 # This simulation demonstrates a simple cloth hanging behavior. A planar cloth
 # mesh is fixed on one side and hangs under gravity, colliding with the ground.
 #
-# Command: python -m newton.examples cloth_hanging (--solver [semi_implicit, style3d, xpbd, vbd])
+# Command: python -m newton.examples cloth_hanging (--solver [semi_implicit, style3d, xpbd, vbd, lox])
 #
 ###########################################################################
 
@@ -36,6 +36,8 @@ class Example:
             self.sim_substeps = 32
         elif self.solver_type == "style3d":
             self.sim_substeps = 2
+        elif self.solver_type == "lox":
+            self.sim_substeps = 4
         else:
             self.sim_substeps = 10
 
@@ -47,6 +49,9 @@ class Example:
         if self.solver_type == "style3d":
             builder = newton.ModelBuilder()
             newton.solvers.SolverStyle3D.register_custom_attributes(builder)
+        elif self.solver_type == "lox":
+            builder = newton.ModelBuilder()
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         else:
             builder = newton.ModelBuilder()
 
@@ -96,7 +101,7 @@ class Example:
                 "spring_kd": 1.0e0,
             }
 
-        else:  # self.solver_type == "vbd"
+        else:  # self.solver_type in ("vbd", "lox")
             solver_params = {
                 "tri_ke": 1.0e3,
                 "tri_ka": 1.0e3,
@@ -128,7 +133,7 @@ class Example:
                 model=self.model,
                 iterations=self.iterations,
             )
-        else:  # self.solver_type == "vbd"
+        elif self.solver_type == "vbd":
             self.solver = newton.solvers.SolverVBD(
                 model=self.model,
                 iterations=self.iterations,
@@ -136,6 +141,13 @@ class Example:
                 particle_self_contact_margin=0.02,
                 particle_self_contact_gap=0.01,
             )
+        else:  # self.solver_type == "lox"
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.lox.max_iterations = 8
+            config.lox.projection_iterations = 2
+            config.lox.deformable_preconditioner = args.deformable_preconditioner
+            config.lox.deformable_cr_iterations = args.deformable_cr_iterations
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -208,8 +220,20 @@ class Example:
             "--solver",
             help="Type of solver",
             type=str,
-            choices=["semi_implicit", "style3d", "xpbd", "vbd"],
+            choices=["semi_implicit", "style3d", "xpbd", "vbd", "lox"],
             default="vbd",
+        )
+        parser.add_argument(
+            "--deformable-preconditioner",
+            choices=("incomplete_ldlt", "multilevel", "two_level", "block_jacobi"),
+            default="incomplete_ldlt",
+            help="LOX cloth candidate preconditioner.",
+        )
+        parser.add_argument(
+            "--deformable-cr-iterations",
+            type=int,
+            default=4,
+            help="Fixed CR iterations per LOX cloth candidate solve.",
         )
         parser.add_argument("--width", type=int, default=64, help="Cloth resolution in x.")
         parser.add_argument("--height", type=int, default=32, help="Cloth resolution in y.")

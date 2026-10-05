@@ -23,6 +23,7 @@ import newton.usd
 class Example:
     def __init__(self, viewer, args):
         # setup simulation parameters first
+        self.solver_type = getattr(args, "solver", "vbd")
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
 
@@ -46,6 +47,8 @@ class Example:
         self.faces = mesh_indices.reshape(-1, 3)
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         contact_ke = 1.0e2
         contact_kd = 1.0e2
@@ -76,23 +79,37 @@ class Example:
         self.model.soft_contact_kd = contact_kd
         self.model.soft_contact_mu = contact_mu
 
-        # The solver owns the collision pipeline: it runs rigid and particle-shape
+        # VBD owns the collision pipeline: it runs rigid and particle-shape
         # detection itself at every step and writes soft self-contact results into
-        # its own contacts buffer (solver.contacts).
+        # its own contacts buffer (solver.contacts). LOX receives the
+        # particle-shape contacts of this pipeline and detects self-contacts itself.
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             broad_phase="nxn",
             soft_contact_gap=0.1,
         )
+        self.contacts = None
 
-        self.solver = newton.solvers.SolverVBD(
-            self.model,
-            iterations=self.iterations,
-            particle_enable_self_contact=True,
-            particle_self_contact_margin=0.2,
-            particle_self_contact_gap=0.15,
-            collision_pipeline=self.collision_pipeline,
-        )
+        if self.solver_type == "lox":
+            self.contacts = self.collision_pipeline.contacts()
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = args.lox_iterations
+            config.lox.projection_iterations = 2
+            config.lox.deformable_cr_iterations = 6
+            config.lox.deformable_enable_self_contact = True
+            config.lox.deformable_self_contact_margin = 0.35
+            config.lox.deformable_self_contact_gap = 0.2
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
+        else:
+            self.solver = newton.solvers.SolverVBD(
+                self.model,
+                iterations=self.iterations,
+                particle_enable_self_contact=True,
+                particle_self_contact_margin=0.2,
+                particle_self_contact_gap=0.15,
+                collision_pipeline=self.collision_pipeline,
+            )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -114,8 +131,10 @@ class Example:
             # apply forces to the model
             self.viewer.apply_forces(self.state_0)
 
-            # detection runs inside step(): the solver owns the pipeline
-            self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
+            # VBD runs detection inside step(); LOX consumes the pipeline contacts.
+            if self.contacts is not None:
+                self.collision_pipeline.collide(self.state_0, self.contacts)
+            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
             # swap states
             self.state_0, self.state_1 = self.state_1, self.state_0
@@ -141,11 +160,14 @@ class Example:
         )
 
         # Test that particles haven't drifted too far from initial x,y position
-        # Initial position was (0, 0, 10), so check x,y are within reasonable bounds
+        # Initial position was (0, 0, 10), so check x,y are within reasonable bounds.
+        # LOX resolves the ground contact as a hard constraint, and the curved
+        # cloth rolls farther after landing.
+        xy_limit = 6.0 if self.solver_type == "lox" else 5.0
         newton.examples.test_particle_state(
             self.state_0,
             "particles stayed near initial x,y position",
-            lambda q, qd: abs(q[0]) < 5.0 and abs(q[1]) < 5.0,
+            lambda q, qd: abs(q[0]) < xy_limit and abs(q[1]) < xy_limit,
         )
 
         # Test that spring/edge lengths haven't stretched too much from rest length
@@ -168,7 +190,10 @@ class Example:
 
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
-    viewer, args = newton.examples.init()
+    parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd", help="Dynamics solver to use.")
+    parser.add_argument("--lox-iterations", type=int, default=10, help="LOX splitting iterations per substep.")
+    viewer, args = newton.examples.init(parser)
 
     # Create viewer and run
     newton.examples.run(Example(viewer, args), args)
