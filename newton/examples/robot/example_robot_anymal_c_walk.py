@@ -12,6 +12,7 @@ Success criteria:
 
 Runs:
 - `python -m newton.examples robot_anymal_c_walk`
+- `python -m newton.examples robot_anymal_c_walk --solver lox`
 """
 
 import numpy as np
@@ -89,9 +90,12 @@ class Example:
     def __init__(self, viewer, args):
         self.viewer = viewer
         self.device = wp.get_device()
+        self.solver_type = str(getattr(args, "solver", "mujoco")).lower()
 
         builder = newton.ModelBuilder()
         newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
             armature=0.06,
             limit_ke=1.0e3,
@@ -152,16 +156,21 @@ class Example:
             builder.joint_target_kd[i] = 5
 
         self.model = builder.finalize()
-        use_mujoco_contacts = getattr(args, "use_mujoco_contacts", False)
+        use_mujoco_contacts = self.solver_type == "mujoco" and getattr(args, "use_mujoco_contacts", False)
 
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            use_mujoco_contacts=use_mujoco_contacts,
-            solver="newton",
-            ls_iterations=50,
-            njmax=50,
-            nconmax=100,
-        )
+        if self.solver_type == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        else:
+            self.solver = newton.solvers.SolverMuJoCo(
+                self.model,
+                use_mujoco_contacts=use_mujoco_contacts,
+                solver="newton",
+                ls_iterations=50,
+                njmax=50,
+                nconmax=100,
+            )
 
         self.viewer.set_model(self.model)
 
@@ -243,7 +252,10 @@ class Example:
 
         # Initialize ONNX and solver lazy buffers before recording the graph.
         self._policy_step()
-        self.simulate()
+        # SolverKamino attaches its joint arrays to the states on their first step,
+        # so LOX records its first step directly in the graph.
+        if self.solver_type != "lox":
+            self.simulate()
 
         self.state_0.assign(state_0)
         self.state_1.assign(state_1)
@@ -384,6 +396,13 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         newton.examples.add_mujoco_contacts_arg(parser)
+        parser.add_argument(
+            "--solver",
+            type=str,
+            choices=["mujoco", "lox"],
+            default="mujoco",
+            help="Solver type: mujoco (default) or lox",
+        )
         return parser
 
 
