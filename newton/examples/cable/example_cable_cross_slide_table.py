@@ -18,9 +18,11 @@
 #
 # Run interactively:
 #   uv run --extra examples python -m newton.examples.cable.example_cable_cross_slide_table
+#   uv run --extra examples python -m newton.examples.cable.example_cable_cross_slide_table --solver lox
 #
 # Run as a test:
 #   uv run --extra examples python -m newton.examples.cable.example_cable_cross_slide_table --test --viewer null
+#   uv run --extra examples python -m newton.examples.cable.example_cable_cross_slide_table --solver lox --test --viewer null
 #
 ###########################################################################
 
@@ -33,6 +35,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.math import quat_velocity
 
 TABLE_RECT_HALF_X = 0.050
 TABLE_RECT_HALF_Y = 0.060
@@ -46,11 +49,82 @@ MOUSE_PICK_STIFFNESS = 0.01
 MOUSE_PICK_DAMPING = 0.001
 PULLEY_OPACITY = 0.55
 CONTACT_KE = 1.0e6
+CABLE_SEGMENT_LENGTH = 0.015
+CABLE_PRETENSION_FORCE = 5.0
+CABLE_SETTLING_DURATION = 0.5
+TABLE_MOTION_START_TIME = 0.75
+PRETENSIONED_START_RAMP_DURATION = 3.0
+STARTUP_HOLD_STIFFNESS = 5.0e3
+STARTUP_HOLD_DAMPING = 50.0
+
+
+@wp.func
+def table_target(t: float, motion_start_time: float, start_ramp_duration: float) -> wp.vec2:
+    """Return the commanded table position at a simulation time."""
+    motion_time = wp.max(t - motion_start_time, 0.0)
+    ramp = wp.clamp(motion_time / start_ramp_duration, 0.0, 1.0)
+    ramp = ramp * ramp * (3.0 - 2.0 * ramp)
+    phase_time = motion_time - wp.floor(motion_time / TABLE_RECT_PERIOD) * TABLE_RECT_PERIOD
+    side = 4.0 * phase_time / TABLE_RECT_PERIOD
+
+    table_x = -TABLE_RECT_HALF_X
+    table_y = -TABLE_RECT_HALF_Y
+    if side < 1.0:
+        table_x = -TABLE_RECT_HALF_X + 2.0 * TABLE_RECT_HALF_X * side
+    elif side < 2.0:
+        table_x = TABLE_RECT_HALF_X
+        table_y = -TABLE_RECT_HALF_Y + 2.0 * TABLE_RECT_HALF_Y * (side - 1.0)
+    elif side < 3.0:
+        table_x = TABLE_RECT_HALF_X - 2.0 * TABLE_RECT_HALF_X * (side - 2.0)
+        table_y = TABLE_RECT_HALF_Y
+    else:
+        table_y = TABLE_RECT_HALF_Y - 2.0 * TABLE_RECT_HALF_Y * (side - 3.0)
+    return wp.vec2(ramp * table_x, ramp * table_y)
+
+
+@wp.kernel
+def hold_table_during_startup(
+    sim_time: wp.array[wp.float32],
+    slide_joint_coord: int,
+    slide_joint_dof: int,
+    table_joint_coord: int,
+    table_joint_dof: int,
+    joint_q: wp.array[wp.float32],
+    joint_qd: wp.array[wp.float32],
+    joint_f: wp.array[wp.float32],
+):
+    """Hold the table at its initial pose while cable pretension settles."""
+    release = wp.clamp(
+        (sim_time[0] - CABLE_SETTLING_DURATION) / (TABLE_MOTION_START_TIME - CABLE_SETTLING_DURATION),
+        0.0,
+        1.0,
+    )
+    release = release * release * (3.0 - 2.0 * release)
+    hold = 1.0 - release
+    joint_f[slide_joint_dof] = -hold * (
+        STARTUP_HOLD_STIFFNESS * joint_q[slide_joint_coord] + STARTUP_HOLD_DAMPING * joint_qd[slide_joint_dof]
+    )
+    joint_f[table_joint_dof] = -hold * (
+        STARTUP_HOLD_STIFFNESS * joint_q[table_joint_coord] + STARTUP_HOLD_DAMPING * joint_qd[table_joint_dof]
+    )
+
+
+@wp.func
+def _input_pulley_angles(target: wp.vec2, input_drive_radius: float) -> wp.vec2:
+    """Map a table target to the left and right input-pulley angles."""
+    command_x = -target[1]
+    command_y = target[0]
+    return wp.vec2(
+        (command_x + command_y) / input_drive_radius,
+        (command_y - command_x) / input_drive_radius,
+    )
 
 
 @wp.kernel
 def drive_input_pulleys(
     sim_time: wp.array[wp.float32],
+    motion_start_time: float,
+    start_ramp_duration: float,
     body_indices: wp.array[wp.int32],
     body_base_xforms: wp.array[wp.transform],
     input_drive_radius: float,
@@ -70,33 +144,15 @@ def drive_input_pulleys(
     # slide and table are moved only by the cable and passive pulleys. In
     # this layout, a direct cable-drive command maps approximately to world
     # (x, y) = (command_y, -command_x), so invert that mapping first.
-    ramp = wp.clamp(t / START_RAMP_DURATION, 0.0, 1.0)
-    ramp = ramp * ramp * (3.0 - 2.0 * ramp)
-    phase_time = t - wp.floor(t / TABLE_RECT_PERIOD) * TABLE_RECT_PERIOD
-    side = 4.0 * phase_time / TABLE_RECT_PERIOD
-
-    table_x = -TABLE_RECT_HALF_X
-    table_y = -TABLE_RECT_HALF_Y
-    if side < 1.0:
-        table_x = -TABLE_RECT_HALF_X + 2.0 * TABLE_RECT_HALF_X * side
-    elif side < 2.0:
-        table_x = TABLE_RECT_HALF_X
-        table_y = -TABLE_RECT_HALF_Y + 2.0 * TABLE_RECT_HALF_Y * (side - 1.0)
-    elif side < 3.0:
-        table_x = TABLE_RECT_HALF_X - 2.0 * TABLE_RECT_HALF_X * (side - 2.0)
-        table_y = TABLE_RECT_HALF_Y
-    else:
-        table_y = TABLE_RECT_HALF_Y - 2.0 * TABLE_RECT_HALF_Y * (side - 3.0)
-
-    target_x = ramp * table_x
-    target_y = ramp * table_y
+    target = table_target(t, motion_start_time, start_ramp_duration)
+    target_x = target[0]
+    target_y = target[1]
     if tid == 0:
         target_table_xy[0] = target_x
         target_table_xy[1] = target_y
-    command_x = -target_y
-    command_y = target_x
-    q_left = (command_x + command_y) / input_drive_radius
-    q_right = (command_y - command_x) / input_drive_radius
+    angles = _input_pulley_angles(target, input_drive_radius)
+    q_left = angles[0]
+    q_right = angles[1]
 
     p = wp.transform_get_translation(base_xform)
     q = wp.transform_get_rotation(base_xform)
@@ -110,6 +166,47 @@ def drive_input_pulleys(
     xform = wp.transform(p, q)
     body_q0[body] = xform
     body_q1[body] = xform
+
+
+@wp.kernel
+def drive_input_pulleys_lox(
+    sim_time: wp.array[wp.float32],
+    motion_start_time: float,
+    start_ramp_duration: float,
+    body_indices: wp.array[wp.int32],
+    body_base_xforms: wp.array[wp.transform],
+    input_drive_radius: float,
+    driven_angles: wp.array[wp.float32],
+    target_table_xy: wp.array[wp.float32],
+    dt: float,
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Drive input pulleys with twists that LOX integrates to the next pose."""
+    tid = wp.tid()
+    body = body_indices[tid]
+    base_xform = body_base_xforms[tid]
+    target_now = table_target(sim_time[0], motion_start_time, start_ramp_duration)
+    target_next = table_target(sim_time[0] + dt, motion_start_time, start_ramp_duration)
+    angles_now = _input_pulley_angles(target_now, input_drive_radius)
+    angles_next = _input_pulley_angles(target_next, input_drive_radius)
+
+    if tid == 0:
+        target_table_xy[0] = target_next[0]
+        target_table_xy[1] = target_next[1]
+
+    angle_now = angles_now[tid]
+    angle_next = angles_next[tid]
+    driven_angles[tid] = angle_next
+    position = wp.transform_get_translation(base_xform)
+    base_rotation = wp.transform_get_rotation(base_xform)
+    rotation_now = wp.mul(wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), angle_now), base_rotation)
+    rotation_next = wp.mul(wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), angle_next), base_rotation)
+    body_q[body] = wp.transform(position, rotation_now)
+    body_qd[body] = wp.spatial_vector(
+        wp.vec3(0.0),
+        quat_velocity(rotation_next, rotation_now, dt),
+    )
 
 
 @wp.kernel
@@ -158,13 +255,14 @@ def add_pulley(
     *,
     parent: int | None,
     sheave_mu: float,
+    axle_friction: float = 1.0,
     label: str | None = None,
 ) -> tuple[int, int | None]:
     """Add one XY-table pulley.
 
     A parent of ``None`` means the pulley is one of the two driven blue
     inputs. Pulleys with a parent are free-spinning revolute joints on that
-    stage body.
+    stage body, with the joint friction ``axle_friction``.
     """
     body = builder.add_link(
         xform=wp.transform(center, wp.quat_identity()),
@@ -185,7 +283,7 @@ def add_pulley(
             parent_xform=wp.transform(center - parent_position, wp.quat_identity()),
             child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
             armature=1.0e-4,
-            friction=1.0,
+            friction=axle_friction,
             label=f"{label}_free_axle" if label else None,
         )
 
@@ -409,12 +507,27 @@ class Example:
     def __init__(self, viewer, args):
         # Store viewer and configure simulation cadence.
         self.viewer = viewer
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
+        self.cable_segment_length = float(getattr(args, "cable_segment_length", CABLE_SEGMENT_LENGTH))
+        cable_pretension = getattr(args, "cable_pretension", None)
+        if cable_pretension is None:
+            cable_pretension = CABLE_PRETENSION_FORCE if self.solver_type == "lox" else 0.0
+        self.cable_pretension_force = float(cable_pretension)
+        if self.cable_segment_length <= 0.0:
+            raise ValueError("cable_segment_length must be positive")
+        if self.cable_pretension_force < 0.0:
+            raise ValueError("cable_pretension must be non-negative")
+        self.use_cable_pretension = self.cable_pretension_force > 0.0
+        self.table_motion_start_time = TABLE_MOTION_START_TIME if self.use_cable_pretension else 0.0
+        self.start_ramp_duration = (
+            PRETENSIONED_START_RAMP_DURATION if self.use_cable_pretension else START_RAMP_DURATION
+        )
 
         fps = 60
         self.frame_dt = 1.0 / fps
         self.sim_time = 0.0
-        self.sim_substeps = 10
-        sim_iterations = 5
+        self.sim_substeps = 2 if self.solver_type == "lox" else 10
+        sim_iterations = 25 if self.solver_type == "lox" else 5
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         # Cable and mechanism dimensions.
@@ -424,7 +537,6 @@ class Example:
         beige_sheave_radius = 0.025
         input_sheave_mu = 1.0
         passive_sheave_mu = 0.35
-        initial_segment_length = 0.015
         cable_wrap_clearance_scale = 1.1
         cable_wrap_clearance = cable_radius * cable_wrap_clearance_scale
         self.input_drive_radius = self.input_pulley_radius + cable_wrap_clearance
@@ -447,6 +559,8 @@ class Example:
         # Build the table frame and assign stiff, frictional contact material
         # so the cable remains guided by the pulley grooves.
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         builder.rigid_gap = 5.0 * cable_radius
         builder.default_shape_cfg.ke = CONTACT_KE
         builder.default_shape_cfg.kd = 0.0
@@ -498,6 +612,8 @@ class Example:
             friction=0.0,
             label="green_x_slide_axis",
         )
+        self.slide_joint_coord = builder.joint_q_start[slide_joint]
+        self.slide_joint_dof = builder.joint_qd_start[slide_joint]
         table_joint = builder.add_joint_prismatic(
             parent=self.slide_body,
             child=self.table_body,
@@ -511,6 +627,8 @@ class Example:
             friction=0.0,
             label="beige_y_table_axis",
         )
+        self.table_joint_coord = builder.joint_q_start[table_joint]
+        self.table_joint_dof = builder.joint_qd_start[table_joint]
         table_articulation_joints = [slide_joint, table_joint]
 
         # Non-colliding stage visuals and a marker used for table tracking.
@@ -622,6 +740,7 @@ class Example:
                 color,
                 parent=parent,
                 sheave_mu=sheave_mu,
+                axle_friction=0.0 if self.solver_type == "lox" else 1.0,
                 label=f"xy_table_{i}_{label}",
             )
             if pulley_joint is None:
@@ -654,26 +773,46 @@ class Example:
                 label=label,
             )
 
-        # Adjust the cable length so every segment is equal.
+        # Route equal-length cable segments, then shorten their rest length to establish pretension.
         cable_points, cable_segment_length = create_xy_table_cable_points(
             start=left_anchor_world,
             pulley_centers=pulley_centers,
             pulley_radii=pulley_radii,
             end=right_anchor_world,
-            segment_length=initial_segment_length,
+            segment_length=self.cable_segment_length,
             wrap_clearance=cable_wrap_clearance,
         )
-        cable_rod = newton.Rod(cable_points, radius=cable_radius, rest_straight=True)
+        cable_segment_count = len(cable_points) - 1
+        cable_stretch_stiffness = 1.0e5
+        cable_rest_segment_length = cable_segment_length - self.cable_pretension_force / cable_stretch_stiffness
+        if cable_rest_segment_length <= 0.0:
+            raise ValueError("cable_pretension is too large for the cable segment length and stiffness")
+        if self.use_cable_pretension:
+            # A straight rest rod with shorter segments; its edge lengths set the rest lengths.
+            straight_rod = newton.Rod.create_straight(
+                start=left_anchor_world,
+                direction=wp.vec3(1.0, 0.0, 0.0),
+                length=cable_segment_count * cable_rest_segment_length,
+                segment_count=cable_segment_count,
+            )
+            cable_rod = newton.Rod(
+                cable_points,
+                radius=cable_radius,
+                rest_points=straight_rod.points,
+                rest_quaternions=straight_rod.quaternions,
+            )
+        else:
+            cable_rod = newton.Rod(cable_points, radius=cable_radius, rest_straight=True)
 
         cable_cfg = builder.default_shape_cfg.copy()
-        cable_cfg.density = 200.0
+        cable_cfg.density = 1000.0 if self.use_cable_pretension else 200.0
         cable_cfg.gap = 2.0 * cable_radius
 
         self.cable_bodies, cable_joints = builder.add_rod(
             rod=cable_rod,
             cfg=cable_cfg,
-            stretch_stiffness=1.0e5,
-            stretch_damping=1.0e-4,
+            stretch_stiffness=cable_stretch_stiffness,
+            stretch_damping=2.0 if self.use_cable_pretension else 1.0e-4,
             bend_stiffness=1.0e-2,
             bend_damping=1.0e-2,
             wrap_in_articulation=False,
@@ -739,12 +878,22 @@ class Example:
 
         # Preserve cable-pulley friction state and preallocate it before CUDA graph capture.
         self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="latest")
-        self.solver = newton.solvers.SolverVBD(
-            self.model,
-            iterations=sim_iterations,
-            rigid_contact_history=True,
-            rigid_body_contact_buffer_size=256,
-        )
+        if self.solver_type == "vbd":
+            self.solver = newton.solvers.SolverVBD(
+                self.model,
+                iterations=sim_iterations,
+                rigid_contact_history=True,
+                rigid_body_contact_buffer_size=256,
+            )
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.materials.friction_mix_mode = "multiply"
+            config.lox.max_iterations = sim_iterations
+            config.lox.projection_sweeps_per_iteration = 10
+            config.lox.gauss_seidel_max_colors = 1
+            config.lox.projection_acceleration = "apgd"
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -798,21 +947,58 @@ class Example:
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
 
-            wp.launch(
-                drive_input_pulleys,
-                dim=self.kinematic_body_indices.shape[0],
-                inputs=[
-                    self.sim_time_wp,
-                    self.kinematic_body_indices,
-                    self.kinematic_body_base_xforms,
-                    self.input_drive_radius,
-                    self.input_pulley_angles,
-                    self.target_table_xy,
-                    self.state_0.body_q,
-                    self.state_1.body_q,
-                ],
-                device=self.model.device,
-            )
+            if self.use_cable_pretension:
+                wp.launch(
+                    hold_table_during_startup,
+                    dim=1,
+                    inputs=[
+                        self.sim_time_wp,
+                        self.slide_joint_coord,
+                        self.slide_joint_dof,
+                        self.table_joint_coord,
+                        self.table_joint_dof,
+                        self.state_0.joint_q,
+                        self.state_0.joint_qd,
+                    ],
+                    outputs=[self.control.joint_f],
+                    device=self.model.device,
+                )
+
+            if self.solver_type == "lox":
+                wp.launch(
+                    drive_input_pulleys_lox,
+                    dim=self.kinematic_body_indices.shape[0],
+                    inputs=[
+                        self.sim_time_wp,
+                        self.table_motion_start_time,
+                        self.start_ramp_duration,
+                        self.kinematic_body_indices,
+                        self.kinematic_body_base_xforms,
+                        self.input_drive_radius,
+                        self.input_pulley_angles,
+                        self.target_table_xy,
+                        self.sim_dt,
+                    ],
+                    outputs=[self.state_0.body_q, self.state_0.body_qd],
+                    device=self.model.device,
+                )
+            else:
+                wp.launch(
+                    drive_input_pulleys,
+                    dim=self.kinematic_body_indices.shape[0],
+                    inputs=[
+                        self.sim_time_wp,
+                        self.table_motion_start_time,
+                        self.start_ramp_duration,
+                        self.kinematic_body_indices,
+                        self.kinematic_body_base_xforms,
+                        self.input_drive_radius,
+                        self.input_pulley_angles,
+                        self.target_table_xy,
+                    ],
+                    outputs=[self.state_0.body_q, self.state_1.body_q],
+                    device=self.model.device,
+                )
 
             self.viewer.apply_forces(self.state_0)
             self.collision_pipeline.collide(self.state_0, self.contacts)
@@ -926,6 +1112,17 @@ class Example:
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd", help="Cable dynamics solver.")
+    parser.add_argument(
+        "--cable-segment-length", type=float, default=CABLE_SEGMENT_LENGTH, help="Target cable segment length [m]."
+    )
+    parser.add_argument(
+        "--cable-pretension",
+        type=float,
+        default=None,
+        help="Cable pretension force [N]. Defaults to 5 N with LOX and 0 N with VBD.",
+    )
+    viewer, args = newton.examples.init(parser)
     example = Example(viewer, args)
     newton.examples.run(example, args)
