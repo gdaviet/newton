@@ -22,6 +22,7 @@ from .llt import LLTBlockedRCMTraversalSolver
 from .system_kernels import (
     _assemble_body_inertial_systems,
     _assemble_joint_rows,
+    _assemble_rod_rows,
     _build_candidate_right_hand_side,
     _invert_single_body_blocks,
     _solve_single_body_blocks,
@@ -31,6 +32,7 @@ from .types import (
     DynamicRows,
     EffortRows,
     LOXSystemData,
+    RodRows,
     StructuralRows,
     capacity_offsets,
     segment_local_indices,
@@ -357,6 +359,45 @@ class LOXSystem:
             device=self.device,
         )
 
+    def add_rod_rows(
+        self,
+        body_a: wp.array[wp.int32],
+        body_b: wp.array[wp.int32],
+        jacobian_a: wp.array[vec6f],
+        jacobian_b: wp.array[vec6f],
+        stress: wp.array[wp.float32],
+        tangent: wp.array[wp.float32],
+        time_step: wp.array[wp.float32],
+        prescribed_twist: wp.array[vec6f],
+    ) -> None:
+        """Add the six linearized material rows of each rod to the smooth system."""
+        rod_count = body_a.shape[0]
+        if rod_count == 0:
+            return
+        wp.launch(
+            _assemble_rod_rows,
+            dim=(rod_count, 12),
+            inputs=[
+                time_step,
+                self.body_world,
+                self._data.info.dim,
+                self._data.info.mio,
+                self._data.info.vio,
+                body_a,
+                body_b,
+                self._data.body_block,
+                self._data.body_local,
+                jacobian_a,
+                jacobian_b,
+                stress,
+                tangent,
+                prescribed_twist,
+                self._inverse_permutation,
+            ],
+            outputs=[self._matrix, self._data.right_hand_side],
+            device=self.device,
+        )
+
     def factorize(self) -> None:
         """Invert the single-body blocks of the current matrices and factorize the others with the sparse LLT."""
         if self.num_sparse_blocks < self.num_blocks:
@@ -405,13 +446,15 @@ class LOXSystem:
         dynamic_rows: DynamicRows,
         effort_rows: EffortRows,
         structural_rows: StructuralRows,
+        rod_rows: RodRows,
         anchor_scale: float = 1.0,
     ) -> None:
         """Build the right-hand side of the candidate solve of one iteration.
 
         Adds the splitting target ``W (s p + u)`` and the current row impulses to the frozen
-        right-hand side ``f``: the structural multiplier impulses ``h J_s^T lambda`` and the
-        effort-limit counter-impulses ``J_d^T c``. The single-body blocks also write their solution.
+        right-hand side ``f``: the structural multiplier impulses ``h J_s^T lambda``, the
+        effort-limit counter-impulses ``J_d^T c``, and the proximal corrections of the rods.
+        The single-body blocks also write their solution.
 
         Args:
             projected_twist: Anchor twist ``p`` of each body, or ``None`` for no anchor.
@@ -419,6 +462,7 @@ class LOXSystem:
             dynamic_rows: Dynamic rows, which hold the Jacobians of the effort rows.
             effort_rows: Effort-limit rows and their counter-impulses.
             structural_rows: Structural rows and their multiplier impulses.
+            rod_rows: Rod rows and their proximal correction impulses.
             anchor_scale: Factor ``s`` of the anchor twist.
         """
         wp.launch(
@@ -439,6 +483,7 @@ class LOXSystem:
                 dynamic_rows.jacobian_b,
                 effort_rows.counter,
                 structural_rows.body_impulse,
+                rod_rows.body_impulse,
                 self._data.body_block,
                 self._data.info.dim,
                 self._data.single_body_inverse,

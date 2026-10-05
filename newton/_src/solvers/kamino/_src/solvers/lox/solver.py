@@ -251,6 +251,7 @@ class LOXSolver:
             selective_weights=config.selective_weights,
             rotation_correction=rotation_correction,
             joint_proximal_relaxation=config.joint_proximal_relaxation,
+            rod_proximal_relaxation=config.rod_proximal_relaxation,
             contact_compliance=config.contact_compliance,
             contact_implicit_restitution=config.contact_implicit_restitution,
             contact_spatial_friction=config.contact_spatial_friction,
@@ -367,6 +368,10 @@ class LOXSolver:
             | ModelFlags.JOINT_DOF_FORCE_PROPERTIES
             | ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
         )
+        if flags & (
+            ModelFlags.JOINT_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES
+        ):
+            self._problem.rods.refresh_rest_state()
         if self._seed_topology is not None and flags & reseed_flags:
             self._estimate_joint_penalty_scale(float(self._config.joint_penalty_seed_time_step), warn_failures=False)
 
@@ -747,6 +752,7 @@ class LOXSolver:
             problem.data.dynamic_rows,
             problem.data.effort_rows,
             problem.data.structural_rows,
+            problem.data.rod_rows,
             anchor_scale=consensus_fraction,
         )
         system.solve_candidate()
@@ -793,7 +799,7 @@ class LOXSolver:
         )
 
     def _update_multipliers(self) -> None:
-        """Update the splitting dual, the structural multipliers, and the effort counters.
+        """Update the splitting dual, the structural multipliers, the effort counters, and the rod proximal rows.
 
         With convergence checks, the body residual reduction advances the splitting dual.
         """
@@ -832,6 +838,14 @@ class LOXSolver:
                 splitting.projected_twist,
                 splitting.world_active,
             )
+        problem.rods.update_proximal(
+            time_step,
+            config.rotation_tolerance,
+            config.velocity_tolerance,
+            splitting.global_twist,
+            splitting.world_active,
+            splitting.world_failed,
+        )
 
     def _update_convergence_status(self, conditional: bool) -> None:
         """Reduce the iteration residuals, then deactivate converged and failed worlds."""
@@ -932,6 +946,7 @@ class LOXSolver:
                 splitting.iteration_count,
                 problem.data.structural_rows.world_residual,
                 problem.data.effort_rows.world_residual_max if self._problem.has_bounded_effort else None,
+                problem.data.rod_rows.world_residual,
                 splitting.world_active,
                 splitting.world_converged,
                 iteration_condition,

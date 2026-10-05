@@ -181,6 +181,23 @@ Enable these features through ``config.lox`` after selecting
   retain the classical 3D contact solve. Kamino's primitive collision pipeline
   provides no angular coefficients.
 
+LOX rod joints
+--------------
+
+LOX supports ``JointType.ROD`` joints between rigid bodies, as built by
+:meth:`newton.ModelBuilder.add_joint_rod`, which the other Kamino backends
+reject. Each rod adds six smooth material rows to the body system: stretch and
+shear in the joint frame of the parent body, then bend and twist, with the
+stiffness and damping of its six joint DOFs. As in ``SolverVBD``, the rest bend
+and twist come from the angular rest rotation in ``Model.joint_target_q``;
+call ``notify_model_changed`` with
+``ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES`` after changing it. The rows are
+linearized at the beginning of each time step. Set
+``config.lox.rod_proximal_relaxation`` in
+``(0, 1]`` to also correct the bend and twist rows towards their exact
+candidate-pose strain during the splitting iterations. Rod joints require zero
+armature, joint damping, and joint friction, and unbounded joint limits.
+
 Inspecting terminal status
 --------------------------
 

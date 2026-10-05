@@ -27,8 +27,10 @@ from ...core.types import mat36f, mat66f, vec6f, vec6i
 
 __all__ = [
     "ProjectionWeights",
+    "SmoothJointRows",
     "_assemble_body_inertial_systems",
     "_assemble_joint_rows",
+    "_assemble_rod_rows",
     "_build_candidate_right_hand_side",
     "_compute_free_body_blocks",
     "_compute_patch_weights",
@@ -618,6 +620,88 @@ def _assemble_joint_rows(
             wp.atomic_add(matrix, _matrix_index(matrix_offset, dimension, other_rows[row], col), cross_row[row])
 
 
+@wp.kernel
+def _assemble_rod_rows(
+    # Inputs:
+    model_time_dt: wp.array[wp.float32],
+    model_bodies_wid: wp.array[wp.int32],
+    dimensions: wp.array[wp.int32],
+    matrix_offsets: wp.array[wp.int32],
+    vector_offsets: wp.array[wp.int32],
+    rod_body_a: wp.array[wp.int32],
+    rod_body_b: wp.array[wp.int32],
+    body_block: wp.array[wp.int32],
+    body_local: wp.array[wp.int32],
+    jacobian_a: wp.array[vec6f],
+    jacobian_b: wp.array[vec6f],
+    stress: wp.array[wp.float32],
+    tangent: wp.array[wp.float32],
+    prescribed_twist: wp.array[vec6f],
+    inverse_permutation: wp.array[wp.int32],
+    # Outputs:
+    matrix: wp.array[wp.float32],
+    right_hand_side: wp.array[wp.float32],
+):
+    """Add the six linearized material rows of each rod to the smooth system.
+
+    Each row adds ``dt^2 k_t J^T J`` to the matrix and ``(-dt s - dt^2 k_t J_p v_p) J^T`` to the
+    right-hand side, with stress ``s``, tangent stiffness ``k_t``, and the twists ``v_p`` of
+    the prescribed endpoints. Twelve threads assemble each rod, one per unknown of its two bodies,
+    as in :func:`_assemble_joint_rows`.
+    """
+    rod, unknown = wp.tid()
+    side = unknown // 6
+    axis = unknown - 6 * side
+    bid_a = rod_body_a[rod]
+    bid_b = rod_body_b[rod]
+    bid_a_local = body_local[bid_a] if bid_a >= 0 else -1
+    bid_b_local = body_local[bid_b]
+    if bid_a_local < 0 and bid_b_local < 0:
+        return
+    block = body_block[bid_a] if bid_a_local >= 0 else body_block[bid_b]
+    if bid_b_local >= 0 and body_block[bid_b] != block:
+        return
+    dt = model_time_dt[model_bodies_wid[bid_b]]
+
+    # The thread assembles one unknown of the body of its side, A or B
+    on_a = side == 0
+    bid_local = wp.where(on_a, bid_a_local, bid_b_local)
+    other_local = wp.where(on_a, bid_b_local, bid_a_local)
+    if bid_local < 0:
+        return
+    body_row = vec6f(0.0)
+    cross_row = vec6f(0.0)
+    right_hand_side_entry = wp.float32(0.0)
+    for local_row in range(6):
+        row = 6 * rod + local_row
+        a_jacobian = jacobian_a[row]
+        b_jacobian = jacobian_b[row]
+        scale = dt * dt * tangent[row]
+        prescribed_velocity = wp.float32(0.0)
+        if bid_a >= 0 and bid_a_local < 0:
+            prescribed_velocity += wp.dot(a_jacobian, prescribed_twist[bid_a])
+        if bid_b_local < 0:
+            prescribed_velocity += wp.dot(b_jacobian, prescribed_twist[bid_b])
+        jacobian = wp.where(on_a, a_jacobian, b_jacobian)
+        jacobian_axis = _select_axis(jacobian, axis)
+        body_row += scale * (jacobian_axis * jacobian)
+        cross_row += scale * (jacobian_axis * wp.where(on_a, b_jacobian, a_jacobian))
+        right_hand_side_entry += (-dt * stress[row] - scale * prescribed_velocity) * jacobian_axis
+
+    dimension = dimensions[block]
+    matrix_offset = matrix_offsets[block]
+    vector_offset = vector_offsets[block]
+    wp.atomic_add(right_hand_side, vector_offset + 6 * bid_local + axis, right_hand_side_entry)
+    col = _body_matrix_row(vector_offset, inverse_permutation, bid_local, axis, dimension)
+    rows = _body_matrix_rows(vector_offset, inverse_permutation, bid_local, dimension)
+    for row in range(6):
+        wp.atomic_add(matrix, _matrix_index(matrix_offset, dimension, rows[row], col), body_row[row])
+    if other_local >= 0:
+        other_rows = _body_matrix_rows(vector_offset, inverse_permutation, other_local, dimension)
+        for row in range(6):
+            wp.atomic_add(matrix, _matrix_index(matrix_offset, dimension, other_rows[row], col), cross_row[row])
+
+
 @wp.func
 def _read_body_block(
     matrix: wp.array[wp.float32], offset: wp.int32, dimension: wp.int32, rows: vec6i, cols: vec6i
@@ -628,6 +712,29 @@ def _read_body_block(
         for col in range(6):
             block[row, col] = matrix[_matrix_index(offset, dimension, rows[row], cols[col])]
     return block
+
+
+@wp.struct
+class SmoothJointRows:
+    """Rows of the smooth matrix ``A`` between two bodies, read by the patch Schur weights.
+
+    A row of kind ``0`` is a structural row with coefficient ``dt^2 k``, of kind ``1`` a dynamic row with
+    its effective inertia, and of kind ``2`` a rod row, six per rod, with coefficient ``dt^2 k_t``.
+    """
+
+    structural_jacobian_a: wp.array[vec6f]
+    structural_jacobian_b: wp.array[vec6f]
+    structural_penalty: wp.array[wp.float32]
+    structural_world: wp.array[wp.int32]
+    dynamic_jacobian_a: wp.array[vec6f]
+    dynamic_jacobian_b: wp.array[vec6f]
+    dynamic_effective_inertia: wp.array[wp.float32]
+    rod_body_b: wp.array[wp.int32]
+    rod_jacobian_a: wp.array[vec6f]
+    rod_jacobian_b: wp.array[vec6f]
+    rod_tangent: wp.array[wp.float32]
+    body_world: wp.array[wp.int32]
+    time_step: wp.array[wp.float32]
 
 
 @wp.func
@@ -668,26 +775,23 @@ def _load_symmetric_mat66(array: wp.array2d[wp.float32], index: wp.int32) -> mat
 
 
 @wp.func
-def _joint_row_side_block(
-    kind: wp.int32,
-    row: wp.int32,
-    side: wp.int32,
-    structural_jacobian_a: wp.array[vec6f],
-    structural_jacobian_b: wp.array[vec6f],
-    structural_penalty: wp.array[wp.float32],
-    structural_world: wp.array[wp.int32],
-    dynamic_jacobian_a: wp.array[vec6f],
-    dynamic_jacobian_b: wp.array[vec6f],
-    dynamic_effective_inertia: wp.array[wp.float32],
-    model_time_dt: wp.array[wp.float32],
-) -> mat66f:
-    """Return the diagonal-block term ``c J^T J`` of one joint row on one of its bodies."""
+def _joint_row(kind: wp.int32, row: wp.int32, rows: SmoothJointRows) -> tuple[wp.float32, vec6f, vec6f]:
+    """Return the matrix coefficient and the Jacobians on both bodies of one row of :class:`SmoothJointRows`."""
     if kind == 0:
-        dt = model_time_dt[structural_world[row]]
-        jacobian = wp.where(side == 0, structural_jacobian_a[row], structural_jacobian_b[row])
-        return (dt * dt * structural_penalty[row]) * wp.outer(jacobian, jacobian)
-    jacobian = wp.where(side == 0, dynamic_jacobian_a[row], dynamic_jacobian_b[row])
-    return dynamic_effective_inertia[row] * wp.outer(jacobian, jacobian)
+        dt = rows.time_step[rows.structural_world[row]]
+        return dt * dt * rows.structural_penalty[row], rows.structural_jacobian_a[row], rows.structural_jacobian_b[row]
+    if kind == 1:
+        return rows.dynamic_effective_inertia[row], rows.dynamic_jacobian_a[row], rows.dynamic_jacobian_b[row]
+    dt = rows.time_step[rows.body_world[rows.rod_body_b[row // 6]]]
+    return dt * dt * rows.rod_tangent[row], rows.rod_jacobian_a[row], rows.rod_jacobian_b[row]
+
+
+@wp.func
+def _joint_row_side_block(kind: wp.int32, row: wp.int32, side: wp.int32, rows: SmoothJointRows) -> mat66f:
+    """Return the diagonal-block term ``c J^T J`` of one joint row on one of its bodies."""
+    coefficient, jacobian_a, jacobian_b = _joint_row(kind, row, rows)
+    jacobian = wp.where(side == 0, jacobian_a, jacobian_b)
+    return coefficient * wp.outer(jacobian, jacobian)
 
 
 @wp.func
@@ -750,14 +854,7 @@ def _compute_free_body_blocks(
     incidence_kind: wp.array[wp.int32],
     incidence_row: wp.array[wp.int32],
     incidence_side: wp.array[wp.int32],
-    structural_jacobian_a: wp.array[vec6f],
-    structural_jacobian_b: wp.array[vec6f],
-    structural_penalty: wp.array[wp.float32],
-    structural_world: wp.array[wp.int32],
-    dynamic_jacobian_a: wp.array[vec6f],
-    dynamic_jacobian_b: wp.array[vec6f],
-    dynamic_effective_inertia: wp.array[wp.float32],
-    model_time_dt: wp.array[wp.float32],
+    joint_rows: SmoothJointRows,
     # Outputs:
     diagonal_block: wp.array2d[wp.float32],
     diagonal_lower: wp.array2d[wp.float32],
@@ -789,14 +886,7 @@ def _compute_free_body_blocks(
             incidence_kind[incident],
             incidence_row[incident],
             incidence_side[incident],
-            structural_jacobian_a,
-            structural_jacobian_b,
-            structural_penalty,
-            structural_world,
-            dynamic_jacobian_a,
-            dynamic_jacobian_b,
-            dynamic_effective_inertia,
-            model_time_dt,
+            joint_rows,
         )
     symmetric = 0.5 * (result + wp.transpose(result))
     _store_lower_mat66(free_block, bid, symmetric)
@@ -804,26 +894,6 @@ def _compute_free_body_blocks(
     if not valid:
         lower = mat66f(0.0)
     _store_lower_mat66(free_lower, bid, lower)
-
-
-@wp.func
-def _joint_row(
-    kind: wp.int32,
-    row: wp.int32,
-    structural_jacobian_a: wp.array[vec6f],
-    structural_jacobian_b: wp.array[vec6f],
-    structural_penalty: wp.array[wp.float32],
-    structural_world: wp.array[wp.int32],
-    dynamic_jacobian_a: wp.array[vec6f],
-    dynamic_jacobian_b: wp.array[vec6f],
-    dynamic_effective_inertia: wp.array[wp.float32],
-    model_time_dt: wp.array[wp.float32],
-) -> tuple[wp.float32, vec6f, vec6f]:
-    """Return the matrix coefficient and the Jacobians on both bodies of one structural or dynamic joint row."""
-    if kind == 0:
-        dt = model_time_dt[structural_world[row]]
-        return dt * dt * structural_penalty[row], structural_jacobian_a[row], structural_jacobian_b[row]
-    return dynamic_effective_inertia[row], dynamic_jacobian_a[row], dynamic_jacobian_b[row]
 
 
 @wp.func
@@ -853,14 +923,7 @@ def _free_patch_schur(
     neighbor_row_kind: wp.array[wp.int32],
     neighbor_row: wp.array[wp.int32],
     neighbor_row_side: wp.array[wp.int32],
-    structural_jacobian_a: wp.array[vec6f],
-    structural_jacobian_b: wp.array[vec6f],
-    structural_penalty: wp.array[wp.float32],
-    structural_world: wp.array[wp.int32],
-    dynamic_jacobian_a: wp.array[vec6f],
-    dynamic_jacobian_b: wp.array[vec6f],
-    dynamic_effective_inertia: wp.array[wp.float32],
-    model_time_dt: wp.array[wp.float32],
+    joint_rows: SmoothJointRows,
 ) -> mat66f:
     """Return the Schur complement ``S_free`` of body ``i`` in its free patch, in Woodbury form.
 
@@ -894,14 +957,7 @@ def _free_patch_schur(
                 coefficient, jacobian_a, jacobian_b = _joint_row(
                     neighbor_row_kind[row_entry],
                     neighbor_row[row_entry],
-                    structural_jacobian_a,
-                    structural_jacobian_b,
-                    structural_penalty,
-                    structural_world,
-                    dynamic_jacobian_a,
-                    dynamic_jacobian_b,
-                    dynamic_effective_inertia,
-                    model_time_dt,
+                    joint_rows,
                 )
                 if coefficient > 0.0:
                     neighbor_side = neighbor_row_side[row_entry]
@@ -945,14 +1001,7 @@ def _free_patch_schur_subtraction(
     neighbor_row_kind: wp.array[wp.int32],
     neighbor_row: wp.array[wp.int32],
     neighbor_row_side: wp.array[wp.int32],
-    structural_jacobian_a: wp.array[vec6f],
-    structural_jacobian_b: wp.array[vec6f],
-    structural_penalty: wp.array[wp.float32],
-    structural_world: wp.array[wp.int32],
-    dynamic_jacobian_a: wp.array[vec6f],
-    dynamic_jacobian_b: wp.array[vec6f],
-    dynamic_effective_inertia: wp.array[wp.float32],
-    model_time_dt: wp.array[wp.float32],
+    joint_rows: SmoothJointRows,
 ) -> mat66f:
     """Return ``S_free = F_i + sum_e (R_ei - A_ij (F_j + R_ej)^-1 A_ji)``, the free-patch Schur complement of a body.
 
@@ -966,14 +1015,7 @@ def _free_patch_schur_subtraction(
             coefficient, jacobian_a, jacobian_b = _joint_row(
                 neighbor_row_kind[row_entry],
                 neighbor_row[row_entry],
-                structural_jacobian_a,
-                structural_jacobian_b,
-                structural_penalty,
-                structural_world,
-                dynamic_jacobian_a,
-                dynamic_jacobian_b,
-                dynamic_effective_inertia,
-                model_time_dt,
+                joint_rows,
             )
             neighbor_side = neighbor_row_side[row_entry]
             neighbor_jacobian = wp.where(neighbor_side == 0, jacobian_a, jacobian_b)
@@ -1072,14 +1114,7 @@ def make_patch_schur_kernel(woodbury: bool):
         neighbor_row_kind: wp.array[wp.int32],
         neighbor_row: wp.array[wp.int32],
         neighbor_row_side: wp.array[wp.int32],
-        structural_jacobian_a: wp.array[vec6f],
-        structural_jacobian_b: wp.array[vec6f],
-        structural_penalty: wp.array[wp.float32],
-        structural_world: wp.array[wp.int32],
-        dynamic_jacobian_a: wp.array[vec6f],
-        dynamic_jacobian_b: wp.array[vec6f],
-        dynamic_effective_inertia: wp.array[wp.float32],
-        model_time_dt: wp.array[wp.float32],
+        joint_rows: SmoothJointRows,
         # Outputs:
         free_schur: wp.array2d[wp.float32],
         pinned_schur: wp.array2d[wp.float32],
@@ -1099,14 +1134,7 @@ def make_patch_schur_kernel(woodbury: bool):
                 neighbor_row_kind,
                 neighbor_row,
                 neighbor_row_side,
-                structural_jacobian_a,
-                structural_jacobian_b,
-                structural_penalty,
-                structural_world,
-                dynamic_jacobian_a,
-                dynamic_jacobian_b,
-                dynamic_effective_inertia,
-                model_time_dt,
+                joint_rows,
             )
         else:
             free = _free_patch_schur_subtraction(
@@ -1118,14 +1146,7 @@ def make_patch_schur_kernel(woodbury: bool):
                 neighbor_row_kind,
                 neighbor_row,
                 neighbor_row_side,
-                structural_jacobian_a,
-                structural_jacobian_b,
-                structural_penalty,
-                structural_world,
-                dynamic_jacobian_a,
-                dynamic_jacobian_b,
-                dynamic_effective_inertia,
-                model_time_dt,
+                joint_rows,
             )
         _store_lower_mat66(free_schur, bid, 0.5 * (free + wp.transpose(free)))
         offset = matrix_offsets[block]
@@ -1267,6 +1288,7 @@ def _build_candidate_right_hand_side(
     dynamic_jacobian_b: wp.array[vec6f],
     effort_counter: wp.array[wp.float32],
     structural_impulse: wp.array[vec6f],
+    rod_impulse: wp.array[vec6f],
     body_block: wp.array[wp.int32],
     dimensions: wp.array[wp.int32],
     single_body_inverse: wp.array[mat66f],
@@ -1288,6 +1310,9 @@ def _build_candidate_right_hand_side(
     target = apply_body_weight(weight[bid], anchor + splitting_dual[bid])
     # Structural multiplier impulses h J^T lambda of the rows in the smooth system
     target += structural_impulse[bid]
+    # Proximal corrections of the rod rows
+    if rod_impulse:
+        target += rod_impulse[bid]
     # Effort-limit counter-impulses J^T c
     effort_start = body_effort_offset[bid]
     effort_end = body_effort_offset[bid + 1]
