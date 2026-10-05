@@ -19,7 +19,8 @@ The per-layer transform applied via ``set_layer_transform`` is a pure
 render-time displacement: it shifts every drawn object in the layer
 without changing the underlying physics state, so passing
 ``wp.transform_identity()`` (or a zero-translation transform) makes the
-layers overlay exactly.
+layers overlay exactly. Passing ``--solver lox`` adds a fifth layer
+driven by the Kamino LOX solver.
 
 Success criteria:
 - Four solver layers show connected four-link pendulum chains initially overlaid in the same view.
@@ -30,6 +31,7 @@ Success criteria:
 
 Runs:
 - `python -m newton.examples basic_multi_solver_overlay`
+- `python -m newton.examples basic_multi_solver_overlay --solver lox`
 """
 
 import warnings
@@ -102,6 +104,12 @@ def _create_kamino_solver(model: newton.Model) -> newton.solvers.SolverKamino:
     config.integrator = "moreau"
     config.scc.max_alternating_iterations = 8
     config.scc.use_schur_complement = True
+    return newton.solvers.SolverKamino(model, config=config)
+
+
+def _create_lox_solver(model: newton.Model) -> newton.solvers.SolverKamino:
+    config = newton.solvers.SolverKamino.Config.from_model(model, dynamics_solver="lox")
+    config.use_collision_detector = False
     return newton.solvers.SolverKamino(model, config=config)
 
 
@@ -218,6 +226,16 @@ class Example:
                 True,
             ),
         ]
+        if getattr(args, "solver", None) == "lox":
+            specs.append(
+                (
+                    "Kamino LOX",
+                    (0.95, 0.80, 0.20),
+                    _create_lox_solver,
+                    newton.solvers.SolverKamino.register_custom_attributes,
+                    False,
+                )
+            )
         self.layers: list[_SolverLayer] = [
             _SolverLayer(
                 name,
@@ -286,5 +304,13 @@ class Example:
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    parser = newton.examples.create_parser()
+    parser.add_argument(
+        "--solver",
+        type=str,
+        choices=["lox"],
+        default=None,
+        help="Additional solver layer to overlay on the default layers.",
+    )
+    viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

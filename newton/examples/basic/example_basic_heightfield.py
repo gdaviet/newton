@@ -4,7 +4,7 @@
 """Example Basic Heightfield
 
 Demonstrates heightfield terrain with objects dropped onto it.
-Supports XPBD, MuJoCo, and Kamino SCC solvers.
+Supports XPBD, MuJoCo, Kamino SCC, and Kamino LOX solvers.
 
 Success criteria:
 - Five spheres start above a wavy heightfield and drop onto its surface.
@@ -17,6 +17,7 @@ Runs:
 - `python -m newton.examples basic_heightfield`
 - `python -m newton.examples basic_heightfield --solver mujoco`
 - `python -m newton.examples basic_heightfield --solver kamino`
+- `python -m newton.examples basic_heightfield --solver lox`
 """
 
 import numpy as np
@@ -38,7 +39,7 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         builder = newton.ModelBuilder()
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         # Create a wave-like heightfield terrain
@@ -90,6 +91,11 @@ class Example:
             solver_config.integrator = "moreau"
             solver_config.scc.max_alternating_iterations = 8
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            self.model.rigid_contact_max = 160
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.solver = newton.solvers.SolverXPBD(self.model, iterations=10)
         self.collision_pipeline = newton.CollisionPipeline(
@@ -114,7 +120,7 @@ class Example:
         self.capture()
 
     def capture(self):
-        if (wp.get_device().is_cuda or self.solver_type != "kamino") and not wp.config.verify_cuda:
+        if (wp.get_device().is_cuda or self.solver_type not in ("kamino", "lox")) and not wp.config.verify_cuda:
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph
@@ -122,7 +128,7 @@ class Example:
             self.graph = None
 
     def simulate(self):
-        if self.solver_type == "xpbd":
+        if self.solver_type in ("xpbd", "lox"):
             self.collision_pipeline.collide(self.state_0, self.contacts)
         for substep in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -172,8 +178,8 @@ if __name__ == "__main__":
         "--solver",
         type=str,
         default="xpbd",
-        choices=["xpbd", "mujoco", "kamino"],
-        help="Solver type: xpbd (default), mujoco, or kamino",
+        choices=["xpbd", "mujoco", "kamino", "lox"],
+        help="Solver type: xpbd (default), mujoco, kamino, or lox",
     )
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)
