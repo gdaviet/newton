@@ -8,6 +8,7 @@
 # sphere-sphere contact.
 #
 # Command: python -m newton.examples newton_cradle
+# LOX: python -m newton.examples newton_cradle --solver lox
 #
 ###########################################################################
 
@@ -33,9 +34,10 @@ SUBSTEPS = {
     "mujoco": 10,
     "featherstone": 20,
     "kamino": 5,
+    "lox": 5,
 }
-SOLVER_CHOICES = ("xpbd", "vbd", "mujoco", "featherstone", "kamino")
-NATIVE_CONTACT_SOLVERS = {"mujoco", "kamino"}
+SOLVER_CHOICES = ("xpbd", "vbd", "mujoco", "featherstone", "kamino", "lox")
+NATIVE_CONTACT_SOLVERS = {"mujoco", "kamino", "lox"}
 
 
 class Example:
@@ -50,6 +52,8 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, GRAVITY))
+        if self.solver_name == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         builder.rigid_gap = 0.001
         builder.default_shape_cfg.ke = 1.0e5
         builder.default_shape_cfg.kd = 0.0
@@ -151,6 +155,10 @@ class Example:
             self.solver = newton.solvers.SolverFeatherstone(self.model, angular_damping=0.0)
         elif self.solver_name == "kamino":
             solver_config = newton.solvers.SolverKamino.Config.from_model(self.model)
+            solver_config.use_collision_detector = True
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_name == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
             solver_config.use_collision_detector = True
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:

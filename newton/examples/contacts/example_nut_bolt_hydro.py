@@ -8,6 +8,7 @@
 #
 # Command: python -m newton.examples nut_bolt_hydro
 #          python -m newton.examples nut_bolt_hydro --solver kamino
+#          python -m newton.examples nut_bolt_hydro --solver lox
 #
 ###########################################################################
 
@@ -196,7 +197,7 @@ class Example:
         world_builder = self._build_nut_bolt_scene()
 
         main_scene = newton.ModelBuilder()
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(main_scene)
         main_scene.default_shape_cfg.gap = 0.001 * self.scene_scale
         # Add ground plane at z = ground_plane_offset.
@@ -268,6 +269,11 @@ class Example:
                 self.model, dynamics_solver="dvi", sparse_dynamics=True, sparse_jacobian=True
             )
             solver_config.dvi.max_alternating_iterations = 4
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
+            solver_config.lox.max_iterations = args.lox_iterations
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             raise ValueError(f"Unknown solver '{self.solver_type}'")
@@ -508,10 +514,11 @@ class Example:
         parser.add_argument(
             "--solver",
             type=str,
-            choices=["xpbd", "mujoco", "kamino"],
+            choices=["xpbd", "mujoco", "kamino", "lox"],
             default="mujoco",
-            help="Solver to use: 'xpbd', 'mujoco', or 'kamino'.",
+            help="Solver to use: 'xpbd', 'mujoco', 'kamino', or 'lox'.",
         )
+        parser.add_argument("--lox-iterations", type=int, default=20, help="LOX splitting iterations per substep.")
         parser.add_argument(
             "--num-per-world",
             type=int,

@@ -10,6 +10,7 @@
 # approach, grasp, lift, move, place and release for each brick.
 #
 # Command: python -m newton.examples brick_stacking
+# LOX: python -m newton.examples brick_stacking --solver lox
 #
 ###########################################################################
 
@@ -391,6 +392,7 @@ def advance_task_kernel(
 class Example:
     def __init__(self, viewer, args=None):
         self.viewer = viewer
+        self.solver_type = str(getattr(args, "solver", "mujoco")).lower()
         self.sim_time = 0.0
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -436,6 +438,8 @@ class Example:
 
         # Build full scene
         scene = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(scene)
         scene.add_builder(franka_builder)
         self.add_bricks(scene)
         scene.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.75, gap=0.01))
@@ -452,18 +456,23 @@ class Example:
             broad_phase="nxn",
         )
 
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            solver="newton",
-            integrator="implicitfast",
-            iterations=15,
-            ls_iterations=100,
-            nconmax=contact_max,
-            njmax=contact_max * 2,
-            cone="elliptic",
-            impratio=50.0,
-            use_mujoco_contacts=False,
-        )
+        if self.solver_type == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        else:
+            self.solver = newton.solvers.SolverMuJoCo(
+                self.model,
+                solver="newton",
+                integrator="implicitfast",
+                iterations=15,
+                ls_iterations=100,
+                nconmax=contact_max,
+                njmax=contact_max * 2,
+                cone="elliptic",
+                impratio=50.0,
+                use_mujoco_contacts=False,
+            )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -494,6 +503,8 @@ class Example:
         builder = newton.ModelBuilder()
         builder.rigid_gap = 0.005
         newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         builder.add_urdf(
             newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
@@ -515,8 +526,14 @@ class Example:
             GRIPPER_OPEN,
         ]
         builder.joint_target_q[:9] = builder.joint_q[:9]
-        builder.joint_target_ke[:9] = [400, 400, 400, 400, 400, 400, 400, 100, 100]
-        builder.joint_target_kd[:9] = [40, 40, 40, 40, 40, 40, 40, 10, 10]
+        if self.solver_type == "lox":
+            # The gravity-compensation attributes below apply to SolverMuJoCo only, so LOX uses
+            # stiffer drives to carry the arm's weight.
+            builder.joint_target_ke[:9] = [18000, 18000, 14000, 14000, 8000, 8000, 8000, 100, 100]
+            builder.joint_target_kd[:9] = [900, 900, 700, 700, 400, 400, 400, 10, 10]
+        else:
+            builder.joint_target_ke[:9] = [400, 400, 400, 400, 400, 400, 400, 100, 100]
+            builder.joint_target_kd[:9] = [40, 40, 40, 40, 40, 40, 40, 10, 10]
         builder.joint_effort_limit[:9] = [87, 87, 87, 87, 12, 12, 12, 100, 100]
         builder.joint_armature[:9] = [0.3] * 4 + [0.11] * 3 + [0.15] * 2
 
@@ -1041,6 +1058,13 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument(
+        "--solver",
+        type=str,
+        choices=["mujoco", "lox"],
+        default="mujoco",
+        help="Solver type: mujoco (default) or lox",
+    )
 
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)
