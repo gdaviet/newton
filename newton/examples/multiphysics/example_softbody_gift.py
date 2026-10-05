@@ -145,8 +145,8 @@ class Example:
         self.iterations = 15
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        if self.solver_type != "vbd":
-            raise ValueError("The falling gift example only supports the VBD solver.")
+        if self.solver_type not in {"vbd", "lox"}:
+            raise ValueError("The falling gift example supports the VBD and LOX solvers.")
 
         # Simulation parameters
         self.base_height = 20.0
@@ -157,6 +157,8 @@ class Example:
         strap2_verts, strap2_faces = cloth_loop_around_box(hx=1.015, hz=2.025, width=0.6)
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         builder.add_ground_plane()
 
         # Add 4 stacked soft body blocks
@@ -216,15 +218,27 @@ class Example:
         self.model.soft_contact_kd = 5.0e-1
         self.model.soft_contact_mu = 1.0
 
-        self.solver = newton.solvers.SolverVBD(
-            model=self.model,
-            iterations=self.iterations,
-            particle_enable_self_contact=True,
-            particle_self_contact_margin=0.04,
-            particle_self_contact_gap=0.02,
-            particle_topological_contact_filter_threshold=1,
-            particle_enable_tile_solve=False,
-        )
+        if self.solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = self.iterations
+            config.lox.deformable_enable_self_contact = True
+            config.lox.deformable_self_contact_margin = 0.04
+            config.lox.deformable_self_contact_gap = 0.02
+            config.lox.deformable_self_contact_vertex_buffer_size = 64
+            config.lox.deformable_self_contact_edge_buffer_size = 64
+
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
+        else:
+            self.solver = newton.solvers.SolverVBD(
+                model=self.model,
+                iterations=self.iterations,
+                particle_enable_self_contact=True,
+                particle_self_contact_margin=0.04,
+                particle_self_contact_gap=0.02,
+                particle_topological_contact_filter_threshold=1,
+                particle_enable_tile_solve=False,
+            )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -292,9 +306,9 @@ class Example:
         parser = newton.examples.create_parser()
         parser.add_argument(
             "--solver",
-            help="Type of solver (only 'vbd' supports this example)",
+            help="Type of deformable solver",
             type=str,
-            choices=["vbd"],
+            choices=["vbd", "lox"],
             default="vbd",
         )
         return parser

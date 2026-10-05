@@ -7,7 +7,7 @@
 # This simulation loads the `square_cloth.usd` asset and hangs it from one
 # edge under gravity, using the VBD solver with stiff material parameters.
 #
-# Command: python -m newton.examples cloth_stiff_material_hanging
+# Command: python -m newton.examples cloth_stiff_material_hanging (--solver [vbd, lox])
 #
 ###########################################################################
 
@@ -36,6 +36,7 @@ class Example:
         self.iterations = 10
 
         self.viewer = viewer
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
 
         usd_stage = Usd.Stage.Open(os.path.join(warp.examples.get_asset_directory(), "square_cloth.usd"))
         usd_prim = usd_stage.GetPrimAtPath("/root/cloth/cloth")
@@ -47,6 +48,8 @@ class Example:
         vertices = [wp.vec3(v) for v in mesh_points]
 
         builder = newton.ModelBuilder()
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         builder.add_ground_plane()
         builder.add_cloth_mesh(
             pos=wp.vec3(0.0, 0.0, 2.0),
@@ -56,8 +59,10 @@ class Example:
             indices=mesh_indices,
             vel=wp.vec3(0.0, 0.0, 0.0),
             density=0.2,
-            tri_ke=1.0e8,
-            tri_ka=1.0e8,
+            # LOX hangs a softer membrane; at the VBD stiffness its linearized
+            # steps damp the swing of the cloth almost entirely.
+            tri_ke=1.0e4 if self.solver_type == "lox" else 1.0e8,
+            tri_ka=1.0e4 if self.solver_type == "lox" else 1.0e8,
             tri_kd=0,
             edge_ke=1.0e1,
             edge_kd=0.0,
@@ -81,13 +86,21 @@ class Example:
             flags[fixed_vertex_id] = flags[fixed_vertex_id] & ~ParticleFlags.ACTIVE
         self.model.particle_flags = wp.array(flags)
 
-        self.solver = newton.solvers.SolverVBD(
-            model=self.model,
-            iterations=self.iterations,
-            particle_enable_self_contact=False,
-            particle_self_contact_margin=0.002,
-            particle_self_contact_gap=0.0015,
-        )
+        if self.solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = 4
+            config.lox.deformable_proximal_iterations = 4
+            config.lox.deformable_enable_self_contact = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
+        else:
+            self.solver = newton.solvers.SolverVBD(
+                model=self.model,
+                iterations=self.iterations,
+                particle_enable_self_contact=False,
+                particle_self_contact_margin=0.002,
+                particle_self_contact_gap=0.0015,
+            )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -160,6 +173,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd", help="Dynamics solver to use.")
 
     viewer, args = newton.examples.init(parser)
 
