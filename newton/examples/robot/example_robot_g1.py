@@ -8,6 +8,7 @@
 # from a USD stage using newton.ModelBuilder.add_usd().
 #
 # Command: python -m newton.examples robot_g1 --world-count 16
+#          python -m newton.examples robot_g1 --solver lox
 #
 ###########################################################################
 
@@ -33,7 +34,7 @@ class Example:
         self.viewer = viewer
 
         g1 = newton.ModelBuilder()
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(g1)
         else:
             newton.solvers.SolverMuJoCo.register_custom_attributes(g1)
@@ -83,6 +84,10 @@ class Example:
                 "key_and_position_with_net_force_backup_and_tangential_net_force"
             )
             solver_config.dvi.use_schur_complement = True
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.solver = newton.solvers.SolverMuJoCo(
@@ -176,7 +181,7 @@ class Example:
         parser = newton.examples.create_parser()
         newton.examples.add_world_count_arg(parser)
         newton.examples.add_mujoco_contacts_arg(parser)
-        parser.add_argument("--solver", choices=["mujoco", "kamino"], default="mujoco")
+        parser.add_argument("--solver", choices=["mujoco", "kamino", "lox"], default="mujoco")
         parser.set_defaults(world_count=4)
         return parser
 

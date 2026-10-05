@@ -13,6 +13,7 @@
 #
 #
 # Command: python -m newton.examples sensor_contact
+#          python -m newton.examples sensor_contact --solver lox
 #
 ###########################################################################
 
@@ -39,7 +40,7 @@ class Example:
         self.solver_type = getattr(args, "solver", "mujoco")
 
         builder = newton.ModelBuilder()
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(builder)
         else:
             newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
@@ -72,6 +73,10 @@ class Example:
             solver_config.dvi.max_alternating_iterations = 8
             solver_config.dvi.use_schur_complement = True
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.solver = newton.solvers.SolverMuJoCo(
                 self.model,
@@ -82,8 +87,12 @@ class Example:
             )
 
         # used for storing contact info required by contact sensor
+        self.collision_pipeline = None
         if self.solver_type == "kamino":
             self.contacts = newton.CollisionPipeline(self.model).contacts()
+        elif self.solver_type == "lox":
+            self.collision_pipeline = newton.CollisionPipeline(self.model)
+            self.contacts = self.collision_pipeline.contacts()
         else:
             self.contacts = Contacts(
                 self.solver.get_max_contact_count(),
@@ -145,10 +154,14 @@ class Example:
     def simulate(self):
         self.state_0.clear_forces()
         self.viewer.apply_forces(self.state_0)
+        contacts = None
+        if self.collision_pipeline is not None:
+            self.collision_pipeline.collide(self.state_0, self.contacts)
+            contacts = self.contacts
         if self.state_1 is None:
-            self.solver.step(self.state_0, self.state_0, self.control, None, self.sim_dt)
+            self.solver.step(self.state_0, self.state_0, self.control, contacts, self.sim_dt)
         else:
-            self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
+            self.solver.step(self.state_0, self.state_1, self.control, contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
         self.solver.update_contacts(self.contacts, self.state_0)
 
@@ -242,7 +255,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
-    parser.add_argument("--solver", choices=["mujoco", "kamino"], default="mujoco")
+    parser.add_argument("--solver", choices=["mujoco", "kamino", "lox"], default="mujoco")
 
     viewer, args = newton.examples.init(parser)
 

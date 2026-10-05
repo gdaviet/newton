@@ -16,6 +16,7 @@
 # python -m newton.examples robot_policy --robot go2
 # python -m newton.examples robot_policy --robot anymal
 # python -m newton.examples robot_policy --robot anymal --physx
+# python -m newton.examples robot_policy --robot anymal --physx --solver lox
 ###########################################################################
 
 from dataclasses import dataclass
@@ -237,13 +238,17 @@ class Example:
         self.viewer = viewer
 
         self.use_mujoco = False
+        self.solver_type = str(getattr(args, "solver", "mujoco")).lower()
         self.config = config
         self.robot_config = robot_config
 
         self.device = wp.get_device()
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
+        else:
+            newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
         builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
             armature=0.1,
             limit_ke=1.0e2,
@@ -280,19 +285,37 @@ class Example:
         self.model = builder.finalize()
         self.model.set_gravity((0.0, 0.0, -9.81))
 
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            use_mujoco_cpu=self.use_mujoco,
-            solver="newton",
-            nconmax=30,
-            njmax=100,
-        )
+        if self.solver_type == "lox":
+            # Match the model body poses to the joint coordinates before building the solver
+            newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.model)
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = True
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+            penalty_scales = self.solver.lox_joint_penalty_scale_seed(self.sim_dt).numpy()
+            formatted_scales = ", ".join(f"{scale:.3g}" for scale in penalty_scales)
+            print(f"[INFO] Seeded LOX joint penalty scales per world: [{formatted_scales}]")
+        else:
+            self.solver = newton.solvers.SolverMuJoCo(
+                self.model,
+                use_mujoco_cpu=self.use_mujoco,
+                solver="newton",
+                nconmax=30,
+                njmax=100,
+            )
 
         self.state_temp = self.model.state()
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.contacts = newton.Contacts(self.solver.get_max_contact_count(), 0)
+        if self.solver_type == "lox":
+            self.contacts = newton.Contacts(
+                self.model.rigid_contact_max,
+                0,
+                device=self.model.device,
+                requested_attributes=self.model.get_requested_contact_attributes(),
+            )
+        else:
+            self.contacts = newton.Contacts(self.solver.get_max_contact_count(), 0)
 
         self.viewer.set_model(self.model)
         self.viewer.vsync = True
@@ -359,6 +382,9 @@ class Example:
         wp.copy(self.state_1.joint_qd, self._initial_joint_qd)
         newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
         newton.eval_fk(self.model, self.state_1.joint_q, self.state_1.joint_qd, self.state_1)
+        if self.solver_type == "lox":
+            self.solver.reset(self.state_0)
+            self.state_1.assign(self.state_0)
         if self._prev_act_wp is not None:
             self._prev_act_wp.zero_()
 
@@ -422,6 +448,8 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
+        if self.solver_type == "lox":
+            assert not self.solver.status.numpy()["failed"].any(), "LOX solver reported a failed policy rollout."
         newton.examples.test_body_state(
             self.model,
             self.state_0,
@@ -443,6 +471,13 @@ class Example:
             "--physx",
             action="store_true",
             help="Run physX policy instead of MJWarp.",
+        )
+        parser.add_argument(
+            "--solver",
+            type=str,
+            choices=["mujoco", "lox"],
+            default="mujoco",
+            help="Solver type: mujoco (default) or lox",
         )
         return parser
 

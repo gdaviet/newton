@@ -4,10 +4,11 @@
 ###########################################################################
 # Example Robot Anymal D
 #
-# Shows how to simulate Anymal D with multiple worlds using MuJoCo or Kamino.
+# Shows how to simulate Anymal D with multiple worlds using MuJoCo, Kamino, or LOX.
 #
 # Command: python -m newton.examples robot_anymal_d --world-count 16
 #          python -m newton.examples robot_anymal_d --solver kamino
+#          python -m newton.examples robot_anymal_d --solver lox
 #
 ###########################################################################
 
@@ -36,7 +37,7 @@ class Example:
         self.device = wp.get_device()
 
         articulation_builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(articulation_builder)
         else:
             newton.solvers.SolverMuJoCo.register_custom_attributes(articulation_builder)
@@ -99,6 +100,10 @@ class Example:
             # resolved throughout the alternating solve to hold the stance.
             solver_config.dvi.max_alternating_iterations = 32
             solver_config.dvi.bilateral_solve_interval = 1
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.solver = newton.solvers.SolverMuJoCo(
@@ -199,7 +204,7 @@ class Example:
             )
             # fmt: on
 
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             body_q = self.state_0.body_q.numpy()
             base_heights = [body_q[i, 2] for i, label in enumerate(self.model.body_label) if label.endswith("/base")]
             foot_heights = [body_q[i, 2] for i, label in enumerate(self.model.body_label) if label.endswith("_FOOT")]
@@ -213,7 +218,7 @@ class Example:
         parser = newton.examples.create_parser()
         newton.examples.add_world_count_arg(parser)
         newton.examples.add_mujoco_contacts_arg(parser)
-        parser.add_argument("--solver", choices=["mujoco", "kamino"], default="mujoco")
+        parser.add_argument("--solver", choices=["mujoco", "kamino", "lox"], default="mujoco")
         parser.set_defaults(world_count=8)
         return parser
 
