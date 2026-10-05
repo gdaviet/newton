@@ -11,8 +11,8 @@ rigid bodies, causing them to bounce and settle realistically.
 This example builds rigid/VBD proxy coupling directly through
 ``SolverCoupledProxy`` so the generic proxy path exercises the default API.
 
-Pass ``--solver vbd`` to run the same scene with a single VBD solver
-(no coupling) as a reference baseline.
+Pass ``--solver vbd`` or ``--solver lox`` to run the same scene with one
+monolithic solver (no proxy coupling) as a reference baseline.
 
 Success criteria:
 - Rigid boxes and an articulated chain appear above a cloth sheet and several soft bodies.
@@ -26,6 +26,7 @@ Runs:
   - Deformable contact reactions affect the rigid bodies through proxy coupling.
 - `python -m newton.examples mujoco_vbd_coupled_solver --solver vbd`
   - The same scene runs as a single-solver VBD reference.
+- `python -m newton.examples mujoco_vbd_coupled_solver --solver lox`
 """
 
 from __future__ import annotations
@@ -114,13 +115,17 @@ class Example:
         self.frame_dt = 1.0 / self.fps
         self.sim_substeps = 8
         self.sim_dt = self.frame_dt / self.sim_substeps
-        self.use_coupled = getattr(args, "solver", "coupled") == "coupled"
+        self.solver_type = getattr(args, "solver", "coupled")
+        self.use_coupled = self.solver_type == "coupled"
 
         self.rigid_solver = getattr(args, "rigid_solver", "mujoco")
 
         builder = newton.ModelBuilder()
         builder.default_shape_cfg.ke = 2.0e4
-        _register_rigid_solver_custom_attributes(builder, self.rigid_solver)
+        if self.solver_type == "lox":
+            SolverKamino.register_custom_attributes(builder)
+        else:
+            _register_rigid_solver_custom_attributes(builder, self.rigid_solver)
         builder.add_ground_plane()
 
         # ---- Rigid bodies (free-floating + articulated) ----
@@ -199,9 +204,19 @@ class Example:
                 ),
             )
 
-        else:
+        elif self.solver_type == "vbd":
             # ---------- Pure-VBD path (reference baseline) ----------
             self.solver = SolverVBD(model=self.model, **vbd_kwargs)
+        else:
+            # ---------- Monolithic LOX path ----------
+            config = SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = args.lox_iterations
+            config.lox.projection_sweeps_per_iteration = 3
+            config.lox.deformable_cr_iterations = 6
+            config.lox.deformable_enable_self_contact = True
+            config.lox.deformable_self_contact_margin = 0.02
+            self.solver = SolverKamino(self.model, config=config)
 
         # Simulation state
         self.state_0 = self.model.state()
@@ -368,11 +383,12 @@ class Example:
         parser.add_argument(
             "--solver",
             "-s",
-            help="'coupled' for rigid+VBD coupling, 'vbd' for pure-VBD baseline",
+            help="'coupled' for rigid+VBD coupling, or a monolithic solver baseline",
             type=str,
-            choices=["coupled", "vbd"],
+            choices=["coupled", "vbd", "lox"],
             default="coupled",
         )
+        parser.add_argument("--lox-iterations", type=int, default=12, help="LOX splitting iterations per substep.")
         _add_rigid_solver_arg(parser)
         parser.add_argument(
             "--mass-scale",
