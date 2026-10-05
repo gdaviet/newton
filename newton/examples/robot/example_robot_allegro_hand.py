@@ -14,6 +14,7 @@
 #
 # Command: python -m newton.examples robot_allegro_hand --world-count 16
 #          python -m newton.examples robot_allegro_hand --solver kamino
+#          python -m newton.examples robot_allegro_hand --solver lox
 #
 ###########################################################################
 
@@ -81,7 +82,7 @@ class Example:
         max_contacts_per_world = 300
 
         allegro_hand = newton.ModelBuilder()
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(allegro_hand)
         else:
             newton.solvers.SolverMuJoCo.register_custom_attributes(allegro_hand)
@@ -150,6 +151,11 @@ class Example:
             )
             solver_config.dvi.use_schur_complement = True
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            self.model.rigid_contact_max = max_contacts_per_world * self.world_count
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.solver = newton.solvers.SolverMuJoCo(
                 self.model,
@@ -209,6 +215,9 @@ class Example:
             self.solver.notify_model_changed(ModelFlags.JOINT_PROPERTIES)
             if self.solver_type == "kamino":
                 self.collision_pipeline.collide(self.state_0, self.contacts)
+            elif self.solver_type == "lox":
+                # Move the hand bodies to the updated joint parent transforms
+                newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
 
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
@@ -274,7 +283,7 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         newton.examples.add_world_count_arg(parser)
-        parser.add_argument("--solver", choices=["mujoco", "kamino"], default="mujoco")
+        parser.add_argument("--solver", choices=["mujoco", "kamino", "lox"], default="mujoco")
         parser.set_defaults(world_count=None)
         return parser
 
