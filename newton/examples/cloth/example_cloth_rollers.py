@@ -5,7 +5,7 @@
 # Cloth Rollers
 #
 # A rolled cloth mesh that unrolls as the inner seam rotates.
-# Command: uv run -m newton.examples cloth_rollers
+# Command: uv run -m newton.examples cloth_rollers (--solver [vbd, lox])
 #
 ###########################################################################
 
@@ -63,6 +63,40 @@ def rotate_cylinder(
     q0[particle_index][1] = y0
     q0[particle_index][2] = z1 + center_z
     q1[particle_index] = q0[particle_index]
+
+
+@wp.kernel
+def prescribe_rotation_velocity(
+    angular_speed: float,
+    dt: float,
+    time: wp.array[float],
+    center_x: float,
+    center_z: float,
+    q: wp.array[wp.vec3],
+    indices: wp.array[wp.int64],
+    qd: wp.array[wp.vec3],
+):
+    """Set velocities that integrate prescribed points to their rotation targets."""
+    i = wp.tid()
+    particle_index = indices[i]
+    t = time[0]
+    c0 = wp.cos(-angular_speed * (t - dt))
+    s0 = wp.sin(-angular_speed * (t - dt))
+    c1 = wp.cos(angular_speed * t)
+    s1 = wp.sin(angular_speed * t)
+
+    x0 = q[particle_index][0] - center_x
+    z0 = q[particle_index][2] - center_z
+
+    rx = c0 * x0 + s0 * z0
+    rz = -s0 * x0 + c0 * z0
+
+    target = wp.vec3(
+        c1 * rx + s1 * rz + center_x,
+        q[particle_index][1],
+        -s1 * rx + c1 * rz + center_z,
+    )
+    qd[particle_index] = (target - q[particle_index]) / dt
 
 
 def rolled_cloth_mesh(
@@ -178,6 +212,7 @@ class Example:
         self.viewer = viewer
         self.sim_time = 0.0
         self.args = args
+        self.solver_type = getattr(args, "solver", "vbd")
 
         # Visualization scale: simulation is in cm, visualization in meters
         self.viz_scale = 0.01
@@ -223,6 +258,8 @@ class Example:
 
         # Build model with zero gravity
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         # Generate cloth mesh with extension going directly to target
         self.cloth_verts, self.cloth_faces, self.spiral_rows, self.ext_rows = rolled_cloth_mesh(
@@ -331,6 +368,7 @@ class Example:
         # Offset = cloth thickness + self_contact_radius to allow air gap
         positions = self.model.particle_q.numpy()
         attach_offset = self_contact_radius * 1.2
+        self.cloth_drive_radius = self.cyl2_radius + attach_offset
         left_x = self.cyl2_center[0] - self.cyl2_radius - attach_offset
         for idx in self.fixed_point_indices:
             positions[idx][0] = left_x
@@ -339,10 +377,14 @@ class Example:
 
         # Fix the outer edge vertices (kinematic, attached to cylinder 2)
         if len(self.fixed_point_indices):
-            flags = self.model.particle_flags.numpy()
-            for fixed_vertex_id in self.fixed_point_indices:
-                flags[fixed_vertex_id] = flags[fixed_vertex_id] & ~ParticleFlags.ACTIVE
-            self.model.particle_flags = wp.array(flags)
+            if self.solver_type == "lox":
+                # LOX integrates active zero-mass particles with their prescribed velocity.
+                self._make_particles_prescribed(self.fixed_point_indices)
+            else:
+                flags = self.model.particle_flags.numpy()
+                for fixed_vertex_id in self.fixed_point_indices:
+                    flags[fixed_vertex_id] = flags[fixed_vertex_id] & ~ParticleFlags.ACTIVE
+                self.model.particle_flags = wp.array(flags)
 
         self.fixed_point_indices = wp.array(self.fixed_point_indices)
 
@@ -360,10 +402,13 @@ class Example:
         self.cyl2_indices = wp.array(cyl2_idx_list, dtype=wp.int64)
 
         # Make all cylinder vertices static (kinematic, not simulated)
-        flags = self.model.particle_flags.numpy()
-        for id in range(self.num_cloth_verts, len(builder.particle_q)):
-            flags[id] = flags[id] & ~ParticleFlags.ACTIVE
-        self.model.particle_flags = wp.array(flags)
+        if self.solver_type == "lox":
+            self._make_particles_prescribed(range(self.num_cloth_verts, len(builder.particle_q)))
+        else:
+            flags = self.model.particle_flags.numpy()
+            for id in range(self.num_cloth_verts, len(builder.particle_q)):
+                flags[id] = flags[id] & ~ParticleFlags.ACTIVE
+            self.model.particle_flags = wp.array(flags)
 
         # Rotation parameters - match linear velocity at surface
         # v = omega * r, so for same v: omega2 = omega1 * r1 / r2
@@ -371,25 +416,44 @@ class Example:
         linear_velocity = self.angular_speed * self.cyl1_radius
         self.angular_speed_cyl1 = linear_velocity / self.cyl1_radius  # = angular_speed
         self.angular_speed_cyl2 = linear_velocity / self.cyl2_radius  # slower due to larger radius
+        self.angular_speed_cloth_edge = self.angular_speed_cyl2
+        if self.solver_type == "lox":
+            # Match the roller's integrated chord velocity at the offset cloth radius.
+            roller_step_distance = 2.0 * self.cyl2_radius * math.sin(0.5 * self.angular_speed_cyl2 * self.sim_dt)
+            self.angular_speed_cloth_edge = (
+                2.0 * math.asin(roller_step_distance / (2.0 * self.cloth_drive_radius)) / self.sim_dt
+            )
         self.spin_duration = spin_duration  # seconds
 
         # Create solver
-        self.solver = newton.solvers.SolverVBD(
-            model=self.model,
-            iterations=self.iterations,
-            particle_enable_self_contact=True,
-            particle_self_contact_margin=0.3,
-            particle_self_contact_gap=0.3,
-            # The 0.6 query radius packs many edge pairs (measured peak demand:
-            # 24 vertex / 146 edge pairs); overflow drops pairs.
-            particle_vertex_contact_buffer_size=48,
-            particle_edge_contact_buffer_size=160,
-            collision_frequency={newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: 5},
-            collision_frequency_type={
-                newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: newton.solvers.SolverBase.CollisionFrequencyType.ITERATIONS,
-            },
-            particle_topological_contact_filter_threshold=2,
-        )
+        if self.solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.lox.max_iterations = self.iterations
+            config.lox.projection_sweeps_per_iteration = 25
+            config.lox.deformable_enable_self_contact = True
+            config.lox.deformable_self_contact_margin = 0.3
+            config.lox.deformable_self_contact_gap = 0.3
+            config.lox.deformable_self_contact_vertex_buffer_size = 48
+            config.lox.deformable_self_contact_edge_buffer_size = 160
+            config.lox.deformable_enable_penetration_free_contact = True
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
+        else:
+            self.solver = newton.solvers.SolverVBD(
+                model=self.model,
+                iterations=self.iterations,
+                particle_enable_self_contact=True,
+                particle_self_contact_margin=0.3,
+                particle_self_contact_gap=0.3,
+                # The 0.6 query radius packs many edge pairs (measured peak demand:
+                # 24 vertex / 146 edge pairs); overflow drops pairs.
+                particle_vertex_contact_buffer_size=48,
+                particle_edge_contact_buffer_size=160,
+                collision_frequency={newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: 5},
+                collision_frequency_type={
+                    newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: newton.solvers.SolverBase.CollisionFrequencyType.ITERATIONS,
+                },
+                particle_topological_contact_filter_threshold=2,
+            )
 
         # Create states
         self.state_0 = self.model.state()
@@ -421,13 +485,27 @@ class Example:
 
         self.capture()
 
+    def _make_particles_prescribed(self, indices):
+        """Give particles zero mass while keeping them active so LOX integrates their velocity."""
+        flags = self.model.particle_flags.numpy()
+        masses = self.model.particle_mass.numpy()
+        inverse_masses = self.model.particle_inv_mass.numpy()
+        for particle in indices:
+            flags[particle] = flags[particle] | ParticleFlags.ACTIVE
+            masses[particle] = 0.0
+            inverse_masses[particle] = 0.0
+        self.model.particle_flags = wp.array(flags, dtype=wp.int32, device=self.model.device)
+        self.model.particle_mass = wp.array(masses, dtype=wp.float32, device=self.model.device)
+        self.model.particle_inv_mass = wp.array(inverse_masses, dtype=wp.float32, device=self.model.device)
+
     def capture(self):
         with wp.ScopedCapture() as capture:
             self.simulate()
         self.graph = capture.graph
 
     def simulate(self):
-        self.solver.rebuild_bvh(self.state_0)
+        if self.solver_type != "lox":
+            self.solver.rebuild_bvh(self.state_0)
 
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -438,25 +516,33 @@ class Example:
             # Apply rotation (rotation kernels are always in the graph;
             # spin_duration check is evaluated at capture time)
             if self.sim_time < self.spin_duration:
+                if self.solver_type == "lox":
+                    # LOX moves the prescribed particles with velocities that reach their rotation targets.
+                    rotation_kernel = prescribe_rotation_velocity
+                    rotation_output = self.state_0.particle_qd
+                else:
+                    rotation_kernel = rotate_cylinder
+                    rotation_output = self.state_1.particle_q
+
                 # Rotate cloth outer edge (attached to cylinder 2's left side)
                 wp.launch(
-                    kernel=rotate_cylinder,
+                    kernel=rotation_kernel,
                     dim=len(self.fixed_point_indices),
                     inputs=[
-                        self.angular_speed_cyl2,  # Same speed as cylinder 2
+                        self.angular_speed_cloth_edge,  # Follows cylinder 2
                         self.sim_dt,
                         self.sim_time_wp,
                         self.cyl2_center[0],  # Rotate around cylinder 2's center
                         self.cyl2_center[1],
                         self.state_0.particle_q,
                         self.fixed_point_indices,
-                        self.state_1.particle_q,
+                        rotation_output,
                     ],
                 )
 
                 # Rotate cylinder 1 (around its center, faster due to smaller radius)
                 wp.launch(
-                    kernel=rotate_cylinder,
+                    kernel=rotation_kernel,
                     dim=self.num_cyl1_indices,
                     inputs=[
                         self.angular_speed_cyl1,
@@ -466,13 +552,13 @@ class Example:
                         self.cyl1_center[1],
                         self.state_0.particle_q,
                         self.cyl1_indices,
-                        self.state_1.particle_q,
+                        rotation_output,
                     ],
                 )
 
                 # Rotate cylinder 2 (around its center, slower due to larger radius)
                 wp.launch(
-                    kernel=rotate_cylinder,
+                    kernel=rotation_kernel,
                     dim=self.num_cyl2_indices,
                     inputs=[
                         self.angular_speed_cyl2,
@@ -482,7 +568,7 @@ class Example:
                         self.cyl2_center[1],
                         self.state_0.particle_q,
                         self.cyl2_indices,
-                        self.state_1.particle_q,
+                        rotation_output,
                     ],
                 )
 
@@ -541,6 +627,7 @@ class Example:
 if __name__ == "__main__":
     # Create parser with base arguments
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd", help="Dynamics solver to use.")
 
     # Parse arguments and initialize viewer
     viewer, args = newton.examples.init(parser)

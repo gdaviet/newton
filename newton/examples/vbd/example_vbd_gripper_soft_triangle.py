@@ -14,7 +14,7 @@
 # ``enable_rigid_soft_full_surface_contact=True``. With the flag off the
 # triangle slips out and falls.
 #
-# Command: python -m newton.examples vbd_gripper_soft_triangle
+# Command: python -m newton.examples vbd_gripper_soft_triangle (--solver [vbd, lox])
 ###########################################################################
 
 from __future__ import annotations
@@ -55,6 +55,9 @@ PARAMS = {
     "fps": 60,
     "sim_substeps": 20,
     "solver_iterations": 5,
+    # LOX needs more outer coupling iterations than VBD for the loaded joints.
+    "lox_sim_substeps": 20,
+    "lox_solver_iterations": 20,
     "gravity": (0.0, 0.0, -9.8),
     "num_frames": 360,
     # water-tight rigid-soft contact. True = grip the triangle by its face (this feature);
@@ -88,6 +91,7 @@ PARAMS = {
     "finger_drive_ke": 1.0e5,
     "finger_drive_kd": 1.0e2,
     "gantry_link_mass": 0.01,
+    "lox_gantry_link_mass": 1.0,
     # soft triangle standing VERTICALLY in the x-z plane (face normal along y). Big, with
     # its centroid on the grip point; vertices far out in x and z (outside the jaws). The
     # near-zero y-thickness < open_half_gap so the OPEN jaws start clear and sweep in.
@@ -121,11 +125,12 @@ PARAMS = {
 class Example:
     def __init__(self, viewer, args):
         self.viewer = viewer
+        self.solver_type = getattr(args, "solver", "vbd")
         self.params = PARAMS
         self.sim_time = 0.0
         self.fps = self.params["fps"]
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = self.params["sim_substeps"]
+        self.sim_substeps = self.params["lox_sim_substeps" if self.solver_type == "lox" else "sim_substeps"]
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.frame = 0
         self._current_waypoint = 0
@@ -133,6 +138,8 @@ class Example:
         self._gripper_frac = 0.0
 
         builder = newton.ModelBuilder(gravity=self.params["gravity"])
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         self._build_gripper(builder)
         self._add_soft_mesh(builder)
 
@@ -146,12 +153,18 @@ class Example:
 
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.model)
 
-        self.solver = newton.solvers.SolverVBD(
-            self.model,
-            iterations=self.params["solver_iterations"],
-            integrate_with_external_rigid_solver=False,
-            rigid_body_contact_buffer_size=self.params["rigid_body_contact_buffer_size"],
-        )
+        if self.solver_type == "lox":
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.use_collision_detector = False
+            config.lox.max_iterations = self.params["lox_solver_iterations"]
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
+        else:
+            self.solver = newton.solvers.SolverVBD(
+                self.model,
+                iterations=self.params["solver_iterations"],
+                integrate_with_external_rigid_solver=False,
+                rigid_body_contact_buffer_size=self.params["rigid_body_contact_buffer_size"],
+            )
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             broad_phase=self.params["collision_broad_phase"],
@@ -188,14 +201,25 @@ class Example:
         grab_z = p["grab_z"]
         h = p["finger_half"]
 
+        gantry_mass = p["gantry_link_mass"]
+        gantry_inertia = None
+        if self.solver_type == "lox":
+            # These invisible links have no shapes from which to infer inertia. LOX
+            # uses heavier links with the inertia of a mass-equivalent cube matching
+            # a finger pad.
+            gantry_mass = p["lox_gantry_link_mass"]
+            gantry_inertia = wp.mat33(np.eye(3) * ((2.0 / 3.0) * gantry_mass * h * h))
+
         gantry_z = builder.add_link(
             xform=wp.transform(wp.vec3(0.0, 0.0, grab_z), wp.quat_identity()),
-            mass=p["gantry_link_mass"],
+            mass=gantry_mass,
+            inertia=gantry_inertia,
             label="gantry_z",
         )
         gantry_x = builder.add_link(
             xform=wp.transform(wp.vec3(0.0, 0.0, grab_z), wp.quat_identity()),
-            mass=p["gantry_link_mass"],
+            mass=gantry_mass,
+            inertia=gantry_inertia,
             label="gantry_x",
         )
         left_finger = builder.add_link(
@@ -346,6 +370,42 @@ class Example:
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
+    def test_post_step(self):
+        """Keep the LOX state finite and the prismatic locks bounded."""
+        if self.solver_type != "lox":
+            return
+
+        body_q = self.state_0.body_q.numpy()
+        arrays = (
+            body_q,
+            self.state_0.body_qd.numpy(),
+            self.state_0.particle_q.numpy(),
+            self.state_0.particle_qd.numpy(),
+        )
+        if not all(np.all(np.isfinite(values)) for values in arrays):
+            raise AssertionError("gripper simulation produced a non-finite body or particle state")
+
+        parents, children = self.model.joint_parent.numpy(), self.model.joint_child.numpy()
+        parent_frames, child_frames = self.model.joint_X_p.numpy(), self.model.joint_X_c.numpy()
+        axes = self.model.joint_axis.numpy()
+        for joint, (parent, child) in enumerate(zip(parents, children, strict=True)):
+            parent_pose = (
+                wp.transform_identity() if parent < 0 else wp.transform(body_q[parent, :3], body_q[parent, 3:])
+            )
+            child_pose = wp.transform(body_q[child, :3], body_q[child, 3:])
+            parent_frame = parent_pose * wp.transform(parent_frames[joint, :3], parent_frames[joint, 3:])
+            child_frame = child_pose * wp.transform(child_frames[joint, :3], child_frames[joint, 3:])
+            relative = wp.transform_inverse(parent_frame) * child_frame
+            position = np.asarray(wp.transform_get_translation(relative))
+            orientation = np.asarray(wp.transform_get_rotation(relative))
+            transverse_norm = float(np.linalg.norm(position - np.dot(position, axes[joint]) * axes[joint]))
+            orientation_error = 2.0 * np.arctan2(np.linalg.norm(orientation[:3]), abs(orientation[3]))
+            if transverse_norm > 0.01 or orientation_error > 0.1:
+                raise AssertionError(
+                    f"joint {joint} left its prismatic manifold "
+                    f"(transverse={transverse_norm:.6f} m, rotation={orientation_error:.6f} rad)"
+                )
+
     def test_final(self):
         """The gripped triangle must be held in the air, not dropped to the ground."""
         q = self.state_0.particle_q.numpy()
@@ -357,6 +417,7 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.set_defaults(num_frames=PARAMS["num_frames"])
+        parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd", help="Dynamics solver to use.")
         return parser
 
 

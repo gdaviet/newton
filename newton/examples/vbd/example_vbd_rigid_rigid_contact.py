@@ -9,7 +9,7 @@
 # container and settle under gravity.  This exercises pure rigid-rigid
 # contact handling in the VBD solver at a small (centimeter) scale.
 #
-# Command: python -m newton.examples vbd_rigid_rigid_contact
+# Command: python -m newton.examples vbd_rigid_rigid_contact (--solver [vbd, lox])
 #
 ###########################################################################
 
@@ -191,14 +191,20 @@ def build_model(builder, params, seed=42):
     }
 
 
-def setup_sim(builder, params):
+def setup_sim(builder, params, solver_type):
     model = builder.finalize()
 
-    solver = newton.solvers.SolverVBD(
-        model=model,
-        iterations=params["solver_iterations"],
-        rigid_body_contact_buffer_size=params["rigid_body_contact_buffer_size"],
-    )
+    if solver_type == "lox":
+        config = newton.solvers.SolverKamino.Config.from_model(model, dynamics_solver="lox")
+        config.use_collision_detector = False
+        config.lox.max_iterations = params["solver_iterations"]
+        solver = newton.solvers.SolverKamino(model, config=config)
+    else:
+        solver = newton.solvers.SolverVBD(
+            model=model,
+            iterations=params["solver_iterations"],
+            rigid_body_contact_buffer_size=params["rigid_body_contact_buffer_size"],
+        )
 
     return model, solver
 
@@ -206,6 +212,7 @@ def setup_sim(builder, params):
 class Example:
     def __init__(self, viewer, args):
         self.viewer = viewer
+        self.solver_type = getattr(args, "solver", "vbd")
         self.params = PARAMS
         self.sim_time = 0.0
         self.fps = self.params["fps"]
@@ -216,8 +223,10 @@ class Example:
 
         seed = getattr(args, "seed", 42)
         builder = newton.ModelBuilder(gravity=self.params["gravity"])
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         self.info = build_model(builder, self.params, seed=seed)
-        self.model, self.solver = setup_sim(builder, self.params)
+        self.model, self.solver = setup_sim(builder, self.params, self.solver_type)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -282,6 +291,7 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--seed", type=int, default=42)
+        parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd", help="Dynamics solver to use.")
         parser.set_defaults(paused=True)
         return parser
 
