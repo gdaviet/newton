@@ -7,9 +7,11 @@
 # A closed four-bar linkage is split across two rigid solvers: two links are
 # owned by Kamino and two links are owned by MuJoCo. SolverCoupledADMM detects
 # the model revolute joints that connect bodies owned by different solvers and
-# turns them into ADMM attachments.
+# turns them into ADMM attachments. Passing ``--solver lox`` simulates the
+# whole linkage with the Kamino LOX solver as an uncoupled reference.
 #
 # Command: python -m newton.examples kamino_mujoco_admm_solver
+#          python -m newton.examples kamino_mujoco_admm_solver --solver lox
 #
 ###########################################################################
 
@@ -116,6 +118,7 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.use_graph = bool(args.graph_capture)
         self.world_count = max(1, int(args.world_count))
+        self.solver_type = str(getattr(args, "solver", "coupled")).lower()
 
         template = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         SolverKamino.register_custom_attributes(template)
@@ -136,40 +139,46 @@ class Example:
 
         self.device = self.model.device
 
-        kamino_config = _make_kamino_config()
-        kamino_config.padmm.max_iterations = args.kamino_iterations
+        if self.solver_type == "lox":
+            lox_config = SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            lox_config.use_collision_detector = False
+            lox_config.lox.max_iterations = args.kamino_iterations
+            self.solver = SolverKamino(self.model, config=lox_config)
+        else:
+            kamino_config = _make_kamino_config()
+            kamino_config.padmm.max_iterations = args.kamino_iterations
 
-        self.solver = SolverCoupledADMM(
-            model=self.model,
-            entries=[
-                SolverCoupled.Entry(
-                    name="kamino",
-                    solver=lambda v: SolverKamino(model=v, config=kamino_config),
-                    bodies=self.kamino_bodies,
-                    joints=self.kamino_joints,
-                    configure_view=_configure_kamino_rigid_view,
-                ),
-                SolverCoupled.Entry(
-                    name="mjc",
-                    solver=lambda v: SolverMuJoCo(
-                        model=v,
-                        **{"use_mujoco_contacts": False, "njmax": 64, "nconmax": 64},
+            self.solver = SolverCoupledADMM(
+                model=self.model,
+                entries=[
+                    SolverCoupled.Entry(
+                        name="kamino",
+                        solver=lambda v: SolverKamino(model=v, config=kamino_config),
+                        bodies=self.kamino_bodies,
+                        joints=self.kamino_joints,
+                        configure_view=_configure_kamino_rigid_view,
                     ),
-                    bodies=self.mujoco_bodies,
-                    joints=self.mujoco_joints,
+                    SolverCoupled.Entry(
+                        name="mjc",
+                        solver=lambda v: SolverMuJoCo(
+                            model=v,
+                            **{"use_mujoco_contacts": False, "njmax": 64, "nconmax": 64},
+                        ),
+                        bodies=self.mujoco_bodies,
+                        joints=self.mujoco_joints,
+                    ),
+                ],
+                coupling=SolverCoupledADMM.Config(
+                    iterations=args.admm_iterations,
+                    rho=args.rho,
+                    gamma=args.gamma,
+                    baumgarte=args.baumgarte,
+                    joint_stiffness=args.joint_stiffness,
+                    joint_angular_stiffness=args.joint_stiffness,
+                    joint_damping=args.joint_damping,
+                    joint_angular_damping=args.joint_damping,
                 ),
-            ],
-            coupling=SolverCoupledADMM.Config(
-                iterations=args.admm_iterations,
-                rho=args.rho,
-                gamma=args.gamma,
-                baumgarte=args.baumgarte,
-                joint_stiffness=args.joint_stiffness,
-                joint_angular_stiffness=args.joint_stiffness,
-                joint_damping=args.joint_damping,
-                joint_angular_damping=args.joint_damping,
-            ),
-        )
+            )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -332,6 +341,8 @@ class Example:
         for i in range(self.sim_substeps):
             self.state_0.clear_forces()
             newton.examples.apply_coupled_viewer_forces(self, self.state_0)
+            if self.solver_type == "lox":
+                self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             if need_state_copy and i == self.sim_substeps - 1:
                 self.state_0.assign(self.state_1)
@@ -369,6 +380,13 @@ class Example:
         newton.examples.add_coupled_view_args(parser)
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(world_count=4)
+        parser.add_argument(
+            "--solver",
+            type=str,
+            choices=["coupled", "lox"],
+            default="coupled",
+            help="Solver type: coupled (default, Kamino-MuJoCo ADMM) or lox",
+        )
         parser.add_argument("--substeps", type=int, default=3, help="Coupled substeps per rendered frame.")
         parser.add_argument("--admm-iterations", type=int, default=2, help="ADMM iterations per coupled substep.")
         parser.add_argument("--rho", type=float, default=50.0, help="ADMM penalty parameter.")
@@ -376,7 +394,9 @@ class Example:
         parser.add_argument("--baumgarte", type=float, default=0.02, help="Position error correction fraction.")
         parser.add_argument("--joint-stiffness", type=float, default=2.0e4, help="Cross-solver joint stiffness [N/m].")
         parser.add_argument("--joint-damping", type=float, default=1.0, help="Cross-solver joint damping [N*s/m].")
-        parser.add_argument("--kamino-iterations", type=int, default=40, help="Kamino PADMM iterations per substep.")
+        parser.add_argument(
+            "--kamino-iterations", type=int, default=40, help="Kamino PADMM or LOX iterations per substep."
+        )
         parser.add_argument(
             "--no-graph-capture",
             action="store_false",

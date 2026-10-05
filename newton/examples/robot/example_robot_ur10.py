@@ -10,6 +10,7 @@
 #
 # Command: python -m newton.examples robot_ur10 --world-count 16
 #          python -m newton.examples robot_ur10 --solver kamino
+#          python -m newton.examples robot_ur10 --solver lox
 #
 ###########################################################################
 
@@ -67,7 +68,7 @@ class Example:
         self.device = wp.get_device()
 
         ur10 = newton.ModelBuilder()
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(ur10)
         else:
             newton.solvers.SolverMuJoCo.register_custom_attributes(ur10)
@@ -157,6 +158,10 @@ class Example:
             solver_config.dvi.max_alternating_iterations = 8
             solver_config.dvi.bilateral_solve_interval = 8
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.solver = newton.solvers.SolverMuJoCo(self.model, disable_contacts=True)
 
@@ -214,7 +219,7 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         newton.examples.add_world_count_arg(parser)
-        parser.add_argument("--solver", choices=["mujoco", "kamino"], default="mujoco")
+        parser.add_argument("--solver", choices=["mujoco", "kamino", "lox"], default="mujoco")
         parser.set_defaults(world_count=None)
         return parser
 

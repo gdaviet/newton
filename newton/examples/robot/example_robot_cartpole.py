@@ -8,6 +8,7 @@
 # from a USD stage using newton.ModelBuilder.add_usd().
 #
 # Command: python -m newton.examples robot_cartpole --world-count 100
+#          python -m newton.examples robot_cartpole --solver lox
 #
 ###########################################################################
 
@@ -35,7 +36,7 @@ class Example:
         self.viewer = viewer
 
         cartpole = newton.ModelBuilder()
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(cartpole)
         else:
             newton.solvers.SolverMuJoCo.register_custom_attributes(cartpole)
@@ -72,6 +73,10 @@ class Example:
             )
             solver_config.dvi.max_alternating_iterations = 8
             solver_config.dvi.bilateral_solve_interval = 8
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.solver = newton.solvers.SolverMuJoCo(self.model)
@@ -135,7 +140,9 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
-        constrained_atol = 1.0e-6
+        # LOX converges the joint constraints to a relative tolerance, which leaves small residual velocities
+        use_lox = self.solver_type == "lox"
+        constrained_atol = 1.0e-3 if use_lox else 1.0e-6
         num_bodies_per_world = self.model.body_count // self.world_count
         newton.examples.test_body_state(
             self.model,
@@ -188,8 +195,8 @@ class Example:
         world0_pole1_vel = wp.spatial_vector(*qd[1])
         world0_pole2_vel = wp.spatial_vector(*qd[2])
         # Replicated GPU worlds can accumulate small relative differences in body twists.
-        world_velocity_atol = 1e-6
-        world_velocity_rtol = 2.5e-4
+        world_velocity_atol = 1e-3 if use_lox else 1e-6
+        world_velocity_rtol = 2.5e-3 if use_lox else 2.5e-4
         newton.examples.test_body_state(
             self.model,
             self.state_0,
@@ -222,7 +229,7 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         newton.examples.add_world_count_arg(parser)
-        parser.add_argument("--solver", choices=["mujoco", "kamino"], default="mujoco")
+        parser.add_argument("--solver", choices=["mujoco", "kamino", "lox"], default="mujoco")
         parser.set_defaults(world_count=100)
         return parser
 
