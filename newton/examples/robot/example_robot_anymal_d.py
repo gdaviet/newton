@@ -3,7 +3,7 @@
 
 """Example Robot Anymal D
 
-Shows how to simulate Anymal D with multiple worlds using MuJoCo or Kamino.
+Shows how to simulate Anymal D with multiple worlds using MuJoCo, Kamino, or LOX.
 
 Success criteria:
 - ANYmal D robots appear standing on the ground.
@@ -16,6 +16,7 @@ Runs:
 - `python -m newton.examples robot_anymal_d --world-count 16`
   - 16 ANYmal D robots appear.
 - `python -m newton.examples robot_anymal_d --solver kamino`
+- `python -m newton.examples robot_anymal_d --solver lox`
 """
 
 import warp as wp
@@ -46,7 +47,7 @@ class Example:
         self.device = wp.get_device()
 
         articulation_builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(articulation_builder)
         else:
             newton.solvers.SolverMuJoCo.register_custom_attributes(articulation_builder)
@@ -109,6 +110,10 @@ class Example:
             solver_config.scc.max_alternating_iterations = 32
             solver_config.scc.use_schur_complement = True
             configure_ldl(solver_config, args)
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.solver = newton.solvers.SolverMuJoCo(
@@ -217,7 +222,7 @@ class Example:
                 lambda q, qd: max(abs(qd)) < 0.25,
             )
 
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             body_q = self.state_0.body_q.numpy()
             base_heights = [body_q[i, 2] for i, label in enumerate(self.model.body_label) if label.endswith("/base")]
             foot_heights = [body_q[i, 2] for i, label in enumerate(self.model.body_label) if label.endswith("_FOOT")]
@@ -233,7 +238,7 @@ class Example:
         add_ldl_arguments(parser)
         newton.examples.add_world_count_arg(parser)
         newton.examples.add_mujoco_contacts_arg(parser)
-        parser.add_argument("--solver", choices=["mujoco", "kamino"], default="mujoco")
+        parser.add_argument("--solver", choices=["mujoco", "kamino", "lox"], default="mujoco")
         parser.set_defaults(world_count=8)
         return parser
 

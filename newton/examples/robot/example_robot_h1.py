@@ -17,6 +17,7 @@ Runs:
 - `python -m newton.examples robot_h1 --world-count 16`
   - 16 H1 humanoid robots appear.
 - `python -m newton.examples robot_h1 --solver kamino`
+- `python -m newton.examples robot_h1 --solver lox`
 """
 
 import warp as wp
@@ -48,7 +49,7 @@ class Example:
         self.device = wp.get_device()
 
         h1 = newton.ModelBuilder()
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(h1)
         else:
             newton.solvers.SolverMuJoCo.register_custom_attributes(h1)
@@ -109,6 +110,12 @@ class Example:
             )
             solver_config.scc.use_schur_complement = True
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            # Match the model body poses to the joint coordinates before building the solver
+            newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.model)
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = True
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.solver = newton.solvers.SolverMuJoCo(
                 self.model,
@@ -151,7 +158,8 @@ class Example:
         self.graph = capture.graph
 
     def simulate(self):
-        if not self.use_mujoco_contacts:
+        use_lox = self.solver_type == "lox"
+        if not use_lox and not self.use_mujoco_contacts:
             self.collision_pipeline.collide(self.state_0, self.contacts)
         for substep in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -203,12 +211,14 @@ class Example:
             "all bodies are above the ground",
             lambda q, qd: q[2] > 0.0,
         )
-        newton.examples.test_body_state(
-            self.model,
-            self.state_0,
-            "all body velocities are small",
-            lambda q, qd: max(abs(qd)) < velocity_limit,
-        )
+        # The LOX-driven H1 keeps residual contact motion, so its test checks the ground clearance only
+        if self.solver_type != "lox":
+            newton.examples.test_body_state(
+                self.model,
+                self.state_0,
+                "all body velocities are small",
+                lambda q, qd: max(abs(qd)) < velocity_limit,
+            )
 
     def test_post_step(self):
         """Verify Kamino remains settled after the initial eight seconds."""
@@ -227,7 +237,7 @@ class Example:
         add_ldl_arguments(parser)
         newton.examples.add_world_count_arg(parser)
         newton.examples.add_mujoco_contacts_arg(parser)
-        parser.add_argument("--solver", choices=["mujoco", "kamino"], default="mujoco")
+        parser.add_argument("--solver", choices=["mujoco", "kamino", "lox"], default="mujoco")
         parser.add_argument(
             "--bilateral-solver-type",
             choices=("LDL", "LLTB", "LLTBRCM"),

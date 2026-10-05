@@ -21,6 +21,7 @@ Success criteria:
 
 Runs:
 - `python -m newton.examples sensor_contact`
+- `python -m newton.examples sensor_contact --solver lox`
 """
 
 import numpy as np
@@ -45,7 +46,7 @@ class Example:
         self.solver_type = getattr(args, "solver", "mujoco")
 
         builder = newton.ModelBuilder()
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(builder)
         else:
             newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
@@ -77,6 +78,10 @@ class Example:
             solver_config.integrator = "moreau"
             solver_config.scc.max_alternating_iterations = 8
             solver_config.scc.use_schur_complement = True
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.solver = newton.solvers.SolverMuJoCo(
@@ -155,6 +160,8 @@ class Example:
     def simulate(self):
         self.state_0.clear_forces()
         self.viewer.apply_forces(self.state_0)
+        if self.solver_type == "lox":
+            self.collision_pipeline.collide(self.state_0, self.contacts)
         wp.copy(self.contact_state.body_q, self.state_0.body_q)
         wp.copy(self.contact_state.body_qd, self.state_0.body_qd)
         self.solver.step(
@@ -253,7 +260,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
-    parser.add_argument("--solver", choices=["mujoco", "kamino"], default="mujoco")
+    parser.add_argument("--solver", choices=["mujoco", "kamino", "lox"], default="mujoco")
 
     viewer, args = newton.examples.init(parser)
 
