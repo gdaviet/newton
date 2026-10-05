@@ -9,6 +9,7 @@
 #
 # Command: python -m newton.examples basic_pendulum --solver xpbd
 #          python -m newton.examples basic_pendulum --solver kamino
+#          python -m newton.examples basic_pendulum --solver lox
 #
 ###########################################################################
 
@@ -35,7 +36,7 @@ class Example:
             self.sim_dt = self.frame_dt / self.sim_substeps
 
         builder = newton.ModelBuilder()
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         hx = 1.0
@@ -86,6 +87,10 @@ class Example:
             solver_config.dvi.bilateral_solver_type = "LLTBRCM"
             solver_config.dvi.max_alternating_iterations = 8
             solver_config.dvi.bilateral_solve_interval = 8
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.solver = newton.solvers.SolverXPBD(self.model)
@@ -142,18 +147,23 @@ class Example:
         self.sim_time += self.frame_dt
 
     def test_final(self):
+        # LOX converges the joint constraints to a relative tolerance, which leaves a small out-of-plane drift
+        use_lox = self.solver_type == "lox"
+        out_of_plane_position_tolerance = 1e-4 if use_lox else 1e-5
+        out_of_plane_velocity_tolerance = 1e-3 if use_lox else 1e-4
+
         # rough check that the pendulum links are in the correct area
         newton.examples.test_body_state(
             self.model,
             self.state_0,
             "pendulum links in correct area",
-            lambda q, qd: abs(q[0]) < 1e-5 and abs(q[1]) < 1.0 and q[2] < 5.0 and q[2] > 0.0,
+            lambda q, qd: abs(q[0]) < out_of_plane_position_tolerance and abs(q[1]) < 1.0 and q[2] < 5.0 and q[2] > 0.0,
             [0, 1],
         )
 
         def check_velocities(_, qd):
             # velocity outside the plane of the pendulum should be close to zero
-            check = abs(qd[0]) < 1e-4 and abs(qd[6]) < 1e-4
+            check = abs(qd[0]) < out_of_plane_velocity_tolerance and abs(qd[6]) < out_of_plane_velocity_tolerance
             # velocity in the plane of the pendulum should be reasonable
             check = check and abs(qd[1]) < 10.0 and abs(qd[2]) < 5.0 and abs(qd[3]) < 10.0 and abs(qd[4]) < 10.0
             return check
@@ -182,7 +192,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--solver",
         type=str,
-        choices=["xpbd", "kamino"],
+        choices=["xpbd", "kamino", "lox"],
         default="xpbd",
         help="Solver backend to use.",
     )

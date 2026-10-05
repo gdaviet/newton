@@ -13,6 +13,7 @@
 # XPBD: python -m newton.examples basic_dzhanibekov --solver xpbd
 # MuJoCo: python -m newton.examples basic_dzhanibekov --solver mujoco
 # Kamino: python -m newton.examples basic_dzhanibekov --solver kamino
+# LOX: python -m newton.examples basic_dzhanibekov --solver lox
 #
 ###########################################################################
 
@@ -45,7 +46,7 @@ class Example:
         self.min_stem_axis_y = 1.0
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         self.body = builder.add_body(
@@ -125,15 +126,21 @@ class Example:
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
             self.collision_pipeline = None
             self.contacts = None
+        elif self.solver_type == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+            self.collision_pipeline = None
+            self.contacts = None
         else:
             raise ValueError(
-                f"Unknown solver type: {self.solver_type}. Choose from 'vbd', 'xpbd', 'mujoco', or 'kamino'."
+                f"Unknown solver type: {self.solver_type}. Choose from 'vbd', 'xpbd', 'mujoco', 'kamino', or 'lox'."
             )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.initial_rotational_energy = self._rotational_energy() if self.solver_type == "kamino" else None
+        self.initial_rotational_energy = self._rotational_energy() if self.solver_type in ("kamino", "lox") else None
 
         self.initial_body_q = self.state_0.body_q.numpy().copy()
         self.body_com = self.model.body_com.numpy()[self.body].copy()
@@ -214,8 +221,8 @@ if __name__ == "__main__":
         "--solver",
         type=str,
         default="vbd",
-        choices=["vbd", "xpbd", "mujoco", "kamino"],
-        help="Solver type: vbd (default), xpbd, mujoco, or kamino.",
+        choices=["vbd", "xpbd", "mujoco", "kamino", "lox"],
+        help="Solver type: vbd (default), xpbd, mujoco, kamino, or lox.",
     )
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

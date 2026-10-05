@@ -10,6 +10,7 @@
 # Command: python -m newton.examples basic_joints --solver xpbd
 #          python -m newton.examples basic_joints --solver vbd
 #          python -m newton.examples basic_joints --solver kamino
+#          python -m newton.examples basic_joints --solver lox
 #
 ###########################################################################
 
@@ -46,7 +47,7 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         builder = newton.ModelBuilder()
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         static_cfg = newton.ModelBuilder.ShapeConfig()
@@ -206,6 +207,9 @@ class Example:
             solver_config.dvi.bilateral_solve_interval = 5
             solver_config.dvi.inequality_sweeps_per_iteration = 1
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.solver = newton.solvers.SolverXPBD(self.model)
 
@@ -357,7 +361,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--solver",
         type=str,
-        choices=["xpbd", "vbd", "kamino"],
+        choices=["xpbd", "vbd", "kamino", "lox"],
         default="xpbd",
         help="Solver backend to use.",
     )
