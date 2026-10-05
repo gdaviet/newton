@@ -984,7 +984,7 @@ class LOXSolverConfig:
 
         The LOX backend, including all of its options, may change without
         following the normal deprecation policy. It supports rigid bodies
-        only; cable and deformable extensions are not supported.
+        and rod joints.
     """
 
     max_iterations: int = 16
@@ -1075,6 +1075,16 @@ class LOXSolverConfig:
     primal matrix, and factorization. The relaxation changes convergence speed
     without changing the nonlinear fixed point. The angular rows and the
     positional rows of the other joint types retain the frozen linear residual.
+    """
+
+    rod_proximal_relaxation: float = 0.0
+    """Relaxation factor for exact candidate-pose rod bend and twist strains.
+
+    Zero retains the frozen rod strain linearization. Positive values correct the
+    bend and twist rows of each rod towards their exact candidate-pose strain
+    within the splitting iterations, while reusing the frozen Jacobian, primal
+    matrix, and factorization. The twist strain follows the candidate twist
+    continuously across angle branches.
     """
 
     position_tolerance: float = 1.0e-5
@@ -1256,6 +1266,14 @@ class LOXSolverConfig:
         ):
             raise ValueError(
                 f"Invalid joint_proximal_relaxation: {self.joint_proximal_relaxation}. Must be in range [0, 1]."
+            )
+        if (
+            not np.isfinite(self.rod_proximal_relaxation)
+            or self.rod_proximal_relaxation < 0.0
+            or self.rod_proximal_relaxation > 1.0
+        ):
+            raise ValueError(
+                f"Invalid rod_proximal_relaxation: {self.rod_proximal_relaxation}. Must be in range [0, 1]."
             )
         if (
             not isinstance(self.gauss_seidel_max_colors, int)

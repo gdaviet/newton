@@ -1405,7 +1405,7 @@ class SolverKamino(SolverBase, CouplingInterface):
         - springs
         - triangles, edges, tetrahedra
         - muscles
-        - distance or rod joints
+        - distance joints, and rod joints with non-LOX backends
         - bodies with singular inertial properties that are attached to movable bodies for non-LOX backends
 
         Args:
@@ -1417,6 +1417,10 @@ class SolverKamino(SolverBase, CouplingInterface):
 
         unsupported_features = []
         use_lox = config.dynamics_solver == "lox"
+        if use_lox:
+            from ._src.solvers.lox.rod import validate_rod_model  # noqa: PLC0415
+
+            validate_rod_model(model)
         if model.particle_count > 0:
             unsupported_features.append(f"particles (found {model.particle_count})")
         if model.spring_count > 0:
@@ -1442,8 +1446,10 @@ class SolverKamino(SolverBase, CouplingInterface):
                 # Check for explicitly unsupported joint types
                 if joint_type == JointType.DISTANCE:
                     unsupported_joint_types["DISTANCE"] = unsupported_joint_types.get("DISTANCE", 0) + 1
-                elif joint_type == JointType.ROD:
+                elif joint_type == JointType.ROD and not use_lox:
                     unsupported_joint_types["ROD"] = unsupported_joint_types.get("ROD", 0) + 1
+            if use_lox and config.use_fk_solver and np.any(joint_type_np == int(JointType.ROD)):
+                unsupported_features.append("rod joints with use_fk_solver=True")
             if len(unsupported_joint_types) > 0:
                 joint_desc = [f"{name} ({count} instances)" for name, count in unsupported_joint_types.items()]
                 unsupported_features.append("joint types: " + ", ".join(joint_desc))

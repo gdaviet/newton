@@ -126,6 +126,19 @@ Enable these features through ``config.lox`` after selecting
   share one elliptic friction budget. Contacts with zero angular coefficients
   retain the classical 3D contact solve.
 
+LOX rod joints
+--------------
+
+LOX supports ``JointType.ROD`` joints between rigid bodies, as built by
+:meth:`newton.ModelBuilder.add_joint_rod`, which the other Kamino backends
+reject. Each rod adds six smooth material rows to the body system: stretch and
+shear in the joint frame of the parent body, then bend and twist, with the
+stiffness and damping of its joint DOFs. The rows are linearized at the
+beginning of each time step. Set ``config.lox.rod_proximal_relaxation`` in
+``(0, 1]`` to also correct the bend and twist rows towards their exact
+candidate-pose strain during the splitting iterations. Rod joints require zero
+armature, joint damping, and joint friction, and unbounded joint limits.
+
 Inspecting terminal status
 --------------------------
 

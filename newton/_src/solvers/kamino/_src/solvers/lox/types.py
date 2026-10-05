@@ -42,6 +42,7 @@ __all__ = [
     "LOXSystemData",
     "ProjectionAcceleration",
     "ProjectionData",
+    "RodRows",
     "SpatialContactBlocks",
     "SpatialContactRows",
     "SplittingState",
@@ -567,6 +568,73 @@ class EffortRows:
         """Largest effort residual of each world."""
 
 
+class RodRows:
+    """Smooth material rows of the rod joints, six per rod.
+
+    The rows of each rod hold its stretch and shear strains in the joint frame of body A,
+    then its bend and twist strains. Each row is a smooth elastic and damping element
+    ``0.5 k_t (J v - v_0)^2`` linearized at the beginning of the time step and assembled
+    into the body system, with tangent stiffness ``k_t = k + d / dt``. With proximal
+    relaxation, the bend and twist rows also carry a proximal coordinate and multiplier,
+    which correct the next candidate solve towards the exact candidate-pose strain.
+
+    Args:
+        joint: Kamino joint of each rod.
+        body_a: Body A of each rod, or ``-1``.
+        body_b: Body B of each rod.
+        dof_offset: First joint DOF of each rod.
+        num_worlds: Number of worlds.
+        num_bodies: Total number of bodies.
+        proximal: Whether to allocate the proximal correction arrays.
+        device: Device of the arrays.
+    """
+
+    def __init__(
+        self,
+        joint: np.ndarray,
+        body_a: np.ndarray,
+        body_b: np.ndarray,
+        dof_offset: np.ndarray,
+        num_worlds: int,
+        num_bodies: int,
+        proximal: bool,
+        device: wp.DeviceLike,
+    ):
+        self.count = len(joint)
+        """Number of rods."""
+        row_count = 6 * self.count
+        self.joint = to_warp_int32_array(joint, device)
+        """Kamino joint of each rod."""
+        self.body_a = to_warp_int32_array(body_a, device)
+        """Body A of each rod, or ``-1``."""
+        self.body_b = to_warp_int32_array(body_b, device)
+        """Body B of each rod."""
+        self.dof_offset = to_warp_int32_array(dof_offset, device)
+        """First joint DOF of each rod: stretch, shear, bend, and twist stiffness and damping."""
+        self.rest_curvature = wp.zeros(self.count, dtype=wp.vec3f, device=device)
+        """Rest curvature of each rod in the joint frame of body A."""
+        self.rest_twist = wp.zeros(self.count, dtype=wp.float32, device=device)
+        """Rest twist angle of each rod [rad]."""
+        self.strain = wp.zeros(row_count, dtype=wp.float32, device=device)
+        """Strain of each row [m or rad]."""
+        self.stress = wp.zeros(row_count, dtype=wp.float32, device=device)
+        """Elastic and damping stress of each row [N or N m]."""
+        self.tangent = wp.zeros(row_count, dtype=wp.float32, device=device)
+        """Tangent stiffness ``k + d / dt`` of each row [N/m or N m/rad]."""
+        self.jacobian_a = wp.zeros(row_count, dtype=vec6f, device=device)
+        """Strain-rate Jacobian of each row with respect to the twist of body A."""
+        self.jacobian_b = wp.zeros(row_count, dtype=vec6f, device=device)
+        """Strain-rate Jacobian of each row with respect to the twist of body B."""
+        self.proximal_coordinate = wp.zeros(row_count, dtype=wp.float32, device=device) if proximal else None
+        """Proximal strain coordinate of each row, with proximal relaxation."""
+        self.multiplier = wp.zeros(row_count, dtype=wp.float32, device=device) if proximal else None
+        """Proximal stress multiplier of each row, with proximal relaxation."""
+        self.body_impulse = wp.zeros(num_bodies, dtype=vec6f, device=device) if proximal else None
+        """Proximal correction impulse of each body in the next candidate solve, with proximal relaxation."""
+        self.world_residual = wp.zeros(num_worlds, dtype=wp.float32, device=device) if proximal else None
+        """Largest scaled proximal residual of each world, with proximal relaxation."""
+
+
 class SplittingState:
     """Body and world state of the LOX splitting iterations.
 
@@ -641,6 +709,8 @@ class LOXProblemData:
         """Joint kinematic rows enforced by an augmented Lagrangian penalty."""
         self.effort_rows: EffortRows | None = None
         """Bounded actuator-effort corrections of the dynamic rows."""
+        self.rod_rows: RodRows | None = None
+        """Smooth material rows of the rod joints."""
         self.box_rows: BoxRows | None = None
         """Joint friction and joint limit rows."""
         self.contact_rows: ContactRows | None = None

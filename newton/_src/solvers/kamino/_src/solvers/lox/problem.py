@@ -55,8 +55,10 @@ from .problem_kernels import (
     _write_limit_outputs,
     make_update_structural_multipliers_kernel,
 )
+from .rod import RodMaterials, validate_rod_model
 from .system import LOXSystem
 from .system_kernels import (
+    SmoothJointRows,
     _compute_free_body_blocks,
     make_patch_weights_kernel,
 )
@@ -158,6 +160,7 @@ class LOXProblem:
         selective_weights: bool = True,
         rotation_correction: JointCorrectionMode = JointCorrectionMode.TWOPI,
         joint_proximal_relaxation: float = 0.0,
+        rod_proximal_relaxation: float = 0.0,
         contact_compliance: bool = False,
         contact_restitution: bool = False,
         contact_spatial_friction: bool = False,
@@ -174,6 +177,7 @@ class LOXProblem:
         self.selective_weights = selective_weights
         self.rotation_correction = rotation_correction
         self.joint_proximal_relaxation = joint_proximal_relaxation
+        self.rod_proximal_relaxation = rod_proximal_relaxation
         self._joint_max_correction = math.inf
         self._joint_translation_dead_zone = 0.0
         self._joint_rotation_dead_zone = 0.0
@@ -243,6 +247,9 @@ class LOXProblem:
             "structural rows", self._data.structural_rows.body_a, self._data.structural_rows.body_b
         )
         self._allocate_effort_rows(dynamic_world, dynamic_dof)
+        self.rods = RodMaterials(self.model, self.kamino_data, self.rod_proximal_relaxation)
+        self._data.rod_rows = self.rods.data
+        self.system.validate_body_pairs("rod rows", self._data.rod_rows.body_a, self._data.rod_rows.body_b)
         self._allocate_unilaterals(*self._allocate_joint_frictions())
 
     def validate_model_changed(self) -> None:
@@ -258,6 +265,8 @@ class LOXProblem:
         effort_limit = source_model.joint_effort_limit.numpy()
         if np.any(np.isnan(effort_limit) | (effort_limit < 0.0)):
             raise ValueError("Joint effort limits must be nonnegative or positive infinity.")
+        if self._data.rod_rows.count > 0:
+            validate_rod_model(source_model)
 
     def prepare_joint_penalty_scale_seed(self, time_step: float) -> None:
         """Prepare the initial rigid state for LOX penalty-scale seeding."""
@@ -432,8 +441,8 @@ class LOXProblem:
         """Assemble the frozen smooth primal system of the time step.
 
         :meth:`begin_time_step` must be called first. The matrix and right-hand side
-        stay fixed during the iterations; the multiplier and effort-limit impulses are
-        added to the candidate right-hand side of each iteration.
+        stay fixed during the iterations; the multiplier, effort-limit, and rod proximal
+        impulses are added to the candidate right-hand side of each iteration.
 
         Args:
             time_step: Time step of each world [s].
@@ -556,25 +565,21 @@ class LOXProblem:
                 outputs=[rows.body_impulse],
                 device=self.device,
             )
+        self.rods.add_to_system(self.system, time_step, prescribed_twist=self.body_velocity_begin)
 
     def prepare_patch_schur(self) -> None:
         """Build the joint neighbors and joint rows of each body for the patch Schur weights.
 
-        For each dynamic body, list its joint rows to other dynamic bodies of its factor block and, for
-        each joint neighbor, the joint rows between the two bodies with the side of the neighbor.
+        For each dynamic body, list its joint and rod rows to other dynamic bodies of its factor block and,
+        for each joint neighbor, the rows between the two bodies with the side of the neighbor.
         """
         system = self.system
         body_count = system.num_bodies
         body_block = np.asarray(system.body_block_host, dtype=np.int32)
         incident: list[list[tuple[int, int, int]]] = [[] for _ in range(body_count)]
         pair_rows: list[dict[int, list[tuple[int, int, int]]]] = [{} for _ in range(body_count)]
-        for kind, rows in ((0, self._data.structural_rows), (1, self._data.dynamic_rows)):
-            if rows is None or rows.count == 0:
-                continue
-            body_a = rows.body_a.numpy()
-            body_b = rows.body_b.numpy()
-            for row in range(rows.count):
-                a, b = int(body_a[row]), int(body_b[row])
+        for kind, row_bodies in self._smooth_joint_row_bodies():
+            for row, (a, b) in enumerate(row_bodies):
                 if a < 0 or b < 0 or a == b or body_block[a] < 0 or body_block[a] != body_block[b]:
                     continue
                 incident[a].append((kind, row, 0))
@@ -615,14 +620,11 @@ class LOXProblem:
         self._neighbor_row_side = int_array([entry[2] for entry in neighbor_rows])
         self._free_block = wp.zeros(max(body_count, 1), dtype=mat66f, device=device)
         self._free_lower = wp.zeros(max(body_count, 1), dtype=mat66f, device=device)
+        self._joint_rows = self._smooth_joint_rows()
         # The Woodbury form handles up to six joint rows between two bodies
         self._patch_weights_kernel = make_patch_weights_kernel(
             woodbury=max((len(rows) for rows in pair_rows_flat), default=0) <= 6
         )
-        # Placeholders of the joint row arrays of a problem without structural or dynamic rows
-        self._empty_vec6 = wp.zeros(1, dtype=vec6f, device=device)
-        self._empty_float = wp.zeros(1, dtype=wp.float32, device=device)
-        self._empty_int = wp.zeros(1, dtype=wp.int32, device=device)
 
     def compute_patch_schur_weights(self, beta: float = 0.0, sigma: float = 0.0) -> None:
         """Set the body weights to the geometric means of the free and pinned patch Schur complements in ``A``.
@@ -637,23 +639,7 @@ class LOXProblem:
         system = self.system
         if system.num_bodies == 0:
             return
-        structural = self._data.structural_rows
-        dynamic = self._data.dynamic_rows
-        has_structural = structural is not None and structural.count > 0
-        has_dynamic = dynamic is not None and dynamic.count > 0
-        empty_vec6 = self._empty_vec6
-        empty_float = self._empty_float
-        empty_int = self._empty_int
-        rows = [
-            structural.jacobian_a if has_structural else empty_vec6,
-            structural.jacobian_b if has_structural else empty_vec6,
-            structural.penalty if has_structural else empty_float,
-            structural.world if has_structural else empty_int,
-            dynamic.jacobian_a if has_dynamic else empty_vec6,
-            dynamic.jacobian_b if has_dynamic else empty_vec6,
-            dynamic.effective_inertia if has_dynamic else empty_float,
-            self.model.time.dt,
-        ]
+        rows = self._joint_rows
         data = system.data
         wp.launch(
             _compute_free_body_blocks,
@@ -668,7 +654,7 @@ class LOXProblem:
                 self._incidence_kind,
                 self._incidence_row,
                 self._incidence_side,
-                *rows,
+                rows,
             ],
             outputs=[self._free_block, self._free_lower],
             device=self.device,
@@ -691,13 +677,54 @@ class LOXProblem:
                 self._neighbor_row_kind,
                 self._neighbor_row,
                 self._neighbor_row_side,
-                *rows,
+                rows,
                 beta,
                 sigma,
             ],
             outputs=[data.weight, data.inverse_weight],
             device=self.device,
         )
+
+    def _smooth_joint_row_bodies(self) -> list[tuple[int, list[tuple[int, int]]]]:
+        """Return the kind of each group of :class:`SmoothJointRows` and the bodies A and B of its rows."""
+        groups = []
+        for kind, rows in ((0, self._data.structural_rows), (1, self._data.dynamic_rows)):
+            if rows is None or rows.count == 0:
+                continue
+            groups.append((kind, list(zip(rows.body_a.numpy().tolist(), rows.body_b.numpy().tolist(), strict=True))))
+        rods = self._data.rod_rows
+        if rods.count > 0:
+            # Six rows per rod, between the bodies of the rod
+            rod_bodies = zip(rods.body_a.numpy().tolist(), rods.body_b.numpy().tolist(), strict=True)
+            groups.append((2, [bodies for bodies in rod_bodies for _ in range(6)]))
+        return groups
+
+    def _smooth_joint_rows(self) -> SmoothJointRows:
+        """Return the rows of the smooth matrix between two bodies, with placeholder arrays for absent kinds."""
+        empty_int = wp.zeros(1, dtype=wp.int32, device=self.device)
+        empty_float = wp.zeros(1, dtype=wp.float32, device=self.device)
+        empty_vec6 = wp.zeros(1, dtype=vec6f, device=self.device)
+        rows = SmoothJointRows()
+        structural = self._data.structural_rows
+        has_structural = structural is not None and structural.count > 0
+        rows.structural_jacobian_a = structural.jacobian_a if has_structural else empty_vec6
+        rows.structural_jacobian_b = structural.jacobian_b if has_structural else empty_vec6
+        rows.structural_penalty = structural.penalty if has_structural else empty_float
+        rows.structural_world = structural.world if has_structural else empty_int
+        dynamic = self._data.dynamic_rows
+        has_dynamic = dynamic is not None and dynamic.count > 0
+        rows.dynamic_jacobian_a = dynamic.jacobian_a if has_dynamic else empty_vec6
+        rows.dynamic_jacobian_b = dynamic.jacobian_b if has_dynamic else empty_vec6
+        rows.dynamic_effective_inertia = dynamic.effective_inertia if has_dynamic else empty_float
+        rods = self._data.rod_rows
+        has_rods = rods.count > 0
+        rows.rod_body_b = rods.body_b if has_rods else empty_int
+        rows.rod_jacobian_a = rods.jacobian_a if has_rods else empty_vec6
+        rows.rod_jacobian_b = rods.jacobian_b if has_rods else empty_vec6
+        rows.rod_tangent = rods.tangent if has_rods else empty_float
+        rows.body_world = self.model.bodies.wid
+        rows.time_step = self.model.time.dt
+        return rows
 
     def update_structural_multipliers_from_twist(
         self,
@@ -938,6 +965,7 @@ class LOXProblem:
                 outputs=[joint_wrench],
                 device=self.device,
             )
+        self.rods.accumulate_wrenches(joint_wrench, self.model.time.dt, body_velocity, world_failed)
 
     def reset_structural_multipliers(self, world_mask: wp.array[wp.bool] | None = None) -> None:
         """Clear the structural multiplier warm starts of the masked worlds, or of all worlds."""
