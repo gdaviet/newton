@@ -10,6 +10,7 @@
 #
 # Command: uv run -m newton.examples basic_conveyor
 #          uv run -m newton.examples basic_conveyor --solver kamino
+#          uv run -m newton.examples basic_conveyor --solver lox
 #
 ###########################################################################
 
@@ -379,7 +380,7 @@ class Example:
             builder.add_articulation([builder.add_joint_free(bag_body)], label=f"bag_{i}")
             self.bag_bodies.append(bag_body)
 
-        if solver_type == "kamino":
+        if solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         builder.color()
@@ -403,6 +404,11 @@ class Example:
             solver_config.integrator = "moreau"
             solver_config.dvi.max_alternating_iterations = 1
             solver_config.dvi.bilateral_solve_interval = 1
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif solver_type == "lox":
+            self.model.rigid_contact_max = 1024
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.solver = newton.solvers.SolverXPBD(self.model)
@@ -521,7 +527,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--solver",
         type=str,
-        choices=["xpbd", "vbd", "kamino"],
+        choices=["xpbd", "vbd", "kamino", "lox"],
         default="xpbd",
         help="Solver backend to use.",
     )
