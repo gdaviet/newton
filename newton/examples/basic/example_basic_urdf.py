@@ -12,6 +12,7 @@
 #
 # Command: python -m newton.examples basic_urdf
 # Kamino DVI: python -m newton.examples basic_urdf --solver kamino
+# Kamino LOX: python -m newton.examples basic_urdf --solver lox
 #
 ###########################################################################
 
@@ -37,7 +38,7 @@ class Example:
         self.viewer = viewer
 
         quadruped = newton.ModelBuilder()
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(quadruped)
 
         # set default parameters for the quadruped
@@ -109,6 +110,12 @@ class Example:
             solver_config.dvi.max_alternating_iterations = 8
             solver_config.dvi.use_schur_complement = True
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            self.update_step_interval = 1
+            self.model.rigid_contact_max = 128 * self.world_count
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.update_step_interval = 1
             self.solver = newton.solvers.SolverXPBD(self.model)
@@ -134,7 +141,7 @@ class Example:
         self.capture()
 
     def capture(self):
-        if (wp.get_device().is_cuda or self.solver_type != "kamino") and not wp.config.verify_cuda:
+        if (wp.get_device().is_cuda or self.solver_type not in ("kamino", "lox")) and not wp.config.verify_cuda:
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph
@@ -216,8 +223,8 @@ class Example:
             "--solver",
             type=str,
             default="xpbd",
-            choices=["vbd", "xpbd", "kamino"],
-            help="Solver type: xpbd (default), vbd, or kamino",
+            choices=["vbd", "xpbd", "kamino", "lox"],
+            help="Solver type: xpbd (default), vbd, kamino, or lox",
         )
         return parser
 

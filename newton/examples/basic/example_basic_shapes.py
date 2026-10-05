@@ -6,11 +6,12 @@
 #
 # Shows how to programmatically create a variety of
 # collision shapes using the newton.ModelBuilder() API.
-# Supports XPBD (default), VBD, and Kamino DVI solvers.
+# Supports XPBD (default), VBD, Kamino DVI, and Kamino LOX solvers.
 #
 # Command: python -m newton.examples basic_shapes
 # With VBD: python -m newton.examples basic_shapes --solver vbd
 # With Kamino DVI: python -m newton.examples basic_shapes --solver kamino
+# With Kamino LOX: python -m newton.examples basic_shapes --solver lox
 #
 #
 ###########################################################################
@@ -36,7 +37,7 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         builder = newton.ModelBuilder()
-        if self.solver_type == "kamino":
+        if self.solver_type in ("kamino", "lox"):
             newton.solvers.SolverKamino.register_custom_attributes(builder)
 
         builder.default_shape_cfg.mu = 1.0  # Friction coefficient
@@ -118,6 +119,11 @@ class Example:
             )
             solver_config.dynamics.cull_speculative_contacts = False
             solver_config.dvi.max_alternating_iterations = 2
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        elif self.solver_type == "lox":
+            self.model.rigid_contact_max = 256
+            solver_config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            solver_config.use_collision_detector = False
             self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
         else:
             self.solver = newton.solvers.SolverXPBD(self.model, iterations=5)
@@ -280,8 +286,8 @@ if __name__ == "__main__":
         "--solver",
         type=str,
         default="xpbd",
-        choices=["vbd", "xpbd", "kamino"],
-        help="Solver type: xpbd (default), vbd, or kamino",
+        choices=["vbd", "xpbd", "kamino", "lox"],
+        help="Solver type: xpbd (default), vbd, kamino, or lox",
     )
 
     viewer, args = newton.examples.init(parser)
