@@ -210,6 +210,9 @@ def _query_collider_sdf(
 
         if wp.static(_SDF_SIGN_FROM_AVERAGE_NORMAL):
             face_normal = get_average_face_normal(mesh, cp)
+            if wp.length_sq(face_normal) < 1.0e-12:
+                # Edge rounding can leave the average-normal query without faces.
+                face_normal = wp.mesh_eval_face_normal(mesh, query.face)
             sign = wp.where(wp.dot(face_normal, x_local - cp) > 0.0, 1.0, -1.0)
         else:
             face_normal = wp.mesh_eval_face_normal(mesh, query.face)
@@ -512,6 +515,24 @@ def collider_is_deformable(collider_id: int, collider: Collider):
 
 
 @wp.kernel
+def stabilize_collider_velocity(
+    dt: float,
+    fraction: float,
+    collider_sdf: wp.array[float],
+    collider_normals: wp.array[wp.vec3],
+    collider_velocity: wp.array[wp.vec3],
+):
+    """Correct penetration and allow separated contacts to close their gap."""
+    i = wp.tid()
+    normal = collider_normals[i]
+    if wp.length_sq(normal) == 0.0:
+        return
+    gap = collider_sdf[i]
+    target = -wp.where(gap < 0.0, fraction * gap, gap) / dt
+    collider_velocity[i] += target * normal
+
+
+@wp.kernel
 def fill_collider_coupling_matrices(
     node_positions: wp.array[wp.vec3],
     collider: Collider,
@@ -685,6 +706,8 @@ def rasterize_collider(
     collider_ids: wp.array[int],
     temporary_store: fem.TemporaryStore,
     node_environment_offsets: wp.array | None = None,
+    *,
+    contact_gap: float = 0.0,
 ):
     """Rasterize collider signed-distance, normals, velocity, and material onto grid nodes.
 
@@ -711,6 +734,7 @@ def rasterize_collider(
         temporary_store: Temporary storage for intermediate buffers.
         node_environment_offsets: Packed collision-node offsets by world. If ``None``, every node
             queries every collider in stable order.
+        contact_gap: Minimum contact activation distance [m].
     """
     collision_node_count = collider_position_field.dof_values.shape[0]
 
@@ -726,6 +750,7 @@ def rasterize_collider(
     activation_distance = (
         0.0 if collider_position_field.degree == 0 else _COLLIDER_ACTIVATION_DISTANCE / collider_position_field.degree
     )
+    activation_distance = max(activation_distance, contact_gap / voxel_size)
 
     wp.launch(
         rasterize_collider_kernel,

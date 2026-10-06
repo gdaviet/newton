@@ -48,6 +48,9 @@ MuJoCo and Kamino currently have dedicated backend guides:
 - :doc:`Kamino <kamino>` — constrained rigid mechanisms with kinematic loops
   and hard frictional contacts; experimental.
 
+Experimental P0 transfer and recovery controls are described in the
+:doc:`Implicit MPM guide <implicit_mpm>`.
+
 The other solver backends are documented through their linked API references
 and the comparison tables below.
 

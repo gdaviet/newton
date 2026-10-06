@@ -378,14 +378,19 @@ def update_particle_strains(
     elastic_strain: wp.array[wp.mat33],
     particle_Jp: wp.array[float],
     particle_stress: wp.array[wp.mat33],
+    residual_strain_tracking: bool,
+    residual_deformation_gradient_prev: wp.array[wp.mat33],
+    residual_deformation_gradient: wp.array[wp.mat33],
 ):
     if ~particle_flags[s.qp_index] & newton.ParticleFlags.ACTIVE:
         elastic_strain[s.qp_index] = elastic_strain_prev[s.qp_index]
         particle_Jp[s.qp_index] = particle_Jp_prev[s.qp_index]
+        residual_deformation_gradient[s.qp_index] = residual_deformation_gradient_prev[s.qp_index]
         return
     if particle_density[s.qp_index] == 0.0:
         elastic_strain[s.qp_index] = elastic_strain_prev[s.qp_index]
         particle_Jp[s.qp_index] = particle_Jp_prev[s.qp_index]
+        residual_deformation_gradient[s.qp_index] = residual_deformation_gradient_prev[s.qp_index]
         return
 
     # plastic strain
@@ -422,6 +427,14 @@ def update_particle_strains(
     wp.atomic_add(particle_Jp, s.qp_index, gimp_weight * particle_Jp_new)
     wp.atomic_add(particle_stress, s.qp_index, gimp_weight * particle_stress_new)
     wp.atomic_add(elastic_strain, s.qp_index, gimp_weight * elastic_strain_new)
+
+    if residual_strain_tracking:
+        # Subtract every increment already represented by the weak solve.
+        residual_delta = dt * vel_grad - skew - p_strain_delta - elastic_strain_delta(s)
+        residual_prev = residual_deformation_gradient_prev[s.qp_index]
+        residual_new = residual_prev + residual_delta @ residual_prev
+        residual_new = project_particle_strain(residual_new, residual_prev, 1.0)
+        wp.atomic_add(residual_deformation_gradient, s.qp_index, gimp_weight * residual_new)
 
 
 @wp.func
@@ -504,6 +517,20 @@ def compute_unilateral_strain_offset(
     unilateral_strain_offset[i] = spherical_part
 
 
+@wp.kernel
+def compute_density_strain_offset(
+    fraction: float,
+    particle_volume: wp.array[float],
+    collider_volume: wp.array[float],
+    node_volume: wp.array[float],
+    unilateral_strain_offset: wp.array[float],
+):
+    i = wp.tid()
+    # Preserve the overpacking error that the ordinary void allowance clamps away.
+    volume_error = node_volume[i] - collider_volume[i] - particle_volume[i]
+    unilateral_strain_offset[i] += fraction * volume_error
+
+
 @wp.func
 def stress_strain_relationship(sig: wp.mat33, compliance: float, poisson: float):
     return (sig * (1.0 + poisson) - poisson * (wp.trace(sig) * wp.identity(n=3, dtype=float))) * compliance
@@ -539,6 +566,23 @@ def strain_rhs(
         strain = -alpha * wp.ddot(tau(s), RSinvRt_prev - Id)
 
     return strain * inv_cell_volume
+
+
+@fem.integrand
+def residual_strain_offset(
+    s: fem.Sample,
+    tau: fem.Field,
+    residual_deformation_gradient: wp.array[wp.mat33],
+    particle_flags: wp.array[wp.int32],
+    fraction: float,
+    inv_cell_volume: float,
+):
+    if ~particle_flags[s.qp_index] & newton.ParticleFlags.ACTIVE:
+        return 0.0
+
+    J = wp.determinant(residual_deformation_gradient[s.qp_index])
+    # This signed offset requests expansion when the residual is compressed.
+    return fraction * wp.log(wp.max(J, EPSILON)) * tau(s) * inv_cell_volume
 
 
 @fem.integrand
@@ -610,10 +654,18 @@ def compute_eigenvalues(
     values: wp.array[Any],
     ones: wp.array2d[float],
     yield_parameters: wp.array[YieldParamVec],
+    zero_mean_tolerance: float,
     eigenvalues: wp.array2d[float],
     eigenvectors: wp.array3d[float],
     rotated_volume: wp.array2d[float],
 ):
+    """Diagonalize element mass blocks and orient modes by their integrals.
+
+    Modes whose integral is below ``zero_mean_tolerance`` times its absolute
+    integral are kept with a zero rotated volume, so that roundoff in the
+    integral of symmetric zero-mean modes does not select their sign or drop
+    them.
+    """
     row = wp.tid()
 
     diag_index = wps.bsr_block_index(row, row, offsets, columns)
@@ -642,17 +694,23 @@ def compute_eigenvalues(
                 ev_s = 0.0
             else:
                 ys = float(0.0)
+                abs_s = float(0.0)
 
                 for j in range(scales.length):
                     node_index = row * nodes_per_elt + j
                     s += ev[k, j] * ones[row, j]
+                    abs_s += wp.abs(ev[k, j] * ones[row, j])
                     ys += ev[k, j] * yield_parameters[node_index][0]
 
-                ev_s = wp.sign(s)
-                rv[k] = ev_s * s
+                if wp.abs(s) < zero_mean_tolerance * abs_s:
+                    ev_s = 1.0
+                    rv[k] = 0.0
+                else:
+                    ev_s = wp.sign(s)
+                    rv[k] = ev_s * s
 
-                if ys * ev_s < 0.0:
-                    ev_s = 0.0
+                    if ys * ev_s < 0.0:
+                        ev_s = 0.0
 
             for j in range(scales.length):
                 ev[k, j] *= ev_s
@@ -917,6 +975,7 @@ def reset_mpm_particle_history(
     world_count: int,
     initial_particle_Jp: wp.array[float],
     particle_elastic_strain: wp.array[wp.mat33],
+    particle_residual_deformation_gradient: wp.array[wp.mat33],
     particle_transform: wp.array[wp.mat33],
     particle_qd_grad: wp.array[wp.mat33],
     particle_stress: wp.array[wp.mat33],
@@ -928,6 +987,7 @@ def reset_mpm_particle_history(
     if reset_world_selected(world, world_mask, world_count):
         identity = wp.identity(n=3, dtype=float)
         particle_elastic_strain[particle_index] = identity
+        particle_residual_deformation_gradient[particle_index] = identity
         particle_transform[particle_index] = identity
         particle_qd_grad[particle_index] = wp.mat33(0.0)
         particle_stress[particle_index] = wp.mat33(0.0)
