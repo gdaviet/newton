@@ -256,7 +256,7 @@ def preprocess_stress_and_strain(
 ):
     """Prepare stress and strain for the rheology solve.
 
-    Adds the unilateral strain offset to ``strain_rhs`` (removed in
+    Adds the signed strain offset to ``strain_rhs`` (removed in
     :func:`postprocess_stress_and_strain`), disables cohesion for nodes
     with a positive offset, and projects the initial stress guess onto
     the yield surface.
@@ -267,13 +267,13 @@ def preprocess_stress_and_strain(
     yield_params = yield_stress[tau_i]
     offset = unilateral_strain_offset[tau_i]
 
-    if offset > 0.0:
-        # add unilateral strain offset to strain rhs
-        # will be removed in postprocess_stress_and_strain
+    if offset != 0.0:
+        # Accept signed feedback; postprocessing removes the offset again.
         b = strain_rhs[tau_i]
         b += unilateral_offset_to_strain_rhs(offset)
         strain_rhs[tau_i] = b
 
+    if offset > 0.0:
         yield_params[1] = 0.0  # disable cohesion if offset > 0 (not compact)
         yield_stress[tau_i] = yield_params
 
@@ -601,9 +601,11 @@ def make_solve_flow_rule(has_viscosity: bool = True, has_dilatancy: bool = True)
             dilatancy = 0.0
 
         if wp.static(has_viscosity):
-            D_visc = vec6(1.0) + get_viscosity(yield_params) / strain_node_volume * D
-            D = wp.cw_div(D, D_visc)
-            b = wp.cw_div(b, D_visc)
+            # Empty strain modes have no material viscosity to apply.
+            if strain_node_volume > 0.0:
+                D_visc = vec6(1.0) + get_viscosity(yield_params) / strain_node_volume * D
+                D = wp.cw_div(D, D_visc)
+                b = wp.cw_div(b, D_visc)
 
         if wp.static(_USE_CAM_CLAY):
             return solve_flow_rule_camclay(D, b, r_guess, yield_params)
@@ -1119,6 +1121,7 @@ def expand_flat_ids(
 
 @wp.kernel
 def reorder_strain_mat(
+    flat_color_offsets: wp.array[int],
     flat_constraint_ids: wp.array[int],
     strain_mat_offsets: wp.array[int],
     strain_mat_columns: wp.array[int],
@@ -1129,8 +1132,14 @@ def reorder_strain_mat(
     reordered_vals_z: wp.array2d[float],
     reordered_n_entries: wp.array[int],
 ):
-    """Reorder strain_mat into entry-major SoA layout for coalesced access."""
+    """Reorder strain_mat into entry-major SoA layout for coalesced access.
+
+    Only the first ``flat_color_offsets[-1]`` flat slots hold colored strain
+    nodes; the remaining slots of capacity-sized arrays are left untouched.
+    """
     fi = wp.tid()
+    if fi >= flat_color_offsets[flat_color_offsets.shape[0] - 1]:
+        return
     tau_i = flat_constraint_ids[fi]
     beg = strain_mat_offsets[tau_i]
     n = strain_mat_offsets[tau_i + 1] - beg

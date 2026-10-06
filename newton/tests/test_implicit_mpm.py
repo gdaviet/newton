@@ -8,12 +8,15 @@ import warp as wp
 import warp.fem as fem
 
 import newton
+from newton._src.solvers.implicit_mpm.cell_quadrature import CellQuadrature
+from newton._src.solvers.implicit_mpm.implicit_mpm_solver_kernels import compute_eigenvalues
 from newton._src.solvers.implicit_mpm.rasterized_collisions import (
     _ALL_COLLIDER_WORLDS,
     Collider,
     collision_sdf,
     rasterize_collider_kernel,
 )
+from newton._src.solvers.implicit_mpm.rheology_solver_kernels import YieldParamVec
 from newton._src.solvers.implicit_mpm.solve_rheology import (
     _ITERATIVE_LINEAR_SOLVERS,
     ArraySquaredNorm,
@@ -1145,6 +1148,357 @@ def test_shared_solver_globalizes_external_multiworld_colliders(test, device):
     test.assertEqual(np.unique(collider.face_material_index.numpy()).shape[0], 2)
 
 
+def test_cell_quadrature_weights(test, device):
+    """Check that cell quadrature transfer weights are continuous partitions of unity.
+
+    Particles on either side of an interior cell face receive the same point
+    weights, and particles near the grid boundary renormalize their weights
+    over the existing cells.
+    """
+    voxel_size = 0.25
+    res = 4
+    grid = fem.Grid3D(bounds_lo=wp.vec3(0.0), bounds_hi=wp.vec3(res * voxel_size), res=wp.vec3i(res))
+    domain = fem.Cells(grid)
+
+    rng = np.random.default_rng(42)
+    face_count = 16
+    face = 2.0 * voxel_size
+    offset = 1.0e-5
+    base = rng.uniform(0.1, 0.9, size=(face_count, 3))
+    below = base.copy()
+    below[:, 1] = face - offset
+    above = base.copy()
+    above[:, 1] = face + offset
+    scattered = rng.uniform(0.0, res * voxel_size, size=(64, 3))
+    positions = wp.array(np.concatenate([below, above, scattered]), dtype=wp.vec3, device=device)
+
+    for points_per_axis in (1, 2):
+        with test.subTest(points_per_axis=points_per_axis), wp.ScopedDevice(device):
+            # PicQuadrature launches some of its binning kernels on the current device
+            pic = fem.PicQuadrature(domain, positions, use_domain_element_indices=True)
+            cell_quadrature = CellQuadrature(points_per_axis, device=device)
+            cell_quadrature.compute_weights(pic, positions, voxel_size, temporary_store=None)
+            # Copy before releasing, since CPU arrays share memory with their NumPy views
+            index = cell_quadrature.point_index.numpy().copy()
+            weight = cell_quadrature.point_weight.numpy().copy()
+            point_coords = cell_quadrature.point_coords.numpy().copy()
+            cell_quadrature.release()
+
+            test.assertTrue(np.all(weight >= 0.0))
+            np.testing.assert_allclose(weight.sum(axis=1), 1.0, atol=1.0e-5)
+            test.assertTrue(np.all(index[weight > 0.0] >= 0))
+            test.assertEqual(point_coords.shape, (res**3, points_per_axis**3, 3))
+            np.testing.assert_allclose(np.sort(np.unique(point_coords)), cell_quadrature.abscissae, atol=1.0e-6)
+
+            for p in range(face_count):
+                weights_below = {q: w for q, w in zip(index[p], weight[p], strict=True) if q >= 0}
+                weights_above = {
+                    q: w for q, w in zip(index[face_count + p], weight[face_count + p], strict=True) if q >= 0
+                }
+                difference = max(
+                    abs(weights_below.get(q, 0.0) - weights_above.get(q, 0.0))
+                    for q in set(weights_below) | set(weights_above)
+                )
+                test.assertLess(difference, 1.0e-3)
+
+
+def _run_elastic_block(device, integration_scheme, strain_basis, step_count=40, collider_basis="S2"):
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -9.81, 0.0))
+    SolverImplicitMPM.register_custom_attributes(builder)
+    builder.add_particle_grid(
+        pos=wp.vec3(0.025, 0.025, 0.025),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=6,
+        dim_y=6,
+        dim_z=6,
+        cell_x=0.05,
+        cell_y=0.05,
+        cell_z=0.05,
+        mass=0.125,
+        jitter=0.0,
+        radius_mean=0.025,
+        custom_attributes={
+            "mpm:young_modulus": 1.0e5,
+            "mpm:poisson_ratio": 0.3,
+            "mpm:friction": 10.0,
+            "mpm:yield_stress": 1.0e7,
+            "mpm:yield_pressure": 1.0e8,
+            "mpm:tensile_yield_ratio": 1.0,
+        },
+    )
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+
+    config = SolverImplicitMPM.Config(
+        voxel_size=0.1,
+        grid_type="dense",
+        strain_basis=strain_basis,
+        collider_basis=collider_basis,
+        integration_scheme=integration_scheme,
+        solver="gs",
+        max_iterations=200,
+        tolerance=1.0e-6,
+    )
+    return _step_mpm(model, config, step_count=step_count)
+
+
+def test_strain_mode_mass_filter(test, device):
+    """Keep a positive-mass zero-mean mode while dropping a zero-mass mode."""
+    with wp.ScopedDevice(device):
+        mass = np.diag((1.0, 1.0 / 12.0, 0.0)).astype(np.float32)
+        eigenvalues = wp.empty((1, 3), dtype=float, device=device)
+        eigenvectors = wp.empty((1, 3, 3), dtype=float, device=device)
+        rotated_volume = wp.empty((1, 3), dtype=float, device=device)
+        wp.launch(
+            compute_eigenvalues,
+            dim=1,
+            inputs=[
+                wp.array((0, 1), dtype=int, device=device),
+                wp.array((0,), dtype=int, device=device),
+                wp.array(mass[None], dtype=wp.mat33, device=device),
+                wp.array(((1.0, 0.0, 0.0),), dtype=float, device=device),
+                # A heterogeneous material can have a negative moment against a zero-mean mode.
+                wp.array(((1.0,) * 6, (-1.0 / 12.0,) * 6, (0.0,) * 6), dtype=YieldParamVec, device=device),
+                1.0e-4,
+                eigenvalues,
+                eigenvectors,
+                rotated_volume,
+            ],
+            device=device,
+        )
+        modes = eigenvectors.numpy()[0]
+        np.testing.assert_allclose(modes.T @ modes, np.diag((1.0, 1.0, 0.0)), atol=1.0e-6)
+        np.testing.assert_allclose(modes.T @ np.diag(eigenvalues.numpy()[0]) @ modes, mass, atol=1.0e-6)
+
+
+def test_strain_modes_symmetric_cell(test, device):
+    """Retain full-rank strain modes and uniform material parameters on a symmetric cell."""
+
+    class ModeSolver(SolverImplicitMPM):
+        def _build_strain_eigenbasis(self, pic, scratch, inv_cell_volume):
+            eigenvectors, rotated_volume = super()._build_strain_eigenbasis(pic, scratch, inv_cell_volume)
+            self.element = int(pic.cell_indices.numpy().reshape(-1)[0])
+            self.mode_count = eigenvectors.shape[1]
+            self.modes = eigenvectors.numpy()[self.element].copy()
+            self.mode_mass = (
+                scratch.strain_node_particle_volume.numpy().reshape(-1, self.mode_count)[self.element].copy()
+            )
+            return eigenvectors, rotated_volume
+
+        def _solve_rheology(self, pic, scratch, rigidity_operator, last_step_data, inv_cell_volume):
+            result = super()._solve_rheology(pic, scratch, rigidity_operator, last_step_data, inv_cell_volume)
+            self.mode_yield_parameters = (
+                scratch.strain_yield_parameters_field.dof_values.numpy()
+                .reshape(-1, self.mode_count, 6)[self.element]
+                .copy()
+            )
+            return result
+
+    abscissae = (0.5 - 0.5 / np.sqrt(3.0), 0.5 + 0.5 / np.sqrt(3.0))
+    positions = np.array(np.meshgrid(abscissae, abscissae, abscissae)).reshape(3, -1).T
+    expected_yield = np.array((300.0 * np.sqrt(1.5), 150.0 * np.sqrt(1.5), 20.0, 60.0, 0.0, 1000.0))
+    with wp.ScopedDevice(device):
+        for integration_scheme in ("pic", "gimp", "cell"):
+            for strain_basis in ("P1d", "Q1d"):
+                with test.subTest(integration_scheme=integration_scheme, strain_basis=strain_basis):
+                    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+                    SolverImplicitMPM.register_custom_attributes(builder)
+                    for position in positions:
+                        builder.add_particle(
+                            pos=position,
+                            vel=(0.0, 0.0, 0.0),
+                            mass=0.125,
+                            radius=0.25,
+                            custom_attributes={
+                                "mpm:young_modulus": 1.0e4,
+                                "mpm:friction": 0.2,
+                                "mpm:yield_pressure": 300.0,
+                                "mpm:tensile_yield_ratio": 0.5,
+                                "mpm:yield_stress": 20.0,
+                                "mpm:viscosity": 10.0,
+                            },
+                        )
+                    model = builder.finalize(device=device)
+                    solver = ModeSolver(
+                        model,
+                        SolverImplicitMPM.Config(
+                            voxel_size=1.0,
+                            grid_type="fixed",
+                            integration_scheme=integration_scheme,
+                            strain_basis=strain_basis,
+                            max_iterations=0,
+                            warmstart_mode="none",
+                        ),
+                    )
+                    state = model.state()
+                    solver.step(state, state, None, None, 0.01)
+                    test.assertTrue(np.all(solver.mode_mass > 1.0e-6))
+                    np.testing.assert_allclose(solver.modes @ solver.modes.T, np.eye(solver.mode_count), atol=2.0e-5)
+                    np.testing.assert_allclose(
+                        solver.mode_yield_parameters,
+                        np.tile(expected_yield, (solver.mode_count, 1)),
+                        rtol=2.0e-4,
+                        atol=2.0e-4,
+                    )
+
+
+def test_cell_integration_elastic_block(test, device):
+    """Step an elastic block resting on the ground with fixed cell quadrature.
+
+    Each supported strain basis keeps the block finite, above the ground, and
+    close to its rest shape, consistent with particle quadrature.
+    """
+    _solver, reference = _run_elastic_block(device, "pic", "P0")
+    reference_height = np.mean(reference.particle_q.numpy()[:, 1])
+
+    for strain_basis in ("P0", "P1d", "Q1d"):
+        with test.subTest(strain_basis=strain_basis):
+            _solver, state = _run_elastic_block(device, "cell", strain_basis)
+            positions = state.particle_q.numpy()
+            elastic_strain = state.mpm.particle_elastic_strain.numpy()
+            test.assertTrue(np.isfinite(positions).all())
+            test.assertTrue(np.isfinite(elastic_strain).all())
+
+            extent = np.max(positions, axis=0) - np.min(positions, axis=0)
+            np.testing.assert_allclose(extent, 0.25, atol=0.03)
+            test.assertGreater(np.min(positions[:, 1]), -0.02)
+            test.assertAlmostEqual(np.mean(positions[:, 1]), reference_height, delta=0.02)
+
+            determinant = np.linalg.det(elastic_strain)
+            test.assertGreater(np.min(determinant), 0.9)
+            test.assertLess(np.max(determinant), 1.1)
+
+
+def test_cell_integration_particle_contact_rows(test, device):
+    """Check that cell-scheme contact rows of particle colliders interpolate through the cell points.
+
+    Each active row combines the trilinear point weights with the nodal shape
+    functions at the points, so its coefficients sum to one, and the block
+    stays above the ground.
+    """
+    solver, state = _run_elastic_block(device, "cell", "P0", step_count=10, collider_basis="pic8")
+    collider_matrix = solver._scratchpad.collider_matrix
+    offsets = collider_matrix.offsets.numpy()
+    values = collider_matrix.values.numpy().reshape(-1)
+    row_sums = np.array([values[offsets[row] : offsets[row + 1]].sum() for row in range(collider_matrix.nrow)])
+    active = np.abs(row_sums) > 0.0
+    test.assertGreater(np.count_nonzero(active), 0)
+    np.testing.assert_allclose(row_sums[active], 1.0, atol=1.0e-4)
+    # Two-hop rows reach the 27 nodes around each particle, beyond its own cell
+    test.assertGreater(np.max(np.diff(offsets)), 8)
+
+    positions = state.particle_q.numpy()
+    test.assertTrue(np.isfinite(positions).all())
+    test.assertGreater(np.min(positions[:, 1]), -0.02)
+
+
+def _make_cell_viscous_block(device, viscosity, strain_basis="P0", solver="gs", max_iterations=5, young_modulus=1.0e15):
+    builder = _make_mpm_particle_builder(gravity=(0.0, 0.0, 0.0), young_modulus=young_modulus, dimensions=(6, 6, 6))
+    model = builder.finalize(device=device)
+    model.mpm.friction.zero_()
+    model.mpm.viscosity.fill_(viscosity)
+    config = SolverImplicitMPM.Config(
+        voxel_size=0.1,
+        grid_type="fixed",
+        integration_scheme="cell",
+        strain_basis=strain_basis,
+        solver=solver,
+        max_iterations=max_iterations,
+        tolerance=0.0,
+        air_drag=1.0e-6,
+    )
+    return model, SolverImplicitMPM(model, config=config)
+
+
+def test_cell_integration_viscosity_decay(test, device):
+    """Dissipate shear with increasing viscosity, including truncated solves."""
+    with wp.ScopedDevice(device):
+        for strain_basis, solver, max_iterations in (
+            ("P0", "gs", 5),
+            ("P0", "jacobi", 5),
+            ("P0", "gs", 100),
+            ("P1d", "gs", 5),
+            ("Q1d", "gs", 5),
+        ):
+            with test.subTest(strain_basis=strain_basis, solver=solver, max_iterations=max_iterations):
+                energies = []
+                for viscosity in (0.0, 10.0, 1000.0):
+                    model, mpm_solver = _make_cell_viscous_block(
+                        device, viscosity, strain_basis, solver, max_iterations
+                    )
+                    state, output = model.state(), model.state()
+                    positions = state.particle_q.numpy()
+                    centered = positions - np.mean(positions, axis=0)
+                    velocities = np.column_stack((centered[:, 1], centered[:, 0], np.zeros(model.particle_count)))
+                    state.particle_qd.assign(wp.array(velocities, dtype=wp.vec3, device=device))
+                    initial_energy = np.sum(model.particle_mass.numpy()[:, None] * velocities**2)
+                    for _ in range(5):
+                        mpm_solver.step(state, output, None, None, 0.01)
+                        state, output = output, state
+                        velocities = state.particle_qd.numpy()
+                        test.assertTrue(np.isfinite(velocities).all())
+                        energy = np.sum(model.particle_mass.numpy()[:, None] * velocities**2)
+                        test.assertLessEqual(energy, initial_energy * 1.001)
+                    energies.append(energy)
+                test.assertLess(energies[1], 0.95 * energies[0])
+                test.assertLess(energies[2], 0.5 * energies[1])
+
+
+def test_cell_integration_viscosity_translation(test, device):
+    """Preserve uniform translation when viscosity has no strain to dissipate."""
+    with wp.ScopedDevice(device):
+        model, solver = _make_cell_viscous_block(device, 1000.0)
+        state = model.state()
+        translation = np.array((0.3, -0.1, 0.2), dtype=np.float32)
+        initial_positions = state.particle_q.numpy().copy()
+        state.particle_qd.fill_(wp.vec3(translation))
+        for _ in range(5):
+            solver.step(state, state, None, None, 0.01)
+        np.testing.assert_allclose(
+            state.particle_qd.numpy(), np.tile(translation, (model.particle_count, 1)), atol=2.0e-5
+        )
+        np.testing.assert_allclose(state.particle_q.numpy(), initial_positions + 0.05 * translation, atol=2.0e-6)
+
+
+def test_cell_integration_viscosity_elastic_history(test, device):
+    """Keep kinematic and stress-based elastic increments consistent in a converged viscous solve."""
+    with wp.ScopedDevice(device):
+        strains = []
+        for kinematic_update in (False, True):
+            model, solver = _make_cell_viscous_block(device, 10.0, max_iterations=300, young_modulus=1.0e4)
+            solver._cell_kinematic_update = kinematic_update
+            state, output = model.state(), model.state()
+            positions = state.particle_q.numpy()
+            centered = positions - np.mean(positions, axis=0)
+            velocities = np.column_stack((centered[:, 1], centered[:, 0], np.zeros(model.particle_count)))
+            state.particle_qd.assign(wp.array(velocities, dtype=wp.vec3, device=device))
+            solver.step(state, output, None, None, 0.01)
+            strains.append(output.mpm.particle_elastic_strain.numpy().copy())
+        test.assertGreater(np.max(np.abs(strains[0] - np.eye(3))), 1.0e-5)
+        np.testing.assert_allclose(strains[1], strains[0], atol=2.0e-5, rtol=0.0)
+
+
+def test_cell_integration_rejects_unsupported(test, device):
+    """Reject configurations and materials that cell quadrature does not support."""
+    model = _make_mpm_particle_builder().finalize(device=device)
+    for options, error in (
+        ({"strain_basis": "Q1"}, ValueError),
+        ({"strain_basis": "pic8"}, ValueError),
+        ({"velocity_basis": "B2"}, NotImplementedError),
+        ({"critical_fraction": 0.5}, NotImplementedError),
+    ):
+        with test.subTest(**options):
+            config = SolverImplicitMPM.Config(voxel_size=0.1, grid_type="dense", integration_scheme="cell", **options)
+            with test.assertRaises(error):
+                SolverImplicitMPM(model, config)
+
+    model.mpm.hardening.fill_(1.0)
+    model_config = SolverImplicitMPM.Config(voxel_size=0.1, grid_type="dense", integration_scheme="cell")
+    with test.assertRaises(NotImplementedError):
+        SolverImplicitMPM(model, model_config)
+
+
 def test_sand_cube_on_plane(test, device):
     # Emits a cube of particles on the ground
 
@@ -1722,6 +2076,42 @@ add_function_test(
     check_output=False,
 )
 
+
+add_function_test(
+    TestImplicitMPM, "test_cell_integration_elastic_block", test_cell_integration_elastic_block, devices=devices
+)
+add_function_test(
+    TestImplicitMPM, "test_strain_modes_symmetric_cell", test_strain_modes_symmetric_cell, devices=devices
+)
+add_function_test(TestImplicitMPM, "test_strain_mode_mass_filter", test_strain_mode_mass_filter, devices=devices)
+add_function_test(
+    TestImplicitMPM,
+    "test_cell_integration_particle_contact_rows",
+    test_cell_integration_particle_contact_rows,
+    devices=devices,
+)
+add_function_test(
+    TestImplicitMPM,
+    "test_cell_integration_rejects_unsupported",
+    test_cell_integration_rejects_unsupported,
+    devices=devices,
+)
+add_function_test(TestImplicitMPM, "test_cell_quadrature_weights", test_cell_quadrature_weights, devices=devices)
+add_function_test(
+    TestImplicitMPM, "test_cell_integration_viscosity_decay", test_cell_integration_viscosity_decay, devices=devices
+)
+add_function_test(
+    TestImplicitMPM,
+    "test_cell_integration_viscosity_translation",
+    test_cell_integration_viscosity_translation,
+    devices=devices,
+)
+add_function_test(
+    TestImplicitMPM,
+    "test_cell_integration_viscosity_elastic_history",
+    test_cell_integration_viscosity_elastic_history,
+    devices=devices,
+)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)

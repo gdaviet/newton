@@ -25,6 +25,14 @@ from ...geometry.particle_surface import ParticleSurface
 from ...sim import ModelFlags, StateFlags
 from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
+from . import particle_quadrature
+from .cell_quadrature import (
+    POINT_STENCIL_SIZE as CELL_POINT_STENCIL_SIZE,
+)
+from .cell_quadrature import (
+    CellQuadrature,
+    cell_stencil_points,
+)
 from .implicit_mpm_model import ImplicitMPMModel
 from .particle_surface_colliders import extrapolate_surface_sdf_into_colliders
 from .rasterized_collisions import (
@@ -33,6 +41,7 @@ from .rasterized_collisions import (
     interpolate_collider_normals,
     project_outside_collider,
     rasterize_collider,
+    stabilize_collider_velocity,
 )
 from .render_grains import sample_render_grains, update_render_grains
 from .solve_rheology import CollisionData, MomentumData, RheologyData, YieldParamVec, solve_rheology
@@ -44,14 +53,13 @@ from .implicit_mpm_solver_kernels import (
     INFINITY,
     YIELD_PARAM_LENGTH,
     _rebuild_capacity,
-    advect_particles,
     allocate_by_voxels,
-    average_elastic_parameters,
+    average_element_yield_parameters,
     build_active_particle_mask,
     collision_weight_field,
-    compliance_form,
     compute_bounds,
     compute_color_offsets,
+    compute_density_strain_offset,
     compute_eigenvalues,
     compute_unilateral_strain_offset,
     fill_uniform_color_block_indices,
@@ -59,13 +67,11 @@ from .implicit_mpm_solver_kernels import (
     integrate_active_fraction,
     integrate_collider_fraction,
     integrate_collider_fraction_apic,
-    integrate_elastic_parameters,
     integrate_fraction,
     integrate_mass,
     integrate_particle_stress,
     integrate_velocity,
     integrate_velocity_apic,
-    integrate_yield_parameters,
     inverse_scale_sym_tensor,
     inverse_scale_vector,
     make_cell_color_kernel,
@@ -80,18 +86,18 @@ from .implicit_mpm_solver_kernels import (
     mat31,
     mat66,
     node_color,
+    normalize_strain_yield_parameters,
     record_volume_rebuild_status,
     reset_mpm_collider_history,
     reset_mpm_grid_warmstart,
     reset_mpm_particle_history,
     reset_mpm_point_warmstart,
+    residual_strain_offset,
     rotate_matrix_columns,
     rotate_matrix_rows,
     scatter_field_dof_values,
     strain_delta_form,
-    strain_rhs,
     update_particle_frames,
-    update_particle_strains,
     voxel_coordinates,
 )
 
@@ -646,7 +652,11 @@ class ImplicitMPMScratchpad:
             self.collider_total_volumes = fem.borrow_temporary(temporary_store, shape=collider_count, dtype=float)
 
         if max_colors > 0:
-            self.color_indices = fem.borrow_temporary(temporary_store, shape=(2, strain_node_count), dtype=int)
+            # Cell-based coloring sorts one entry per partition cell, and cells without
+            # particles make that count exceed the particle-based strain node count.
+            partition_cell_count = self._strain_space_restriction.space_partition.geo_partition.cell_count()
+            color_block_capacity = max(strain_node_count, partition_cell_count)
+            self.color_indices = fem.borrow_temporary(temporary_store, shape=(2, color_block_capacity), dtype=int)
             self.color_offsets = fem.borrow_temporary(temporary_store, shape=max_colors + 1, dtype=int)
 
     def release_temporaries(self):
@@ -898,8 +908,37 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         """
         transfer_scheme: Literal["apic", "pic"] = "apic"
         """Transfer scheme to use for particle-grid transfers."""
-        integration_scheme: Literal["pic", "gimp"] = "pic"
-        """Integration scheme controlling shape-function support."""
+        integration_scheme: Literal["pic", "gimp", "cell"] = "pic"
+        """Integration scheme for strain-space integrals.
+
+        ``"pic"`` integrates at particles and ``"gimp"`` over particle
+        domains. ``"cell"`` integrates at points with fixed positions in each
+        grid cell, the cell center for the ``"P0"`` strain basis and the
+        2x2x2 Gauss points for ``"P1d"`` and ``"Q1d"``, so that the integrands
+        never cross a shape-function kink as particles move. Following MPM
+        Lite, particles exchange data with fixed points using trilinear
+        weights on the lattice of points, which are continuous in particle
+        position:
+
+        - strain history and material parameters go to the quadrature
+          points, each weighted by its transferred particle volume;
+        - mass and momentum reach the grid nodes through the cell centers;
+        - particles move with the grid velocity and gradient sampled at the
+          cell centers, and particle-based collider bases constrain that same
+          velocity;
+        - the elastic deformation gradient follows ``F <- (I + dt G) F``,
+          less the solver's plastic strain increment.
+
+        Trilinear hourglass modes average out at the cell centers and never
+        reach the particles.
+
+        .. experimental::
+
+            ``"cell"`` requires the ``"Q1"`` velocity basis and a single FEM
+            environment, and does not support hardening, dilatancy,
+            kinematic (zero-density) particles, or a positive
+            :attr:`critical_fraction`.
+        """
 
         # material / background
         critical_fraction: float = 0.0
@@ -908,6 +947,70 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         """Numerical drag for the background air."""
 
         # experimental
+        collider_stabilization_fraction: float = 0.0
+        """Experimental fraction of PIC contact penetration corrected per step.
+
+        Values in ``[0, 1]`` add an outward normal target velocity of
+        ``fraction * penetration / dt``. Zero disables penetration recovery.
+        Requires a particle collider basis (``"pic"`` or ``"picN"``).
+        This parameter may change without prior notice.
+        """
+        collider_contact_gap: float = 0.0
+        """Experimental predictive contact activation distance [m].
+
+        Positive values activate PIC contacts before penetration. Separated
+        particles may approach at ``gap / dt`` so they can reach the surface
+        during the step. Requires a particle collider basis. Zero retains
+        the existing activation distance. This parameter may change without
+        prior notice.
+        """
+        density_strain_fraction: float = 0.0
+        """Fraction of the particle volume-filling error corrected per step.
+
+        Values in ``[0, 1]`` add the signed offset
+        ``fraction * (available_node_volume - particle_node_volume)`` to the
+        divergence constraint. The default measurement uses the same
+        integration as :attr:`critical_fraction`, including collider volume
+        subtraction.
+        The target filling fraction is one. Overfilled nodes produce negative
+        offsets, requesting expansion. Zero disables this feedback.
+
+        This correction does not require residual deformation history.
+
+        .. experimental::
+
+            Density-based divergence feedback may change without prior notice.
+        """
+        residual_strain_fraction: float = 0.0
+        """Fraction of accumulated residual volumetric strain corrected per step.
+
+        Values in ``[0, 1]`` add a signed offset to the existing divergence
+        constraint, using ``fraction * log(det(F_residual))``. Compression
+        produces a negative offset and requests expansion on the next step.
+        The particle update accumulates sampled symmetric strain minus the
+        normalized plastic and elastic increments in the residual history.
+        Zero disables feedback. Passive history recording can be enabled
+        independently with :attr:`residual_strain_tracking`.
+
+        This is a per-step fraction; its approximate relaxation time is
+        ``dt / fraction`` for small positive fractions. Only the volumetric
+        part is corrected; residual shear is retained in the history.
+
+        .. experimental::
+
+            Residual-strain divergence feedback may change without prior notice.
+        """
+        residual_strain_tracking: bool = False
+        """Record sampled-strain residual history without enabling divergence feedback.
+
+        A positive :attr:`residual_strain_fraction` also enables recording.
+        Cell integration uses :attr:`density_strain_fraction` for recovery
+        and does not support residual history recording.
+
+        .. experimental::
+
+            Passive residual-strain diagnostics may change without prior notice.
+        """
         collider_normal_from_sdf_gradient: bool = False
         """Compute collider normals from sdf gradient rather than closest point"""
         collider_basis: _MPMColliderBasisName = "S2"
@@ -1209,6 +1312,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         Attributes registered on State (per-particle):
             - ``mpm:particle_qd_grad``: Velocity gradient for APIC transfer
             - ``mpm:particle_elastic_strain``: Elastic deformation gradient
+            - ``mpm:particle_residual_deformation_gradient``: Experimental sampled-strain residual history
             - ``mpm:particle_Jp``: Determinant of plastic deformation gradient
             - ``mpm:particle_stress``: Cauchy stress tensor [Pa]
             - ``mpm:particle_transform``: Overall deformation gradient for rendering
@@ -1359,6 +1463,16 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         )
         builder.add_custom_attribute(
             newton.ModelBuilder.CustomAttribute(
+                name="particle_residual_deformation_gradient",
+                frequency=newton.Model.AttributeFrequency.PARTICLE,
+                assignment=newton.Model.AttributeAssignment.STATE,
+                dtype=wp.mat33,
+                default=identity,
+                namespace="mpm",
+            )
+        )
+        builder.add_custom_attribute(
+            newton.ModelBuilder.CustomAttribute(
                 name="particle_Jp",
                 frequency=newton.Model.AttributeFrequency.PARTICLE,
                 assignment=newton.Model.AttributeAssignment.STATE,
@@ -1446,6 +1560,13 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         self.verbose = verbose if verbose is not None else wp.config.log_level <= wp.LOG_DEBUG
         self.enable_timers = enable_timers
 
+        self.residual_strain_fraction = float(config.residual_strain_fraction)
+        if not math.isfinite(self.residual_strain_fraction) or not 0.0 <= self.residual_strain_fraction <= 1.0:
+            raise ValueError("residual_strain_fraction must be finite and in [0, 1]")
+        self.residual_strain_tracking = bool(config.residual_strain_tracking or self.residual_strain_fraction > 0.0)
+        self.density_strain_fraction = float(config.density_strain_fraction)
+        if not math.isfinite(self.density_strain_fraction) or not 0.0 <= self.density_strain_fraction <= 1.0:
+            raise ValueError("density_strain_fraction must be finite and in [0, 1]")
         self.velocity_basis = "Q1"
         self.strain_basis = config.strain_basis
         self.velocity_basis = config.velocity_basis
@@ -1480,9 +1601,44 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         self.solver = _resolve_solver_spec(config.solver, self.velocity_basis)
         self.coloring = any("gauss-seidel" in solver or "gs" in solver for solver in self.solver)
         self.apic = config.transfer_scheme == "apic"
+        if config.integration_scheme not in ("pic", "gimp", "cell"):
+            raise ValueError(f"Invalid integration scheme: {config.integration_scheme}")
         self.gimp = config.integration_scheme == "gimp"
+        self._cell_quadrature = None
+        self._cell_transfer_quadrature = None
+        self._cell_kinematic_update = False
+        self._cell_two_hop_transfers = False
+        self._cell_grid_points = None
+        self._cell_grid_flags = None
+        self._element_yield_parameters = None
+        if config.integration_scheme == "cell":
+            self._cell_quadrature = CellQuadrature(
+                points_per_axis=self._cell_points_per_axis(config), device=model.device
+            )
+            # Transfers go through cell centers, where trilinear hourglass modes vanish
+            self._cell_transfer_quadrature = (
+                self._cell_quadrature
+                if self._cell_quadrature.points_per_axis == 1
+                else CellQuadrature(points_per_axis=1, device=model.device)
+            )
+            self._validate_cell_quadrature_materials()
+            self._set_cell_two_hop_transfers(True)
+            self._cell_kinematic_update = True
         self.collider_normal_from_sdf_gradient = config.collider_normal_from_sdf_gradient
         self.collider_basis = config.collider_basis
+        self.collider_stabilization_fraction = float(config.collider_stabilization_fraction)
+        self.collider_contact_gap = float(config.collider_contact_gap)
+        if (
+            not math.isfinite(self.collider_stabilization_fraction)
+            or not 0.0 <= self.collider_stabilization_fraction <= 1.0
+        ):
+            raise ValueError("collider_stabilization_fraction must be finite and in [0, 1]")
+        if not math.isfinite(self.collider_contact_gap) or self.collider_contact_gap < 0.0:
+            raise ValueError("collider_contact_gap must be finite and nonnegative")
+        if (
+            self.collider_stabilization_fraction > 0.0 or self.collider_contact_gap > 0.0
+        ) and not self.collider_basis.startswith("pic"):
+            raise ValueError("Contact stabilization and predictive gaps require a particle collider basis")
 
         if config.collider_velocity_mode not in ("forward", "backward"):
             raise ValueError(f"Invalid collider velocity mode: {config.collider_velocity_mode}")
@@ -1691,6 +1847,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             raise ValueError("state is missing the 'mpm' custom-attribute namespace.")
         for name, dtype in (
             ("particle_elastic_strain", wp.mat33),
+            ("particle_residual_deformation_gradient", wp.mat33),
             ("particle_transform", wp.mat33),
             ("particle_qd_grad", wp.mat33),
             ("particle_stress", wp.mat33),
@@ -1868,6 +2025,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 if world_mask is None:
                     identity = wp.mat33(np.eye(3))
                     state.mpm.particle_elastic_strain.fill_(identity)
+                    state.mpm.particle_residual_deformation_gradient.fill_(identity)
                     state.mpm.particle_transform.fill_(identity)
                     state.mpm.particle_qd_grad.zero_()
                     state.mpm.particle_stress.zero_()
@@ -1882,6 +2040,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                             self._initial_world_count,
                             self.model.mpm.particle_Jp,
                             state.mpm.particle_elastic_strain,
+                            state.mpm.particle_residual_deformation_gradient,
                             state.mpm.particle_transform,
                             state.mpm.particle_qd_grad,
                             state.mpm.particle_stress,
@@ -1925,8 +2084,14 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         with wp.ScopedDevice(model.device):
             pic = self._particles_to_cells(state_in.particle_q)
             scratch = self._rebuild_scratchpad(pic)
-            self._step_impl(state_in, state_out, dt, pic, scratch)
-            scratch.release_temporaries()
+            try:
+                self._step_impl(state_in, state_out, dt, pic, scratch)
+            finally:
+                scratch.release_temporaries()
+                if self._cell_quadrature is not None:
+                    self._cell_quadrature.release()
+                    if self._cell_transfer_quadrature is not self._cell_quadrature:
+                        self._cell_transfer_quadrature.release()
 
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
@@ -2514,7 +2679,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                         if self._grid_status is None:
                             self._grid_status = wp.zeros(1, dtype=wp.uint32, device=positions.device)
                             self._grid_accumulated_status = wp.zeros(1, dtype=wp.uint32, device=positions.device)
-                        point_mask = self._update_grid_point_mask(positions, self._mpm_model.particle_flags)
+                        point_mask = self._update_grid_point_mask(positions, particle_flags)
                     volume = allocate_by_voxels(
                         positions,
                         voxel_size,
@@ -2667,7 +2832,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             scratch.allocate_temporaries(
                 collider_count=self._mpm_model.collider.collider_mesh.shape[0],
                 has_compliant_bodies=self._mpm_model.has_compliant_colliders,
-                has_critical_fraction=self._mpm_model.critical_fraction > 0.0,
+                has_critical_fraction=self._mpm_model.critical_fraction > 0.0 or self.density_strain_fraction > 0.0,
                 max_colors=self._max_colors(),
                 temporary_store=self.temporary_store,
             )
@@ -2677,10 +2842,139 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
         return scratch
 
+    def _cell_points_per_axis(self, config: Config) -> int:
+        """Validate the ``"cell"`` integration scheme and return its points per cell axis."""
+        if config.velocity_basis != "Q1":
+            raise NotImplementedError(
+                f"Config.integration_scheme='cell' requires velocity_basis='Q1', got {config.velocity_basis!r}."
+            )
+        if self._separate_worlds:
+            raise NotImplementedError("Config.integration_scheme='cell' does not support Config.separate_worlds=True.")
+        if self.residual_strain_tracking:
+            raise NotImplementedError(
+                "Cell integration uses density_strain_fraction rather than residual strain history."
+            )
+        if config.critical_fraction > 0.0:
+            raise NotImplementedError("Config.integration_scheme='cell' does not support a positive critical_fraction.")
+        points_per_axis = {"P0": 1, "P1d": 2, "Q1d": 2}.get(config.strain_basis)
+        if points_per_axis is None:
+            raise ValueError(
+                "Config.integration_scheme='cell' supports the 'P0', 'P1d', and 'Q1d' strain bases, "
+                f"got {config.strain_basis!r}."
+            )
+        return points_per_axis
+
+    def _validate_cell_quadrature_materials(self):
+        mpm_model = self._mpm_model
+        unsupported = [
+            name
+            for name, present in (
+                ("hardening", mpm_model.has_hardening),
+                ("dilatancy", mpm_model.has_dilatancy),
+            )
+            if present
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                f"Config.integration_scheme='cell' does not support particle {', '.join(unsupported)}."
+            )
+
+    def _set_cell_two_hop_transfers(self, enabled: bool):
+        """Route mass, momentum, contact, and particle advection through the fixed cell points.
+
+        Two-hop transfers follow MPM Lite and are the default for the ``"cell"``
+        integration scheme; disabling them keeps particle-based transfers for
+        comparison. Call this outside graph capture, before stepping.
+        """
+        if enabled:
+            if self._cell_quadrature is None:
+                raise ValueError("Two-hop transfers require Config.integration_scheme='cell'.")
+            active = (self._mpm_model.particle_flags.numpy() & int(newton.ParticleFlags.ACTIVE)) != 0
+            if np.any(self._mpm_model.particle_density.numpy()[active] <= 0.0):
+                raise NotImplementedError("Two-hop transfers do not support kinematic (zero-density) particles.")
+            if self._cell_grid_points is None:
+                stencil_point_count = self._initial_particle_count * CELL_POINT_STENCIL_SIZE
+                self._cell_grid_points = wp.empty(stencil_point_count, dtype=wp.vec3, device=self.model.device)
+                self._cell_grid_flags = wp.empty(stencil_point_count, dtype=wp.int32, device=self.model.device)
+        if bool(enabled) != self._cell_two_hop_transfers:
+            # The grid point mask is sized by the number of points defining the grid
+            self._grid_point_mask = None
+        self._cell_two_hop_transfers = bool(enabled)
+
+    def _prepare_cell_quadrature(self, state_in: newton.State, dt: float, pic: fem.PicQuadrature):
+        """Transfer particle history to the fixed cell points for this step."""
+        self._validate_cell_quadrature_materials()
+
+        mpm_model = self._mpm_model
+        cell_quadrature = self._cell_quadrature
+        with self._timer("Cell quadrature"):
+            cell_quadrature.compute_weights(
+                pic, state_in.particle_q, mpm_model.voxel_size, temporary_store=self.temporary_store
+            )
+            cell_quadrature.transfer_particles(
+                pic.domain,
+                particle_flags=mpm_model.material_particle_flags,
+                particle_volume=mpm_model.material_particle_volume,
+                elastic_strain=state_in.mpm.particle_elastic_strain,
+                particle_stress=state_in.mpm.particle_stress,
+                particle_Jp=state_in.mpm.particle_Jp,
+                material_parameters=mpm_model.material_parameters,
+                dt=dt,
+                inv_cell_volume=1.0 / mpm_model.voxel_size**3,
+                temporary_store=self.temporary_store,
+            )
+            if self._cell_two_hop_transfers:
+                transfer_quadrature = self._cell_transfer_quadrature
+                if transfer_quadrature is not cell_quadrature:
+                    transfer_quadrature.compute_weights(
+                        pic, state_in.particle_q, mpm_model.voxel_size, temporary_store=self.temporary_store
+                    )
+                transfer_quadrature.transfer_momentum(
+                    pic.domain,
+                    apic=self.apic,
+                    dt=dt,
+                    particle_flags=mpm_model.particle_flags,
+                    particle_volume=mpm_model.particle_volume,
+                    particle_density=mpm_model.particle_density,
+                    velocities=state_in.particle_qd,
+                    velocity_gradients=state_in.mpm.particle_qd_grad,
+                    particle_world=self.model.particle_world,
+                    gravity=self.model.gravity,
+                    inv_cell_volume=1.0 / mpm_model.voxel_size**3,
+                    temporary_store=self.temporary_store,
+                )
+
+    def _strain_quadrature(self, pic: fem.PicQuadrature) -> tuple[fem.Quadrature, wp.array[wp.int32]]:
+        """Return the quadrature and per-point flags used for strain-space integrals."""
+        if self._cell_quadrature is not None:
+            return self._cell_quadrature.quadrature, self._cell_quadrature.point_flags
+        return pic, self._mpm_model.material_particle_flags
+
     def _particles_to_cells(self, positions: wp.array) -> fem.PicQuadrature:
         """Rebuild the grid and grid partition around particles, then assign particles to grid cells."""
 
         # Rebuild grid
+
+        grid_positions = positions
+        grid_flags = self._mpm_model.particle_flags
+        if self._cell_two_hop_transfers:
+            # Two-hop transfers reach every cell of each particle's point stencil,
+            # so the grid covers those cells and gives their nodes mass.
+            wp.launch(
+                cell_stencil_points,
+                dim=(positions.shape[0], CELL_POINT_STENCIL_SIZE),
+                inputs=[
+                    positions,
+                    grid_flags,
+                    max(self._cell_quadrature.abscissae[0], self._cell_transfer_quadrature.abscissae[0])
+                    * self._mpm_model.voxel_size,
+                    self._cell_grid_points,
+                    self._cell_grid_flags,
+                ],
+                device=positions.device,
+            )
+            grid_positions = self._cell_grid_points
+            grid_flags = self._cell_grid_flags
 
         # The fixed grid and the rebuildable sparse grid both persist across steps: the
         # fixed grid is static, the sparse grid is refreshed in place from the current
@@ -2688,9 +2982,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         if self._scratchpad is not None and (self.grid_type == "fixed" or self._sparse_rebuildable):
             grid = self._scratchpad.grid
             if self._sparse_rebuildable:
-                point_mask = self._update_grid_point_mask(positions, self._mpm_model.particle_flags)
+                point_mask = self._update_grid_point_mask(grid_positions, grid_flags)
                 grid.rebuild(
-                    positions,
+                    grid_positions,
                     point_envs=self._particle_environment,
                     status=self._grid_status,
                     point_mask=point_mask,
@@ -2703,8 +2997,8 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 )
         else:
             grid = self._allocate_grid(
-                positions,
-                self._mpm_model.particle_flags,
+                grid_positions,
+                grid_flags,
                 voxel_size=self._mpm_model.voxel_size,
                 temporary_store=self.temporary_store,
                 padding_voxels=self.grid_padding,
@@ -2719,9 +3013,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 geo_partition = grid
             else:
                 max_cell_count = self.max_active_cell_count
-                geo_partition = self._create_geometry_partition(
-                    grid, positions, self._mpm_model.particle_flags, max_cell_count
-                )
+                geo_partition = self._create_geometry_partition(grid, grid_positions, grid_flags, max_cell_count)
 
         # Bin particles to grid cells
         with self._timer("Bin particles"):
@@ -2734,143 +3026,18 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 self._separate_worlds and self.grid_type == "sparse" and not self._sparse_rebuildable
             )
 
-            if self.gimp:
-                particle_locations = self._particle_grid_locations_gimp(
-                    domain, positions, self._mpm_model.particle_radius, self._particle_environment
-                )
-                pic = fem.PicQuadrature(
-                    domain=domain,
-                    positions=particle_locations,
-                    measures=self._mpm_model.particle_volume,
-                    temporary_store=self.temporary_store,
-                    use_domain_element_indices=use_domain_element_indices,
-                )
-            else:
-                pic = fem.PicQuadrature(
-                    domain=domain,
-                    positions=positions,
-                    env_indices=self._particle_environment,
-                    measures=self._mpm_model.particle_volume,
-                    temporary_store=self.temporary_store,
-                    use_domain_element_indices=use_domain_element_indices,
-                )
+            pic = particle_quadrature.make_quadrature(
+                domain,
+                positions,
+                self._mpm_model,
+                self._particle_environment,
+                gimp=self.gimp,
+                separate_worlds=self._separate_worlds,
+                temporary_store=self.temporary_store,
+                use_domain_element_indices=use_domain_element_indices,
+            )
 
         return pic
-
-    def _particle_grid_locations_gimp(
-        self,
-        domain: fem.GeometryDomain,
-        positions: wp.array,
-        radii: wp.array,
-        particle_environment: wp.array | None,
-    ) -> wp.array:
-        """Convert particle positions to grid locations."""
-
-        cell_lookup = domain.element_partition_lookup
-        cell_closest_point = domain.element_closest_point
-
-        @wp.func
-        def add_cell(
-            particle_cell_indices: wp.array[fem.ElementIndex],
-            particle_cell_coords: wp.array[fem.Coords],
-            particle_cell_fractions: wp.array[float],
-            cell_index: int,
-            cell_coords: fem.Coords,
-            cell_weight: float,
-        ):
-            for i in range(8):
-                if particle_cell_indices[i] == fem.NULL_NODE_INDEX:
-                    particle_cell_indices[i] = cell_index
-                    particle_cell_coords[i] = cell_coords
-                    particle_cell_fractions[i] = cell_weight
-                    return
-
-                if particle_cell_indices[i] == cell_index:
-                    particle_cell_fractions[i] += cell_weight
-                    return
-
-        separate_worlds = self._separate_worlds
-
-        @fem.cache.dynamic_kernel(suffix=f"{domain.name}_{'isolated' if separate_worlds else 'shared'}")
-        def particle_locations_gimp(
-            cell_arg_value: domain.ElementArg,
-            domain_index_arg_value: domain.ElementIndexArg,
-            positions: wp.array[wp.vec3],
-            radii: wp.array[float],
-            particle_environment: wp.array[int],
-            cell_index: wp.array2d[fem.ElementIndex],
-            cell_coords: wp.array2d[fem.Coords],
-            cell_fractions: wp.array2d[float],
-        ):
-            p = wp.tid()
-            domain_arg = domain.DomainArg(cell_arg_value, domain_index_arg_value)
-
-            center = positions[p]
-            radius = radii[p]
-
-            tot_weight = float(0.0)
-
-            # Find cell containing each corner of the particle,
-            # merging repeated cell indices
-            for vtx in range(8):
-                i = (vtx & 4) >> 2
-                j = (vtx & 2) >> 1
-                k = vtx & 1
-
-                pos = center - wp.vec3(radius) + 2.0 * radius * wp.vec3(float(i), float(j), float(k))
-                if wp.static(separate_worlds):
-                    sample = cell_lookup(domain_arg, pos, int(particle_environment[p]))
-                else:
-                    sample = cell_lookup(domain_arg, pos)
-
-                if sample.element_index == fem.NULL_ELEMENT_INDEX:
-                    continue
-
-                elem_index = domain.element_partition_index(domain_index_arg_value, sample.element_index)
-                cell_weight = wp.min(wp.min(sample.element_coords), 1.0 - wp.max(sample.element_coords))
-
-                if cell_weight > 0.0:
-                    tot_weight += cell_weight
-                    cell_center_coords, _ = cell_closest_point(cell_arg_value, sample.element_index, center)
-                    add_cell(
-                        cell_index[p],
-                        cell_coords[p],
-                        cell_fractions[p],
-                        elem_index,
-                        cell_center_coords,
-                        cell_weight,
-                    )
-
-            # Normalize the weights over the cells
-            for vtx in range(8):
-                if cell_index[p, vtx] != fem.NULL_NODE_INDEX:
-                    cell_fractions[p, vtx] /= tot_weight
-
-        device = positions.device
-
-        cell_indices = fem.borrow_temporary(self.temporary_store, shape=(positions.shape[0], 8), dtype=fem.ElementIndex)
-        cell_coords = fem.borrow_temporary(self.temporary_store, shape=(positions.shape[0], 8), dtype=fem.Coords)
-        cell_fractions = fem.borrow_temporary(self.temporary_store, shape=(positions.shape[0], 8), dtype=float)
-
-        cell_indices.fill_(fem.NULL_NODE_INDEX)
-
-        wp.launch(
-            particle_locations_gimp,
-            dim=positions.shape[0],
-            inputs=[
-                domain.element_arg_value(device=device),
-                domain.element_index_arg_value(device=device),
-                positions,
-                radii,
-                particle_environment,
-                cell_indices,
-                cell_coords,
-                cell_fractions,
-            ],
-            device=device,
-        )
-
-        return cell_indices, cell_coords, cell_fractions
 
     def _step_impl(
         self,
@@ -2903,6 +3070,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
         self._require_collision_space_fields(scratch, last_step_data)
         self._require_velocity_space_fields(scratch, mpm_model.has_compliant_particles)
+
+        if self._cell_quadrature is not None:
+            self._prepare_cell_quadrature(state_in, dt, pic)
 
         # Rasterize colliders to discrete space
         self._rasterize_colliders(state_in, dt, last_step_data, scratch, inv_cell_volume)
@@ -2949,18 +3119,35 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         model = self.model
         mpm_model = self._mpm_model
 
+        if self._cell_two_hop_transfers:
+            # Mass and momentum reach the nodes through the fixed cell points
+            cell_quadrature = self._cell_transfer_quadrature
+            transfer_quadrature = cell_quadrature.transfer_quadrature
+            velocities = cell_quadrature.point_velocity
+            velocity_gradients = cell_quadrature.point_velocity_gradient
+            transfer_world = cell_quadrature.point_world
+            transfer_density = cell_quadrature.point_density
+            transfer_flags = cell_quadrature.point_transfer_flags
+        else:
+            transfer_quadrature = pic
+            velocities = state_in.particle_qd
+            velocity_gradients = state_in.mpm.particle_qd_grad
+            transfer_world = model.particle_world
+            transfer_density = mpm_model.particle_density
+            transfer_flags = mpm_model.particle_flags
+
         with self._timer("Unconstrained velocity"):
             velocity_int = fem.integrate(
                 integrate_velocity,
-                quadrature=pic,
+                quadrature=transfer_quadrature,
                 fields={"u": scratch.velocity_test},
                 values={
-                    "velocities": state_in.particle_qd,
-                    "dt": dt,
+                    "velocities": velocities,
+                    "dt": 0.0 if self._cell_two_hop_transfers else dt,
                     "gravity": model.gravity,
-                    "particle_world": model.particle_world,
-                    "particle_density": mpm_model.particle_density,
-                    "particle_flags": mpm_model.particle_flags,
+                    "particle_world": transfer_world,
+                    "particle_density": transfer_density,
+                    "particle_flags": transfer_flags,
                     "inv_cell_volume": inv_cell_volume,
                 },
                 output_dtype=wp.vec3,
@@ -2970,12 +3157,12 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             if self.apic:
                 fem.integrate(
                     integrate_velocity_apic,
-                    quadrature=pic,
+                    quadrature=transfer_quadrature,
                     fields={"u": scratch.velocity_test},
                     values={
-                        "velocity_gradients": state_in.mpm.particle_qd_grad,
-                        "particle_density": mpm_model.particle_density,
-                        "particle_flags": mpm_model.particle_flags,
+                        "velocity_gradients": velocity_gradients,
+                        "particle_density": transfer_density,
+                        "particle_flags": transfer_flags,
                         "inv_cell_volume": inv_cell_volume,
                     },
                     output=velocity_int,
@@ -2985,12 +3172,12 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
             node_particle_mass = fem.integrate(
                 integrate_mass,
-                quadrature=pic,
+                quadrature=transfer_quadrature,
                 fields={"phi": scratch.fraction_test},
                 values={
                     "inv_cell_volume": inv_cell_volume,
-                    "particle_density": mpm_model.particle_density,
-                    "particle_flags": mpm_model.particle_flags,
+                    "particle_density": transfer_density,
+                    "particle_flags": transfer_flags,
                 },
                 output_dtype=float,
                 temporary_store=self.temporary_store,
@@ -3025,6 +3212,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         vel_node_count = scratch.velocity_node_count
 
         with self._timer("Rasterize collider"):
+            self._mpm_model.collider.query_max_dist = max(
+                self._mpm_model.collider.query_max_dist, self.collider_contact_gap
+            )
             # volume associated to each collider node
             fem.integrate(
                 integrate_fraction,
@@ -3054,6 +3244,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 scratch.collider_ids,
                 temporary_store=self.temporary_store,
                 node_environment_offsets=scratch.collider_environment_offsets,
+                contact_gap=self.collider_contact_gap,
             )
 
             # normal interpolation
@@ -3065,8 +3256,32 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                     temporary_store=self.temporary_store,
                 )
 
+            if self.collider_stabilization_fraction > 0.0 or self.collider_contact_gap > 0.0:
+                wp.launch(
+                    stabilize_collider_velocity,
+                    dim=collider_node_count,
+                    inputs=[
+                        dt,
+                        self.collider_stabilization_fraction,
+                        scratch.collider_distance_field.dof_values,
+                        scratch.collider_normal_field.dof_values,
+                        scratch.collider_velocity,
+                    ],
+                )
+
             # Subgrid collisions
-            if self.collider_basis != self.velocity_basis:
+            if self._cell_two_hop_transfers and isinstance(
+                scratch.collider_fraction_test.space.basis, fem.PointBasisSpace
+            ):
+                self._cell_transfer_quadrature.build_collider_matrix(
+                    scratch.collider_matrix,
+                    collider_partition=scratch.collider_fraction_test.space_restriction.space_partition,
+                    velocity_trial=scratch.fraction_trial,
+                    velocity_node_count=vel_node_count,
+                    collider_normals=scratch.collider_normal_field.dof_values,
+                    temporary_store=self.temporary_store,
+                )
+            elif self.collider_basis != self.velocity_basis:
                 #  Map from collider nodes to velocity nodes
                 wps.bsr_set_zero(
                     scratch.collider_matrix, rows_of_blocks=collider_node_count, cols_of_blocks=vel_node_count
@@ -3119,81 +3334,39 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         scratch: ImplicitMPMScratchpad,
         inv_cell_volume: float,
     ):
-        """Build the elasticity and compliance system."""
-
+        """Assemble elasticity from the material data supplied by the selected quadrature."""
         mpm_model = self._mpm_model
-
         if not mpm_model.has_compliant_particles:
             scratch.elastic_strain_delta_field.dof_values.zero_()
             return
 
         with self._timer("Elasticity"):
-            node_particle_volume = fem.integrate(
-                integrate_active_fraction,
-                quadrature=pic,
-                fields={"phi": scratch.fraction_test},
-                values={
-                    "inv_cell_volume": inv_cell_volume,
-                    "particle_flags": mpm_model.material_particle_flags,
-                },
-                output_dtype=float,
-                temporary_store=self.temporary_store,
-            )
-
-            elastic_parameters_int = fem.integrate(
-                integrate_elastic_parameters,
-                quadrature=pic,
-                fields={"u": scratch.velocity_test},
-                values={
-                    "material_parameters": mpm_model.material_parameters,
-                    "particle_flags": mpm_model.material_particle_flags,
-                    "inv_cell_volume": inv_cell_volume,
-                },
-                output_dtype=wp.vec3,
-                temporary_store=self.temporary_store,
-            )
-
-            wp.launch(
-                average_elastic_parameters,
-                dim=scratch.elastic_parameters_field.space_partition.node_count(),
-                inputs=[
-                    elastic_parameters_int,
-                    node_particle_volume,
-                    scratch.elastic_parameters_field.dof_values,
-                ],
-            )
-
+            if self._cell_quadrature is not None:
+                inputs = self._cell_quadrature.elasticity_inputs(dt, inv_cell_volume)
+            else:
+                inputs = particle_quadrature.elasticity_inputs(
+                    pic,
+                    state_in.mpm.particle_elastic_strain,
+                    mpm_model,
+                    dt,
+                    scratch,
+                    inv_cell_volume,
+                    self.temporary_store,
+                )
+            fields = {"tau": scratch.sym_strain_test, **inputs.fields}
             fem.integrate(
-                strain_rhs,
-                quadrature=pic,
-                fields={
-                    "tau": scratch.sym_strain_test,
-                    "elastic_parameters": scratch.elastic_parameters_field,
-                },
-                values={
-                    "elastic_strains": state_in.mpm.particle_elastic_strain,
-                    "particle_flags": mpm_model.material_particle_flags,
-                    "inv_cell_volume": inv_cell_volume,
-                    "dt": dt,
-                },
-                temporary_store=self.temporary_store,
+                inputs.strain_rhs,
+                quadrature=inputs.quadrature,
+                fields=fields,
+                values=inputs.values,
                 output=scratch.elastic_strain_delta_field.dof_values,
+                temporary_store=self.temporary_store,
             )
-
             fem.integrate(
-                compliance_form,
-                quadrature=pic,
-                fields={
-                    "tau": scratch.sym_strain_test,
-                    "sig": scratch.sym_strain_trial,
-                    "elastic_parameters": scratch.elastic_parameters_field,
-                },
-                values={
-                    "elastic_strains": state_in.mpm.particle_elastic_strain,
-                    "particle_flags": mpm_model.material_particle_flags,
-                    "inv_cell_volume": inv_cell_volume,
-                    "dt": dt,
-                },
+                inputs.compliance,
+                quadrature=inputs.quadrature,
+                fields={**fields, "sig": scratch.sym_strain_trial},
+                values=inputs.values if inputs.compliance_values is None else inputs.compliance_values,
                 output=scratch.compliance_matrix,
                 temporary_store=self.temporary_store,
             )
@@ -3207,39 +3380,38 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         inv_cell_volume: float,
     ):
         mpm_model = self._mpm_model
+        strain_quadrature, strain_point_flags = self._strain_quadrature(pic)
 
         with self._timer("Interpolated yield parameters"):
+            if self._cell_quadrature is not None:
+                yield_form, yield_values = self._cell_quadrature.yield_parameters_inputs(inv_cell_volume)
+            else:
+                yield_form, yield_values = particle_quadrature.yield_parameters_inputs(
+                    state_in.mpm.particle_Jp, mpm_model, dt, inv_cell_volume
+                )
             fem.integrate(
-                integrate_yield_parameters,
-                quadrature=pic,
-                fields={
-                    "u": scratch.strain_yield_parameters_test,
-                },
-                values={
-                    "particle_Jp": state_in.mpm.particle_Jp,
-                    "material_parameters": mpm_model.material_parameters,
-                    "particle_flags": mpm_model.material_particle_flags,
-                    "inv_cell_volume": inv_cell_volume,
-                    "dt": dt,
-                },
+                yield_form,
+                quadrature=strain_quadrature,
+                fields={"u": scratch.strain_yield_parameters_test},
+                values=yield_values,
                 output=scratch.strain_yield_parameters_field.dof_values,
                 temporary_store=self.temporary_store,
             )
 
             fem.integrate(
                 integrate_active_fraction,
-                quadrature=pic,
+                quadrature=strain_quadrature,
                 fields={"phi": scratch.divergence_test},
                 values={
                     "inv_cell_volume": inv_cell_volume,
-                    "particle_flags": mpm_model.material_particle_flags,
+                    "particle_flags": strain_point_flags,
                 },
                 output=scratch.strain_node_particle_volume,
                 temporary_store=self.temporary_store,
             )
 
-        # Void fraction (unilateral incompressibility offset)
-        if mpm_model.critical_fraction > 0.0:
+        # Both offsets use the existing particle and available-volume estimates.
+        if mpm_model.critical_fraction > 0.0 or self.density_strain_fraction > 0.0:
             with self._timer("Unilateral offset"):
                 fem.integrate(
                     integrate_fraction,
@@ -3277,25 +3449,56 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                         temporary_store=self.temporary_store,
                     )
 
-                wp.launch(
-                    compute_unilateral_strain_offset,
-                    dim=scratch.strain_node_count,
-                    inputs=[
-                        mpm_model.critical_fraction,
-                        scratch.strain_node_particle_volume,
-                        scratch.strain_node_collider_volume,
-                        scratch.strain_node_volume,
-                        scratch.unilateral_strain_offset,
-                    ],
-                )
+        if mpm_model.critical_fraction > 0.0:
+            wp.launch(
+                compute_unilateral_strain_offset,
+                dim=scratch.strain_node_count,
+                inputs=[
+                    mpm_model.critical_fraction,
+                    scratch.strain_node_particle_volume,
+                    scratch.strain_node_collider_volume,
+                    scratch.strain_node_volume,
+                    scratch.unilateral_strain_offset,
+                ],
+            )
         else:
             scratch.unilateral_strain_offset.zero_()
+
+        if self.density_strain_fraction > 0.0:
+            wp.launch(
+                compute_density_strain_offset,
+                dim=scratch.strain_node_count,
+                inputs=[
+                    self.density_strain_fraction,
+                    scratch.strain_node_particle_volume,
+                    scratch.strain_node_collider_volume,
+                    scratch.strain_node_volume,
+                    scratch.unilateral_strain_offset,
+                ],
+            )
+
+        if self.residual_strain_fraction > 0.0:
+            with self._timer("Residual strain offset"):
+                fem.integrate(
+                    residual_strain_offset,
+                    quadrature=pic,
+                    fields={"tau": scratch.divergence_test},
+                    values={
+                        "residual_deformation_gradient": state_in.mpm.particle_residual_deformation_gradient,
+                        "particle_flags": mpm_model.material_particle_flags,
+                        "fraction": self.residual_strain_fraction,
+                        "inv_cell_volume": inv_cell_volume,
+                    },
+                    output=scratch.unilateral_strain_offset,
+                    add=True,
+                    temporary_store=self.temporary_store,
+                )
 
         # Strain jacobian
         with self._timer("Strain matrix"):
             fem.integrate(
                 strain_delta_form,
-                quadrature=pic,
+                quadrature=strain_quadrature,
                 fields={
                     "u": scratch.velocity_trial,
                     "tau": scratch.divergence_test,
@@ -3303,7 +3506,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 values={
                     "dt": dt,
                     "inv_cell_volume": inv_cell_volume,
-                    "particle_flags": mpm_model.material_particle_flags,
+                    "particle_flags": strain_point_flags,
                 },
                 output_dtype=float,
                 output=scratch.strain_matrix,
@@ -3325,14 +3528,15 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             M_diag.assign(self._mpm_model.material_particle_volume * inv_cell_volume)
             return None, None
 
-        # build mass matrix of PIC integration
+        # Build the strain mass matrix with the selected quadrature.
+        strain_quadrature, strain_point_flags = self._strain_quadrature(pic)
         M = fem.integrate(
             mass_form,
-            quadrature=pic,
+            quadrature=strain_quadrature,
             fields={"p": scratch.divergence_test, "q": scratch.divergence_trial},
             values={
                 "inv_cell_volume": inv_cell_volume,
-                "particle_flags": self._mpm_model.material_particle_flags,
+                "particle_flags": strain_point_flags,
             },
             output_dtype=float,
         )
@@ -3350,6 +3554,23 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         M_diag = scratch.strain_node_particle_volume.reshape((-1, nodes_per_elt))
         rotated_volume = wp.empty_like(M_diag)
 
+        # A positive-mass mode can have an unresolved mean under symmetric
+        # quadrature. Bound cancellation before normalizing material moments.
+        zero_mean_tolerance = 1.0e-3
+        self._element_yield_parameters = None
+        if nodes_per_elt > 1:
+            self._element_yield_parameters = wp.empty(M_elt_wise.nrow, dtype=YieldParamVec)
+            wp.launch(
+                average_element_yield_parameters,
+                dim=M_elt_wise.nrow,
+                inputs=[
+                    nodes_per_elt,
+                    scratch.strain_node_particle_volume,
+                    scratch.strain_yield_parameters_field.dof_values,
+                    self._element_yield_parameters,
+                ],
+            )
+
         wp.launch(
             compute_eigenvalues,
             dim=M_elt_wise.nrow,
@@ -3359,6 +3580,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 M_values,
                 M_diag,
                 scratch.strain_yield_parameters_field.dof_values,
+                zero_mean_tolerance,
             ],
             outputs=[
                 M_diag,
@@ -3423,14 +3645,26 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 inputs=[M_diag, scratch.stress_field.dof_values],
             )
 
-        # Yield parameters are integrated, scale with inverse rotated volume
-        # to correctly recover uniform parameters after eigenbasis rotation
+        # Material moments divided by a vanishing mean are ill-conditioned;
+        # use the element's material average for those modes instead.
         yield_volume = rotated_volume if rotated_volume is not None else M_diag
-        wp.launch(
-            inverse_scale_vector,
-            dim=node_count,
-            inputs=[yield_volume, scratch.strain_yield_parameters_field.dof_values],
-        )
+        if self._element_yield_parameters is not None:
+            wp.launch(
+                normalize_strain_yield_parameters,
+                dim=node_count,
+                inputs=[
+                    M_ev.shape[1],
+                    yield_volume,
+                    self._element_yield_parameters,
+                    scratch.strain_yield_parameters_field.dof_values,
+                ],
+            )
+        else:
+            wp.launch(
+                inverse_scale_vector,
+                dim=node_count,
+                inputs=[yield_volume, scratch.strain_yield_parameters_field.dof_values],
+            )
 
     def _unapply_strain_eigenbasis(
         self,
@@ -3441,13 +3675,19 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
         # Un-integrate strains by scaling with inverse node volume
         M_diag = scratch.strain_node_particle_volume
-        if self._mpm_model.has_compliant_particles:
+        if self._mpm_model.has_compliant_particles or self.residual_strain_tracking:
             wp.launch(
                 inverse_scale_sym_tensor,
                 dim=node_count,
                 inputs=[M_diag, scratch.elastic_strain_delta_field.dof_values],
             )
-        if self._mpm_model.has_hardening:
+        # Cell kinematics subtracts the plastic increment from the velocity
+        # gradient even when the material has no hardening.
+        if (
+            self._mpm_model.has_hardening
+            or self.residual_strain_tracking
+            or (self._cell_kinematic_update and self._mpm_model.has_compliant_particles)
+        ):
             wp.launch(
                 inverse_scale_sym_tensor,
                 dim=node_count,
@@ -3544,76 +3784,72 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         pic: fem.PicQuadrature,
         scratch: ImplicitMPMScratchpad,
     ):
-        """Update particle quantities (strains, velocities, ...) from grid fields an advect them."""
-
+        """Update particle history and advect through the selected quadrature."""
         model = self.model
         mpm_model = self._mpm_model
+        track_residual_strain = self.residual_strain_tracking
+        if state_in is not state_out and not track_residual_strain:
+            wp.copy(
+                state_out.mpm.particle_residual_deformation_gradient,
+                state_in.mpm.particle_residual_deformation_gradient,
+            )
 
-        has_compliant_particles = mpm_model.min_young_modulus < INFINITY
-        has_hardening = mpm_model.max_hardening > 0.0
-
-        if self._stress_warmstart == "particles" or has_compliant_particles or has_hardening:
+        if (
+            self._stress_warmstart == "particles"
+            or mpm_model.has_compliant_particles
+            or mpm_model.has_hardening
+            or track_residual_strain
+        ):
             with self._timer("Particle strain update"):
-                # Update particle elastic strain from grid strain delta
-
-                if state_in is state_out:
-                    elastic_strain_prev = wp.clone(state_in.mpm.particle_elastic_strain)
-                    particle_Jp_prev = wp.clone(state_in.mpm.particle_Jp)
+                history_inputs = {
+                    "grid_vel": scratch.velocity_field,
+                    "elastic_strain_delta": scratch.elastic_strain_delta_field,
+                    "plastic_strain_delta": scratch.plastic_strain_delta_field,
+                    "stress": scratch.stress_field,
+                    "particle_flags": mpm_model.material_particle_flags,
+                    "particle_density": mpm_model.particle_density,
+                    "material_parameters": mpm_model.material_parameters,
+                    "elastic_strain_prev": state_in.mpm.particle_elastic_strain,
+                    "particle_Jp_prev": state_in.mpm.particle_Jp,
+                    "elastic_strain": state_out.mpm.particle_elastic_strain,
+                    "particle_Jp": state_out.mpm.particle_Jp,
+                    "particle_stress": state_out.mpm.particle_stress,
+                    "temporary_store": self.temporary_store,
+                }
+                if self._cell_quadrature is not None:
+                    self._cell_quadrature.update_particles(
+                        dt, kinematic_update=self._cell_kinematic_update, **history_inputs
+                    )
                 else:
-                    elastic_strain_prev = state_in.mpm.particle_elastic_strain
-                    particle_Jp_prev = state_in.mpm.particle_Jp
+                    particle_quadrature.update_particles(
+                        dt,
+                        pic=pic,
+                        particle_volume=mpm_model.material_particle_volume,
+                        residual_strain_tracking=track_residual_strain,
+                        residual_deformation_gradient_prev=state_in.mpm.particle_residual_deformation_gradient,
+                        residual_deformation_gradient=state_out.mpm.particle_residual_deformation_gradient,
+                        **history_inputs,
+                    )
 
-                state_out.mpm.particle_Jp.zero_()
-                state_out.mpm.particle_stress.zero_()
-                state_out.mpm.particle_elastic_strain.zero_()
-
-                fem.interpolate(
-                    update_particle_strains,
-                    at=pic,
-                    values={
-                        "dt": dt,
-                        "particle_flags": mpm_model.material_particle_flags,
-                        "particle_density": mpm_model.particle_density,
-                        "particle_volume": mpm_model.material_particle_volume,
-                        "elastic_strain_prev": elastic_strain_prev,
-                        "elastic_strain": state_out.mpm.particle_elastic_strain,
-                        "particle_stress": state_out.mpm.particle_stress,
-                        "particle_Jp_prev": particle_Jp_prev,
-                        "particle_Jp": state_out.mpm.particle_Jp,
-                        "material_parameters": mpm_model.material_parameters,
-                    },
-                    fields={
-                        "grid_vel": scratch.velocity_field,
-                        "plastic_strain_delta": scratch.plastic_strain_delta_field,
-                        "elastic_strain_delta": scratch.elastic_strain_delta_field,
-                        "stress": scratch.stress_field,
-                    },
-                    temporary_store=self.temporary_store,
-                )
-
-        # (A)PIC advection
         with self._timer("Advection"):
             state_out.particle_qd.zero_()
             state_out.mpm.particle_qd_grad.zero_()
             state_out.particle_q.assign(state_in.particle_q)
-
-            fem.interpolate(
-                advect_particles,
-                at=pic,
-                values={
-                    "particle_flags": mpm_model.particle_flags,
-                    "particle_volume": mpm_model.particle_volume,
-                    "pos": state_out.particle_q,
-                    "vel": state_out.particle_qd,
-                    "vel_grad": state_out.mpm.particle_qd_grad,
-                    "dt": dt,
-                    "max_vel": model.particle_max_velocity,
-                },
-                fields={
-                    "grid_vel": scratch.velocity_field,
-                },
-                temporary_store=self.temporary_store,
-            )
+            advection_inputs = {
+                "max_vel": model.particle_max_velocity,
+                "grid_vel": scratch.velocity_field,
+                "particle_flags": mpm_model.particle_flags,
+                "pos": state_out.particle_q,
+                "vel": state_out.particle_qd,
+                "vel_grad": state_out.mpm.particle_qd_grad,
+                "temporary_store": self.temporary_store,
+            }
+            if self._cell_two_hop_transfers:
+                self._cell_transfer_quadrature.advect_particles(dt, **advection_inputs)
+            else:
+                particle_quadrature.advect_particles(
+                    dt, pic=pic, particle_volume=mpm_model.particle_volume, **advection_inputs
+                )
 
     def _save_data(
         self,
@@ -3666,15 +3902,18 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             self._warmstart_fields(last_step_data, scratch, pic)
 
             if self._stress_warmstart == "particles":
+                strain_quadrature, strain_point_flags = self._strain_quadrature(pic)
                 fem.integrate(
                     integrate_particle_stress,
-                    quadrature=pic,
+                    quadrature=strain_quadrature,
                     fields={
                         "tau": scratch.sym_strain_test,
                     },
                     values={
-                        "particle_stress": state_in.mpm.particle_stress,
-                        "particle_flags": self._mpm_model.material_particle_flags,
+                        "particle_stress": state_in.mpm.particle_stress
+                        if self._cell_quadrature is None
+                        else self._cell_quadrature.point_stress,
+                        "particle_flags": strain_point_flags,
                         "inv_cell_volume": inv_cell_volume,
                     },
                     output=scratch.stress_field.dof_values,

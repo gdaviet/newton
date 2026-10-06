@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -13,34 +14,10 @@ from warp.types import type_size
 import newton
 
 from ...core.reset import reset_world_selected
-from .implicit_mpm_model import MaterialParameters
-from .rheology_solver_kernels import YieldParamVec, project_stress
+from .material_kernels import EPSILON, INFINITY
+from .rheology_solver_kernels import YieldParamVec
 
 wp.set_module_options({"enable_backward": False})
-
-USE_HENCKY_STRAIN_MEASURE = wp.constant(True)
-"""Use Hencky instead of co-rotated elastic model (replaces (S - I) with log S in Hooke's law)"""
-
-MIN_PRINCIPAL_STRAIN = wp.constant(1.0e-6 if USE_HENCKY_STRAIN_MEASURE else 1.0e-2)
-"""Minimum elastic strain for the elastic model (singular value of the elastic deformation gradient)"""
-
-MAX_PRINCIPAL_STRAIN = wp.constant(1.0e6 if USE_HENCKY_STRAIN_MEASURE else 1.0e2)
-"""Maximum elastic strain for the elastic model (singular value of the elastic deformation gradient)"""
-
-MIN_HARDENING_JP = wp.constant(0.1)
-"""Minimum plastic compression ratio for the hardening law (determinant of the plastic deformation gradient)"""
-
-MIN_JP_DELTA = wp.constant(0.01)
-"""Minimum delta for the plastic deformation gradient"""
-
-MAX_JP_DELTA = wp.constant(10.0)
-"""Maximum delta for the plastic deformation gradient"""
-
-INFINITY = wp.constant(1.0e12)
-"""Value above which quantities are considered infinite"""
-
-EPSILON = wp.constant(1.0 / INFINITY)
-"""Value below which quantities are considered zero"""
 
 _QR_TOLERANCE = wp.constant(1.0e-12)
 """Convergence tolerance for the QR eigenvalue decomposition"""
@@ -60,6 +37,18 @@ mat31 = wp.types.matrix(shape=(3, 1), dtype=wp.float32)
 mat11 = wp.types.matrix(shape=(1, 1), dtype=wp.float32)
 
 YIELD_PARAM_LENGTH = type_size(YieldParamVec)
+
+
+@dataclass
+class ElasticityInputs:
+    """Bind quadrature-specific material data to the shared elastic assembly."""
+
+    quadrature: fem.Quadrature
+    strain_rhs: fem.Integrand
+    compliance: fem.Integrand
+    fields: dict[str, fem.Field]
+    values: dict[str, Any]
+    compliance_values: dict[str, Any] | None = None
 
 
 @fem.integrand
@@ -206,91 +195,6 @@ def free_velocity(
     velocity_avg[i] = vel
 
 
-@wp.func
-def hardening_law(Jp: float, hardening: float):
-    if hardening == 0.0:
-        return 1.0
-
-    eps = wp.log(wp.clamp(Jp, MIN_HARDENING_JP, 1.0))
-    h = wp.sinh(-hardening * eps)
-
-    return h
-
-
-@wp.func
-def get_elastic_parameters(
-    i: int,
-    material_parameters: MaterialParameters,
-):
-    # Hardening only affects yield parameters, not elastic stiffness.
-    # This separates the elastic response from the plastic history.
-    E = material_parameters.young_modulus[i]
-    nu = material_parameters.poisson_ratio[i]
-    d = material_parameters.damping[i]
-
-    return wp.vec3(E, nu, d)
-
-
-@wp.func
-def extract_elastic_parameters(
-    params_vec: wp.vec3,
-):
-    compliance = 1.0 / params_vec[0]
-    poisson = params_vec[1]
-    damping = params_vec[2]
-    return compliance, poisson, damping
-
-
-@wp.func
-def get_yield_parameters(i: int, material_parameters: MaterialParameters, particle_Jp: float, dt: float):
-    h = hardening_law(particle_Jp, material_parameters.hardening[i])
-
-    mu = material_parameters.friction[i]
-
-    return YieldParamVec.from_values(
-        mu,
-        material_parameters.yield_pressure[i] * h,
-        material_parameters.tensile_yield_ratio[i],
-        material_parameters.yield_stress[i] * h,
-        material_parameters.dilatancy[i],
-        material_parameters.viscosity[i] / dt,
-    )
-
-
-@fem.integrand
-def integrate_elastic_parameters(
-    s: fem.Sample,
-    u: fem.Field,
-    inv_cell_volume: float,
-    material_parameters: MaterialParameters,
-    particle_flags: wp.array[wp.int32],
-):
-    if ~particle_flags[s.qp_index] & newton.ParticleFlags.ACTIVE:
-        return 0.0
-
-    i = s.qp_index
-    params_vec = get_elastic_parameters(i, material_parameters)
-    return wp.dot(u(s), params_vec) * inv_cell_volume
-
-
-@fem.integrand
-def integrate_yield_parameters(
-    s: fem.Sample,
-    u: fem.Field,
-    inv_cell_volume: float,
-    material_parameters: MaterialParameters,
-    particle_Jp: wp.array[float],
-    dt: float,
-    particle_flags: wp.array[wp.int32],
-):
-    if ~particle_flags[s.qp_index] & newton.ParticleFlags.ACTIVE:
-        return 0.0
-
-    i = s.qp_index
-    params_vec = get_yield_parameters(i, material_parameters, particle_Jp[i], dt)
-    return wp.dot(u(s), params_vec) * inv_cell_volume
-
-
 @fem.integrand
 def integrate_particle_stress(
     s: fem.Sample,
@@ -319,126 +223,40 @@ def average_yield_parameters(
 
 
 @wp.kernel
-def average_elastic_parameters(
-    elastic_parameters_int: wp.array[wp.vec3],
-    particle_volume: wp.array[float],
-    elastic_parameters_avg: wp.array[wp.vec3],
+def average_element_yield_parameters(
+    nodes_per_element: int,
+    node_volume: wp.array[float],
+    node_yield_parameters: wp.array[YieldParamVec],
+    element_yield_parameters: wp.array[YieldParamVec],
 ):
-    i = wp.tid()
-    pvol = particle_volume[i]
-    elastic_parameters_avg[i] = elastic_parameters_int[i] / wp.max(pvol, EPSILON)
+    """Volume-average integrated strain-node yield parameters over each element."""
+    element = wp.tid()
+    volume = float(0.0)
+    yield_parameters = YieldParamVec(0.0)
+    for j in range(nodes_per_element):
+        node = element * nodes_per_element + j
+        volume += node_volume[node]
+        yield_parameters += node_yield_parameters[node]
+    if volume > 0.0:
+        element_yield_parameters[element] = wp.max(YieldParamVec(0.0), yield_parameters / volume)
+    else:
+        element_yield_parameters[element] = YieldParamVec(0.0)
 
 
-@fem.integrand
-def advect_particles(
-    s: fem.Sample,
-    domain: fem.Domain,
-    grid_vel: fem.Field,
-    dt: float,
-    max_vel: float,
-    particle_flags: wp.array[wp.int32],
-    particle_volume: wp.array[float],
-    pos: wp.array[wp.vec3],
-    vel: wp.array[wp.vec3],
-    vel_grad: wp.array[wp.mat33],
+@wp.kernel
+def normalize_strain_yield_parameters(
+    nodes_per_element: int,
+    rotated_volume: wp.array[float],
+    element_yield_parameters: wp.array[YieldParamVec],
+    node_yield_parameters: wp.array[YieldParamVec],
 ):
-    if ~particle_flags[s.qp_index] & newton.ParticleFlags.ACTIVE:
-        return
-
-    p_vel = grid_vel(s)
-    vel_n_sq = wp.length_sq(p_vel)
-
-    p_vel_cfl = wp.where(vel_n_sq > max_vel * max_vel, p_vel * max_vel / wp.sqrt(vel_n_sq), p_vel)
-
-    p_vel_grad = fem.grad(grid_vel, s)
-
-    delta_pos = dt * p_vel_cfl
-
-    gimp_weight = s.qp_weight * fem.measure(domain, s) / particle_volume[s.qp_index]
-    wp.atomic_add(pos, s.qp_index, gimp_weight * delta_pos)
-    wp.atomic_add(vel, s.qp_index, gimp_weight * p_vel_cfl)
-    wp.atomic_add(vel_grad, s.qp_index, gimp_weight * p_vel_grad)
-
-
-@fem.integrand
-def update_particle_strains(
-    s: fem.Sample,
-    domain: fem.Domain,
-    grid_vel: fem.Field,
-    plastic_strain_delta: fem.Field,
-    elastic_strain_delta: fem.Field,
-    stress: fem.Field,
-    dt: float,
-    particle_flags: wp.array[wp.int32],
-    particle_density: wp.array[float],
-    particle_volume: wp.array[float],
-    material_parameters: MaterialParameters,
-    elastic_strain_prev: wp.array[wp.mat33],
-    particle_Jp_prev: wp.array[float],
-    elastic_strain: wp.array[wp.mat33],
-    particle_Jp: wp.array[float],
-    particle_stress: wp.array[wp.mat33],
-):
-    if ~particle_flags[s.qp_index] & newton.ParticleFlags.ACTIVE:
-        elastic_strain[s.qp_index] = elastic_strain_prev[s.qp_index]
-        particle_Jp[s.qp_index] = particle_Jp_prev[s.qp_index]
-        return
-    if particle_density[s.qp_index] == 0.0:
-        elastic_strain[s.qp_index] = elastic_strain_prev[s.qp_index]
-        particle_Jp[s.qp_index] = particle_Jp_prev[s.qp_index]
-        return
-
-    # plastic strain
-    p_strain_delta = plastic_strain_delta(s)
-    p_rate = wp.trace(p_strain_delta)
-
-    delta_Jp = wp.exp(
-        p_rate
-        * wp.where(
-            p_rate < 0.0, material_parameters.hardening_rate[s.qp_index], material_parameters.softening_rate[s.qp_index]
-        )
-    )
-    particle_Jp_new = particle_Jp_prev[s.qp_index] * wp.clamp(delta_Jp, MIN_JP_DELTA, MAX_JP_DELTA)
-
-    elastic_parameters_vec = get_elastic_parameters(s.qp_index, material_parameters)
-    compliance, _poisson, _damping = extract_elastic_parameters(elastic_parameters_vec)
-
-    yield_parameters_vec = get_yield_parameters(s.qp_index, material_parameters, particle_Jp_new, dt)
-    stress_0 = fem.SymmetricTensorMapper.value_to_dof_3d(stress(s))
-    particle_stress_new = fem.SymmetricTensorMapper.dof_to_value_3d(project_stress(stress_0, yield_parameters_vec))
-
-    # elastic strain
-    prev_strain = elastic_strain_prev[s.qp_index]
-    vel_grad = fem.grad(grid_vel, s)
-    skew = 0.5 * dt * (vel_grad - wp.transpose(vel_grad))
-    strain_delta = elastic_strain_delta(s) + skew
-
-    # The skew-symmetric part of the velocity gradient is used as a linearized
-    # approximation of the finite rotation increment (matches standard deformation gradient update).
-    elastic_strain_new = prev_strain + strain_delta @ prev_strain
-    elastic_strain_new = project_particle_strain(elastic_strain_new, prev_strain, compliance)
-
-    gimp_weight = s.qp_weight * fem.measure(domain, s) / particle_volume[s.qp_index]
-    wp.atomic_add(particle_Jp, s.qp_index, gimp_weight * particle_Jp_new)
-    wp.atomic_add(particle_stress, s.qp_index, gimp_weight * particle_stress_new)
-    wp.atomic_add(elastic_strain, s.qp_index, gimp_weight * elastic_strain_new)
-
-
-@wp.func
-def project_particle_strain(
-    F: wp.mat33,
-    F_prev: wp.mat33,
-    compliance: float,
-):
-    if compliance <= EPSILON:
-        return wp.identity(n=3, dtype=float)
-
-    _U, xi, _V = wp.svd3(F)
-
-    if wp.min(xi) < MIN_PRINCIPAL_STRAIN or wp.max(xi) > MAX_PRINCIPAL_STRAIN:
-        return F_prev  # non-recoverable, discard update
-
-    return F
+    """Normalize material moments and use element averages for zero-mean strain modes."""
+    node = wp.tid()
+    volume = rotated_volume[node]
+    if volume == 0.0:
+        node_yield_parameters[node] = element_yield_parameters[node // nodes_per_element]
+    else:
+        node_yield_parameters[node] = node_yield_parameters[node] / volume
 
 
 @wp.kernel
@@ -504,75 +322,35 @@ def compute_unilateral_strain_offset(
     unilateral_strain_offset[i] = spherical_part
 
 
-@wp.func
-def stress_strain_relationship(sig: wp.mat33, compliance: float, poisson: float):
-    return (sig * (1.0 + poisson) - poisson * (wp.trace(sig) * wp.identity(n=3, dtype=float))) * compliance
+@wp.kernel
+def compute_density_strain_offset(
+    fraction: float,
+    particle_volume: wp.array[float],
+    collider_volume: wp.array[float],
+    node_volume: wp.array[float],
+    unilateral_strain_offset: wp.array[float],
+):
+    i = wp.tid()
+    # Preserve the overpacking error that the ordinary void allowance clamps away.
+    volume_error = node_volume[i] - collider_volume[i] - particle_volume[i]
+    unilateral_strain_offset[i] += fraction * volume_error
 
 
 @fem.integrand
-def strain_rhs(
+def residual_strain_offset(
     s: fem.Sample,
     tau: fem.Field,
-    elastic_parameters: fem.Field,
-    elastic_strains: wp.array[wp.mat33],
-    inv_cell_volume: float,
-    dt: float,
+    residual_deformation_gradient: wp.array[wp.mat33],
     particle_flags: wp.array[wp.int32],
+    fraction: float,
+    inv_cell_volume: float,
 ):
     if ~particle_flags[s.qp_index] & newton.ParticleFlags.ACTIVE:
         return 0.0
 
-    _compliance, _poisson, damping = extract_elastic_parameters(elastic_parameters(s))
-    alpha = 1.0 / (1.0 + damping / dt)
-
-    F_prev = elastic_strains[s.qp_index]
-    U_prev, xi_prev, _V_prev = wp.svd3(F_prev)
-
-    if wp.static(USE_HENCKY_STRAIN_MEASURE):
-        RlogSRt_prev = (
-            U_prev @ wp.diag(wp.vec3(wp.log(xi_prev[0]), wp.log(xi_prev[1]), wp.log(xi_prev[2]))) @ wp.transpose(U_prev)
-        )
-        strain = alpha * wp.ddot(tau(s), RlogSRt_prev)
-    else:
-        RSinvRt_prev = U_prev @ wp.diag(1.0 / xi_prev) @ wp.transpose(U_prev)
-        Id = wp.identity(n=3, dtype=float)
-        strain = -alpha * wp.ddot(tau(s), RSinvRt_prev - Id)
-
-    return strain * inv_cell_volume
-
-
-@fem.integrand
-def compliance_form(
-    s: fem.Sample,
-    domain: fem.Domain,
-    tau: fem.Field,
-    sig: fem.Field,
-    elastic_parameters: fem.Field,
-    elastic_strains: wp.array[wp.mat33],
-    inv_cell_volume: float,
-    dt: float,
-    particle_flags: wp.array[wp.int32],
-):
-    if ~particle_flags[s.qp_index] & newton.ParticleFlags.ACTIVE:
-        return 0.0
-
-    F = elastic_strains[s.qp_index]
-
-    compliance, poisson, damping = extract_elastic_parameters(elastic_parameters(s))
-    gamma = compliance / (1.0 + damping / dt)
-
-    U, xi, V = wp.svd3(F)
-    Rt = V @ wp.transpose(U)
-
-    if wp.static(USE_HENCKY_STRAIN_MEASURE):
-        R = wp.transpose(Rt)
-        return wp.ddot(Rt @ tau(s) @ R, stress_strain_relationship(Rt @ sig(s) @ R, gamma, poisson)) * inv_cell_volume
-    else:
-        FinvT = U @ wp.diag(1.0 / xi) @ wp.transpose(V)
-        return (
-            wp.ddot(Rt @ tau(s) @ FinvT, stress_strain_relationship(Rt @ sig(s) @ FinvT, gamma, poisson))
-            * inv_cell_volume
-        )
+    J = wp.determinant(residual_deformation_gradient[s.qp_index])
+    # This signed offset requests expansion when the residual is compressed.
+    return fraction * wp.log(wp.max(J, EPSILON)) * tau(s) * inv_cell_volume
 
 
 @fem.integrand
@@ -610,10 +388,17 @@ def compute_eigenvalues(
     values: wp.array[Any],
     ones: wp.array2d[float],
     yield_parameters: wp.array[YieldParamVec],
+    zero_mean_tolerance: float,
     eigenvalues: wp.array2d[float],
     eigenvectors: wp.array3d[float],
     rotated_volume: wp.array2d[float],
 ):
+    """Diagonalize element mass blocks and orient modes by their integrals.
+
+    Positive-mass modes whose integral cancels within ``zero_mean_tolerance``
+    are kept with a zero rotated volume. Their material parameters use element
+    averages, so cancellation does not select their sign or drop them.
+    """
     row = wp.tid()
 
     diag_index = wps.bsr_block_index(row, row, offsets, columns)
@@ -642,17 +427,23 @@ def compute_eigenvalues(
                 ev_s = 0.0
             else:
                 ys = float(0.0)
+                abs_s = float(0.0)
 
                 for j in range(scales.length):
                     node_index = row * nodes_per_elt + j
                     s += ev[k, j] * ones[row, j]
+                    abs_s += wp.abs(ev[k, j] * ones[row, j])
                     ys += ev[k, j] * yield_parameters[node_index][0]
 
-                ev_s = wp.sign(s)
-                rv[k] = ev_s * s
+                if wp.abs(s) <= zero_mean_tolerance * abs_s:
+                    ev_s = 1.0
+                    rv[k] = 0.0
+                else:
+                    ev_s = wp.sign(s)
+                    rv[k] = ev_s * s
 
-                if ys * ev_s < 0.0:
-                    ev_s = 0.0
+                    if ys * ev_s < 0.0:
+                        ev_s = 0.0
 
             for j in range(scales.length):
                 ev[k, j] *= ev_s
@@ -917,6 +708,7 @@ def reset_mpm_particle_history(
     world_count: int,
     initial_particle_Jp: wp.array[float],
     particle_elastic_strain: wp.array[wp.mat33],
+    particle_residual_deformation_gradient: wp.array[wp.mat33],
     particle_transform: wp.array[wp.mat33],
     particle_qd_grad: wp.array[wp.mat33],
     particle_stress: wp.array[wp.mat33],
@@ -928,6 +720,7 @@ def reset_mpm_particle_history(
     if reset_world_selected(world, world_mask, world_count):
         identity = wp.identity(n=3, dtype=float)
         particle_elastic_strain[particle_index] = identity
+        particle_residual_deformation_gradient[particle_index] = identity
         particle_transform[particle_index] = identity
         particle_qd_grad[particle_index] = wp.mat33(0.0)
         particle_stress[particle_index] = wp.mat33(0.0)

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Water-like MPM dam break rendered as an extracted surface mesh."""
+"""Water-like MPM dam break or full static tank with optional surface reconstruction."""
 
 import argparse
 import warnings
@@ -71,6 +71,8 @@ class Example:
         self.sim_substeps = args.substeps
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.viewer = viewer
+        self.full_tank = args.full_tank
+        self.particle_projection = args.particle_projection
 
         self.tank_extents = np.asarray(args.tank_extents, dtype=np.float32)
         self.world_count = args.world_count
@@ -114,6 +116,14 @@ class Example:
         mpm_config.strain_basis = args.strain_basis
         mpm_config.collider_basis = args.collider_basis
         mpm_config.velocity_basis = args.velocity_basis
+        mpm_config.integration_scheme = args.integration_scheme
+        mpm_config.transfer_scheme = args.transfer_scheme
+        mpm_config.solver = args.solver
+        mpm_config.density_strain_fraction = args.density_strain_fraction
+        mpm_config.residual_strain_fraction = args.residual_strain_fraction
+        mpm_config.residual_strain_tracking = args.residual_strain_tracking
+        mpm_config.collider_stabilization_fraction = args.collider_stabilization_fraction
+        mpm_config.collider_contact_gap = args.collider_contact_gap
         mpm_config.separate_worlds = self.world_count > 1
         self.solver = SolverImplicitMPM(self.model, config=mpm_config)
 
@@ -128,52 +138,56 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.state_0.mpm.particle_Jp.fill_(1.0)
-        self.solver.project_outside(self.state_0, self.state_0, self.sim_dt)
+        if self.particle_projection:
+            self.solver.project_outside(self.state_0, self.state_0, self.sim_dt)
 
-        surface_voxel_size = args.surface_voxel_size if args.surface_voxel_size is not None else 0.3 * args.voxel_size
-        surface_kernel_radius = (
-            args.surface_kernel_radius
-            if args.surface_kernel_radius is not None
-            else max(3.0 * self.particle_spacing, 1.5 * surface_voxel_size)
-        )
-        surface_max_grid_cells = (
-            args.surface_max_grid_cells if args.surface_max_grid_cells is not None else 4_000_000 * self.world_count
-        )
-        self.surface = self.solver.create_particle_surface(
-            voxel_size=surface_voxel_size,
-            max_grid_cells=surface_max_grid_cells,
-            kernel_radius=surface_kernel_radius,
-            threshold=args.surface_threshold,
-            smooth_lambda=args.surface_smoothing,
-            anisotropic=args.anisotropic,
-            kernel_scale=args.surface_kernel_scale,
-            anisotropy_ratio=args.anisotropy_ratio,
-            anisotropy_scale=args.anisotropy_scale,
-            anisotropy_min_neighbors=args.anisotropy_min_neighbors,
-            anisotropy_binning=args.anisotropic and args.anisotropy_binning,
-            anisotropy_strength=args.anisotropy_strength,
-            field_smooth_iterations=args.field_smooth_iterations,
-            field_smooth_radius=args.field_smooth_radius,
-            field_mode="sdf" if args.extrapolate_into_colliders else "density",
-            redistance_iterations=1 if args.extrapolate_into_colliders else 0,
-            mesh_smooth_iterations=args.mesh_smooth_iterations,
-        )
-        self.extrapolate_into_colliders = args.extrapolate_into_colliders
-        self.collider_extrapolation_depth = min(2.0 * surface_voxel_size, 0.5 * args.wall_thickness)
+        self.surface = None
+        if args.surface:
+            surface_voxel_size = (
+                args.surface_voxel_size if args.surface_voxel_size is not None else 0.3 * args.voxel_size
+            )
+            surface_kernel_radius = (
+                args.surface_kernel_radius
+                if args.surface_kernel_radius is not None
+                else max(3.0 * self.particle_spacing, 1.5 * surface_voxel_size)
+            )
+            surface_max_grid_cells = (
+                args.surface_max_grid_cells if args.surface_max_grid_cells is not None else 4_000_000 * self.world_count
+            )
+            self.surface = self.solver.create_particle_surface(
+                voxel_size=surface_voxel_size,
+                max_grid_cells=surface_max_grid_cells,
+                kernel_radius=surface_kernel_radius,
+                threshold=args.surface_threshold,
+                smooth_lambda=args.surface_smoothing,
+                anisotropic=args.anisotropic,
+                kernel_scale=args.surface_kernel_scale,
+                anisotropy_ratio=args.anisotropy_ratio,
+                anisotropy_scale=args.anisotropy_scale,
+                anisotropy_min_neighbors=args.anisotropy_min_neighbors,
+                anisotropy_binning=args.anisotropic and args.anisotropy_binning,
+                anisotropy_strength=args.anisotropy_strength,
+                field_smooth_iterations=args.field_smooth_iterations,
+                field_smooth_radius=args.field_smooth_radius,
+                field_mode="sdf" if args.extrapolate_into_colliders else "density",
+                redistance_iterations=1 if args.extrapolate_into_colliders else 0,
+                mesh_smooth_iterations=args.mesh_smooth_iterations,
+            )
+            self.extrapolate_into_colliders = args.extrapolate_into_colliders
+            self.collider_extrapolation_depth = min(2.0 * surface_voxel_size, 0.5 * args.wall_thickness)
+            self._empty_surface_points = wp.empty(0, dtype=wp.vec3, device=self.model.device)
+            self._empty_surface_indices = wp.empty(0, dtype=wp.int32, device=self.model.device)
+            self._empty_surface_normals = wp.empty(0, dtype=wp.vec3, device=self.model.device)
         self.surface_path = "/model/water_surface"
         self.surface_triangle_count = 0
         self._rtx_water_material_bound = False
-
-        self._empty_surface_points = wp.empty(0, dtype=wp.vec3, device=self.model.device)
-        self._empty_surface_indices = wp.empty(0, dtype=wp.int32, device=self.model.device)
-        self._empty_surface_normals = wp.empty(0, dtype=wp.vec3, device=self.model.device)
 
         self.viewer.set_model(self.model)
         # The worlds are physically separated so the combined extracted mesh
         # can be rendered directly without a second vertex-packing pass.
         self.viewer.set_world_offsets((0.0, 0.0, 0.0))
         self.viewer.show_visual = False
-        self.viewer.show_particles = args.show_particles
+        self.viewer.show_particles = args.show_particles or self.surface is None
         camera_scale = max(1.0, np.sqrt(self.world_count))
         self.viewer.set_camera(
             pos=wp.vec3(5.0 * camera_scale, -6.0 * camera_scale, 4.0 * camera_scale),
@@ -220,7 +234,7 @@ class Example:
     def _capture_surface_extraction(self):
         self.surface_graph = None
         self.surface_mesh = None
-        if not self.model.device.is_cuda:
+        if self.surface is None or not self.model.device.is_cuda:
             return
         if self.sim_substeps % 2 != 0:
             warnings.warn("Sim substeps must be even for graph capture of surface extraction", stacklevel=2)
@@ -234,22 +248,23 @@ class Example:
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.solver.step(self.state_0, self.state_1, None, None, self.sim_dt)
-            self.solver.project_outside(self.state_1, self.state_1, self.sim_dt)
-            wp.launch(
-                _project_inside_tank,
-                dim=self.state_1.particle_count,
-                inputs=[
-                    self.state_1.particle_q,
-                    self.state_1.particle_qd,
-                    self.model.particle_flags,
-                    self.model.particle_world,
-                    self.world_offsets,
-                    wp.vec3(self.tank_extents),
-                    self.floor_height,
-                    self.projection_threshold,
-                ],
-                device=self.model.device,
-            )
+            if self.particle_projection:
+                self.solver.project_outside(self.state_1, self.state_1, self.sim_dt)
+                wp.launch(
+                    _project_inside_tank,
+                    dim=self.state_1.particle_count,
+                    inputs=[
+                        self.state_1.particle_q,
+                        self.state_1.particle_qd,
+                        self.model.particle_flags,
+                        self.model.particle_world,
+                        self.world_offsets,
+                        wp.vec3(self.tank_extents),
+                        self.floor_height,
+                        self.projection_threshold,
+                    ],
+                    device=self.model.device,
+                )
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
@@ -259,6 +274,9 @@ class Example:
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
+        if self.surface is None:
+            self.viewer.end_frame()
+            return
 
         if self.surface_graph is None:
             self.surface_mesh = self._extract_surface()
@@ -290,7 +308,11 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
+        """Check finite water state, tank containment, surface extraction, and dam-break spreading."""
         positions = self.state_0.particle_q.numpy()
+        velocities = self.state_0.particle_qd.numpy()
+        if not np.all(np.isfinite(positions)) or not np.all(np.isfinite(velocities)):
+            raise ValueError("Water particle positions or velocities are not finite")
         particle_world = self.model.particle_world.numpy()
         particle_world = np.maximum(particle_world, 0)
         local_positions = positions - self.world_offsets_np[particle_world]
@@ -304,7 +326,7 @@ class Example:
         )
         if not np.all(inside_tank):
             raise ValueError(f"{np.count_nonzero(~inside_tank)} water particles escaped the tank")
-        if self.sim_time >= 0.5:
+        if not self.full_tank and self.sim_time >= 0.5:
             stalled_worlds = [
                 world
                 for world in range(self.world_count)
@@ -312,12 +334,13 @@ class Example:
             ]
             if stalled_worlds:
                 raise ValueError(f"The water column did not spread in worlds {stalled_worlds}")
-        if self.surface_triangle_count == 0:
-            raise ValueError("Water surface extraction produced no triangles")
-        index_world_offsets = self.surface_mesh.index_world_offsets.numpy()
-        empty_worlds = np.flatnonzero(np.diff(index_world_offsets) == 0).tolist()
-        if empty_worlds:
-            raise ValueError(f"Water surface extraction produced no triangles in worlds {empty_worlds}")
+        if self.surface is not None:
+            if self.surface_triangle_count == 0:
+                raise ValueError("Water surface extraction produced no triangles")
+            index_world_offsets = self.surface_mesh.index_world_offsets.numpy()
+            empty_worlds = np.flatnonzero(np.diff(index_world_offsets) == 0).tolist()
+            if empty_worlds:
+                raise ValueError(f"Water surface extraction produced no triangles in worlds {empty_worlds}")
 
     @staticmethod
     def _emit_water(builder: newton.ModelBuilder, args) -> tuple[float, float]:
@@ -326,6 +349,9 @@ class Example:
 
         water_lo = np.asarray(args.emit_lo, dtype=np.float32)
         water_hi = np.asarray(args.emit_hi, dtype=np.float32)
+        if args.full_tank:
+            water_lo[:2] = -np.asarray(args.tank_extents[:2], dtype=np.float32)
+            water_hi[:2] = args.tank_extents[:2]
         water_extent = water_hi - water_lo
         if np.any(water_extent <= 0.0):
             raise ValueError("emit_hi must be greater than emit_lo on every axis")
@@ -494,6 +520,55 @@ class Example:
         parser.add_argument("--collider-basis", "-cb", type=str, default="pic")
         parser.add_argument("--velocity-basis", "-vb", type=str, default="Q1")
         parser.add_argument(
+            "--integration-scheme",
+            choices=["pic", "gimp", "cell"],
+            default="pic",
+            help="Strain integration; experimental cell mode uses two-hop transfers and requires Q1 and one world",
+        )
+        parser.add_argument("--solver", type=str, default="auto", help="Rheology solver, e.g. gs or jacobi")
+        parser.add_argument(
+            "--transfer-scheme",
+            choices=["apic", "pic"],
+            default="apic",
+            help="Momentum transfer; PIC omits the affine velocity contribution and adds numerical damping",
+        )
+        parser.add_argument(
+            "--density-strain-fraction",
+            type=float,
+            default=0.0,
+            help="Experimental fraction of signed grid volume error corrected per step [0, 1]",
+        )
+        parser.add_argument(
+            "--residual-strain-fraction",
+            type=float,
+            default=0.0,
+            help="Experimental fraction of residual volume strain corrected per step; PIC/GIMP only [0, 1]",
+        )
+        parser.add_argument(
+            "--residual-strain-tracking",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Record residual deformation without feedback; PIC/GIMP only",
+        )
+        parser.add_argument(
+            "--collider-stabilization-fraction",
+            type=float,
+            default=0.0,
+            help="Experimental fraction of PIC contact penetration corrected per step [0, 1]",
+        )
+        parser.add_argument(
+            "--collider-contact-gap",
+            type=float,
+            default=0.0,
+            help="Experimental predictive PIC contact activation distance [m]",
+        )
+        parser.add_argument(
+            "--particle-projection",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Project particles out of colliders and clamp them inside the tank after each step",
+        )
+        parser.add_argument(
             "--projection-threshold",
             type=float,
             default=None,
@@ -512,6 +587,11 @@ class Example:
         parser.add_argument("--emit-lo", type=float, nargs=3, default=[-2.0, -0.5, -0.01])
         parser.add_argument("--emit-hi", type=float, nargs=3, default=[0.0, 0.5, 1.0])
         parser.add_argument(
+            "--full-tank",
+            action="store_true",
+            help="Fill the full tank footprint for a static-water test; retain the emission z bounds",
+        )
+        parser.add_argument(
             "--tank-extents",
             type=float,
             nargs=3,
@@ -519,6 +599,12 @@ class Example:
             help="Tank interior half-extents; its interior spans z=[0, 2 * hz] [m]",
         )
         parser.add_argument("--wall-thickness", type=float, default=0.15)
+        parser.add_argument(
+            "--surface",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Reconstruct and render the water surface; disabling this shows particles instead",
+        )
         parser.add_argument(
             "--surface-voxel-size",
             type=float,

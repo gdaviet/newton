@@ -19,6 +19,9 @@ class ImplicitMPMSingleWorld:
     rounds = 2
 
     def setup(self):
+        self._setup()
+
+    def _setup(self, *, integration_scheme="pic", density_strain_fraction=0.0, max_active_cell_count=-1):
         device = wp.get_device()
         if not device.is_cuda:
             raise SkipNotImplemented
@@ -44,10 +47,12 @@ class ImplicitMPMSingleWorld:
 
         config = SolverImplicitMPM.Config()
         config.grid_type = "fixed"
+        config.max_active_cell_count = max_active_cell_count
         config.grid_padding = 3
         config.voxel_size = 0.05
         config.transfer_scheme = "pic"
-        config.integration_scheme = "pic"
+        config.integration_scheme = integration_scheme
+        config.density_strain_fraction = density_strain_fraction
         config.solver = "jacobi"
         config.max_iterations = 10
         config.tolerance = 0.0
@@ -70,6 +75,30 @@ class ImplicitMPMSingleWorld:
             self.solver.step(self.state_0, self.state_1, None, None, self.dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
         wp.synchronize_device()
+
+
+class ImplicitMPMP0Recovery(ImplicitMPMSingleWorld):
+    """Compare captured P0 transfers and volume recovery at the same iteration budget."""
+
+    params = [("pic", "cell"), (0.0, 0.05)]
+    param_names = ["integration_scheme", "density_strain_fraction"]
+
+    def setup(self, integration_scheme, density_strain_fraction):
+        self._setup(
+            integration_scheme=integration_scheme,
+            density_strain_fraction=density_strain_fraction,
+            max_active_cell_count=4096,
+        )
+        with wp.ScopedCapture(device=self.model.device) as capture:
+            self.solver.step(self.state_0, self.state_1, None, None, self.dt)
+            self.solver.step(self.state_1, self.state_0, None, None, self.dt)
+        self.graph = capture.graph
+
+    @skip_benchmark_if(wp.get_cuda_device_count() == 0)
+    def time_step(self, integration_scheme, density_strain_fraction):
+        for _ in range(5):
+            wp.capture_launch(self.graph)
+        wp.synchronize_device(self.model.device)
 
 
 if __name__ == "__main__":

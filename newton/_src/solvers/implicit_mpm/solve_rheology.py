@@ -634,6 +634,8 @@ class _RheologySolver:
         self.device = self.momentum.velocity.device
 
         self.delta_stress = fem.borrow_temporary_like(self.rheology.stress, temporary_store)
+        # Colored solvers only write active strain nodes; the residual reads every entry.
+        self.delta_stress.zero_()
         self.strain_residual = fem.borrow_temporary(
             temporary_store, shape=(self.size,), dtype=float, device=self.device
         )
@@ -834,7 +836,7 @@ class _ReorderedGaussSeidelSolver(_RheologySolver):
             device=self.device,
         )
 
-        # Expand color blocks into flat constraint IDs (fully written by kernel)
+        # Expand color blocks into flat constraint IDs (kernel writes the colored prefix)
         self._flat_constraint_ids = fem.borrow_temporary(
             temporary_store, shape=(n_total,), dtype=int, device=self.device
         )
@@ -872,6 +874,7 @@ class _ReorderedGaussSeidelSolver(_RheologySolver):
             kernel=reorder_strain_mat,
             dim=n_total,
             inputs=[
+                self._flat_color_offsets,
                 self._flat_constraint_ids,
                 self.rheology.strain_mat.offsets,
                 self.rheology.strain_mat.columns,
@@ -1076,6 +1079,7 @@ class _BatchedGaussSeidelSolver(_RheologySolver):
             kernel=reorder_strain_mat,
             dim=n_total,
             inputs=[
+                self._flat_color_offsets,
                 self._flat_constraint_ids,
                 self.rheology.strain_mat.offsets,
                 self.rheology.strain_mat.columns,
@@ -1793,8 +1797,11 @@ def _run_solver_loop(
     temporary_store: fem.TemporaryStore,
 ):
     solve_graph = None
+    if max_iterations <= 0:
+        return solve_graph
     if use_graph:
-        solve_granularity = 5
+        # Retain five-iteration batches when they divide the requested budget.
+        solve_granularity = math.gcd(5, max_iterations)
 
         iteration_and_condition = fem.borrow_temporary(temporary_store, shape=(2,), dtype=int)
         iteration_and_condition.fill_(1)
@@ -1856,7 +1863,7 @@ def _run_solver_loop(
                 )
                 res_l2, res_linf = _nonlinear_solver_result_norms(residual, host_tolerance_scale)
                 print(
-                    f"{rheology_solver.name} terminated after {iteration_and_condition.numpy()[0]} iterations with residuals {res_l2}, {res_linf}"
+                    f"{rheology_solver.name} terminated after {iteration_and_condition.numpy()[0] - 1} iterations with residuals {res_l2}, {res_linf}"
                 )
 
         iteration_and_condition.release()
@@ -1868,8 +1875,9 @@ def _run_solver_loop(
             else l2_tolerance_scale.numpy()
         )
 
-        for batch in range(max_iterations // solve_granularity):
-            for _k in range(solve_granularity):
+        for batch_start in range(0, max_iterations, solve_granularity):
+            batch_size = min(solve_granularity, max_iterations - batch_start)
+            for _k in range(batch_size):
                 contact_solver.solve()
                 rheology_solver.solve()
 
@@ -1878,7 +1886,7 @@ def _run_solver_loop(
 
             if verbose:
                 print(
-                    f"{rheology_solver.name} iteration #{(batch + 1) * solve_granularity} \t res(l2)={res_l2}, res(linf)={res_linf}"
+                    f"{rheology_solver.name} iteration #{batch_start + batch_size} \t res(l2)={res_l2}, res(linf)={res_linf}"
                 )
             if res_l2 < tolerance and res_linf < tolerance:
                 break
