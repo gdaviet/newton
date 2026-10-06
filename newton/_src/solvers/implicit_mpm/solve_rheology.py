@@ -21,7 +21,9 @@ from .contact_solver_kernels import (
     apply_subgrid_impulse,
     apply_subgrid_impulse_warmstart,
     compute_collider_delassus_diagonal,
+    compute_collider_delassus_diagonal_binding,
     compute_collider_inv_mass,
+    count_binding_collider_rows,
     solve_nodal_friction,
     solve_subgrid_friction,
 )
@@ -386,6 +388,10 @@ class RheologyData:
     strain_velocity_node_count: int = -1
 
 
+# Experiment switch: speculative contact rows (sdf > 0) do not count in the Jacobi multiplicity.
+_BINDING_MULTIPLICITY = False
+
+
 @dataclass
 class CollisionData:
     """Collider contact data consumed by the rheology solver.
@@ -419,6 +425,7 @@ class CollisionData:
     collider_velocities: wp.array[wp.vec3]
     rigidity_operator: tuple[sp.BsrMatrix, sp.BsrMatrix] | None
     collider_impulse: wp.array[wp.vec3]
+    collider_sdf: wp.array[float] | None = None
     has_colliders: bool = False
 
 
@@ -1709,21 +1716,50 @@ class _SubgridContactSolver(_ContactSolver):
 
         sp.bsr_set_transpose(dest=self.collision.transposed_collider_mat, src=self.collision.collider_mat)
 
-        wp.launch(
-            compute_collider_delassus_diagonal,
-            dim=self.collision.collider_impulse.shape[0],
-            inputs=[
-                self.collision.collider_mat.offsets,
-                self.collision.collider_mat.columns,
-                self.collision.collider_mat.values,
-                self.collider_inv_mass,
-                self.collision.transposed_collider_mat.offsets,
-                self.momentum.inv_volume,
-            ],
-            outputs=[
-                self.collider_delassus_diagonal,
-            ],
-        )
+        if self.collision.collider_sdf is not None and _BINDING_MULTIPLICITY:
+            node_row_count = wp.zeros(
+                self.momentum.inv_volume.shape[0], dtype=int, device=self.collider_inv_mass.device
+            )
+            wp.launch(
+                count_binding_collider_rows,
+                dim=self.collision.collider_impulse.shape[0],
+                inputs=[
+                    self.collision.collider_mat.offsets,
+                    self.collision.collider_mat.columns,
+                    self.collision.collider_sdf,
+                    node_row_count,
+                ],
+            )
+            wp.launch(
+                compute_collider_delassus_diagonal_binding,
+                dim=self.collision.collider_impulse.shape[0],
+                inputs=[
+                    self.collision.collider_mat.offsets,
+                    self.collision.collider_mat.columns,
+                    self.collision.collider_mat.values,
+                    self.collider_inv_mass,
+                    self.collision.collider_sdf,
+                    node_row_count,
+                    self.momentum.inv_volume,
+                ],
+                outputs=[self.collider_delassus_diagonal],
+            )
+        else:
+            wp.launch(
+                compute_collider_delassus_diagonal,
+                dim=self.collision.collider_impulse.shape[0],
+                inputs=[
+                    self.collision.collider_mat.offsets,
+                    self.collision.collider_mat.columns,
+                    self.collision.collider_mat.values,
+                    self.collider_inv_mass,
+                    self.collision.transposed_collider_mat.offsets,
+                    self.momentum.inv_volume,
+                ],
+                outputs=[
+                    self.collider_delassus_diagonal,
+                ],
+            )
 
         # define solve operation
         self.apply_collider_impulse_launch = wp.launch(

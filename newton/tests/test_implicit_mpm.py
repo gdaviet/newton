@@ -1541,6 +1541,7 @@ def test_multiworld_rasterize_collider_node_environments(test, device):
             None,
             0.1,
             0.0,
+            0,
             0.01,
             node_positions,
             node_environment_offsets,

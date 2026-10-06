@@ -900,6 +900,132 @@ def build_active_particle_mask(
     )
 
 
+@wp.func
+def gimp_half_size(particle_volume: float, voxel_size: float):
+    """Half edge of the cubic GIMP particle domain, capped at half a voxel (two cells per axis at most)."""
+    return wp.min(0.5 * wp.pow(wp.max(particle_volume, 0.0), 1.0 / 3.0), 0.5 * voxel_size)
+
+
+@wp.kernel
+def gimp_domain_corners(
+    positions: wp.array[wp.vec3],
+    particle_volume: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_environment: wp.array[int],
+    voxel_size: float,
+    corners: wp.array[wp.vec3],
+    corner_flags: wp.array[wp.int32],
+    corner_environment: wp.array[int],
+):
+    """Corners of each GIMP particle domain; the cells containing them are the cells the domain overlaps."""
+    p, v = wp.tid()
+    half = gimp_half_size(particle_volume[p], voxel_size)
+    signs = wp.vec3(float(2 * ((v >> 2) & 1) - 1), float(2 * ((v >> 1) & 1) - 1), float(2 * (v & 1) - 1))
+    corners[8 * p + v] = positions[p] + half * signs
+    corner_flags[8 * p + v] = particle_flags[p]
+    if particle_environment:
+        corner_environment[8 * p + v] = particle_environment[p]
+
+
+@wp.kernel
+def invert_point_particle_indices(point_particle: wp.array[int], particle_point: wp.array[int]):
+    """particle_point[p] = index of the quadrature point of particle p (one point per particle)."""
+    point = wp.tid()
+    p = point_particle[point]
+    if p >= 0:
+        particle_point[p] = point
+
+
+@fem.integrand
+def gimp_contact_weights(
+    s: fem.Sample,
+    domain: fem.Domain,
+    u: fem.Field,
+    particle_volume: wp.array[float],
+    gimp_cells: wp.array2d[int],
+    particle_contact_node: wp.array[int],
+    contact_normal: wp.array[wp.vec3],
+    max_nodes: int,
+    rows: wp.array[int],
+    cols: wp.array[int],
+    values: wp.array[float],
+):
+    """Triplets of S_ip = sum_k f_k N_i(x_k): row = particle contact node, column = velocity node."""
+    p = s.qp_index
+    node = particle_contact_node[p]
+    if node < 0:
+        return
+    if wp.length_sq(contact_normal[node]) == 0.0:
+        # invalid normal, contact is disabled
+        return
+
+    cell = fem.element_partition_index(domain, s.element_index)
+    slot = int(-1)
+    for k in range(8):
+        if slot < 0 and gimp_cells[p, k] == cell:
+            slot = k
+    if slot < 0:
+        return
+
+    fraction = s.qp_weight * fem.measure(domain, s) / particle_volume[p]
+    base = (p * 8 + slot) * max_nodes
+    for k in range(fem.node_count(u, s)):
+        rows[base + k] = node
+        cols[base + k] = fem.node_partition_index(u, fem.node_index(u, s, k))
+        values[base + k] = fraction * fem.node_inner_weight(u, s, k)
+
+
+@fem.integrand
+def gimp_store_point_stress(
+    s: fem.Sample,
+    domain: fem.Domain,
+    stress: fem.Field,
+    gimp_cells: wp.array2d[int],
+    point_stress: wp.array2d[wp.mat33],
+    point_valid: wp.array2d[float],
+):
+    """Store the solver stress at each GIMP sub-point on its particle, by slot."""
+    p = s.qp_index
+    cell = fem.element_partition_index(domain, s.element_index)
+    for k in range(8):
+        if gimp_cells[p, k] == cell:
+            point_stress[p, k] = stress(s)
+            point_valid[p, k] = 1.0
+
+
+@fem.integrand
+def integrate_gimp_point_stress(
+    s: fem.Sample,
+    domain: fem.Domain,
+    tau: fem.Field,
+    inv_cell_volume: float,
+    gimp_cells: wp.array2d[int],
+    point_stress: wp.array2d[wp.mat33],
+    point_valid: wp.array2d[float],
+    particle_stress: wp.array[wp.mat33],
+    particle_flags: wp.array[wp.int32],
+):
+    """Warm-start stress integral using the stress stored at this sub-point's slot."""
+    if ~particle_flags[s.qp_index] & newton.ParticleFlags.ACTIVE:
+        return 0.0
+
+    p = s.qp_index
+    cell = fem.element_partition_index(domain, s.element_index)
+    value = particle_stress[p]
+    for k in range(8):
+        if gimp_cells[p, k] == cell and point_valid[p, k] > 0.0:
+            value = point_stress[p, k]
+    return wp.ddot(tau(s), value) * inv_cell_volume
+
+
+@wp.kernel
+def zero_separated_impulses(sdf: wp.array[float], impulse: wp.array[wp.vec3]):
+    """Start contact nodes outside the collider (inside the activation gap) from zero impulse."""
+    i = wp.tid()
+    if sdf[i] > 0.0:
+        impulse[i] = wp.vec3(0.0)
+
+
 @wp.kernel
 def record_volume_rebuild_status(status: wp.array[wp.uint32], accumulated_status: wp.array[wp.uint32]):
     """Retain and report rebuild failures without a host synchronization."""

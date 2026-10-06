@@ -87,6 +87,9 @@ class Collider:
     material_projection_threshold: wp.array[float]
     """Projection threshold for each collider material. Shape (material_count,)"""
 
+    material_gap: wp.array[float]
+    """Contact gap of each collider material [m]; point contact nodes activate within it. Shape (material_count,)"""
+
     body_com: wp.array[wp.vec3]
     """Body center of mass of each collider. Shape (body_count,)"""
 
@@ -433,6 +436,7 @@ def rasterize_collider_kernel(
     body_q_prev: wp.array[wp.transform],
     voxel_size: float,
     activation_distance: float,
+    speculative_gap: int,
     dt: float,
     node_positions: wp.array[wp.vec3],
     node_environment_offsets: wp.array[int],
@@ -459,6 +463,8 @@ def rasterize_collider_kernel(
         body_q_prev: Previous rigid body transforms (for finite-difference velocity).
         voxel_size: Grid voxel size [m], used to scale the activation distance.
         activation_distance: Distance (in voxels) below which to activate the collider.
+        speculative_gap: If nonzero, nodes outside the collider may close their gap within the step but not cross the
+            surface: the collider normal velocity is offset by the gap divided by ``dt``.
         dt: Timestep length (used to scale adhesion and finite-difference velocity).
         node_positions: Grid node positions to sample at.
         node_environment_offsets: Packed node offsets by world, or null to query every collider.
@@ -483,7 +489,10 @@ def rasterize_collider_kernel(
         sdf, sdf_gradient, sdf_vel, collider_id, material_id = collision_sdf(
             x, environment_index, collider, body_q, body_qd, body_q_prev, dt
         )
-        bc_active = sdf < activation_distance * voxel_size
+        threshold = activation_distance * voxel_size
+        if speculative_gap != 0 and collider_id >= 0:
+            threshold = wp.max(threshold, collider.material_gap[material_id])
+        bc_active = sdf < threshold
 
     collider_sdf[i] = sdf
 
@@ -501,6 +510,8 @@ def rasterize_collider_kernel(
     collider_friction[i] = collider.material_friction[material_id]
     collider_adhesion[i] = collider.material_adhesion[material_id] * dt * node_volumes[i] / voxel_size
 
+    if speculative_gap != 0 and sdf > 0.0:
+        sdf_vel -= sdf_gradient * (sdf / dt)
     collider_velocity[i] = sdf_vel
 
 
@@ -685,6 +696,7 @@ def rasterize_collider(
     collider_ids: wp.array[int],
     temporary_store: fem.TemporaryStore,
     node_environment_offsets: wp.array | None = None,
+    velocity_degree: int = 1,
 ):
     """Rasterize collider signed-distance, normals, velocity, and material onto grid nodes.
 
@@ -723,9 +735,13 @@ def rasterize_collider(
         temporary_store=temporary_store,
     )
 
-    activation_distance = (
-        0.0 if collider_position_field.degree == 0 else _COLLIDER_ACTIVATION_DISTANCE / collider_position_field.degree
-    )
+    # Point (particle) nodes activate within a gap, in voxels, and may close it within the step without crossing
+    # the surface; the default gap stays below the next particle layer for the velocity basis resolution.
+    point_nodes = collider_position_field.degree == 0
+    if point_nodes:
+        activation_distance = _COLLIDER_ACTIVATION_DISTANCE / (velocity_degree + 1)
+    else:
+        activation_distance = _COLLIDER_ACTIVATION_DISTANCE / collider_position_field.degree
 
     wp.launch(
         rasterize_collider_kernel,
@@ -737,6 +753,7 @@ def rasterize_collider(
             body_q_prev,
             voxel_size,
             activation_distance,
+            1 if point_nodes else 0,
             dt,
             collider_position_field.dof_values,
             node_environment_offsets,

@@ -440,6 +440,7 @@ class ImplicitMPMModel:
         collider_projection_threshold: list[float] | None = None,
         collider_particle_ids: list[list[int] | wp.array[int] | None] | None = None,
         model: newton.Model | None = None,
+        collider_gaps: list[float] | None = None,
         body_com: wp.array | None = None,
         body_mass: wp.array | None = None,
         body_inv_inertia: wp.array | None = None,
@@ -502,6 +503,7 @@ class ImplicitMPMModel:
         collider_projection_threshold = (
             None if collider_projection_threshold is None else list(collider_projection_threshold)
         )
+        collider_gaps = None if collider_gaps is None else list(collider_gaps)
         collider_particle_ids = None if collider_particle_ids is None else list(collider_particle_ids)
         supplied_world_ids = None if collider_world_ids is None else list(collider_world_ids)
 
@@ -582,6 +584,7 @@ class ImplicitMPMModel:
         collider_meshes = require_aligned("collider_meshes", collider_meshes)
         collider_thicknesses = require_aligned("collider_thicknesses", collider_thicknesses)
         collider_projection_threshold = require_aligned("collider_projection_threshold", collider_projection_threshold)
+        collider_gaps = require_aligned("collider_gaps", collider_gaps)
         collider_friction = require_aligned("collider_friction", collider_friction)
         collider_adhesion = require_aligned("collider_adhesion", collider_adhesion)
         collider_particle_ids = require_aligned("collider_particle_ids", collider_particle_ids)
@@ -723,6 +726,7 @@ class ImplicitMPMModel:
         material_friction = [_DEFAULT_FRICTION] * material_count
         material_adhesion = [_DEFAULT_ADHESION] * material_count
         material_projection_threshold = [_DEFAULT_PROJECTION_THRESHOLD * self.voxel_size] * material_count
+        material_gap = [0.0] * material_count
 
         def assign_material(
             material_id: int,
@@ -730,6 +734,7 @@ class ImplicitMPMModel:
             friction: float | None = None,
             adhesion: float | None = None,
             projection_threshold: float | None = None,
+            gap: float | None = None,
         ):
             if thickness is not None:
                 material_thickness[material_id] = thickness
@@ -739,6 +744,8 @@ class ImplicitMPMModel:
                 material_adhesion[material_id] = adhesion
             if projection_threshold is not None:
                 material_projection_threshold[material_id] = projection_threshold
+            if gap is not None:
+                material_gap[material_id] = gap
 
         def assign_collider_material(material_id: int, collider_id: int):
             assign_material(
@@ -747,6 +754,7 @@ class ImplicitMPMModel:
                 collider_friction[collider_id],
                 collider_adhesion[collider_id],
                 collider_projection_threshold[collider_id],
+                collider_gaps[collider_id],
             )
 
         for collider_id, body_id in enumerate(collider_body_ids):
@@ -892,6 +900,7 @@ class ImplicitMPMModel:
             self.collider.material_friction = wp.array(material_friction, dtype=float)
             self.collider.material_adhesion = wp.array(material_adhesion, dtype=float)
             self.collider.material_projection_threshold = wp.array(material_projection_threshold, dtype=float)
+            self.collider.material_gap = wp.array(material_gap, dtype=float)
 
         self.collider.body_com = body_com
         self.collider_body_mass = body_mass

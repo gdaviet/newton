@@ -243,6 +243,43 @@ def compute_collider_delassus_diagonal(
 
 
 @wp.kernel
+def count_binding_collider_rows(
+    collider_mat_offsets: wp.array[int],
+    collider_mat_columns: wp.array[int],
+    collider_sdf: wp.array[float],
+    node_row_count: wp.array[int],
+):
+    """Per velocity node, the number of collider rows at or inside the collider surface."""
+    i = wp.tid()
+    if collider_sdf[i] > 0.0:
+        return
+    for b in range(collider_mat_offsets[i], collider_mat_offsets[i + 1]):
+        wp.atomic_add(node_row_count, collider_mat_columns[b], 1)
+
+
+@wp.kernel
+def compute_collider_delassus_diagonal_binding(
+    collider_mat_offsets: wp.array[int],
+    collider_mat_columns: wp.array[int],
+    collider_mat_values: wp.array[float],
+    collider_inv_mass: wp.array[float],
+    collider_sdf: wp.array[float],
+    node_row_count: wp.array[int],
+    inv_volume: wp.array[float],
+    delassus_diagonal: wp.array[float],
+):
+    """Jacobi-scaled diagonal counting only rows at or inside the surface, plus the row itself."""
+    i = wp.tid()
+    own = wp.where(collider_sdf[i] > 0.0, 1, 0)
+    w = collider_inv_mass[i]
+    for b in range(collider_mat_offsets[i], collider_mat_offsets[i + 1]):
+        u_i = collider_mat_columns[b]
+        weight = collider_mat_values[b]
+        w += weight * weight * inv_volume[u_i] * float(node_row_count[u_i] + own)
+    delassus_diagonal[i] = w
+
+
+@wp.kernel
 def solve_subgrid_friction(
     velocity: wp.array[wp.vec3],
     collider_mat_offsets: wp.array[int],
