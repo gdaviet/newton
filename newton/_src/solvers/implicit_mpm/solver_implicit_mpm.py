@@ -31,8 +31,6 @@ from .cell_quadrature import (
 )
 from .cell_quadrature import (
     CellQuadrature,
-    assign_element_yield_parameters,
-    average_element_yield_parameters,
     cell_stencil_points,
 )
 from .implicit_mpm_model import ImplicitMPMModel
@@ -56,6 +54,7 @@ from .implicit_mpm_solver_kernels import (
     YIELD_PARAM_LENGTH,
     _rebuild_capacity,
     allocate_by_voxels,
+    average_element_yield_parameters,
     build_active_particle_mask,
     collision_weight_field,
     compute_bounds,
@@ -87,6 +86,7 @@ from .implicit_mpm_solver_kernels import (
     mat31,
     mat66,
     node_color,
+    normalize_strain_yield_parameters,
     record_volume_rebuild_status,
     reset_mpm_collider_history,
     reset_mpm_grid_warmstart,
@@ -3528,7 +3528,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             M_diag.assign(self._mpm_model.material_particle_volume * inv_cell_volume)
             return None, None
 
-        # build mass matrix of PIC integration
+        # Build the strain mass matrix with the selected quadrature.
         strain_quadrature, strain_point_flags = self._strain_quadrature(pic)
         M = fem.integrate(
             mass_form,
@@ -3554,12 +3554,11 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         M_diag = scratch.strain_node_particle_volume.reshape((-1, nodes_per_elt))
         rotated_volume = wp.empty_like(M_diag)
 
-        # Fixed symmetric cell points make the integrals of zero-mean strain modes
-        # vanish up to roundoff; those modes take their element's yield parameters.
-        zero_mean_tolerance = 0.0
+        # A positive-mass mode can have zero mean with any symmetric quadrature.
+        # Its material parameters cannot be recovered by dividing by that mean.
+        zero_mean_tolerance = 1.0e-4
         self._element_yield_parameters = None
-        if self._cell_quadrature is not None and nodes_per_elt > 1:
-            zero_mean_tolerance = 1.0e-4
+        if nodes_per_elt > 1:
             self._element_yield_parameters = wp.empty(M_elt_wise.nrow, dtype=YieldParamVec)
             wp.launch(
                 average_element_yield_parameters,
@@ -3646,14 +3645,26 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 inputs=[M_diag, scratch.stress_field.dof_values],
             )
 
-        # Yield parameters are integrated, scale with inverse rotated volume
-        # to correctly recover uniform parameters after eigenbasis rotation
+        # Material moments divided by a vanishing mean are ill-conditioned;
+        # use the element's material average for those modes instead.
         yield_volume = rotated_volume if rotated_volume is not None else M_diag
-        wp.launch(
-            inverse_scale_vector,
-            dim=node_count,
-            inputs=[yield_volume, scratch.strain_yield_parameters_field.dof_values],
-        )
+        if self._element_yield_parameters is not None:
+            wp.launch(
+                normalize_strain_yield_parameters,
+                dim=node_count,
+                inputs=[
+                    M_ev.shape[1],
+                    yield_volume,
+                    self._element_yield_parameters,
+                    scratch.strain_yield_parameters_field.dof_values,
+                ],
+            )
+        else:
+            wp.launch(
+                inverse_scale_vector,
+                dim=node_count,
+                inputs=[yield_volume, scratch.strain_yield_parameters_field.dof_values],
+            )
 
     def _unapply_strain_eigenbasis(
         self,
@@ -3713,17 +3724,6 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         M_ev, rotated_volume = self._build_strain_eigenbasis(pic, scratch, inv_cell_volume)
 
         self._apply_strain_eigenbasis(scratch, M_ev, rotated_volume)
-
-        if self._element_yield_parameters is not None:
-            wp.launch(
-                assign_element_yield_parameters,
-                dim=scratch.strain_node_count,
-                inputs=[
-                    M_ev.shape[1],
-                    self._element_yield_parameters,
-                    scratch.strain_yield_parameters_field.dof_values,
-                ],
-            )
 
         with self._timer("Strain solve"):
             momentum_data = MomentumData(

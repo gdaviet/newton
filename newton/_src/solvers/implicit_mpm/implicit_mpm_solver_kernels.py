@@ -223,6 +223,43 @@ def average_yield_parameters(
 
 
 @wp.kernel
+def average_element_yield_parameters(
+    nodes_per_element: int,
+    node_volume: wp.array[float],
+    node_yield_parameters: wp.array[YieldParamVec],
+    element_yield_parameters: wp.array[YieldParamVec],
+):
+    """Volume-average integrated strain-node yield parameters over each element."""
+    element = wp.tid()
+    volume = float(0.0)
+    yield_parameters = YieldParamVec(0.0)
+    for j in range(nodes_per_element):
+        node = element * nodes_per_element + j
+        volume += node_volume[node]
+        yield_parameters += node_yield_parameters[node]
+    if volume > 0.0:
+        element_yield_parameters[element] = wp.max(YieldParamVec(0.0), yield_parameters / volume)
+    else:
+        element_yield_parameters[element] = YieldParamVec(0.0)
+
+
+@wp.kernel
+def normalize_strain_yield_parameters(
+    nodes_per_element: int,
+    rotated_volume: wp.array[float],
+    element_yield_parameters: wp.array[YieldParamVec],
+    node_yield_parameters: wp.array[YieldParamVec],
+):
+    """Normalize material moments and use element averages for zero-mean strain modes."""
+    node = wp.tid()
+    volume = rotated_volume[node]
+    if volume == 0.0:
+        node_yield_parameters[node] = element_yield_parameters[node // nodes_per_element]
+    else:
+        node_yield_parameters[node] = node_yield_parameters[node] / volume
+
+
+@wp.kernel
 def update_particle_frames(
     dt: float,
     min_stretch: float,
@@ -358,10 +395,9 @@ def compute_eigenvalues(
 ):
     """Diagonalize element mass blocks and orient modes by their integrals.
 
-    Modes whose integral is below ``zero_mean_tolerance`` times its absolute
-    integral are kept with a zero rotated volume, so that roundoff in the
-    integral of symmetric zero-mean modes does not select their sign or drop
-    them.
+    Positive-mass modes whose integral cancels within ``zero_mean_tolerance``
+    are kept with a zero rotated volume. Their material parameters use element
+    averages, so cancellation does not select their sign or drop them.
     """
     row = wp.tid()
 
@@ -399,7 +435,7 @@ def compute_eigenvalues(
                     abs_s += wp.abs(ev[k, j] * ones[row, j])
                     ys += ev[k, j] * yield_parameters[node_index][0]
 
-                if wp.abs(s) < zero_mean_tolerance * abs_s:
+                if wp.abs(s) <= zero_mean_tolerance * abs_s:
                     ev_s = 1.0
                     rv[k] = 0.0
                 else:

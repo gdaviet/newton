@@ -472,38 +472,6 @@ def two_hop_collider_triplets(
 
 
 @wp.kernel
-def average_element_yield_parameters(
-    nodes_per_element: int,
-    node_volume: wp.array[float],
-    node_yield_parameters: wp.array[YieldParamVec],
-    element_yield_parameters: wp.array[YieldParamVec],
-):
-    """Volume-average integrated strain-node yield parameters over each element."""
-    element = wp.tid()
-    volume = float(0.0)
-    yield_parameters = YieldParamVec(0.0)
-    for j in range(nodes_per_element):
-        node = element * nodes_per_element + j
-        volume += node_volume[node]
-        yield_parameters += node_yield_parameters[node]
-    if volume > 0.0:
-        element_yield_parameters[element] = wp.max(YieldParamVec(0.0), yield_parameters / volume)
-    else:
-        element_yield_parameters[element] = YieldParamVec(0.0)
-
-
-@wp.kernel
-def assign_element_yield_parameters(
-    nodes_per_element: int,
-    element_yield_parameters: wp.array[YieldParamVec],
-    node_yield_parameters: wp.array[YieldParamVec],
-):
-    """Give every strain mode of an element the element's average yield parameters."""
-    node = wp.tid()
-    node_yield_parameters[node] = element_yield_parameters[node // nodes_per_element]
-
-
-@wp.kernel
 def fill_point_coords(abscissae: wp.array[float], point_coords: wp.array2d[fem.Coords]):
     """Fill the tensor-product point coordinates shared by every cell."""
     cell, local = wp.tid()

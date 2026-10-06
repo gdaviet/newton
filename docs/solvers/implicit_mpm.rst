@@ -44,6 +44,12 @@ The values illustrate a starting configuration; tune the fractions and
 contact distance for the scene and timestep. These experimental options
 are runtime-only and are not authored through USD schemas.
 
+For ``P1d`` and ``Q1d`` strain bases, symmetric quadrature can produce
+positive-mass modes with a vanishing mean. These modes remain in the solve
+and receive the element's volume-averaged yield parameters and viscosity,
+since division by their mean cannot recover material parameters. This
+handling is shared by PIC, GIMP, and cell integration.
+
 ``density_strain_fraction`` injects a fraction of the signed filling error
 into the existing divergence right-hand side. Particle reference volume is
 compared against grid volume minus collider volume. Overfilled cells request

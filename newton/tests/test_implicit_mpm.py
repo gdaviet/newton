@@ -9,12 +9,14 @@ import warp.fem as fem
 
 import newton
 from newton._src.solvers.implicit_mpm.cell_quadrature import CellQuadrature
+from newton._src.solvers.implicit_mpm.implicit_mpm_solver_kernels import compute_eigenvalues
 from newton._src.solvers.implicit_mpm.rasterized_collisions import (
     _ALL_COLLIDER_WORLDS,
     Collider,
     collision_sdf,
     rasterize_collider_kernel,
 )
+from newton._src.solvers.implicit_mpm.rheology_solver_kernels import YieldParamVec
 from newton._src.solvers.implicit_mpm.solve_rheology import (
     _ITERATIVE_LINEAR_SOLVERS,
     ArraySquaredNorm,
@@ -1241,6 +1243,106 @@ def _run_elastic_block(device, integration_scheme, strain_basis, step_count=40, 
     return _step_mpm(model, config, step_count=step_count)
 
 
+def test_strain_mode_mass_filter(test, device):
+    """Keep a positive-mass zero-mean mode while dropping a zero-mass mode."""
+    with wp.ScopedDevice(device):
+        mass = np.diag((1.0, 1.0 / 12.0, 0.0)).astype(np.float32)
+        eigenvalues = wp.empty((1, 3), dtype=float, device=device)
+        eigenvectors = wp.empty((1, 3, 3), dtype=float, device=device)
+        rotated_volume = wp.empty((1, 3), dtype=float, device=device)
+        wp.launch(
+            compute_eigenvalues,
+            dim=1,
+            inputs=[
+                wp.array((0, 1), dtype=int, device=device),
+                wp.array((0,), dtype=int, device=device),
+                wp.array(mass[None], dtype=wp.mat33, device=device),
+                wp.array(((1.0, 0.0, 0.0),), dtype=float, device=device),
+                # A heterogeneous material can have a negative moment against a zero-mean mode.
+                wp.array(((1.0,) * 6, (-1.0 / 12.0,) * 6, (0.0,) * 6), dtype=YieldParamVec, device=device),
+                1.0e-4,
+                eigenvalues,
+                eigenvectors,
+                rotated_volume,
+            ],
+            device=device,
+        )
+        modes = eigenvectors.numpy()[0]
+        np.testing.assert_allclose(modes.T @ modes, np.diag((1.0, 1.0, 0.0)), atol=1.0e-6)
+        np.testing.assert_allclose(modes.T @ np.diag(eigenvalues.numpy()[0]) @ modes, mass, atol=1.0e-6)
+
+
+def test_strain_modes_symmetric_cell(test, device):
+    """Retain full-rank strain modes and uniform material parameters on a symmetric cell."""
+
+    class ModeSolver(SolverImplicitMPM):
+        def _build_strain_eigenbasis(self, pic, scratch, inv_cell_volume):
+            eigenvectors, rotated_volume = super()._build_strain_eigenbasis(pic, scratch, inv_cell_volume)
+            self.element = int(pic.cell_indices.numpy().reshape(-1)[0])
+            self.mode_count = eigenvectors.shape[1]
+            self.modes = eigenvectors.numpy()[self.element].copy()
+            self.mode_mass = (
+                scratch.strain_node_particle_volume.numpy().reshape(-1, self.mode_count)[self.element].copy()
+            )
+            return eigenvectors, rotated_volume
+
+        def _solve_rheology(self, pic, scratch, rigidity_operator, last_step_data, inv_cell_volume):
+            result = super()._solve_rheology(pic, scratch, rigidity_operator, last_step_data, inv_cell_volume)
+            self.mode_yield_parameters = (
+                scratch.strain_yield_parameters_field.dof_values.numpy()
+                .reshape(-1, self.mode_count, 6)[self.element]
+                .copy()
+            )
+            return result
+
+    abscissae = (0.5 - 0.5 / np.sqrt(3.0), 0.5 + 0.5 / np.sqrt(3.0))
+    positions = np.array(np.meshgrid(abscissae, abscissae, abscissae)).reshape(3, -1).T
+    expected_yield = np.array((300.0 * np.sqrt(1.5), 150.0 * np.sqrt(1.5), 20.0, 60.0, 0.0, 1000.0))
+    with wp.ScopedDevice(device):
+        for integration_scheme in ("pic", "gimp", "cell"):
+            for strain_basis in ("P1d", "Q1d"):
+                with test.subTest(integration_scheme=integration_scheme, strain_basis=strain_basis):
+                    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+                    SolverImplicitMPM.register_custom_attributes(builder)
+                    for position in positions:
+                        builder.add_particle(
+                            pos=position,
+                            vel=(0.0, 0.0, 0.0),
+                            mass=0.125,
+                            radius=0.25,
+                            custom_attributes={
+                                "mpm:young_modulus": 1.0e4,
+                                "mpm:friction": 0.2,
+                                "mpm:yield_pressure": 300.0,
+                                "mpm:tensile_yield_ratio": 0.5,
+                                "mpm:yield_stress": 20.0,
+                                "mpm:viscosity": 10.0,
+                            },
+                        )
+                    model = builder.finalize(device=device)
+                    solver = ModeSolver(
+                        model,
+                        SolverImplicitMPM.Config(
+                            voxel_size=1.0,
+                            grid_type="fixed",
+                            integration_scheme=integration_scheme,
+                            strain_basis=strain_basis,
+                            max_iterations=0,
+                            warmstart_mode="none",
+                        ),
+                    )
+                    state = model.state()
+                    solver.step(state, state, None, None, 0.01)
+                    test.assertTrue(np.all(solver.mode_mass > 1.0e-6))
+                    np.testing.assert_allclose(solver.modes @ solver.modes.T, np.eye(solver.mode_count), atol=2.0e-5)
+                    np.testing.assert_allclose(
+                        solver.mode_yield_parameters,
+                        np.tile(expected_yield, (solver.mode_count, 1)),
+                        rtol=2.0e-4,
+                        atol=2.0e-4,
+                    )
+
+
 def test_cell_integration_elastic_block(test, device):
     """Step an elastic block resting on the ground with fixed cell quadrature.
 
@@ -1978,6 +2080,10 @@ add_function_test(
 add_function_test(
     TestImplicitMPM, "test_cell_integration_elastic_block", test_cell_integration_elastic_block, devices=devices
 )
+add_function_test(
+    TestImplicitMPM, "test_strain_modes_symmetric_cell", test_strain_modes_symmetric_cell, devices=devices
+)
+add_function_test(TestImplicitMPM, "test_strain_mode_mass_filter", test_strain_mode_mass_filter, devices=devices)
 add_function_test(
     TestImplicitMPM,
     "test_cell_integration_particle_contact_rows",
