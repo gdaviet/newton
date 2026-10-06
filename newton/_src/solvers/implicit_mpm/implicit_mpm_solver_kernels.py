@@ -381,6 +381,20 @@ def mass_form(
     return p(s) * q(s) * inv_cell_volume
 
 
+@wp.kernel
+def filter_p0_strain_mass(node_volume: wp.array[float]):
+    """Apply the element mass floor directly to constant strain modes.
+
+    For P0, the mass and the integral of the basis function are equal. Empty
+    cells have no mass block; small nonzero blocks use the same unit mass as
+    ``compute_eigenvalues``.
+    """
+    node = wp.tid()
+    volume = node_volume[node]
+    if volume != 0.0 and volume <= _EIGENVALUE_FLOOR:
+        node_volume[node] = 1.0
+
+
 @wp.kernel(module="unique")
 def compute_eigenvalues(
     offsets: wp.array[int],
