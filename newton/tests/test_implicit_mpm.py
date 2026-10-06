@@ -1291,6 +1291,92 @@ def test_cell_integration_particle_contact_rows(test, device):
     test.assertGreater(np.min(positions[:, 1]), -0.02)
 
 
+def _make_cell_viscous_block(device, viscosity, strain_basis="P0", solver="gs", max_iterations=5, young_modulus=1.0e15):
+    builder = _make_mpm_particle_builder(gravity=(0.0, 0.0, 0.0), young_modulus=young_modulus, dimensions=(6, 6, 6))
+    model = builder.finalize(device=device)
+    model.mpm.friction.zero_()
+    model.mpm.viscosity.fill_(viscosity)
+    config = SolverImplicitMPM.Config(
+        voxel_size=0.1,
+        grid_type="fixed",
+        integration_scheme="cell",
+        strain_basis=strain_basis,
+        solver=solver,
+        max_iterations=max_iterations,
+        tolerance=0.0,
+        air_drag=1.0e-6,
+    )
+    return model, SolverImplicitMPM(model, config=config)
+
+
+def test_cell_integration_viscosity_decay(test, device):
+    """Dissipate shear with increasing viscosity, including truncated solves."""
+    with wp.ScopedDevice(device):
+        for strain_basis, solver, max_iterations in (
+            ("P0", "gs", 5),
+            ("P0", "jacobi", 5),
+            ("P0", "gs", 100),
+            ("P1d", "gs", 5),
+            ("Q1d", "gs", 5),
+        ):
+            with test.subTest(strain_basis=strain_basis, solver=solver, max_iterations=max_iterations):
+                energies = []
+                for viscosity in (0.0, 10.0, 1000.0):
+                    model, mpm_solver = _make_cell_viscous_block(
+                        device, viscosity, strain_basis, solver, max_iterations
+                    )
+                    state, output = model.state(), model.state()
+                    positions = state.particle_q.numpy()
+                    centered = positions - np.mean(positions, axis=0)
+                    velocities = np.column_stack((centered[:, 1], centered[:, 0], np.zeros(model.particle_count)))
+                    state.particle_qd.assign(wp.array(velocities, dtype=wp.vec3, device=device))
+                    initial_energy = np.sum(model.particle_mass.numpy()[:, None] * velocities**2)
+                    for _ in range(5):
+                        mpm_solver.step(state, output, None, None, 0.01)
+                        state, output = output, state
+                        velocities = state.particle_qd.numpy()
+                        test.assertTrue(np.isfinite(velocities).all())
+                        energy = np.sum(model.particle_mass.numpy()[:, None] * velocities**2)
+                        test.assertLessEqual(energy, initial_energy * 1.001)
+                    energies.append(energy)
+                test.assertLess(energies[1], 0.95 * energies[0])
+                test.assertLess(energies[2], 0.5 * energies[1])
+
+
+def test_cell_integration_viscosity_translation(test, device):
+    """Preserve uniform translation when viscosity has no strain to dissipate."""
+    with wp.ScopedDevice(device):
+        model, solver = _make_cell_viscous_block(device, 1000.0)
+        state = model.state()
+        translation = np.array((0.3, -0.1, 0.2), dtype=np.float32)
+        initial_positions = state.particle_q.numpy().copy()
+        state.particle_qd.fill_(wp.vec3(translation))
+        for _ in range(5):
+            solver.step(state, state, None, None, 0.01)
+        np.testing.assert_allclose(
+            state.particle_qd.numpy(), np.tile(translation, (model.particle_count, 1)), atol=2.0e-5
+        )
+        np.testing.assert_allclose(state.particle_q.numpy(), initial_positions + 0.05 * translation, atol=2.0e-6)
+
+
+def test_cell_integration_viscosity_elastic_history(test, device):
+    """Keep kinematic and stress-based elastic increments consistent in a converged viscous solve."""
+    with wp.ScopedDevice(device):
+        strains = []
+        for kinematic_update in (False, True):
+            model, solver = _make_cell_viscous_block(device, 10.0, max_iterations=300, young_modulus=1.0e4)
+            solver._cell_kinematic_update = kinematic_update
+            state, output = model.state(), model.state()
+            positions = state.particle_q.numpy()
+            centered = positions - np.mean(positions, axis=0)
+            velocities = np.column_stack((centered[:, 1], centered[:, 0], np.zeros(model.particle_count)))
+            state.particle_qd.assign(wp.array(velocities, dtype=wp.vec3, device=device))
+            solver.step(state, output, None, None, 0.01)
+            strains.append(output.mpm.particle_elastic_strain.numpy().copy())
+        test.assertGreater(np.max(np.abs(strains[0] - np.eye(3))), 1.0e-5)
+        np.testing.assert_allclose(strains[1], strains[0], atol=2.0e-5, rtol=0.0)
+
+
 def test_cell_integration_rejects_unsupported(test, device):
     """Reject configurations and materials that cell quadrature does not support."""
     model = _make_mpm_particle_builder().finalize(device=device)
@@ -1905,6 +1991,21 @@ add_function_test(
     devices=devices,
 )
 add_function_test(TestImplicitMPM, "test_cell_quadrature_weights", test_cell_quadrature_weights, devices=devices)
+add_function_test(
+    TestImplicitMPM, "test_cell_integration_viscosity_decay", test_cell_integration_viscosity_decay, devices=devices
+)
+add_function_test(
+    TestImplicitMPM,
+    "test_cell_integration_viscosity_translation",
+    test_cell_integration_viscosity_translation,
+    devices=devices,
+)
+add_function_test(
+    TestImplicitMPM,
+    "test_cell_integration_viscosity_elastic_history",
+    test_cell_integration_viscosity_elastic_history,
+    devices=devices,
+)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)

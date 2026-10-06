@@ -944,7 +944,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         .. experimental::
 
             ``"cell"`` requires the ``"Q1"`` velocity basis and a single FEM
-            environment, and does not support hardening, viscosity, dilatancy,
+            environment, and does not support hardening, dilatancy,
             kinematic (zero-density) particles, or a positive
             :attr:`critical_fraction`.
         """
@@ -2879,7 +2879,6 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             name
             for name, present in (
                 ("hardening", mpm_model.has_hardening),
-                ("viscosity", mpm_model.has_viscosity),
                 ("dilatancy", mpm_model.has_dilatancy),
             )
             if present
@@ -3896,7 +3895,13 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 dim=node_count,
                 inputs=[M_diag, scratch.elastic_strain_delta_field.dof_values],
             )
-        if self._mpm_model.has_hardening or self.residual_strain_tracking:
+        # Cell kinematics subtracts the plastic increment from the velocity
+        # gradient even when the material has no hardening.
+        if (
+            self._mpm_model.has_hardening
+            or self.residual_strain_tracking
+            or (self._cell_kinematic_update and self._mpm_model.has_compliant_particles)
+        ):
             wp.launch(
                 inverse_scale_sym_tensor,
                 dim=node_count,

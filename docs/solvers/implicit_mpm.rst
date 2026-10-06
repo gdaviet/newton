@@ -70,7 +70,7 @@ budget is divisible by five; other budgets use individual iterations.
    Cell integration and recovery controls may change without prior notice.
    Cell integration currently requires Q1 velocity, one shared FEM
    environment, positive particle density, zero ``critical_fraction``, and
-   materials without hardening, viscosity, or dilatancy. Standard PIC/GIMP
+   materials without hardening or dilatancy. Standard PIC/GIMP
    integration retains its existing material support. Recovery improves
    error handling after truncated solves; it does not guarantee convergence
    for every scene or iteration budget.
@@ -115,7 +115,8 @@ lets the solver's contact recovery determine containment. Omit the option
 to retain the example's existing projection fallback. Use
 ``--integration-scheme pic`` for ordinary particle transfers, and set the
 recovery fractions and contact gap to zero to compare against no feedback.
-Cell mode in this example requires ``--world-count 1`` and zero viscosity.
+Cell mode in this example requires ``--world-count 1``. Particle viscosity
+is supported with cell integration; use ``--viscosity`` to set it in Pa·s.
 
 For a faster preview, add ``--voxel-size 0.1 --particles-per-cell 2``. Use
 ``--viewer null --test --num-frames 60`` for a one-second headless smoke run.
@@ -141,6 +142,11 @@ The recovery regression module checks volume recovery with three iterations,
 penetration recovery and predictive gap closure with one iteration, exact
 iteration budgets on CPU and CUDA graphs, residual-history reset, and full
 step graph replay on both supported test GPUs.
+
+Cell-viscosity regressions check shear decay with five Gauss-Seidel and
+Jacobi iterations, preservation of uniform translation, and consistent
+elastic deformation history. They cover all supported cell strain bases
+on CPU and CUDA.
 
 The dam-break and full-tank commands above also passed 60-frame smoke runs
 at the default 0.05 m grid spacing and three particles per cell axis, with
