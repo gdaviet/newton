@@ -30,7 +30,7 @@ import warp.sparse as wps
 import newton
 
 from .implicit_mpm_model import MaterialParameters
-from .integration import ElasticityInputs
+from .implicit_mpm_solver_kernels import ElasticityInputs
 from .material_kernels import (
     extract_elastic_parameters,
     get_elastic_parameters,

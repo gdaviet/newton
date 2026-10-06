@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -36,6 +37,18 @@ mat31 = wp.types.matrix(shape=(3, 1), dtype=wp.float32)
 mat11 = wp.types.matrix(shape=(1, 1), dtype=wp.float32)
 
 YIELD_PARAM_LENGTH = type_size(YieldParamVec)
+
+
+@dataclass
+class ElasticityInputs:
+    """Bind quadrature-specific material data to the shared elastic assembly."""
+
+    quadrature: fem.Quadrature
+    strain_rhs: fem.Integrand
+    compliance: fem.Integrand
+    fields: dict[str, fem.Field]
+    values: dict[str, Any]
+    compliance_values: dict[str, Any] | None = None
 
 
 @fem.integrand

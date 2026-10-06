@@ -13,8 +13,7 @@ import warp.fem as fem
 import newton
 
 from .implicit_mpm_model import ImplicitMPMModel, MaterialParameters
-from .implicit_mpm_solver_kernels import integrate_active_fraction
-from .integration import ElasticityInputs
+from .implicit_mpm_solver_kernels import ElasticityInputs, integrate_active_fraction
 from .material_kernels import (
     EPSILON,
     USE_HENCKY_STRAIN_MEASURE,

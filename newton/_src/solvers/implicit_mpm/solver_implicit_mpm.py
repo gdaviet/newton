@@ -36,7 +36,6 @@ from .cell_quadrature import (
     cell_stencil_points,
 )
 from .implicit_mpm_model import ImplicitMPMModel
-from .integration import assemble_elasticity
 from .particle_surface_colliders import extrapolate_surface_sdf_into_colliders
 from .rasterized_collisions import (
     Collider,
@@ -3354,7 +3353,23 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                     inv_cell_volume,
                     self.temporary_store,
                 )
-            assemble_elasticity(inputs, scratch, self.temporary_store)
+            fields = {"tau": scratch.sym_strain_test, **inputs.fields}
+            fem.integrate(
+                inputs.strain_rhs,
+                quadrature=inputs.quadrature,
+                fields=fields,
+                values=inputs.values,
+                output=scratch.elastic_strain_delta_field.dof_values,
+                temporary_store=self.temporary_store,
+            )
+            fem.integrate(
+                inputs.compliance,
+                quadrature=inputs.quadrature,
+                fields={**fields, "sig": scratch.sym_strain_trial},
+                values=inputs.values if inputs.compliance_values is None else inputs.compliance_values,
+                output=scratch.compliance_matrix,
+                temporary_store=self.temporary_store,
+            )
 
     def _build_plasticity_system(
         self,
