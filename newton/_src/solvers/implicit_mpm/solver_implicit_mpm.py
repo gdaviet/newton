@@ -63,6 +63,7 @@ from .implicit_mpm_solver_kernels import (
     compute_eigenvalues,
     compute_unilateral_strain_offset,
     fill_uniform_color_block_indices,
+    filter_p0_strain_mass,
     free_velocity,
     integrate_active_fraction,
     integrate_collider_fraction,
@@ -2922,6 +2923,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 dt=dt,
                 inv_cell_volume=1.0 / mpm_model.voxel_size**3,
                 temporary_store=self.temporary_store,
+                transfer_elastic_history=mpm_model.has_compliant_particles,
             )
             if self._cell_two_hop_transfers:
                 transfer_quadrature = self._cell_transfer_quadrature
@@ -3520,7 +3522,17 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         scratch: ImplicitMPMScratchpad,
         inv_cell_volume: float,
     ):
-        if self.strain_basis in ("Q1", "S2"):
+        self._element_yield_parameters = None
+        if self.strain_basis == "P0":
+            # Constant modes have mass equal to their already integrated volume
+            # and do not need a sparse mass matrix or an eigenbasis.
+            wp.launch(
+                filter_p0_strain_mass,
+                dim=scratch.strain_node_count,
+                inputs=[scratch.strain_node_particle_volume],
+            )
+            return None, None
+        elif self.strain_basis in ("Q1", "S2"):
             scratch.strain_node_particle_volume += EPSILON
             return None, None
         elif self.strain_basis[:3] == "pic":
@@ -3557,7 +3569,6 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         # A positive-mass mode can have zero mean with any symmetric quadrature.
         # Its material parameters cannot be recovered by dividing by that mean.
         zero_mean_tolerance = 1.0e-4
-        self._element_yield_parameters = None
         if nodes_per_elt > 1:
             self._element_yield_parameters = wp.empty(M_elt_wise.nrow, dtype=YieldParamVec)
             wp.launch(

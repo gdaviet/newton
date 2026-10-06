@@ -60,6 +60,7 @@ def cell_quadrature_abscissae(points_per_axis: int) -> list[float]:
 
 @wp.kernel
 def transfer_particles_to_points(
+    transfer_elastic_history: bool,
     point_index: wp.array2d[int],
     point_weight: wp.array2d[float],
     particle_flags: wp.array[wp.int32],
@@ -90,10 +91,14 @@ def transfer_particles_to_points(
     if volume <= 0.0:
         return
 
-    elastic_parameters = get_elastic_parameters(p, material_parameters)
     yield_parameters = get_yield_parameters(p, material_parameters, particle_Jp[p], dt)
-    stiffness = volume * elastic_parameters[0]
-    hencky = hencky_strain(elastic_strain[p])
+    elastic_parameters = wp.vec3(0.0)
+    stiffness = float(0.0)
+    hencky = wp.mat33(0.0)
+    if transfer_elastic_history:
+        elastic_parameters = get_elastic_parameters(p, material_parameters)
+        stiffness = volume * elastic_parameters[0]
+        hencky = hencky_strain(elastic_strain[p])
 
     for k in range(POINT_STENCIL_SIZE):
         q = point_index[p, k]
@@ -101,17 +106,19 @@ def transfer_particles_to_points(
             continue
         w = point_weight[p, k]
         wv = w * volume
-        ws = w * stiffness
         wp.atomic_add(point_volume, q, wv)
-        wp.atomic_add(point_stiffness, q, ws)
-        wp.atomic_add(point_elastic_strain, q, ws * hencky)
-        wp.atomic_add(point_elastic_parameters, q, wv * elastic_parameters)
+        if transfer_elastic_history:
+            ws = w * stiffness
+            wp.atomic_add(point_stiffness, q, ws)
+            wp.atomic_add(point_elastic_strain, q, ws * hencky)
+            wp.atomic_add(point_elastic_parameters, q, wv * elastic_parameters)
         wp.atomic_add(point_yield_parameters, q, wv * yield_parameters)
         wp.atomic_add(point_stress, q, wv * particle_stress[p])
 
 
 @wp.kernel
 def normalize_point_data(
+    transfer_elastic_history: bool,
     inv_cell_volume: float,
     point_volume: wp.array[float],
     point_stiffness: wp.array[float],
@@ -132,10 +139,11 @@ def normalize_point_data(
 
     point_flags[q] = newton.ParticleFlags.ACTIVE
     inv_volume = 1.0 / volume
-    stiffness = point_stiffness[q]
-    if stiffness > 0.0:
-        point_elastic_strain[q] = point_elastic_strain[q] / stiffness
-    point_elastic_parameters[q] = point_elastic_parameters[q] * inv_volume
+    if transfer_elastic_history:
+        stiffness = point_stiffness[q]
+        if stiffness > 0.0:
+            point_elastic_strain[q] = point_elastic_strain[q] / stiffness
+        point_elastic_parameters[q] = point_elastic_parameters[q] * inv_volume
     point_yield_parameters[q] = wp.max(YieldParamVec(0.0), point_yield_parameters[q] * inv_volume)
     point_stress[q] = point_stress[q] * inv_volume
 
@@ -606,6 +614,8 @@ class CellQuadrature:
         dt: float,
         inv_cell_volume: float,
         temporary_store: fem.TemporaryStore | None,
+        *,
+        transfer_elastic_history: bool = True,
     ):
         """Transfer particle history to the points and build the point quadrature."""
         device = particle_volume.device
@@ -613,9 +623,13 @@ class CellQuadrature:
 
         self.point_flags = self._borrow(temporary_store, point_count, wp.int32, device)
         self.point_volume = self._borrow(temporary_store, point_count, float, device)
-        self.point_stiffness = self._borrow(temporary_store, point_count, float, device)
-        self.point_elastic_strain = self._borrow(temporary_store, point_count, wp.mat33, device)
-        self.point_elastic_parameters = self._borrow(temporary_store, point_count, wp.vec3, device)
+        self.point_stiffness = None
+        self.point_elastic_strain = None
+        self.point_elastic_parameters = None
+        if transfer_elastic_history:
+            self.point_stiffness = self._borrow(temporary_store, point_count, float, device)
+            self.point_elastic_strain = self._borrow(temporary_store, point_count, wp.mat33, device)
+            self.point_elastic_parameters = self._borrow(temporary_store, point_count, wp.vec3, device)
         self.point_yield_parameters = self._borrow(temporary_store, point_count, YieldParamVec, device)
         self.point_stress = self._borrow(temporary_store, point_count, wp.mat33, device)
         point_fraction = self._borrow(temporary_store, self.point_coords.shape, float, device)
@@ -628,12 +642,14 @@ class CellQuadrature:
             self.point_yield_parameters,
             self.point_stress,
         ):
-            array.zero_()
+            if array is not None:
+                array.zero_()
 
         wp.launch(
             transfer_particles_to_points,
             dim=particle_volume.shape[0],
             inputs=[
+                transfer_elastic_history,
                 self.point_index,
                 self.point_weight,
                 particle_flags,
@@ -656,6 +672,7 @@ class CellQuadrature:
             normalize_point_data,
             dim=point_count,
             inputs=[
+                transfer_elastic_history,
                 inv_cell_volume,
                 self.point_volume,
                 self.point_stiffness,

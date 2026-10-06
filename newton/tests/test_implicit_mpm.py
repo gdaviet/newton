@@ -9,7 +9,11 @@ import warp.fem as fem
 
 import newton
 from newton._src.solvers.implicit_mpm.cell_quadrature import CellQuadrature
-from newton._src.solvers.implicit_mpm.implicit_mpm_solver_kernels import compute_eigenvalues
+from newton._src.solvers.implicit_mpm.implicit_mpm_solver_kernels import (
+    compute_eigenvalues,
+    filter_p0_strain_mass,
+    mat11,
+)
 from newton._src.solvers.implicit_mpm.rasterized_collisions import (
     _ALL_COLLIDER_WORLDS,
     Collider,
@@ -1243,6 +1247,81 @@ def _run_elastic_block(device, integration_scheme, strain_basis, step_count=40, 
     return _step_mpm(model, config, step_count=step_count)
 
 
+def test_p0_strain_mass_filter(test, device):
+    """Match scalar mass diagonalization for empty, underfilled, and full cells."""
+    with wp.ScopedDevice(device):
+        volumes = np.array((0.0, 1.0e-8, 1.0e-6, 2.0e-6, 0.5, 1.0), dtype=np.float32)
+        count = len(volumes)
+        masses = wp.array(volumes, dtype=float, device=device)
+        eigenvalues = wp.empty((count, 1), dtype=float, device=device)
+        eigenvectors = wp.empty((count, 1, 1), dtype=float, device=device)
+        rotated_volume = wp.empty((count, 1), dtype=float, device=device)
+        wp.launch(
+            compute_eigenvalues,
+            dim=count,
+            inputs=[
+                wp.array((0, 0, 1, 2, 3, 4, 5), dtype=int, device=device),
+                wp.array((1, 2, 3, 4, 5), dtype=int, device=device),
+                wp.array(volumes[1:].reshape(-1, 1, 1), dtype=mat11, device=device),
+                wp.array(volumes.reshape(-1, 1), dtype=float, device=device),
+                wp.ones(count, dtype=YieldParamVec, device=device),
+                1.0e-4,
+                eigenvalues,
+                eigenvectors,
+                rotated_volume,
+            ],
+            device=device,
+        )
+        wp.launch(filter_p0_strain_mass, dim=count, inputs=[masses], device=device)
+        np.testing.assert_array_equal(masses.numpy(), eigenvalues.numpy().reshape(-1))
+        np.testing.assert_array_equal(masses.numpy(), rotated_volume.numpy().reshape(-1))
+
+
+def test_cell_transfer_rigid_history(test, device):
+    """Preserve volume, viscosity and stress when elastic history is omitted."""
+    with wp.ScopedDevice(device):
+        builder = _make_mpm_particle_builder(young_modulus=1.0e15)
+        model = builder.finalize(device=device)
+        model.mpm.viscosity.fill_(0.001)
+        solver = SolverImplicitMPM(model, _make_mpm_config(integration_scheme="cell"))
+        mpm_model = solver._mpm_model
+        state = model.state()
+        state.mpm.particle_stress.fill_(wp.mat33(2.0))
+        grid = fem.Grid3D(bounds_lo=wp.vec3(-0.1), bounds_hi=wp.vec3(0.2), res=wp.vec3i(3))
+        domain = fem.Cells(grid)
+        pic = fem.PicQuadrature(domain, state.particle_q, use_domain_element_indices=True)
+        for points_per_axis in (1, 2):
+            with test.subTest(points_per_axis=points_per_axis):
+                cell = CellQuadrature(points_per_axis, device=device)
+                cell.compute_weights(pic, state.particle_q, 0.1, temporary_store=None)
+                outputs = []
+                for elastic_history in (True, False):
+                    cell.transfer_particles(
+                        domain,
+                        particle_flags=mpm_model.material_particle_flags,
+                        particle_volume=mpm_model.material_particle_volume,
+                        elastic_strain=state.mpm.particle_elastic_strain if elastic_history else None,
+                        particle_stress=state.mpm.particle_stress,
+                        particle_Jp=state.mpm.particle_Jp,
+                        material_parameters=mpm_model.material_parameters,
+                        dt=0.01,
+                        inv_cell_volume=1000.0,
+                        temporary_store=None,
+                        transfer_elastic_history=elastic_history,
+                    )
+                    outputs.append(
+                        [
+                            array.numpy().copy()
+                            for array in (cell.point_volume, cell.point_yield_parameters, cell.point_stress)
+                        ]
+                    )
+                for full, rigid in zip(*outputs, strict=True):
+                    np.testing.assert_allclose(rigid, full, rtol=1.0e-6, atol=1.0e-6)
+                test.assertGreater(np.max(outputs[1][1][:, 5]), 0.0)
+                test.assertGreater(np.max(outputs[1][2]), 0.0)
+                cell.release()
+
+
 def test_strain_mode_mass_filter(test, device):
     """Keep a positive-mass zero-mean mode while dropping a zero-mass mode."""
     with wp.ScopedDevice(device):
@@ -2084,6 +2163,10 @@ add_function_test(
     TestImplicitMPM, "test_strain_modes_symmetric_cell", test_strain_modes_symmetric_cell, devices=devices
 )
 add_function_test(TestImplicitMPM, "test_strain_mode_mass_filter", test_strain_mode_mass_filter, devices=devices)
+add_function_test(TestImplicitMPM, "test_p0_strain_mass_filter", test_p0_strain_mass_filter, devices=devices)
+add_function_test(
+    TestImplicitMPM, "test_cell_transfer_rigid_history", test_cell_transfer_rigid_history, devices=devices
+)
 add_function_test(
     TestImplicitMPM,
     "test_cell_integration_particle_contact_rows",
