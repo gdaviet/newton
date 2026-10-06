@@ -125,6 +125,15 @@ rendering and display particles instead. Combine it with ``--viewer null``
 to run without rendering or surface reconstruction. Physics checks remain
 enabled with ``--test``; surface checks run only when reconstruction is enabled.
 
+``--transfer-scheme pic`` disables affine momentum transfer; the default is
+``apic``. This switch is independent of strain integration and collider basis,
+so it can be used with ``--integration-scheme cell --collider-basis pic27``.
+PIC transfer adds numerical damping and can reduce persistent currents in a
+static tank. It does not ensure hydrostatic balance or volume preservation.
+The current stopping test measures the stress residual, so increasing
+``--max-iterations`` alone can still terminate early with contact violations.
+``--tolerance 0`` forces the selected iteration count for diagnosis.
+
 Validation
 ----------
 

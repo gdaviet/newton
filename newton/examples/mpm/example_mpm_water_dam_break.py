@@ -117,6 +117,7 @@ class Example:
         mpm_config.collider_basis = args.collider_basis
         mpm_config.velocity_basis = args.velocity_basis
         mpm_config.integration_scheme = args.integration_scheme
+        mpm_config.transfer_scheme = args.transfer_scheme
         mpm_config.solver = args.solver
         mpm_config.density_strain_fraction = args.density_strain_fraction
         mpm_config.residual_strain_fraction = args.residual_strain_fraction
@@ -525,6 +526,12 @@ class Example:
             help="Strain integration; experimental cell mode uses two-hop transfers and requires Q1 and one world",
         )
         parser.add_argument("--solver", type=str, default="auto", help="Rheology solver, e.g. gs or jacobi")
+        parser.add_argument(
+            "--transfer-scheme",
+            choices=["apic", "pic"],
+            default="apic",
+            help="Momentum transfer; PIC omits the affine velocity contribution and adds numerical damping",
+        )
         parser.add_argument(
             "--density-strain-fraction",
             type=float,
