@@ -30,16 +30,16 @@ import warp.sparse as wps
 import newton
 
 from .implicit_mpm_model import MaterialParameters
-from .implicit_mpm_solver_kernels import (
-    MAX_JP_DELTA,
-    MIN_JP_DELTA,
+from .integration import ElasticityInputs
+from .material_kernels import (
     extract_elastic_parameters,
     get_elastic_parameters,
     get_yield_parameters,
-    project_particle_strain,
+    hencky_strain,
     stress_strain_relationship,
+    update_particle_history,
 )
-from .rheology_solver_kernels import YieldParamVec, project_stress
+from .rheology_solver_kernels import YieldParamVec
 
 wp.set_module_options({"enable_backward": False})
 
@@ -56,12 +56,6 @@ def cell_quadrature_abscissae(points_per_axis: int) -> list[float]:
         raise ValueError(f"Unsupported number of cell quadrature points per axis: {points_per_axis}")
     coords, _weights = fem.polynomial.quadrature_1d(points_per_axis, fem.Polynomial.GAUSS_LEGENDRE)
     return sorted(float(c) for c in coords)
-
-
-@wp.func
-def _hencky_strain(F: wp.mat33):
-    U, xi, _V = wp.svd3(F)
-    return U @ wp.diag(wp.vec3(wp.log(xi[0]), wp.log(xi[1]), wp.log(xi[2]))) @ wp.transpose(U)
 
 
 @wp.kernel
@@ -99,7 +93,7 @@ def transfer_particles_to_points(
     elastic_parameters = get_elastic_parameters(p, material_parameters)
     yield_parameters = get_yield_parameters(p, material_parameters, particle_Jp[p], dt)
     stiffness = volume * elastic_parameters[0]
-    hencky = _hencky_strain(elastic_strain[p])
+    hencky = hencky_strain(elastic_strain[p])
 
     for k in range(POINT_STENCIL_SIZE):
         q = point_index[p, k]
@@ -276,25 +270,12 @@ def update_particle_strains_from_points(
         stress += w * point_stress[q]
         vel_grad += w * point_velocity_gradient[q]
 
-    p_rate = wp.trace(plastic_delta)
-    delta_Jp = wp.exp(
-        p_rate * wp.where(p_rate < 0.0, material_parameters.hardening_rate[p], material_parameters.softening_rate[p])
+    F_new, Jp_new, stress_new = update_particle_history(
+        p, dt, kinematic_update, material_parameters, F_prev, Jp_prev, elastic_delta, plastic_delta, stress, vel_grad
     )
-    Jp_new = Jp_prev * wp.clamp(delta_Jp, MIN_JP_DELTA, MAX_JP_DELTA)
-
-    compliance, _poisson, _damping = extract_elastic_parameters(get_elastic_parameters(p, material_parameters))
-    yield_parameters = get_yield_parameters(p, material_parameters, Jp_new, dt)
-    stress_dof = fem.SymmetricTensorMapper.value_to_dof_3d(stress)
-    particle_stress[p] = fem.SymmetricTensorMapper.dof_to_value_3d(project_stress(stress_dof, yield_parameters))
-
-    if kinematic_update != 0:
-        F_new = F_prev + (dt * vel_grad - plastic_delta) @ F_prev
-    else:
-        skew = 0.5 * dt * (vel_grad - wp.transpose(vel_grad))
-        F_new = F_prev + (elastic_delta + skew) @ F_prev
-
-    elastic_strain[p] = project_particle_strain(F_new, F_prev, compliance)
+    elastic_strain[p] = F_new
     particle_Jp[p] = Jp_new
+    particle_stress[p] = stress_new
 
 
 @wp.kernel
@@ -895,6 +876,31 @@ class CellQuadrature:
             ],
             device=device,
         )
+
+    def elasticity_inputs(self, dt: float, inv_cell_volume: float) -> ElasticityInputs:
+        """Bind transferred cell-point material data to the shared elastic assembly."""
+        values = {
+            "point_elastic_parameters": self.point_elastic_parameters,
+            "point_flags": self.point_flags,
+            "inv_cell_volume": inv_cell_volume,
+            "dt": dt,
+        }
+        return ElasticityInputs(
+            quadrature=self.quadrature,
+            strain_rhs=cell_strain_rhs,
+            compliance=cell_compliance_form,
+            fields={},
+            values={**values, "point_elastic_strain": self.point_elastic_strain},
+            compliance_values=values,
+        )
+
+    def yield_parameters_inputs(self, inv_cell_volume: float) -> tuple[fem.Integrand, dict]:
+        """Bind cell-point material parameters to the shared yield-parameter assembly."""
+        return integrate_point_yield_parameters, {
+            "point_yield_parameters": self.point_yield_parameters,
+            "point_flags": self.point_flags,
+            "inv_cell_volume": inv_cell_volume,
+        }
 
     def update_particles(
         self,

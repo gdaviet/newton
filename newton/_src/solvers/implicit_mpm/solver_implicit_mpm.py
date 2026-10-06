@@ -25,6 +25,7 @@ from ...geometry.particle_surface import ParticleSurface
 from ...sim import ModelFlags, StateFlags
 from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
+from . import particle_quadrature
 from .cell_quadrature import (
     POINT_STENCIL_SIZE as CELL_POINT_STENCIL_SIZE,
 )
@@ -32,12 +33,10 @@ from .cell_quadrature import (
     CellQuadrature,
     assign_element_yield_parameters,
     average_element_yield_parameters,
-    cell_compliance_form,
     cell_stencil_points,
-    cell_strain_rhs,
-    integrate_point_yield_parameters,
 )
 from .implicit_mpm_model import ImplicitMPMModel
+from .integration import assemble_elasticity
 from .particle_surface_colliders import extrapolate_surface_sdf_into_colliders
 from .rasterized_collisions import (
     Collider,
@@ -57,12 +56,9 @@ from .implicit_mpm_solver_kernels import (
     INFINITY,
     YIELD_PARAM_LENGTH,
     _rebuild_capacity,
-    advect_particles,
     allocate_by_voxels,
-    average_elastic_parameters,
     build_active_particle_mask,
     collision_weight_field,
-    compliance_form,
     compute_bounds,
     compute_color_offsets,
     compute_density_strain_offset,
@@ -73,13 +69,11 @@ from .implicit_mpm_solver_kernels import (
     integrate_active_fraction,
     integrate_collider_fraction,
     integrate_collider_fraction_apic,
-    integrate_elastic_parameters,
     integrate_fraction,
     integrate_mass,
     integrate_particle_stress,
     integrate_velocity,
     integrate_velocity_apic,
-    integrate_yield_parameters,
     inverse_scale_sym_tensor,
     inverse_scale_vector,
     make_cell_color_kernel,
@@ -104,9 +98,7 @@ from .implicit_mpm_solver_kernels import (
     rotate_matrix_rows,
     scatter_field_dof_values,
     strain_delta_form,
-    strain_rhs,
     update_particle_frames,
-    update_particle_strains,
     voxel_coordinates,
 )
 
@@ -2953,7 +2945,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                     temporary_store=self.temporary_store,
                 )
 
-    def _strain_quadrature(self, pic: fem.PicQuadrature) -> tuple[fem.PicQuadrature, wp.array[wp.int32]]:
+    def _strain_quadrature(self, pic: fem.PicQuadrature) -> tuple[fem.Quadrature, wp.array[wp.int32]]:
         """Return the quadrature and per-point flags used for strain-space integrals."""
         if self._cell_quadrature is not None:
             return self._cell_quadrature.quadrature, self._cell_quadrature.point_flags
@@ -3035,143 +3027,18 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 self._separate_worlds and self.grid_type == "sparse" and not self._sparse_rebuildable
             )
 
-            if self.gimp:
-                particle_locations = self._particle_grid_locations_gimp(
-                    domain, positions, self._mpm_model.particle_radius, self._particle_environment
-                )
-                pic = fem.PicQuadrature(
-                    domain=domain,
-                    positions=particle_locations,
-                    measures=self._mpm_model.particle_volume,
-                    temporary_store=self.temporary_store,
-                    use_domain_element_indices=use_domain_element_indices,
-                )
-            else:
-                pic = fem.PicQuadrature(
-                    domain=domain,
-                    positions=positions,
-                    env_indices=self._particle_environment,
-                    measures=self._mpm_model.particle_volume,
-                    temporary_store=self.temporary_store,
-                    use_domain_element_indices=use_domain_element_indices,
-                )
+            pic = particle_quadrature.make_quadrature(
+                domain,
+                positions,
+                self._mpm_model,
+                self._particle_environment,
+                gimp=self.gimp,
+                separate_worlds=self._separate_worlds,
+                temporary_store=self.temporary_store,
+                use_domain_element_indices=use_domain_element_indices,
+            )
 
         return pic
-
-    def _particle_grid_locations_gimp(
-        self,
-        domain: fem.GeometryDomain,
-        positions: wp.array,
-        radii: wp.array,
-        particle_environment: wp.array | None,
-    ) -> wp.array:
-        """Convert particle positions to grid locations."""
-
-        cell_lookup = domain.element_partition_lookup
-        cell_closest_point = domain.element_closest_point
-
-        @wp.func
-        def add_cell(
-            particle_cell_indices: wp.array[fem.ElementIndex],
-            particle_cell_coords: wp.array[fem.Coords],
-            particle_cell_fractions: wp.array[float],
-            cell_index: int,
-            cell_coords: fem.Coords,
-            cell_weight: float,
-        ):
-            for i in range(8):
-                if particle_cell_indices[i] == fem.NULL_NODE_INDEX:
-                    particle_cell_indices[i] = cell_index
-                    particle_cell_coords[i] = cell_coords
-                    particle_cell_fractions[i] = cell_weight
-                    return
-
-                if particle_cell_indices[i] == cell_index:
-                    particle_cell_fractions[i] += cell_weight
-                    return
-
-        separate_worlds = self._separate_worlds
-
-        @fem.cache.dynamic_kernel(suffix=f"{domain.name}_{'isolated' if separate_worlds else 'shared'}")
-        def particle_locations_gimp(
-            cell_arg_value: domain.ElementArg,
-            domain_index_arg_value: domain.ElementIndexArg,
-            positions: wp.array[wp.vec3],
-            radii: wp.array[float],
-            particle_environment: wp.array[int],
-            cell_index: wp.array2d[fem.ElementIndex],
-            cell_coords: wp.array2d[fem.Coords],
-            cell_fractions: wp.array2d[float],
-        ):
-            p = wp.tid()
-            domain_arg = domain.DomainArg(cell_arg_value, domain_index_arg_value)
-
-            center = positions[p]
-            radius = radii[p]
-
-            tot_weight = float(0.0)
-
-            # Find cell containing each corner of the particle,
-            # merging repeated cell indices
-            for vtx in range(8):
-                i = (vtx & 4) >> 2
-                j = (vtx & 2) >> 1
-                k = vtx & 1
-
-                pos = center - wp.vec3(radius) + 2.0 * radius * wp.vec3(float(i), float(j), float(k))
-                if wp.static(separate_worlds):
-                    sample = cell_lookup(domain_arg, pos, int(particle_environment[p]))
-                else:
-                    sample = cell_lookup(domain_arg, pos)
-
-                if sample.element_index == fem.NULL_ELEMENT_INDEX:
-                    continue
-
-                elem_index = domain.element_partition_index(domain_index_arg_value, sample.element_index)
-                cell_weight = wp.min(wp.min(sample.element_coords), 1.0 - wp.max(sample.element_coords))
-
-                if cell_weight > 0.0:
-                    tot_weight += cell_weight
-                    cell_center_coords, _ = cell_closest_point(cell_arg_value, sample.element_index, center)
-                    add_cell(
-                        cell_index[p],
-                        cell_coords[p],
-                        cell_fractions[p],
-                        elem_index,
-                        cell_center_coords,
-                        cell_weight,
-                    )
-
-            # Normalize the weights over the cells
-            for vtx in range(8):
-                if cell_index[p, vtx] != fem.NULL_NODE_INDEX:
-                    cell_fractions[p, vtx] /= tot_weight
-
-        device = positions.device
-
-        cell_indices = fem.borrow_temporary(self.temporary_store, shape=(positions.shape[0], 8), dtype=fem.ElementIndex)
-        cell_coords = fem.borrow_temporary(self.temporary_store, shape=(positions.shape[0], 8), dtype=fem.Coords)
-        cell_fractions = fem.borrow_temporary(self.temporary_store, shape=(positions.shape[0], 8), dtype=float)
-
-        cell_indices.fill_(fem.NULL_NODE_INDEX)
-
-        wp.launch(
-            particle_locations_gimp,
-            dim=positions.shape[0],
-            inputs=[
-                domain.element_arg_value(device=device),
-                domain.element_index_arg_value(device=device),
-                positions,
-                radii,
-                particle_environment,
-                cell_indices,
-                cell_coords,
-                cell_fractions,
-            ],
-            device=device,
-        )
-
-        return cell_indices, cell_coords, cell_fractions
 
     def _step_impl(
         self,
@@ -3468,117 +3335,26 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         scratch: ImplicitMPMScratchpad,
         inv_cell_volume: float,
     ):
-        """Build the elasticity and compliance system."""
-
+        """Assemble elasticity from the material data supplied by the selected quadrature."""
         mpm_model = self._mpm_model
-
         if not mpm_model.has_compliant_particles:
             scratch.elastic_strain_delta_field.dof_values.zero_()
             return
 
-        if self._cell_quadrature is not None:
-            self._build_cell_elasticity_system(dt, scratch, inv_cell_volume)
-            return
-
         with self._timer("Elasticity"):
-            elastic_strains = state_in.mpm.particle_elastic_strain
-            node_particle_volume = fem.integrate(
-                integrate_active_fraction,
-                quadrature=pic,
-                fields={"phi": scratch.fraction_test},
-                values={
-                    "inv_cell_volume": inv_cell_volume,
-                    "particle_flags": mpm_model.material_particle_flags,
-                },
-                output_dtype=float,
-                temporary_store=self.temporary_store,
-            )
-
-            elastic_parameters_int = fem.integrate(
-                integrate_elastic_parameters,
-                quadrature=pic,
-                fields={"u": scratch.velocity_test},
-                values={
-                    "material_parameters": mpm_model.material_parameters,
-                    "particle_flags": mpm_model.material_particle_flags,
-                    "inv_cell_volume": inv_cell_volume,
-                },
-                output_dtype=wp.vec3,
-                temporary_store=self.temporary_store,
-            )
-
-            wp.launch(
-                average_elastic_parameters,
-                dim=scratch.elastic_parameters_field.space_partition.node_count(),
-                inputs=[
-                    elastic_parameters_int,
-                    node_particle_volume,
-                    scratch.elastic_parameters_field.dof_values,
-                ],
-            )
-
-            fem.integrate(
-                strain_rhs,
-                quadrature=pic,
-                fields={
-                    "tau": scratch.sym_strain_test,
-                    "elastic_parameters": scratch.elastic_parameters_field,
-                },
-                values={
-                    "elastic_strains": elastic_strains,
-                    "particle_flags": mpm_model.material_particle_flags,
-                    "inv_cell_volume": inv_cell_volume,
-                    "dt": dt,
-                },
-                temporary_store=self.temporary_store,
-                output=scratch.elastic_strain_delta_field.dof_values,
-            )
-
-            fem.integrate(
-                compliance_form,
-                quadrature=pic,
-                fields={
-                    "tau": scratch.sym_strain_test,
-                    "sig": scratch.sym_strain_trial,
-                    "elastic_parameters": scratch.elastic_parameters_field,
-                },
-                values={
-                    "elastic_strains": elastic_strains,
-                    "particle_flags": mpm_model.material_particle_flags,
-                    "inv_cell_volume": inv_cell_volume,
-                    "dt": dt,
-                },
-                output=scratch.compliance_matrix,
-                temporary_store=self.temporary_store,
-            )
-
-    def _build_cell_elasticity_system(self, dt: float, scratch: ImplicitMPMScratchpad, inv_cell_volume: float):
-        """Build the elastic right-hand side and compliance at the fixed cell points."""
-        cell_quadrature = self._cell_quadrature
-
-        with self._timer("Elasticity"):
-            values = {
-                "point_elastic_parameters": cell_quadrature.point_elastic_parameters,
-                "point_flags": cell_quadrature.point_flags,
-                "inv_cell_volume": inv_cell_volume,
-                "dt": dt,
-            }
-            fem.integrate(
-                cell_strain_rhs,
-                quadrature=cell_quadrature.quadrature,
-                fields={"tau": scratch.sym_strain_test},
-                values={**values, "point_elastic_strain": cell_quadrature.point_elastic_strain},
-                temporary_store=self.temporary_store,
-                output=scratch.elastic_strain_delta_field.dof_values,
-            )
-            fem.integrate(
-                cell_compliance_form,
-                quadrature=cell_quadrature.quadrature,
-                fields={"tau": scratch.sym_strain_test, "sig": scratch.sym_strain_trial},
-                values=values,
-                output=scratch.compliance_matrix,
-                temporary_store=self.temporary_store,
-            )
+            if self._cell_quadrature is not None:
+                inputs = self._cell_quadrature.elasticity_inputs(dt, inv_cell_volume)
+            else:
+                inputs = particle_quadrature.elasticity_inputs(
+                    pic,
+                    state_in.mpm.particle_elastic_strain,
+                    mpm_model,
+                    dt,
+                    scratch,
+                    inv_cell_volume,
+                    self.temporary_store,
+                )
+            assemble_elasticity(inputs, scratch, self.temporary_store)
 
     def _build_plasticity_system(
         self,
@@ -3593,35 +3369,19 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
         with self._timer("Interpolated yield parameters"):
             if self._cell_quadrature is not None:
-                fem.integrate(
-                    integrate_point_yield_parameters,
-                    quadrature=strain_quadrature,
-                    fields={"u": scratch.strain_yield_parameters_test},
-                    values={
-                        "point_yield_parameters": self._cell_quadrature.point_yield_parameters,
-                        "point_flags": strain_point_flags,
-                        "inv_cell_volume": inv_cell_volume,
-                    },
-                    output=scratch.strain_yield_parameters_field.dof_values,
-                    temporary_store=self.temporary_store,
-                )
+                yield_form, yield_values = self._cell_quadrature.yield_parameters_inputs(inv_cell_volume)
             else:
-                fem.integrate(
-                    integrate_yield_parameters,
-                    quadrature=pic,
-                    fields={
-                        "u": scratch.strain_yield_parameters_test,
-                    },
-                    values={
-                        "particle_Jp": state_in.mpm.particle_Jp,
-                        "material_parameters": mpm_model.material_parameters,
-                        "particle_flags": mpm_model.material_particle_flags,
-                        "inv_cell_volume": inv_cell_volume,
-                        "dt": dt,
-                    },
-                    output=scratch.strain_yield_parameters_field.dof_values,
-                    temporary_store=self.temporary_store,
+                yield_form, yield_values = particle_quadrature.yield_parameters_inputs(
+                    state_in.mpm.particle_Jp, mpm_model, dt, inv_cell_volume
                 )
+            fem.integrate(
+                yield_form,
+                quadrature=strain_quadrature,
+                fields={"u": scratch.strain_yield_parameters_test},
+                values=yield_values,
+                output=scratch.strain_yield_parameters_field.dof_values,
+                temporary_store=self.temporary_store,
+            )
 
             fem.integrate(
                 integrate_active_fraction,
@@ -4009,13 +3769,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         pic: fem.PicQuadrature,
         scratch: ImplicitMPMScratchpad,
     ):
-        """Update particle strains and velocities from grid fields, then advect them."""
-
+        """Update particle history and advect through the selected quadrature."""
         model = self.model
         mpm_model = self._mpm_model
-
-        has_compliant_particles = mpm_model.min_young_modulus < INFINITY
-        has_hardening = mpm_model.max_hardening > 0.0
         track_residual_strain = self.residual_strain_tracking
         if state_in is not state_out and not track_residual_strain:
             wp.copy(
@@ -4023,111 +3779,62 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 state_in.mpm.particle_residual_deformation_gradient,
             )
 
-        if self._cell_quadrature is not None and (
-            self._stress_warmstart == "particles" or has_compliant_particles or has_hardening
+        if (
+            self._stress_warmstart == "particles"
+            or mpm_model.has_compliant_particles
+            or mpm_model.has_hardening
+            or track_residual_strain
         ):
             with self._timer("Particle strain update"):
-                self._cell_quadrature.update_particles(
-                    dt,
-                    kinematic_update=self._cell_kinematic_update,
-                    grid_vel=scratch.velocity_field,
-                    elastic_strain_delta=scratch.elastic_strain_delta_field,
-                    plastic_strain_delta=scratch.plastic_strain_delta_field,
-                    stress=scratch.stress_field,
-                    particle_flags=mpm_model.material_particle_flags,
-                    particle_density=mpm_model.particle_density,
-                    material_parameters=mpm_model.material_parameters,
-                    elastic_strain_prev=state_in.mpm.particle_elastic_strain,
-                    particle_Jp_prev=state_in.mpm.particle_Jp,
-                    elastic_strain=state_out.mpm.particle_elastic_strain,
-                    particle_Jp=state_out.mpm.particle_Jp,
-                    particle_stress=state_out.mpm.particle_stress,
-                    temporary_store=self.temporary_store,
-                )
-        elif self._stress_warmstart == "particles" or has_compliant_particles or has_hardening or track_residual_strain:
-            with self._timer("Particle strain update"):
-                # Update particle elastic strain from grid strain delta
-
-                if state_in is state_out:
-                    elastic_strain_prev = wp.clone(state_in.mpm.particle_elastic_strain)
-                    particle_Jp_prev = wp.clone(state_in.mpm.particle_Jp)
+                history_inputs = {
+                    "grid_vel": scratch.velocity_field,
+                    "elastic_strain_delta": scratch.elastic_strain_delta_field,
+                    "plastic_strain_delta": scratch.plastic_strain_delta_field,
+                    "stress": scratch.stress_field,
+                    "particle_flags": mpm_model.material_particle_flags,
+                    "particle_density": mpm_model.particle_density,
+                    "material_parameters": mpm_model.material_parameters,
+                    "elastic_strain_prev": state_in.mpm.particle_elastic_strain,
+                    "particle_Jp_prev": state_in.mpm.particle_Jp,
+                    "elastic_strain": state_out.mpm.particle_elastic_strain,
+                    "particle_Jp": state_out.mpm.particle_Jp,
+                    "particle_stress": state_out.mpm.particle_stress,
+                    "temporary_store": self.temporary_store,
+                }
+                if self._cell_quadrature is not None:
+                    self._cell_quadrature.update_particles(
+                        dt, kinematic_update=self._cell_kinematic_update, **history_inputs
+                    )
                 else:
-                    elastic_strain_prev = state_in.mpm.particle_elastic_strain
-                    particle_Jp_prev = state_in.mpm.particle_Jp
+                    particle_quadrature.update_particles(
+                        dt,
+                        pic=pic,
+                        particle_volume=mpm_model.material_particle_volume,
+                        residual_strain_tracking=track_residual_strain,
+                        residual_deformation_gradient_prev=state_in.mpm.particle_residual_deformation_gradient,
+                        residual_deformation_gradient=state_out.mpm.particle_residual_deformation_gradient,
+                        **history_inputs,
+                    )
 
-                residual_prev = state_in.mpm.particle_residual_deformation_gradient
-                if track_residual_strain:
-                    if state_in is state_out:
-                        residual_prev = wp.clone(residual_prev)
-                    state_out.mpm.particle_residual_deformation_gradient.zero_()
-
-                state_out.mpm.particle_Jp.zero_()
-                state_out.mpm.particle_stress.zero_()
-                state_out.mpm.particle_elastic_strain.zero_()
-
-                fem.interpolate(
-                    update_particle_strains,
-                    at=pic,
-                    values={
-                        "dt": dt,
-                        "particle_flags": mpm_model.material_particle_flags,
-                        "particle_density": mpm_model.particle_density,
-                        "particle_volume": mpm_model.material_particle_volume,
-                        "elastic_strain_prev": elastic_strain_prev,
-                        "elastic_strain": state_out.mpm.particle_elastic_strain,
-                        "particle_stress": state_out.mpm.particle_stress,
-                        "particle_Jp_prev": particle_Jp_prev,
-                        "particle_Jp": state_out.mpm.particle_Jp,
-                        "material_parameters": mpm_model.material_parameters,
-                        "residual_strain_tracking": self.residual_strain_tracking,
-                        "residual_deformation_gradient_prev": residual_prev,
-                        "residual_deformation_gradient": state_out.mpm.particle_residual_deformation_gradient,
-                    },
-                    fields={
-                        "grid_vel": scratch.velocity_field,
-                        "plastic_strain_delta": scratch.plastic_strain_delta_field,
-                        "elastic_strain_delta": scratch.elastic_strain_delta_field,
-                        "stress": scratch.stress_field,
-                    },
-                    temporary_store=self.temporary_store,
-                )
-
-        # (A)PIC advection
         with self._timer("Advection"):
             state_out.particle_qd.zero_()
             state_out.mpm.particle_qd_grad.zero_()
             state_out.particle_q.assign(state_in.particle_q)
-
+            advection_inputs = {
+                "max_vel": model.particle_max_velocity,
+                "grid_vel": scratch.velocity_field,
+                "particle_flags": mpm_model.particle_flags,
+                "pos": state_out.particle_q,
+                "vel": state_out.particle_qd,
+                "vel_grad": state_out.mpm.particle_qd_grad,
+                "temporary_store": self.temporary_store,
+            }
             if self._cell_two_hop_transfers:
-                self._cell_transfer_quadrature.advect_particles(
-                    dt,
-                    max_vel=model.particle_max_velocity,
-                    grid_vel=scratch.velocity_field,
-                    particle_flags=mpm_model.particle_flags,
-                    pos=state_out.particle_q,
-                    vel=state_out.particle_qd,
-                    vel_grad=state_out.mpm.particle_qd_grad,
-                    temporary_store=self.temporary_store,
+                self._cell_transfer_quadrature.advect_particles(dt, **advection_inputs)
+            else:
+                particle_quadrature.advect_particles(
+                    dt, pic=pic, particle_volume=mpm_model.particle_volume, **advection_inputs
                 )
-                return
-
-            fem.interpolate(
-                advect_particles,
-                at=pic,
-                values={
-                    "particle_flags": mpm_model.particle_flags,
-                    "particle_volume": mpm_model.particle_volume,
-                    "pos": state_out.particle_q,
-                    "vel": state_out.particle_qd,
-                    "vel_grad": state_out.mpm.particle_qd_grad,
-                    "dt": dt,
-                    "max_vel": model.particle_max_velocity,
-                },
-                fields={
-                    "grid_vel": scratch.velocity_field,
-                },
-                temporary_store=self.temporary_store,
-            )
 
     def _save_data(
         self,
