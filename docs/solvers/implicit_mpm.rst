@@ -120,6 +120,10 @@ Cell mode in this example requires ``--world-count 1`` and zero viscosity.
 For a faster preview, add ``--voxel-size 0.1 --particles-per-cell 2``. Use
 ``--viewer null --test --num-frames 60`` for a one-second headless smoke run.
 Surface extraction still runs in headless mode, so its cost is included.
+Add ``--no-surface`` to skip all surface allocation, extraction, and mesh
+rendering and display particles instead. Combine it with ``--viewer null``
+to run without rendering or surface reconstruction. Physics checks remain
+enabled with ``--test``; surface checks run only when reconstruction is enabled.
 
 Validation
 ----------

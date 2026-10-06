@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Water-like MPM dam break or full static tank rendered as an extracted surface mesh."""
+"""Water-like MPM dam break or full static tank with optional surface reconstruction."""
 
 import argparse
 import warnings
@@ -140,50 +140,53 @@ class Example:
         if self.particle_projection:
             self.solver.project_outside(self.state_0, self.state_0, self.sim_dt)
 
-        surface_voxel_size = args.surface_voxel_size if args.surface_voxel_size is not None else 0.3 * args.voxel_size
-        surface_kernel_radius = (
-            args.surface_kernel_radius
-            if args.surface_kernel_radius is not None
-            else max(3.0 * self.particle_spacing, 1.5 * surface_voxel_size)
-        )
-        surface_max_grid_cells = (
-            args.surface_max_grid_cells if args.surface_max_grid_cells is not None else 4_000_000 * self.world_count
-        )
-        self.surface = self.solver.create_particle_surface(
-            voxel_size=surface_voxel_size,
-            max_grid_cells=surface_max_grid_cells,
-            kernel_radius=surface_kernel_radius,
-            threshold=args.surface_threshold,
-            smooth_lambda=args.surface_smoothing,
-            anisotropic=args.anisotropic,
-            kernel_scale=args.surface_kernel_scale,
-            anisotropy_ratio=args.anisotropy_ratio,
-            anisotropy_scale=args.anisotropy_scale,
-            anisotropy_min_neighbors=args.anisotropy_min_neighbors,
-            anisotropy_binning=args.anisotropic and args.anisotropy_binning,
-            anisotropy_strength=args.anisotropy_strength,
-            field_smooth_iterations=args.field_smooth_iterations,
-            field_smooth_radius=args.field_smooth_radius,
-            field_mode="sdf" if args.extrapolate_into_colliders else "density",
-            redistance_iterations=1 if args.extrapolate_into_colliders else 0,
-            mesh_smooth_iterations=args.mesh_smooth_iterations,
-        )
-        self.extrapolate_into_colliders = args.extrapolate_into_colliders
-        self.collider_extrapolation_depth = min(2.0 * surface_voxel_size, 0.5 * args.wall_thickness)
+        self.surface = None
+        if args.surface:
+            surface_voxel_size = (
+                args.surface_voxel_size if args.surface_voxel_size is not None else 0.3 * args.voxel_size
+            )
+            surface_kernel_radius = (
+                args.surface_kernel_radius
+                if args.surface_kernel_radius is not None
+                else max(3.0 * self.particle_spacing, 1.5 * surface_voxel_size)
+            )
+            surface_max_grid_cells = (
+                args.surface_max_grid_cells if args.surface_max_grid_cells is not None else 4_000_000 * self.world_count
+            )
+            self.surface = self.solver.create_particle_surface(
+                voxel_size=surface_voxel_size,
+                max_grid_cells=surface_max_grid_cells,
+                kernel_radius=surface_kernel_radius,
+                threshold=args.surface_threshold,
+                smooth_lambda=args.surface_smoothing,
+                anisotropic=args.anisotropic,
+                kernel_scale=args.surface_kernel_scale,
+                anisotropy_ratio=args.anisotropy_ratio,
+                anisotropy_scale=args.anisotropy_scale,
+                anisotropy_min_neighbors=args.anisotropy_min_neighbors,
+                anisotropy_binning=args.anisotropic and args.anisotropy_binning,
+                anisotropy_strength=args.anisotropy_strength,
+                field_smooth_iterations=args.field_smooth_iterations,
+                field_smooth_radius=args.field_smooth_radius,
+                field_mode="sdf" if args.extrapolate_into_colliders else "density",
+                redistance_iterations=1 if args.extrapolate_into_colliders else 0,
+                mesh_smooth_iterations=args.mesh_smooth_iterations,
+            )
+            self.extrapolate_into_colliders = args.extrapolate_into_colliders
+            self.collider_extrapolation_depth = min(2.0 * surface_voxel_size, 0.5 * args.wall_thickness)
+            self._empty_surface_points = wp.empty(0, dtype=wp.vec3, device=self.model.device)
+            self._empty_surface_indices = wp.empty(0, dtype=wp.int32, device=self.model.device)
+            self._empty_surface_normals = wp.empty(0, dtype=wp.vec3, device=self.model.device)
         self.surface_path = "/model/water_surface"
         self.surface_triangle_count = 0
         self._rtx_water_material_bound = False
-
-        self._empty_surface_points = wp.empty(0, dtype=wp.vec3, device=self.model.device)
-        self._empty_surface_indices = wp.empty(0, dtype=wp.int32, device=self.model.device)
-        self._empty_surface_normals = wp.empty(0, dtype=wp.vec3, device=self.model.device)
 
         self.viewer.set_model(self.model)
         # The worlds are physically separated so the combined extracted mesh
         # can be rendered directly without a second vertex-packing pass.
         self.viewer.set_world_offsets((0.0, 0.0, 0.0))
         self.viewer.show_visual = False
-        self.viewer.show_particles = args.show_particles
+        self.viewer.show_particles = args.show_particles or self.surface is None
         camera_scale = max(1.0, np.sqrt(self.world_count))
         self.viewer.set_camera(
             pos=wp.vec3(5.0 * camera_scale, -6.0 * camera_scale, 4.0 * camera_scale),
@@ -230,7 +233,7 @@ class Example:
     def _capture_surface_extraction(self):
         self.surface_graph = None
         self.surface_mesh = None
-        if not self.model.device.is_cuda:
+        if self.surface is None or not self.model.device.is_cuda:
             return
         if self.sim_substeps % 2 != 0:
             warnings.warn("Sim substeps must be even for graph capture of surface extraction", stacklevel=2)
@@ -270,6 +273,9 @@ class Example:
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
+        if self.surface is None:
+            self.viewer.end_frame()
+            return
 
         if self.surface_graph is None:
             self.surface_mesh = self._extract_surface()
@@ -327,12 +333,13 @@ class Example:
             ]
             if stalled_worlds:
                 raise ValueError(f"The water column did not spread in worlds {stalled_worlds}")
-        if self.surface_triangle_count == 0:
-            raise ValueError("Water surface extraction produced no triangles")
-        index_world_offsets = self.surface_mesh.index_world_offsets.numpy()
-        empty_worlds = np.flatnonzero(np.diff(index_world_offsets) == 0).tolist()
-        if empty_worlds:
-            raise ValueError(f"Water surface extraction produced no triangles in worlds {empty_worlds}")
+        if self.surface is not None:
+            if self.surface_triangle_count == 0:
+                raise ValueError("Water surface extraction produced no triangles")
+            index_world_offsets = self.surface_mesh.index_world_offsets.numpy()
+            empty_worlds = np.flatnonzero(np.diff(index_world_offsets) == 0).tolist()
+            if empty_worlds:
+                raise ValueError(f"Water surface extraction produced no triangles in worlds {empty_worlds}")
 
     @staticmethod
     def _emit_water(builder: newton.ModelBuilder, args) -> tuple[float, float]:
@@ -585,6 +592,12 @@ class Example:
             help="Tank interior half-extents; its interior spans z=[0, 2 * hz] [m]",
         )
         parser.add_argument("--wall-thickness", type=float, default=0.15)
+        parser.add_argument(
+            "--surface",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Reconstruct and render the water surface; disabling this shows particles instead",
+        )
         parser.add_argument(
             "--surface-voxel-size",
             type=float,
