@@ -1,1 +1,1 @@
-Reduce implicit MPM work for P0 strain bases and omit unused elastic-history transfers for incompressible cell integration, without requiring configuration changes.
+Reduce implicit MPM work for P0 strain bases, omit unused elastic-history transfers for incompressible cell integration, and select Warp's automatic sparse construction for strain and contact matrices, without requiring configuration changes.

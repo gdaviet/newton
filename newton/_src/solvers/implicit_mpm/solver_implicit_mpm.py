@@ -3296,6 +3296,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                     reduction="first",
                     fields={"trial": scratch.fraction_trial, "normal": scratch.collider_normal_field},
                     temporary_store=self.temporary_store,
+                    bsr_options={"construction": "auto"},
                 )
 
     def _build_collider_rigidity_operator(
@@ -3371,6 +3372,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 values=inputs.values if inputs.compliance_values is None else inputs.compliance_values,
                 output=scratch.compliance_matrix,
                 temporary_store=self.temporary_store,
+                bsr_options={"construction": "auto"},
             )
 
     def _build_plasticity_system(
@@ -3513,7 +3515,10 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 output_dtype=float,
                 output=scratch.strain_matrix,
                 temporary_store=self.temporary_store,
-                bsr_options={"prune_numerical_zeros": self._velocity_nodes_per_strain_sample < 0},
+                bsr_options={
+                    "construction": "auto",
+                    "prune_numerical_zeros": self._velocity_nodes_per_strain_sample < 0,
+                },
             )
 
     def _build_strain_eigenbasis(
@@ -3551,6 +3556,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 "particle_flags": strain_point_flags,
             },
             output_dtype=float,
+            bsr_options={"construction": "auto"},
         )
 
         # extract diagonal blocks
