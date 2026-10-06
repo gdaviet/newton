@@ -592,6 +592,8 @@ If you run the examples from a source checkout with uv, use
     </td>
     <td align="center" width="33%">
       <code>python -m newton.examples mpm_water_dam_break</code>
+      <br>Add <code>--full-tank</code> for a static tank;
+      <a href="docs/solvers/implicit_mpm.rst">P0 recovery options</a>.
     </td>
   </tr>
   <tr>

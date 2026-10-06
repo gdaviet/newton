@@ -88,6 +88,39 @@ its residual deformation gradient to identity, including masked world resets.
 Cell integration uses the density controller and does not support this
 residual-history mode.
 
+Dam break and static tank
+-------------------------
+
+The existing ``mpm_water_dam_break`` example exposes the integration scheme,
+solver, volume recovery, contact recovery, and predictive gap as command-line
+options. For a five-iteration P0 run with cell-center transfers:
+
+.. code-block:: console
+
+   uv run --extra examples -m newton.examples mpm_water_dam_break \
+       --integration-scheme cell --solver gs --max-iterations 5 \
+       --density-strain-fraction 0.05 --collider-basis pic8 \
+       --collider-stabilization-fraction 0.2 --collider-contact-gap 0.05 \
+       --no-particle-projection --num-frames 600
+
+Add ``--full-tank`` to fill the tank's full horizontal footprint at the same
+initial water height and test a static water column. Its vertical bounds
+still come from ``--emit-lo`` and ``--emit-hi``. Static-tank test mode checks
+containment, finite particle state, and surface extraction, without the
+dam-break spreading requirement.
+
+``--no-particle-projection`` disables both post-step collider projection and
+the tank-boundary clamp, as well as the initial collider projection. This
+lets the solver's contact recovery determine containment. Omit the option
+to retain the example's existing projection fallback. Use
+``--integration-scheme pic`` for ordinary particle transfers, and set the
+recovery fractions and contact gap to zero to compare against no feedback.
+Cell mode in this example requires ``--world-count 1`` and zero viscosity.
+
+For a faster preview, add ``--voxel-size 0.1 --particles-per-cell 2``. Use
+``--viewer null --test --num-frames 60`` for a one-second headless smoke run.
+Surface extraction still runs in headless mode, so its cost is included.
+
 Validation
 ----------
 
@@ -95,6 +128,12 @@ The recovery regression module checks volume recovery with three iterations,
 penetration recovery and predictive gap closure with one iteration, exact
 iteration budgets on CPU and CUDA graphs, residual-history reset, and full
 step graph replay on both supported test GPUs.
+
+The dam-break and full-tank commands above also passed 60-frame smoke runs
+at the default 0.05 m grid spacing and three particles per cell axis, with
+five Gauss-Seidel iterations and particle projection disabled. These checks
+cover finite state, containment, surface extraction, and dam-break spreading;
+they do not measure long-term hydrostatic drift or volume preservation.
 
 ``ImplicitMPMP0Recovery`` in the ASV simulation benchmarks compares captured
 steps with 2,744 elastic particles and ten Jacobi iterations on a fixed grid.
