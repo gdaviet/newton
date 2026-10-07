@@ -930,6 +930,10 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         - particles move with the grid velocity and gradient sampled at the
           cell centers, and particle-based collider bases constrain that same
           velocity;
+        - for ``"P1d"``, solver strain results, which are affine in each cell,
+          return to particles through the moving least-squares cell frames;
+          other bases return them with trilinear weights on the lattice of
+          points;
         - the elastic deformation gradient follows ``F <- (I + dt G) F``,
           less the solver's plastic strain increment.
 
@@ -1614,8 +1618,11 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         self._cell_grid_environment = None
         self._element_yield_parameters = None
         if config.integration_scheme == "cell":
+            # Affine P1d strain results return to particles through the GMLS cell frames
             self._cell_quadrature = CellQuadrature(
-                points_per_axis=self._cell_points_per_axis(config), device=model.device
+                points_per_axis=self._cell_points_per_axis(config),
+                device=model.device,
+                strain_frames=config.strain_basis == "P1d",
             )
             # Transfers go through cell centers, where trilinear hourglass modes vanish
             self._cell_transfer_quadrature = (
@@ -3838,8 +3845,17 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                     "temporary_store": self.temporary_store,
                 }
                 if self._cell_quadrature is not None:
+                    velocity_gradient = None
+                    if self._cell_quadrature.strain_frames:
+                        # The deformation gradient follows the velocity gradient that advects the particles
+                        velocity_gradient = self._cell_transfer_quadrature.particle_velocity_gradient(
+                            scratch.velocity_field, mpm_model.particle_flags, temporary_store=self.temporary_store
+                        )
                     self._cell_quadrature.update_particles(
-                        dt, kinematic_update=self._cell_kinematic_update, **history_inputs
+                        dt,
+                        kinematic_update=self._cell_kinematic_update,
+                        velocity_gradient=velocity_gradient,
+                        **history_inputs,
                     )
                 else:
                     particle_quadrature.update_particles(

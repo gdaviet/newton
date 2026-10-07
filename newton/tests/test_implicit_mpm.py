@@ -1313,6 +1313,110 @@ def test_cell_gmls_transfer(test, device):
         test.assertAlmostEqual(float(gmls["volume"].sum()), float(volume.sum()), delta=1.0e-3 * volume.sum())
 
 
+@fem.integrand
+def _affine_stress(s: fem.Sample, domain: fem.Domain, offset: wp.mat33, gradient_x: wp.mat33, gradient_y: wp.mat33):
+    x = domain(s)
+    return offset + x[0] * gradient_x + x[1] * gradient_y
+
+
+def test_cell_strain_frames(test, device):
+    """Check that P1d solver results return to particles through affine cell frames.
+
+    Affine P1d stress and plastic strain increments reach the particles
+    exactly, and the supplied particle velocity gradient drives the kinematic
+    deformation gradient update.
+    """
+    rng = np.random.default_rng(9)
+    res = 8
+    dt = 0.1
+    with wp.ScopedDevice(device):
+        grid = fem.Grid3D(bounds_lo=wp.vec3(0.0), bounds_hi=wp.vec3(float(res)), res=wp.vec3i(res))
+        domain = fem.Cells(grid)
+        positions_np = rng.uniform(2.0, res - 2.0, size=(300, 3))
+        count = positions_np.shape[0]
+        positions = wp.array(positions_np, dtype=wp.vec3)
+        flags = wp.full(count, int(newton.ParticleFlags.ACTIVE), dtype=wp.int32)
+        materials = _uniform_material_parameters(count, 1.0e5)
+        # Yield surfaces far away, so that stresses are returned unprojected
+        for name in ("yield_pressure", "yield_stress"):
+            setattr(materials, name, wp.full(count, 1.0e9, dtype=float))
+
+        strain_space = fem.make_collocated_function_space(
+            fem.make_polynomial_basis_space(
+                grid, degree=1, element_basis=fem.ElementBasis.NONCONFORMING_POLYNOMIAL, discontinuous=True
+            ),
+            dof_mapper=fem.SymmetricTensorMapper(dtype=wp.mat33, mapping=fem.SymmetricTensorMapper.Mapping.DB16),
+        )
+
+        def affine_field(offset, gradient_x, gradient_y):
+            field = strain_space.make_field()
+            fem.interpolate(
+                _affine_stress,
+                dest=field,
+                values={"offset": offset, "gradient_x": gradient_x, "gradient_y": gradient_y},
+            )
+            expected = (
+                np.array(offset).reshape(3, 3)
+                + positions_np[:, 0, None, None] * np.array(gradient_x).reshape(3, 3)
+                + positions_np[:, 1, None, None] * np.array(gradient_y).reshape(3, 3)
+            )
+            return field, expected
+
+        stress, expected_stress = affine_field(
+            wp.mat33(1.0, 0.2, 0.0, 0.2, -0.5, 0.1, 0.0, 0.1, 0.3),
+            wp.mat33(0.1, 0.0, 0.05, 0.0, 0.2, 0.0, 0.05, 0.0, -0.1),
+            wp.mat33(-0.2, 0.1, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.15),
+        )
+        plastic, expected_plastic = affine_field(
+            wp.mat33(1.0e-3, 0.0, 2.0e-4, 0.0, -5.0e-4, 0.0, 2.0e-4, 0.0, 3.0e-4),
+            wp.mat33(1.0e-4, 5.0e-5, 0.0, 5.0e-5, 0.0, 0.0, 0.0, 0.0, -1.0e-4),
+            wp.mat33(0.0, 0.0, 1.0e-4, 0.0, 2.0e-4, 0.0, 1.0e-4, 0.0, 0.0),
+        )
+        zero_strain = strain_space.make_field()
+        velocity_gradient_np = np.array(((0.01, 0.02, 0.0), (-0.02, 0.005, 0.01), (0.0, 0.0, -0.01)))
+
+        pic = fem.PicQuadrature(domain, positions, use_domain_element_indices=True)
+        cell_quadrature = CellQuadrature(2, device=device, strain_frames=True)
+        cell_quadrature.compute_weights(pic, positions, 1.0, temporary_store=None)
+        identity = wp.array(np.tile(np.eye(3), (count, 1, 1)), dtype=wp.mat33)
+        cell_quadrature.transfer_particles(
+            domain,
+            particle_flags=flags,
+            particle_volume=wp.full(count, 0.1, dtype=float),
+            elastic_strain=identity,
+            particle_stress=wp.zeros(count, dtype=wp.mat33),
+            particle_Jp=wp.full(count, 1.0, dtype=float),
+            material_parameters=materials,
+            dt=dt,
+            inv_cell_volume=1.0,
+            temporary_store=None,
+        )
+        elastic_strain = wp.zeros(count, dtype=wp.mat33)
+        particle_stress = wp.zeros(count, dtype=wp.mat33)
+        cell_quadrature.update_particles(
+            dt,
+            kinematic_update=True,
+            grid_vel=fem.make_polynomial_space(grid, degree=1, dtype=wp.vec3).make_field(),
+            elastic_strain_delta=zero_strain,
+            plastic_strain_delta=plastic,
+            stress=stress,
+            particle_flags=flags,
+            particle_density=wp.full(count, 1000.0, dtype=float),
+            material_parameters=materials,
+            elastic_strain_prev=identity,
+            particle_Jp_prev=wp.full(count, 1.0, dtype=float),
+            elastic_strain=elastic_strain,
+            particle_Jp=wp.zeros(count, dtype=float),
+            particle_stress=particle_stress,
+            temporary_store=None,
+            velocity_gradient=wp.array(np.broadcast_to(velocity_gradient_np, (count, 3, 3)), dtype=wp.mat33),
+        )
+        np.testing.assert_allclose(particle_stress.numpy(), expected_stress, atol=1.0e-4)
+        expected_deformation = np.eye(3) + dt * velocity_gradient_np - expected_plastic
+        np.testing.assert_allclose(elastic_strain.numpy(), expected_deformation, atol=1.0e-6)
+        cell_quadrature.release()
+
+
 def test_cell_quadrature_weights(test, device):
     """Check that cell quadrature transfer weights are continuous partitions of unity.
 
@@ -1611,26 +1715,28 @@ def test_cell_integration_elastic_block(test, device):
 
 
 def test_cell_integration_particle_contact_rows(test, device):
-    """Check that cell-scheme contact rows of particle colliders interpolate through the cell points.
+    """Check that cell-scheme contact rows of particle colliders interpolate through the cell points or frames.
 
-    Each active row combines the trilinear point weights with the nodal shape
-    functions at the points, so its coefficients sum to one, and the block
+    Each active row combines the particle's point or frame weights with the
+    nodal shape functions, so its coefficients sum to one, and the block
     stays above the ground.
     """
-    solver, state = _run_elastic_block(device, "cell", "P0", step_count=10, collider_basis="pic8")
-    collider_matrix = solver._scratchpad.collider_matrix
-    offsets = collider_matrix.offsets.numpy()
-    values = collider_matrix.values.numpy().reshape(-1)
-    row_sums = np.array([values[offsets[row] : offsets[row + 1]].sum() for row in range(collider_matrix.nrow)])
-    active = np.abs(row_sums) > 0.0
-    test.assertGreater(np.count_nonzero(active), 0)
-    np.testing.assert_allclose(row_sums[active], 1.0, atol=1.0e-4)
-    # Two-hop rows reach the 27 nodes around each particle, beyond its own cell
-    test.assertGreater(np.max(np.diff(offsets)), 8)
+    for strain_basis in ("P0", "P1d"):
+        with test.subTest(strain_basis=strain_basis):
+            solver, state = _run_elastic_block(device, "cell", strain_basis, step_count=10, collider_basis="pic8")
+            collider_matrix = solver._scratchpad.collider_matrix
+            offsets = collider_matrix.offsets.numpy()
+            values = collider_matrix.values.numpy().reshape(-1)
+            row_sums = np.array([values[offsets[row] : offsets[row + 1]].sum() for row in range(collider_matrix.nrow)])
+            active = np.abs(row_sums) > 0.0
+            test.assertGreater(np.count_nonzero(active), 0)
+            np.testing.assert_allclose(row_sums[active], 1.0, atol=1.0e-4)
+            # Two-hop rows reach the nodes around each particle, beyond its own cell
+            test.assertGreater(np.max(np.diff(offsets)), 8)
 
-    positions = state.particle_q.numpy()
-    test.assertTrue(np.isfinite(positions).all())
-    test.assertGreater(np.min(positions[:, 1]), -0.02)
+            positions = state.particle_q.numpy()
+            test.assertTrue(np.isfinite(positions).all())
+            test.assertGreater(np.min(positions[:, 1]), -0.02)
 
 
 def _make_cell_viscous_block(device, viscosity, strain_basis="P0", solver="gs", max_iterations=5, young_modulus=1.0e15):
@@ -2428,6 +2534,7 @@ add_function_test(
 )
 add_function_test(TestImplicitMPM, "test_cell_quadrature_weights", test_cell_quadrature_weights, devices=devices)
 add_function_test(TestImplicitMPM, "test_cell_gmls_transfer", test_cell_gmls_transfer, devices=devices)
+add_function_test(TestImplicitMPM, "test_cell_strain_frames", test_cell_strain_frames, devices=devices)
 add_function_test(
     TestImplicitMPM, "test_cell_integration_separate_worlds", test_cell_integration_separate_worlds, devices=devices
 )

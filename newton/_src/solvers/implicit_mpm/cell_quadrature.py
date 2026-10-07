@@ -16,16 +16,21 @@ partition of unity over the existing cells. The affine fit is evaluated at the
 cell's points; it is continuous in particle position and reproduces linear
 fields.
 
-Results return to particles with trilinear hat weights defined on the lattice
-formed by all points, which are also continuous in particle position. Mass,
-momentum, particle advection and particle-based contact rows may also go
-through the points with these weights ("two-hop" transfers), so that velocity
-modes invisible at the points stay invisible to particles.
+Solver results return to particles with trilinear hat weights defined on the
+lattice formed by all points, which are also continuous in particle position.
+For strain bases that are affine in each cell (P1d), each cell's strain results
+instead form an affine frame about its center, which particles evaluate with
+the GMLS kernel weights; the points then only integrate frame fields.
 
-With one point per cell, the lattice is the dual grid of cell centers, as in
-MPM Lite (https://arxiv.org/abs/2602.07853). With two points per axis, the
-points are the 2x2x2 Gauss-Legendre points of each cell, as in PQMPM
-(https://doi.org/10.1002/nme.6588).
+Mass, momentum, particle advection and particle-based contact rows may also go
+through the cell centers with trilinear weights on their lattice ("two-hop"
+transfers), so that velocity modes invisible at the centers stay invisible to
+particles.
+
+With one point per cell, the points are the cell centers and their lattice is
+the dual grid, as in MPM Lite (https://arxiv.org/abs/2602.07853). With two
+points per axis, the points are the 2x2x2 Gauss-Legendre points of each cell,
+as in PQMPM (https://doi.org/10.1002/nme.6588).
 """
 
 import warp as wp
@@ -331,6 +336,25 @@ def advect_particles_from_points(
 
 
 @wp.kernel
+def interpolate_particle_velocity_gradient(
+    point_index: wp.array2d[int],
+    point_weight: wp.array2d[float],
+    particle_flags: wp.array[wp.int32],
+    point_velocity_gradient: wp.array[wp.mat33],
+    velocity_gradient: wp.array[wp.mat33],
+):
+    """Interpolate the velocity gradient at the lattice points to particles, as in particle advection."""
+    p = wp.tid()
+    gradient = wp.mat33(0.0)
+    if particle_flags[p] & newton.ParticleFlags.ACTIVE:
+        for k in range(POINT_STENCIL_SIZE):
+            q = point_index[p, k]
+            if q >= 0:
+                gradient += point_weight[p, k] * point_velocity_gradient[q]
+    velocity_gradient[p] = gradient
+
+
+@wp.kernel
 def cell_stencil_points(
     positions: wp.array[wp.vec3],
     particle_flags: wp.array[wp.int32],
@@ -433,9 +457,16 @@ class CellQuadrature:
             cell centers and ``2`` uses the 2x2x2 Gauss-Legendre points.
         device: Device of the persistent point coordinates. Construct this
             object outside graph capture, since it copies them from the host.
+        strain_frames: Return solver strain results to particles through
+            per-cell affine frames, for strain bases that are affine in each
+            cell (``"P1d"``). Requires two points per axis; the points then
+            only integrate the frame fields.
     """
 
-    def __init__(self, points_per_axis: int, device: wp.DeviceLike = None):
+    def __init__(self, points_per_axis: int, device: wp.DeviceLike = None, *, strain_frames: bool = False):
+        if strain_frames and points_per_axis < 2:
+            raise ValueError("Strain frames require two points per axis.")
+        self.strain_frames = strain_frames
         self.points_per_axis = points_per_axis
         self.points_per_cell = points_per_axis**3
         self.abscissae = cell_quadrature_abscissae(points_per_axis)
@@ -458,6 +489,10 @@ class CellQuadrature:
         self.point_stress = None
         self._positions = None
         self.voxel_size = None
+        self._cell_center = None
+        self._cell_neighbors = None
+        self._cell_point_row = None
+        self._particle_normalization = None
 
     def _borrow(self, temporary_store: fem.TemporaryStore | None, shape, dtype, device):
         temporary = fem.borrow_temporary(temporary_store, shape=shape, dtype=dtype, device=device)
@@ -484,12 +519,14 @@ class CellQuadrature:
         voxel_size: float,
         temporary_store: fem.TemporaryStore | None,
     ):
-        """Compute each particle's trilinear lattice weights onto the fixed points.
+        """Compute each particle's trilinear lattice weights onto the fixed points, and the GMLS cell neighborhoods.
 
         Each particle's own cell and cell coordinates come from the particle
         quadrature ``pic``, which must use domain element indices. Lattice
         points falling in cells outside the domain partition are skipped and
-        the remaining weights are renormalized.
+        the remaining weights are renormalized. Each cell's existing 3x3x3
+        neighbors and each particle's GMLS kernel normalization over them are
+        shared by the GMLS history fits and the strain frames.
         """
         domain = pic.domain
         device = positions.device
@@ -537,6 +574,33 @@ class CellQuadrature:
             device=device,
         )
 
+        self._cell_center = self._borrow(temporary_store, cell_count, wp.vec3, device)
+        self._cell_neighbors = self._borrow(temporary_store, (cell_count, _CELL_NEIGHBOR_COUNT), int, device)
+        cell_neighbor_mask = self._borrow(temporary_store, cell_count, int, device)
+        self._cell_point_row = self._borrow(temporary_store, cell_count, int, device)
+        self._particle_normalization = self._borrow(temporary_store, particle_count, float, device)
+        wp.launch(
+            _make_cell_neighbor_kernel(domain),
+            dim=cell_count,
+            inputs=[
+                domain.element_arg_value(device=device),
+                domain.element_index_arg_value(device=device),
+                use_geometry_index,
+                voxel_size,
+                self._cell_center,
+                self._cell_neighbors,
+                cell_neighbor_mask,
+                self._cell_point_row,
+            ],
+            device=device,
+        )
+        wp.launch(
+            gmls_particle_normalization,
+            dim=particle_count,
+            inputs=[pic.cell_indices, pic.particle_coords, cell_neighbor_mask, self._particle_normalization],
+            device=device,
+        )
+
     def transfer_particles(
         self,
         domain: fem.GeometryDomain,
@@ -557,7 +621,6 @@ class CellQuadrature:
         particle_count = particle_volume.shape[0]
         point_count = self.point_count
         shape = self.point_coords.shape
-        use_geometry_index = domain.element_count() == domain.geometry_element_count()
 
         self.point_flags = self._borrow(temporary_store, point_count, wp.int32, device)
         self.point_volume = self._borrow(temporary_store, point_count, float, device)
@@ -575,26 +638,14 @@ class CellQuadrature:
         self.point_yield_parameters = self._borrow(temporary_store, point_count, YieldParamVec, device)
         self.point_stress = self._borrow(temporary_store, point_count, wp.mat33, device)
         point_fraction = self._borrow(temporary_store, shape, float, device)
-        cell_neighbor_mask = self._borrow(temporary_store, shape[0], int, device)
-        particle_normalization = self._borrow(temporary_store, particle_count, float, device)
         particle_yield_parameters = self._borrow(temporary_store, particle_count, YieldParamVec, device)
+        # Rows of geometry cells outside the partition stay empty
+        for array in (self.point_flags, self.point_volume, point_fraction):
+            array.zero_()
 
         def per_cell(array):
             return None if array is None else array.reshape(shape)
 
-        mask_kernel, values_kernel = _make_gmls_cell_kernels(domain)
-        wp.launch(
-            mask_kernel,
-            dim=shape[0],
-            inputs=[
-                domain.element_arg_value(device=device),
-                domain.element_index_arg_value(device=device),
-                use_geometry_index,
-                self.voxel_size,
-                cell_neighbor_mask,
-            ],
-            device=device,
-        )
         wp.launch(
             gmls_particle_data,
             dim=particle_count,
@@ -613,31 +664,18 @@ class CellQuadrature:
             device=device,
         )
         wp.launch(
-            gmls_particle_normalization,
-            dim=particle_count,
-            inputs=[
-                self.pic.cell_indices,
-                self.pic.particle_coords,
-                particle_flags,
-                particle_volume,
-                cell_neighbor_mask,
-                particle_normalization,
-            ],
-            device=device,
-        )
-        wp.launch(
-            values_kernel,
+            gmls_cell_values,
             dim=shape[0],
             inputs=[
-                domain.element_arg_value(device=device),
-                domain.element_index_arg_value(device=device),
-                use_geometry_index,
+                self._cell_center,
+                self._cell_neighbors,
+                self._cell_point_row,
                 self.point_coords,
                 self._positions,
                 self.pic.cell_particle_offsets,
                 self.pic.cell_particle_indices,
                 particle_volume,
-                particle_normalization,
+                self._particle_normalization,
                 particle_hencky,
                 particle_elastic_parameters,
                 particle_yield_parameters,
@@ -835,6 +873,35 @@ class CellQuadrature:
             device=device,
         )
 
+    def particle_velocity_gradient(
+        self,
+        grid_vel: fem.DiscreteField,
+        particle_flags: wp.array[wp.int32],
+        temporary_store: fem.TemporaryStore | None,
+    ) -> wp.array[wp.mat33]:
+        """Return the grid velocity gradient sampled at the transfer points and interpolated to particles.
+
+        This is the velocity gradient that :meth:`advect_particles` gives to the particles.
+        """
+        device = particle_flags.device
+        point_velocity = self._borrow(temporary_store, self.point_count, wp.vec3, device)
+        point_velocity_gradient = self._borrow(temporary_store, self.point_count, wp.mat33, device)
+        velocity_gradient = self._borrow(temporary_store, particle_flags.shape[0], wp.mat33, device)
+        fem.interpolate(
+            sample_point_velocity,
+            at=self.transfer_quadrature,
+            fields={"grid_vel": grid_vel},
+            values={"point_velocity": point_velocity, "point_velocity_gradient": point_velocity_gradient},
+            temporary_store=temporary_store,
+        )
+        wp.launch(
+            interpolate_particle_velocity_gradient,
+            dim=particle_flags.shape[0],
+            inputs=[self.point_index, self.point_weight, particle_flags, point_velocity_gradient, velocity_gradient],
+            device=device,
+        )
+        return velocity_gradient
+
     def elasticity_inputs(self, dt: float, inv_cell_volume: float) -> ElasticityInputs:
         """Bind transferred cell-point material data to the shared elastic assembly."""
         values = {
@@ -877,8 +944,17 @@ class CellQuadrature:
         particle_Jp: wp.array[float],
         particle_stress: wp.array[wp.mat33],
         temporary_store: fem.TemporaryStore | None,
+        velocity_gradient: wp.array[wp.mat33] | None = None,
     ):
-        """Sample solver results at the points and interpolate them back to particles."""
+        """Sample solver results at the points and interpolate them back to particles.
+
+        With strain frames, the strain results at each cell's points give its
+        affine frame, and particles evaluate the frames around them with the
+        GMLS kernel weights. The per-particle ``velocity_gradient``, required
+        then, drives the kinematic update; pass the gradient that advects the
+        particles, from :meth:`particle_velocity_gradient` of the transfer
+        quadrature.
+        """
         device = particle_density.device
         point_count = self.point_count
 
@@ -904,6 +980,53 @@ class CellQuadrature:
             },
             temporary_store=temporary_store,
         )
+
+        if self.strain_frames:
+            if velocity_gradient is None:
+                raise ValueError("Strain frames require the particle velocity gradient.")
+            cell_count = self._cell_center.shape[0]
+            shape = self.point_coords.shape
+            frames = [self._borrow(temporary_store, (cell_count, 4), wp.mat33, device) for _ in range(3)]
+            wp.launch(
+                strain_frames_from_points,
+                dim=cell_count,
+                inputs=[
+                    self._cell_point_row,
+                    self.point_coords,
+                    self.voxel_size,
+                    point_elastic_strain_delta.reshape(shape),
+                    point_plastic_strain_delta.reshape(shape),
+                    point_stress.reshape(shape),
+                    *frames,
+                ],
+                device=device,
+            )
+            wp.launch(
+                update_particle_strains_from_frames,
+                dim=particle_density.shape[0],
+                inputs=[
+                    dt,
+                    int(kinematic_update),
+                    self._cell_center,
+                    self._cell_neighbors,
+                    self.pic.cell_indices,
+                    self._particle_normalization,
+                    self._positions,
+                    self.voxel_size,
+                    particle_flags,
+                    particle_density,
+                    material_parameters,
+                    *frames,
+                    velocity_gradient,
+                    elastic_strain_prev,
+                    particle_Jp_prev,
+                    elastic_strain,
+                    particle_Jp,
+                    particle_stress,
+                ],
+                device=device,
+            )
+            return
 
         wp.launch(
             update_particle_strains_from_points,
@@ -1080,6 +1203,9 @@ _GMLS_LOOKUP_TOLERANCE = wp.constant(1.0e-3)
 _GMLS_FULL_NEIGHBOR_MASK = wp.constant((1 << 27) - 1)
 """Neighbor mask of a cell whose 3x3x3 neighborhood is complete."""
 
+_CELL_NEIGHBOR_COUNT = wp.constant(27)
+"""Cells in the 3x3x3 neighborhood of a cell, including itself."""
+
 
 @wp.func
 def _quadratic_bspline(r: float):
@@ -1146,20 +1272,17 @@ def gmls_particle_data(
 def gmls_particle_normalization(
     particle_cell_index: wp.array[fem.ElementIndex],
     particle_coords: wp.array[fem.Coords],
-    particle_flags: wp.array[wp.int32],
-    particle_volume: wp.array[float],
     cell_neighbor_mask: wp.array[int],
     particle_normalization: wp.array[float],
 ):
     """Sum of each particle's kernel weights over the existing cell centers, for a per-particle partition of unity.
 
     The cell-center kernels sum to one over the full lattice, so the sum is one
-    minus the weights of the missing neighbor centers.
+    minus the weights of the missing neighbor centers. Particles outside the
+    domain get zero.
     """
     p = wp.tid()
     particle_normalization[p] = 0.0
-    if (~particle_flags[p] & newton.ParticleFlags.ACTIVE) or particle_volume[p] <= 0.0:
-        return
     cell = particle_cell_index[p]
     if cell == fem.NULL_ELEMENT_INDEX:
         return
@@ -1177,8 +1300,8 @@ def gmls_particle_normalization(
     particle_normalization[p] = total
 
 
-def _make_gmls_cell_kernels(domain: fem.GeometryDomain):
-    """Kernels marking each cell's existing neighbors and fitting GMLS moments once at each cell center."""
+def _make_cell_neighbor_kernel(domain: fem.GeometryDomain):
+    """Kernel computing cell centers and each cell's existing 3x3x3 neighbors in its world."""
     cell_lookup = _make_environment_cell_lookup(domain)
     partition_index = domain.element_partition_index
     element_index = domain.element_index
@@ -1200,191 +1323,369 @@ def _make_gmls_cell_kernels(domain: fem.GeometryDomain):
         return partition_index(domain_index_arg_value, sample.element_index)
 
     @fem.cache.dynamic_kernel(suffix=domain.name)
-    def gmls_cell_neighbor_mask(
+    def gmls_cell_neighbors(
         cell_arg_value: domain.ElementArg,
         domain_index_arg_value: domain.ElementIndexArg,
         use_geometry_index: bool,
         voxel_size: float,
+        cell_center: wp.array[wp.vec3],
+        cell_neighbors: wp.array2d[int],
         cell_neighbor_mask: wp.array[int],
+        cell_point_row: wp.array[int],
     ):
-        """Bit ``(ci + 1) * 9 + (cj + 1) * 3 + (ck + 1)`` is set when the neighbor at offset ``(ci, cj, ck)`` exists."""
+        """Store each partition cell's center, point row, and the partition indices of its 3x3x3 neighbors.
+
+        Neighbor ``(ci + 1) * 9 + (cj + 1) * 3 + (ck + 1)`` is at offset
+        ``(ci, cj, ck)``. Missing neighbors are ``NULL_ELEMENT_INDEX`` and leave
+        their bit of ``cell_neighbor_mask`` unset. The point row indexes the
+        point arrays, by geometry cell when ``use_geometry_index`` is set. Unused
+        partition slots have no neighbors, including themselves.
+        """
         cell = wp.tid()
         domain_arg = domain.DomainArg(cell_arg_value, domain_index_arg_value)
-        geometry_cell = cell
-        if not use_geometry_index:
-            geometry_cell = element_index(domain_index_arg_value, cell)
+        geometry_cell = element_index(domain_index_arg_value, cell)
+        if geometry_cell == fem.NULL_ELEMENT_INDEX:
+            cell_center[cell] = wp.vec3(0.0)
+            cell_neighbor_mask[cell] = 0
+            cell_point_row[cell] = wp.where(use_geometry_index, fem.NULL_ELEMENT_INDEX, cell)
+            for k in range(_CELL_NEIGHBOR_COUNT):
+                cell_neighbors[cell, k] = fem.NULL_ELEMENT_INDEX
+            return
+        cell_point_row[cell] = wp.where(use_geometry_index, geometry_cell, cell)
         x_c = element_position(cell_arg_value, fem.make_free_sample(geometry_cell, fem.Coords(0.5, 0.5, 0.5)))
+        cell_center[cell] = x_c
         mask = int(0)
         for ci in range(-1, 2):
             for cj in range(-1, 2):
                 for ck in range(-1, 2):
-                    exists = ci == 0 and cj == 0 and ck == 0
-                    if not exists:
-                        c = wp.vec3(float(ci), float(cj), float(ck))
-                        exists = cell_neighbor(
-                            domain_arg, domain_index_arg_value, geometry_cell, x_c + voxel_size * c
-                        ) != (fem.NULL_ELEMENT_INDEX)
-                    if exists:
-                        mask = mask | (1 << ((ci + 1) * 9 + (cj + 1) * 3 + (ck + 1)))
-        cell_neighbor_mask[cell] = mask
-
-    @fem.cache.dynamic_kernel(suffix=domain.name)
-    def gmls_cell_values(
-        cell_arg_value: domain.ElementArg,
-        domain_index_arg_value: domain.ElementIndexArg,
-        use_geometry_index: bool,
-        point_coords: wp.array2d[fem.Coords],
-        positions: wp.array[wp.vec3],
-        cell_particle_offsets: wp.array[int],
-        cell_particle_indices: wp.array[int],
-        particle_volume: wp.array[float],
-        particle_normalization: wp.array[float],
-        particle_hencky: wp.array[wp.mat33],
-        particle_elastic_parameters: wp.array[wp.vec3],
-        particle_yield_parameters: wp.array[YieldParamVec],
-        particle_stress: wp.array[wp.mat33],
-        voxel_size: float,
-        inv_cell_volume: float,
-        transfer_elastic_history: bool,
-        stress_order: int,
-        point_volume: wp.array2d[float],
-        point_fraction: wp.array2d[float],
-        point_flags: wp.array2d[wp.int32],
-        point_stiffness: wp.array2d[float],
-        point_elastic_strain: wp.array2d[wp.mat33],
-        point_elastic_parameters: wp.array2d[wp.vec3],
-        point_yield_parameters: wp.array2d[YieldParamVec],
-        point_stress: wp.array2d[wp.mat33],
-    ):
-        """Gather kernel-weighted particle moments around a cell center, then evaluate the fits at its points.
-
-        Point volumes split the cell's kernel volume along the affine expansion
-        of the kernel volume density about the center, whose gradient is the
-        first moment over the kernel variance; clamped to stay non-negative.
-        The strain fit is the ratio of the fits of ``E h`` and ``E``, exact for
-        a uniform Young's modulus ``E``. The stress fit is affine for
-        ``stress_order`` 1 and the kernel-weighted average for 0.
-        """
-        cell = wp.tid()
-        domain_arg = domain.DomainArg(cell_arg_value, domain_index_arg_value)
-        geometry_cell = cell
-        if not use_geometry_index:
-            geometry_cell = element_index(domain_index_arg_value, cell)
-        x_c = element_position(cell_arg_value, fem.make_free_sample(geometry_cell, fem.Coords(0.5, 0.5, 0.5)))
-        inv_voxel_size = 1.0 / voxel_size
-        points_per_cell = point_coords.shape[1]
-
-        weight = float(0.0)
-        m1 = wp.vec3(0.0)
-        m2 = wp.mat33(0.0)
-        stiffness = float(0.0)
-        stiffness_m1 = wp.vec3(0.0)
-        strain_m0 = wp.mat33(0.0)
-        strain_m1_x = wp.mat33(0.0)
-        strain_m1_y = wp.mat33(0.0)
-        strain_m1_z = wp.mat33(0.0)
-        stress_m0 = wp.mat33(0.0)
-        stress_m1_x = wp.mat33(0.0)
-        stress_m1_y = wp.mat33(0.0)
-        stress_m1_z = wp.mat33(0.0)
-        elastic_parameters = wp.vec3(0.0)
-        yield_parameters = YieldParamVec(0.0)
-
-        # The kernel support around the cell center lies within its 3x3x3 neighborhood
-        for ci in range(-1, 2):
-            for cj in range(-1, 2):
-                for ck in range(-1, 2):
+                    k = (ci + 1) * 9 + (cj + 1) * 3 + (ck + 1)
                     neighbor = cell
                     if ci != 0 or cj != 0 or ck != 0:
                         c = wp.vec3(float(ci), float(cj), float(ck))
                         neighbor = cell_neighbor(
                             domain_arg, domain_index_arg_value, geometry_cell, x_c + voxel_size * c
                         )
-                    if neighbor == fem.NULL_ELEMENT_INDEX:
-                        continue
-                    for k in range(cell_particle_offsets[neighbor], cell_particle_offsets[neighbor + 1]):
-                        p = cell_particle_indices[k]
-                        normalization = particle_normalization[p]
-                        if normalization <= 0.0:
-                            continue
-                        d = (positions[p] - x_c) * inv_voxel_size
-                        w = _gmls_kernel_weight(d)
-                        if w <= 0.0:
-                            continue
-                        w *= particle_volume[p] / normalization
-                        stress = particle_stress[p]
+                    cell_neighbors[cell, k] = neighbor
+                    if neighbor != fem.NULL_ELEMENT_INDEX:
+                        mask = mask | (1 << k)
+        cell_neighbor_mask[cell] = mask
 
-                        weight += w
-                        m1 += w * d
-                        m2 += w * wp.outer(d, d)
-                        yield_parameters += w * particle_yield_parameters[p]
-                        stress_m0 += w * stress
-                        if stress_order > 0:
-                            stress_m1_x += (w * d[0]) * stress
-                            stress_m1_y += (w * d[1]) * stress
-                            stress_m1_z += (w * d[2]) * stress
-                        if transfer_elastic_history:
-                            params = particle_elastic_parameters[p]
-                            ws = w * params[0]
-                            hencky = particle_hencky[p]
-                            stiffness += ws
-                            stiffness_m1 += ws * d
-                            strain_m0 += ws * hencky
-                            strain_m1_x += (ws * d[0]) * hencky
-                            strain_m1_y += (ws * d[1]) * hencky
-                            strain_m1_z += (ws * d[2]) * hencky
-                            elastic_parameters += w * params
+    return gmls_cell_neighbors
 
-        inv_weight = 0.0
-        mean = wp.vec3(0.0)
-        if weight > 0.0:
-            inv_weight = 1.0 / weight
-            mean = m1 * inv_weight
 
-        for local in range(points_per_cell):
-            offset = point_coords[cell, local] - wp.vec3(0.5)
-            share = weight / float(points_per_cell)
-            for a in range(3):
-                share *= wp.clamp(1.0 + mean[a] * offset[a] / _GMLS_KERNEL_VARIANCE, 0.0, 2.0)
-            point_volume[cell, local] = share
-            point_fraction[cell, local] = share * inv_cell_volume
-            if share <= 0.0:
-                point_flags[cell, local] = 0
-                point_yield_parameters[cell, local] = YieldParamVec(0.0)
-                point_stress[cell, local] = wp.mat33(0.0)
-                if transfer_elastic_history:
-                    point_stiffness[cell, local] = 0.0
-                    point_elastic_strain[cell, local] = wp.mat33(0.0)
-                    point_elastic_parameters[cell, local] = wp.vec3(0.0)
+@wp.kernel
+def gmls_cell_values(
+    cell_center: wp.array[wp.vec3],
+    cell_neighbors: wp.array2d[int],
+    cell_point_row: wp.array[int],
+    point_coords: wp.array2d[fem.Coords],
+    positions: wp.array[wp.vec3],
+    cell_particle_offsets: wp.array[int],
+    cell_particle_indices: wp.array[int],
+    particle_volume: wp.array[float],
+    particle_normalization: wp.array[float],
+    particle_hencky: wp.array[wp.mat33],
+    particle_elastic_parameters: wp.array[wp.vec3],
+    particle_yield_parameters: wp.array[YieldParamVec],
+    particle_stress: wp.array[wp.mat33],
+    voxel_size: float,
+    inv_cell_volume: float,
+    transfer_elastic_history: bool,
+    stress_order: int,
+    point_volume: wp.array2d[float],
+    point_fraction: wp.array2d[float],
+    point_flags: wp.array2d[wp.int32],
+    point_stiffness: wp.array2d[float],
+    point_elastic_strain: wp.array2d[wp.mat33],
+    point_elastic_parameters: wp.array2d[wp.vec3],
+    point_yield_parameters: wp.array2d[YieldParamVec],
+    point_stress: wp.array2d[wp.mat33],
+):
+    """Gather kernel-weighted particle moments around a cell center, then evaluate the fits at its points.
+
+    Point volumes split the cell's kernel volume along the affine expansion
+    of the kernel volume density about the center, whose gradient is the
+    first moment over the kernel variance; clamped to stay non-negative.
+    The strain fit is the ratio of the fits of ``E h`` and ``E``, exact for
+    a uniform Young's modulus ``E``. The stress fit is affine for
+    ``stress_order`` 1 and the kernel-weighted average for 0.
+    """
+    cell = wp.tid()
+    row = cell_point_row[cell]
+    if row == fem.NULL_ELEMENT_INDEX:
+        return
+    x_c = cell_center[cell]
+    inv_voxel_size = 1.0 / voxel_size
+    points_per_cell = point_coords.shape[1]
+
+    weight = float(0.0)
+    m1 = wp.vec3(0.0)
+    m2 = wp.mat33(0.0)
+    stiffness = float(0.0)
+    stiffness_m1 = wp.vec3(0.0)
+    strain_m0 = wp.mat33(0.0)
+    strain_m1_x = wp.mat33(0.0)
+    strain_m1_y = wp.mat33(0.0)
+    strain_m1_z = wp.mat33(0.0)
+    stress_m0 = wp.mat33(0.0)
+    stress_m1_x = wp.mat33(0.0)
+    stress_m1_y = wp.mat33(0.0)
+    stress_m1_z = wp.mat33(0.0)
+    elastic_parameters = wp.vec3(0.0)
+    yield_parameters = YieldParamVec(0.0)
+
+    # The kernel support around the cell center lies within its 3x3x3 neighborhood
+    for n in range(_CELL_NEIGHBOR_COUNT):
+        neighbor = cell_neighbors[cell, n]
+        if neighbor == fem.NULL_ELEMENT_INDEX:
+            continue
+        for k in range(cell_particle_offsets[neighbor], cell_particle_offsets[neighbor + 1]):
+            p = cell_particle_indices[k]
+            volume = particle_volume[p]
+            normalization = particle_normalization[p]
+            if volume <= 0.0 or normalization <= 0.0:
                 continue
+            d = (positions[p] - x_c) * inv_voxel_size
+            w = _gmls_kernel_weight(d)
+            if w <= 0.0:
+                continue
+            w *= volume / normalization
+            stress = particle_stress[p]
 
-            point_flags[cell, local] = newton.ParticleFlags.ACTIVE
-            point_yield_parameters[cell, local] = wp.max(YieldParamVec(0.0), yield_parameters * inv_weight)
-            c = _gmls_affine_operator(weight, m1, m2, offset)
-
-            stress_c = wp.vec3(0.0)
+            weight += w
+            m1 += w * d
+            m2 += w * wp.outer(d, d)
+            yield_parameters += w * particle_yield_parameters[p]
+            stress_m0 += w * stress
             if stress_order > 0:
-                stress_c = c
-            average = stress_m0 * inv_weight
-            point_stress[cell, local] = (
-                average
-                + stress_c[0] * (stress_m1_x * inv_weight - mean[0] * average)
-                + stress_c[1] * (stress_m1_y * inv_weight - mean[1] * average)
-                + stress_c[2] * (stress_m1_z * inv_weight - mean[2] * average)
-            )
-
+                stress_m1_x += (w * d[0]) * stress
+                stress_m1_y += (w * d[1]) * stress
+                stress_m1_z += (w * d[2]) * stress
             if transfer_elastic_history:
-                point_stiffness[cell, local] = stiffness * share * inv_weight
-                point_elastic_parameters[cell, local] = elastic_parameters * inv_weight
-                average_stiffness = stiffness * inv_weight
-                fitted_stiffness = average_stiffness + wp.dot(c, stiffness_m1 * inv_weight - mean * average_stiffness)
-                fitted_stiffness = wp.max(fitted_stiffness, 0.5 * average_stiffness)
-                average = strain_m0 * inv_weight
-                point_elastic_strain[cell, local] = (
-                    average
-                    + c[0] * (strain_m1_x * inv_weight - mean[0] * average)
-                    + c[1] * (strain_m1_y * inv_weight - mean[1] * average)
-                    + c[2] * (strain_m1_z * inv_weight - mean[2] * average)
-                ) / wp.max(fitted_stiffness, 1.0e-30)
+                params = particle_elastic_parameters[p]
+                ws = w * params[0]
+                hencky = particle_hencky[p]
+                stiffness += ws
+                stiffness_m1 += ws * d
+                strain_m0 += ws * hencky
+                strain_m1_x += (ws * d[0]) * hencky
+                strain_m1_y += (ws * d[1]) * hencky
+                strain_m1_z += (ws * d[2]) * hencky
+                elastic_parameters += w * params
 
-    return gmls_cell_neighbor_mask, gmls_cell_values
+    inv_weight = 0.0
+    mean = wp.vec3(0.0)
+    if weight > 0.0:
+        inv_weight = 1.0 / weight
+        mean = m1 * inv_weight
+
+    for local in range(points_per_cell):
+        offset = point_coords[row, local] - wp.vec3(0.5)
+        share = weight / float(points_per_cell)
+        for a in range(3):
+            share *= wp.clamp(1.0 + mean[a] * offset[a] / _GMLS_KERNEL_VARIANCE, 0.0, 2.0)
+        point_volume[row, local] = share
+        point_fraction[row, local] = share * inv_cell_volume
+        if share <= 0.0:
+            point_flags[row, local] = 0
+            point_yield_parameters[row, local] = YieldParamVec(0.0)
+            point_stress[row, local] = wp.mat33(0.0)
+            if transfer_elastic_history:
+                point_stiffness[row, local] = 0.0
+                point_elastic_strain[row, local] = wp.mat33(0.0)
+                point_elastic_parameters[row, local] = wp.vec3(0.0)
+            continue
+
+        point_flags[row, local] = newton.ParticleFlags.ACTIVE
+        point_yield_parameters[row, local] = wp.max(YieldParamVec(0.0), yield_parameters * inv_weight)
+        c = _gmls_affine_operator(weight, m1, m2, offset)
+
+        stress_c = wp.vec3(0.0)
+        if stress_order > 0:
+            stress_c = c
+        average = stress_m0 * inv_weight
+        point_stress[row, local] = (
+            average
+            + stress_c[0] * (stress_m1_x * inv_weight - mean[0] * average)
+            + stress_c[1] * (stress_m1_y * inv_weight - mean[1] * average)
+            + stress_c[2] * (stress_m1_z * inv_weight - mean[2] * average)
+        )
+
+        if transfer_elastic_history:
+            point_stiffness[row, local] = stiffness * share * inv_weight
+            point_elastic_parameters[row, local] = elastic_parameters * inv_weight
+            average_stiffness = stiffness * inv_weight
+            fitted_stiffness = average_stiffness + wp.dot(c, stiffness_m1 * inv_weight - mean * average_stiffness)
+            fitted_stiffness = wp.max(fitted_stiffness, 0.5 * average_stiffness)
+            average = strain_m0 * inv_weight
+            point_elastic_strain[row, local] = (
+                average
+                + c[0] * (strain_m1_x * inv_weight - mean[0] * average)
+                + c[1] * (strain_m1_y * inv_weight - mean[1] * average)
+                + c[2] * (strain_m1_z * inv_weight - mean[2] * average)
+            ) / wp.max(fitted_stiffness, 1.0e-30)
+
+
+@wp.func
+def _store_frame(
+    frame: wp.array2d[wp.mat33],
+    cell: int,
+    value: wp.mat33,
+    moment_x: wp.mat33,
+    moment_y: wp.mat33,
+    moment_z: wp.mat33,
+    gradient_scale: wp.vec3,
+):
+    frame[cell, 0] = value
+    frame[cell, 1] = moment_x * gradient_scale[0]
+    frame[cell, 2] = moment_y * gradient_scale[1]
+    frame[cell, 3] = moment_z * gradient_scale[2]
+
+
+@wp.kernel
+def strain_frames_from_points(
+    cell_point_row: wp.array[int],
+    point_coords: wp.array2d[fem.Coords],
+    voxel_size: float,
+    point_elastic_strain_delta: wp.array2d[wp.mat33],
+    point_plastic_strain_delta: wp.array2d[wp.mat33],
+    point_stress: wp.array2d[wp.mat33],
+    elastic_frame: wp.array2d[wp.mat33],
+    plastic_frame: wp.array2d[wp.mat33],
+    stress_frame: wp.array2d[wp.mat33],
+):
+    """Fit each cell's affine frames of the solver strain fields from their values at its points.
+
+    Frames store the value at the cell center, then the derivatives along each
+    axis. The strain fields are affine in each cell, so the least-squares fit
+    over the symmetric points is exact: the value is the point mean and each
+    derivative the first moment over the second moment of the point offsets.
+    """
+    cell = wp.tid()
+    elastic = wp.mat33(0.0)
+    elastic_x = wp.mat33(0.0)
+    elastic_y = wp.mat33(0.0)
+    elastic_z = wp.mat33(0.0)
+    plastic = wp.mat33(0.0)
+    plastic_x = wp.mat33(0.0)
+    plastic_y = wp.mat33(0.0)
+    plastic_z = wp.mat33(0.0)
+    stress = wp.mat33(0.0)
+    stress_x = wp.mat33(0.0)
+    stress_y = wp.mat33(0.0)
+    stress_z = wp.mat33(0.0)
+    gradient_scale = wp.vec3(0.0)
+
+    row = cell_point_row[cell]
+    points_per_cell = point_coords.shape[1]
+    if row != fem.NULL_ELEMENT_INDEX:
+        second_moment = wp.vec3(0.0)
+        for local in range(points_per_cell):
+            offset = point_coords[row, local] - wp.vec3(0.5)
+            second_moment += wp.cw_mul(offset, offset)
+            e = point_elastic_strain_delta[row, local]
+            pl = point_plastic_strain_delta[row, local]
+            st = point_stress[row, local]
+            elastic += e
+            elastic_x += offset[0] * e
+            elastic_y += offset[1] * e
+            elastic_z += offset[2] * e
+            plastic += pl
+            plastic_x += offset[0] * pl
+            plastic_y += offset[1] * pl
+            plastic_z += offset[2] * pl
+            stress += st
+            stress_x += offset[0] * st
+            stress_y += offset[1] * st
+            stress_z += offset[2] * st
+        inv_count = 1.0 / float(points_per_cell)
+        elastic *= inv_count
+        plastic *= inv_count
+        stress *= inv_count
+        gradient_scale = wp.cw_div(wp.vec3(1.0 / voxel_size), second_moment)
+
+    _store_frame(elastic_frame, cell, elastic, elastic_x, elastic_y, elastic_z, gradient_scale)
+    _store_frame(plastic_frame, cell, plastic, plastic_x, plastic_y, plastic_z, gradient_scale)
+    _store_frame(stress_frame, cell, stress, stress_x, stress_y, stress_z, gradient_scale)
+
+
+@wp.func
+def _evaluate_frame(frame: wp.array2d[wp.mat33], cell: int, offset: wp.vec3):
+    """Affine frame value at ``offset`` from its cell center."""
+    return frame[cell, 0] + offset[0] * frame[cell, 1] + offset[1] * frame[cell, 2] + offset[2] * frame[cell, 3]
+
+
+@wp.kernel
+def update_particle_strains_from_frames(
+    dt: float,
+    kinematic_update: int,
+    cell_center: wp.array[wp.vec3],
+    cell_neighbors: wp.array2d[int],
+    particle_cell_index: wp.array[fem.ElementIndex],
+    particle_normalization: wp.array[float],
+    positions: wp.array[wp.vec3],
+    voxel_size: float,
+    particle_flags: wp.array[wp.int32],
+    particle_density: wp.array[float],
+    material_parameters: MaterialParameters,
+    elastic_frame: wp.array2d[wp.mat33],
+    plastic_frame: wp.array2d[wp.mat33],
+    stress_frame: wp.array2d[wp.mat33],
+    velocity_gradient: wp.array[wp.mat33],
+    elastic_strain_prev: wp.array[wp.mat33],
+    particle_Jp_prev: wp.array[float],
+    elastic_strain: wp.array[wp.mat33],
+    particle_Jp: wp.array[float],
+    particle_stress: wp.array[wp.mat33],
+):
+    """Update particle history from the affine frames of the cells around each particle.
+
+    Each frame is evaluated at the particle and weighted by the normalized GMLS
+    kernel. The particle velocity gradient drives the kinematic update.
+    """
+    p = wp.tid()
+    F_prev = elastic_strain_prev[p]
+    Jp_prev = particle_Jp_prev[p]
+
+    is_active = (particle_flags[p] & newton.ParticleFlags.ACTIVE) != 0
+    if not is_active or particle_density[p] == 0.0:
+        elastic_strain[p] = F_prev
+        particle_Jp[p] = Jp_prev
+        particle_stress[p] = wp.mat33(0.0)
+        return
+
+    elastic_delta = wp.mat33(0.0)
+    plastic_delta = wp.mat33(0.0)
+    stress = wp.mat33(0.0)
+    cell = particle_cell_index[p]
+    normalization = particle_normalization[p]
+    if cell != fem.NULL_ELEMENT_INDEX and normalization > 0.0:
+        x = positions[p]
+        inv_voxel_size = 1.0 / voxel_size
+        for n in range(_CELL_NEIGHBOR_COUNT):
+            frame = cell_neighbors[cell, n]
+            if frame == fem.NULL_ELEMENT_INDEX:
+                continue
+            offset = x - cell_center[frame]
+            w = _gmls_kernel_weight(offset * inv_voxel_size) / normalization
+            if w <= 0.0:
+                continue
+            elastic_delta += w * _evaluate_frame(elastic_frame, frame, offset)
+            plastic_delta += w * _evaluate_frame(plastic_frame, frame, offset)
+            stress += w * _evaluate_frame(stress_frame, frame, offset)
+
+    F_new, Jp_new, stress_new = update_particle_history(
+        p,
+        dt,
+        kinematic_update,
+        material_parameters,
+        F_prev,
+        Jp_prev,
+        elastic_delta,
+        plastic_delta,
+        stress,
+        velocity_gradient[p],
+    )
+    elastic_strain[p] = F_new
+    particle_Jp[p] = Jp_new
+    particle_stress[p] = stress_new

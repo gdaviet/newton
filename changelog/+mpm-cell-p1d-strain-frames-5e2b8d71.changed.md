@@ -1,0 +1,1 @@
+Return `SolverImplicitMPM` cell-integration strain results to particles through per-cell affine frames for the `"P1d"` strain basis, and index cell history fits by partition cell on dense and fixed grids.
