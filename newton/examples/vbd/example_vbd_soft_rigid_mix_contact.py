@@ -358,7 +358,8 @@ class Example:
         )
 
         self.state_0 = self.model.state()
-        self.state_1 = self.model.state()
+        # LOX steps the state in place, so a single captured solve serves every substep
+        self.state_1 = self.state_0 if self.solver_type == "lox" else self.model.state()
         self.control = self.model.control()
         self.contacts = self.pipeline.contacts()
 
@@ -366,6 +367,16 @@ class Example:
         if hasattr(self.viewer, "renderer"):
             self.viewer.renderer.draw_wireframe = True
         self.viewer.set_camera(wp.vec3(0.41, -0.72, 0.54), -5.3, 121.5)
+
+        self.capture()
+
+    def capture(self):
+        """Capture the LOX solve of one substep in a CUDA graph."""
+        self.graph = None
+        if self.solver_type == "lox" and self.model.device.is_cuda:
+            with wp.ScopedCapture(self.model.device) as capture:
+                self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            self.graph = capture.graph
 
     def simulate(self):
         dz = 0.0
@@ -382,7 +393,10 @@ class Example:
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
             self.pipeline.collide(self.state_0, self.contacts)
-            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            if self.graph is None:
+                self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            else:
+                wp.capture_launch(self.graph)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
