@@ -1,0 +1,1 @@
+Transfer `SolverImplicitMPM` cell-integration history with moving least-squares fits around cell centers, and support separate worlds, hardening, dilatancy, a positive critical fraction, and kinematic particles with `integration_scheme="cell"`.

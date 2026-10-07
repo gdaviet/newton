@@ -916,14 +916,17 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         domains. ``"cell"`` integrates at points with fixed positions in each
         grid cell, the cell center for the ``"P0"`` strain basis and the
         2x2x2 Gauss points for ``"P1d"`` and ``"Q1d"``, so that the integrands
-        never cross a shape-function kink as particles move. Following MPM
-        Lite, particles exchange data with fixed points using trilinear
-        weights on the lattice of points, which are continuous in particle
+        never cross a shape-function kink as particles move. Particle data
+        reaches the fixed points with weights that are continuous in particle
         position:
 
-        - strain history and material parameters go to the quadrature
-          points, each weighted by its transferred particle volume;
-        - mass and momentum reach the grid nodes through the cell centers;
+        - strain history, stress and material parameters come from a moving
+          least-squares fit around each cell center, with a quadratic
+          B-spline kernel, which also sets the point quadrature weights and
+          conserves particle volume; strain fits are affine, and so are
+          stress fits at the 2x2x2 points;
+        - following MPM Lite, mass and momentum reach the grid nodes through
+          the cell centers with trilinear weights on the lattice of points;
         - particles move with the grid velocity and gradient sampled at the
           cell centers, and particle-based collider bases constrain that same
           velocity;
@@ -935,10 +938,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
         .. experimental::
 
-            ``"cell"`` requires the ``"Q1"`` velocity basis and a single FEM
-            environment, and does not support hardening, dilatancy,
-            kinematic (zero-density) particles, or a positive
-            :attr:`critical_fraction`.
+            ``"cell"`` requires the ``"Q1"`` velocity basis.
         """
 
         # material / background
@@ -1611,6 +1611,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         self._cell_two_hop_transfers = False
         self._cell_grid_points = None
         self._cell_grid_flags = None
+        self._cell_grid_environment = None
         self._element_yield_parameters = None
         if config.integration_scheme == "cell":
             self._cell_quadrature = CellQuadrature(
@@ -1622,7 +1623,6 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 if self._cell_quadrature.points_per_axis == 1
                 else CellQuadrature(points_per_axis=1, device=model.device)
             )
-            self._validate_cell_quadrature_materials()
             self._set_cell_two_hop_transfers(True)
             self._cell_kinematic_update = True
         self.collider_normal_from_sdf_gradient = config.collider_normal_from_sdf_gradient
@@ -2591,6 +2591,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         voxel_size: float,
         temporary_store: fem.TemporaryStore,
         padding_voxels: int = 0,
+        *,
+        point_environment: wp.array | None,
+        point_world_ranges: tuple[tuple[int, int], ...] | None,
     ):
         """Create a grid (sparse or dense) covering all particle positions.
 
@@ -2604,6 +2607,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             voxel_size: Grid voxel edge length.
             temporary_store: Temporary storage for intermediate buffers.
             padding_voxels: Additional empty voxels to add around the bounds.
+            point_environment: Environment of each position with separate worlds, else ``None``.
+            point_world_ranges: Contiguous ``[begin, end)`` position ranges of each world with
+                separate worlds, else ``None``.
 
         Returns:
             A geometry partition suitable for FEM field assembly.
@@ -2615,7 +2621,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                         if self._grid_status is None:
                             self._grid_status = wp.zeros(1, dtype=wp.uint32, device=positions.device)
                             self._grid_accumulated_status = wp.zeros(1, dtype=wp.uint32, device=positions.device)
-                        point_mask = self._update_grid_point_mask(positions, self._mpm_model.particle_flags)
+                        point_mask = self._update_grid_point_mask(positions, particle_flags)
                         guard_cells = 3
                         capacity_kwargs = _rebuild_capacity(
                             positions,
@@ -2623,7 +2629,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                             16.0,
                             self.max_active_cell_count,
                             point_mask=point_mask,
-                            point_environment=self._particle_environment,
+                            point_environment=point_environment,
                             environment_count=self._environment_count,
                             guard_cells=guard_cells,
                             temporary_store=temporary_store,
@@ -2633,7 +2639,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                         )
                         grid = fem.Nanogrid.from_environment_voxels(
                             positions,
-                            self._particle_environment,
+                            point_environment,
                             self._environment_count,
                             point_mask=point_mask,
                             voxel_size=voxel_size,
@@ -2649,7 +2655,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                             voxel_coordinates(positions[begin:end], voxel_size, padding_voxels=padding_voxels)
                             if begin != end
                             else wp.empty(0, dtype=wp.vec3i, device=positions.device)
-                            for begin, end in self._particle_world_ranges
+                            for begin, end in point_world_ranges
                         ]
                         cell_count = sum(cell_ijk.shape[0] for cell_ijk in cell_ijks)
                         cell_ijk = wp.empty(cell_count, dtype=wp.vec3i, device=positions.device)
@@ -2766,9 +2772,14 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         return self._grid_point_mask
 
     def _create_geometry_partition(
-        self, grid: fem.Geometry, positions: wp.array, particle_flags: wp.array, max_cell_count: int
+        self,
+        grid: fem.Geometry,
+        positions: wp.array,
+        particle_flags: wp.array,
+        max_cell_count: int,
+        point_environment: wp.array | None,
     ):
-        """Create a geometry partition for the given positions."""
+        """Create a geometry partition for the given positions and, with separate worlds, their environments."""
 
         active_cells = fem.borrow_temporary(self.temporary_store, shape=grid.cell_count(), dtype=int)
         active_cells.zero_()
@@ -2777,7 +2788,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             active_cell_values = {
                 "positions": positions,
                 "particle_flags": particle_flags,
-                "particle_environment": self._particle_environment,
+                "particle_environment": point_environment,
                 "active_cells": active_cells,
             }
         else:
@@ -2849,14 +2860,10 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             raise NotImplementedError(
                 f"Config.integration_scheme='cell' requires velocity_basis='Q1', got {config.velocity_basis!r}."
             )
-        if self._separate_worlds:
-            raise NotImplementedError("Config.integration_scheme='cell' does not support Config.separate_worlds=True.")
         if self.residual_strain_tracking:
             raise NotImplementedError(
                 "Cell integration uses density_strain_fraction rather than residual strain history."
             )
-        if config.critical_fraction > 0.0:
-            raise NotImplementedError("Config.integration_scheme='cell' does not support a positive critical_fraction.")
         points_per_axis = {"P0": 1, "P1d": 2, "Q1d": 2}.get(config.strain_basis)
         if points_per_axis is None:
             raise ValueError(
@@ -2864,21 +2871,6 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 f"got {config.strain_basis!r}."
             )
         return points_per_axis
-
-    def _validate_cell_quadrature_materials(self):
-        mpm_model = self._mpm_model
-        unsupported = [
-            name
-            for name, present in (
-                ("hardening", mpm_model.has_hardening),
-                ("dilatancy", mpm_model.has_dilatancy),
-            )
-            if present
-        ]
-        if unsupported:
-            raise NotImplementedError(
-                f"Config.integration_scheme='cell' does not support particle {', '.join(unsupported)}."
-            )
 
     def _set_cell_two_hop_transfers(self, enabled: bool):
         """Route mass, momentum, contact, and particle advection through the fixed cell points.
@@ -2890,13 +2882,12 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         if enabled:
             if self._cell_quadrature is None:
                 raise ValueError("Two-hop transfers require Config.integration_scheme='cell'.")
-            active = (self._mpm_model.particle_flags.numpy() & int(newton.ParticleFlags.ACTIVE)) != 0
-            if np.any(self._mpm_model.particle_density.numpy()[active] <= 0.0):
-                raise NotImplementedError("Two-hop transfers do not support kinematic (zero-density) particles.")
             if self._cell_grid_points is None:
                 stencil_point_count = self._initial_particle_count * CELL_POINT_STENCIL_SIZE
                 self._cell_grid_points = wp.empty(stencil_point_count, dtype=wp.vec3, device=self.model.device)
                 self._cell_grid_flags = wp.empty(stencil_point_count, dtype=wp.int32, device=self.model.device)
+                if self._separate_worlds:
+                    self._cell_grid_environment = wp.empty(stencil_point_count, dtype=int, device=self.model.device)
         if bool(enabled) != self._cell_two_hop_transfers:
             # The grid point mask is sized by the number of points defining the grid
             self._grid_point_mask = None
@@ -2904,8 +2895,6 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
     def _prepare_cell_quadrature(self, state_in: newton.State, dt: float, pic: fem.PicQuadrature):
         """Transfer particle history to the fixed cell points for this step."""
-        self._validate_cell_quadrature_materials()
-
         mpm_model = self._mpm_model
         cell_quadrature = self._cell_quadrature
         with self._timer("Cell quadrature"):
@@ -2959,6 +2948,8 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
         grid_positions = positions
         grid_flags = self._mpm_model.particle_flags
+        grid_environment = self._particle_environment
+        grid_world_ranges = self._particle_world_ranges
         if self._cell_two_hop_transfers:
             # Two-hop transfers reach every cell of each particle's point stencil,
             # so the grid covers those cells and gives their nodes mass.
@@ -2968,15 +2959,24 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 inputs=[
                     positions,
                     grid_flags,
+                    self._particle_environment,
                     max(self._cell_quadrature.abscissae[0], self._cell_transfer_quadrature.abscissae[0])
                     * self._mpm_model.voxel_size,
                     self._cell_grid_points,
                     self._cell_grid_flags,
+                    self._cell_grid_environment,
                 ],
                 device=positions.device,
             )
             grid_positions = self._cell_grid_points
             grid_flags = self._cell_grid_flags
+            if self._separate_worlds:
+                # Stencil points follow their particle's order, so each world's range scales with the stencil size
+                grid_environment = self._cell_grid_environment
+                grid_world_ranges = tuple(
+                    (CELL_POINT_STENCIL_SIZE * begin, CELL_POINT_STENCIL_SIZE * end)
+                    for begin, end in self._particle_world_ranges
+                )
 
         # The fixed grid and the rebuildable sparse grid both persist across steps: the
         # fixed grid is static, the sparse grid is refreshed in place from the current
@@ -2987,7 +2987,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 point_mask = self._update_grid_point_mask(grid_positions, grid_flags)
                 grid.rebuild(
                     grid_positions,
-                    point_envs=self._particle_environment,
+                    point_envs=grid_environment,
                     status=self._grid_status,
                     point_mask=point_mask,
                 )
@@ -3004,6 +3004,8 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 voxel_size=self._mpm_model.voxel_size,
                 temporary_store=self.temporary_store,
                 padding_voxels=self.grid_padding,
+                point_environment=grid_environment,
+                point_world_ranges=grid_world_ranges,
             )
 
         # Build active partition. Plain sparse uses the whole grid; fixed and rebuildable
@@ -3015,7 +3017,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 geo_partition = grid
             else:
                 max_cell_count = self.max_active_cell_count
-                geo_partition = self._create_geometry_partition(grid, grid_positions, grid_flags, max_cell_count)
+                geo_partition = self._create_geometry_partition(
+                    grid, grid_positions, grid_flags, max_cell_count, grid_environment
+                )
 
         # Bin particles to grid cells
         with self._timer("Bin particles"):

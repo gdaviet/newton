@@ -9,6 +9,7 @@ import warp.fem as fem
 
 import newton
 from newton._src.solvers.implicit_mpm.cell_quadrature import CellQuadrature
+from newton._src.solvers.implicit_mpm.implicit_mpm_model import MaterialParameters
 from newton._src.solvers.implicit_mpm.implicit_mpm_solver_kernels import (
     compute_eigenvalues,
     filter_p0_strain_mass,
@@ -769,6 +770,63 @@ def test_multiworld_shared_grid_couples_worlds(test, device):
     np.testing.assert_allclose(shared_velocity, 0.0, rtol=0.0, atol=1.0e-6)
 
 
+def test_cell_integration_separate_worlds(test, device):
+    """Verify cell integration keeps colocated worlds independent.
+
+    Two worlds share particle positions under opposite gravities. Each world
+    matches a single-world run with its own gravity, for every grid type and
+    for one and 2x2x2 points per cell.
+    """
+
+    def run(gravities, grid_type, strain_basis):
+        local = _make_mpm_particle_builder(gravity=(0.0, 0.0, 0.0), young_modulus=1.0e5, dimensions=(4, 4, 4))
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, 0.0, 0.0))
+        SolverImplicitMPM.register_custom_attributes(builder)
+        for _ in gravities:
+            builder.add_world(local)
+        model = builder.finalize(device=device)
+        for world, gravity in enumerate(gravities):
+            model.set_gravity(gravity, world=world)
+
+        config = _make_mpm_config(
+            grid_type="sparse" if grid_type == "rebuildable" else grid_type, integration_scheme="cell"
+        )
+        config.strain_basis = strain_basis
+        config.tolerance = 1.0e-6
+        config.max_iterations = 100
+        if grid_type == "fixed":
+            config.grid_padding = 1
+        if grid_type in ("fixed", "rebuildable"):
+            config.max_active_cell_count = 256
+        if grid_type == "rebuildable":
+            config.warmstart_mode = "auto"
+        solver, state = _step_mpm(model, config, step_count=3)
+        test.assertEqual(solver._separate_worlds, len(gravities) > 1)
+        starts = model.particle_world_start.numpy()
+        positions = state.particle_q.numpy()
+        velocities = state.particle_qd.numpy()
+        return [
+            (positions[starts[w] : starts[w + 1]], velocities[starts[w] : starts[w + 1]]) for w in range(len(gravities))
+        ]
+
+    gravities = ((3.0, 0.0, 0.0), (0.0, 0.0, -3.0))
+    grid_types = ("dense", "fixed")
+    # Warp releases after 1.17.0 key ExplicitQuadrature functions by geometry, so sparse grids can share
+    # this process with the dense-grid cell tests.
+    warp_version = tuple(int(part) for part in wp.__version__.split(".")[:3])
+    if wp.get_device(device).is_cuda and warp_version > (1, 17, 0):
+        grid_types += ("sparse", "rebuildable")
+    for grid_type in grid_types:
+        for strain_basis in ("P0", "P1d"):
+            with test.subTest(grid_type=grid_type, strain_basis=strain_basis):
+                worlds = run(gravities, grid_type, strain_basis)
+                for world, gravity in enumerate(gravities):
+                    ((position, velocity),) = run((gravity,), grid_type, strain_basis)
+                    test.assertGreater(float(np.abs(np.mean(velocity, axis=0)).max()), 1.0e-2)
+                    np.testing.assert_allclose(worlds[world][0], position, rtol=0.0, atol=1.0e-5)
+                    np.testing.assert_allclose(worlds[world][1], velocity, rtol=0.0, atol=1.0e-3)
+
+
 def test_multiworld_collider_world_validation(test, device):
     """Verify multi-world collider world validation."""
     model = _make_two_world_particle_model(device)
@@ -1150,6 +1208,109 @@ def test_shared_solver_globalizes_external_multiworld_colliders(test, device):
     face_count = _make_box_collider_mesh(device).indices.shape[0] // 3
     test.assertEqual(collider.face_material_index.shape[0], 2 * face_count)
     test.assertEqual(np.unique(collider.face_material_index.numpy()).shape[0], 2)
+
+
+def _uniform_material_parameters(count: int, young_modulus: float) -> MaterialParameters:
+    parameters = MaterialParameters()
+    parameters.young_modulus = wp.full(count, young_modulus, dtype=float)
+    parameters.poisson_ratio = wp.full(count, 0.3, dtype=float)
+    zeros = wp.zeros(count, dtype=float)
+    ones = wp.full(count, 1.0, dtype=float)
+    for name in ("damping", "friction", "viscosity", "hardening", "hardening_rate", "softening_rate", "dilatancy"):
+        setattr(parameters, name, zeros)
+    for name in ("yield_pressure", "tensile_yield_ratio", "yield_stress"):
+        setattr(parameters, name, ones)
+    return parameters
+
+
+@fem.integrand
+def _sample_position(s: fem.Sample, domain: fem.Domain):
+    return domain(s)
+
+
+def _transfer_to_cell_points(domain, positions_np, hencky_np, volume_np, points_per_axis):
+    count = positions_np.shape[0]
+    positions = wp.array(positions_np, dtype=wp.vec3)
+    pic = fem.PicQuadrature(domain, positions, use_domain_element_indices=True)
+    cell_quadrature = CellQuadrature(points_per_axis, device=positions.device)
+    cell_quadrature.compute_weights(pic, positions, 1.0, temporary_store=None)
+    # Symmetric F = exp(h) has Hencky strain h
+    eigenvalues, eigenvectors = np.linalg.eigh(hencky_np)
+    F = np.einsum("pij,pj,pkj->pik", eigenvectors, np.exp(eigenvalues), eigenvectors)
+    cell_quadrature.transfer_particles(
+        domain,
+        particle_flags=wp.full(count, int(newton.ParticleFlags.ACTIVE), dtype=wp.int32),
+        particle_volume=wp.array(volume_np, dtype=float),
+        elastic_strain=wp.array(F, dtype=wp.mat33),
+        particle_stress=wp.array(1.0e3 * hencky_np, dtype=wp.mat33),
+        particle_Jp=wp.full(count, 1.0, dtype=float),
+        material_parameters=_uniform_material_parameters(count, 1.0e5),
+        dt=0.01,
+        inv_cell_volume=1.0,
+        temporary_store=None,
+    )
+    point_positions = wp.empty(cell_quadrature.point_count, dtype=wp.vec3)
+    fem.interpolate(_sample_position, dest=point_positions, at=cell_quadrature.quadrature)
+    # Copy before releasing, since CPU arrays share memory with their NumPy views
+    result = {
+        "position": point_positions.numpy(),
+        "volume": cell_quadrature.point_volume.numpy().copy(),
+        "strain": cell_quadrature.point_elastic_strain.numpy().copy(),
+        "stress": cell_quadrature.point_stress.numpy().copy(),
+    }
+    cell_quadrature.release()
+    return result
+
+
+def test_cell_gmls_transfer(test, device):
+    """Check the GMLS particle-to-point transfer of the cell quadrature.
+
+    On a grid restricted to the cells holding particles, the per-particle
+    partition of unity over the existing cells conserves the particle volume,
+    and uniform strain and stress are reproduced at every cell center. At the
+    2x2x2 Gauss points, where the stress fit is also affine, both fits
+    reproduce a linear field wherever the kernel support lies within the
+    particles.
+    """
+    rng = np.random.default_rng(11)
+    with wp.ScopedDevice(device):
+        positions = rng.uniform(1.0, 3.0, size=(200, 3))
+        uniform = np.diag([0.01, -0.02, 0.005])
+        hencky = np.broadcast_to(uniform, (200, 3, 3))
+        volume = rng.uniform(0.5, 1.5, size=200) * 1.0e-2
+        # Grid restricted to the cells holding particles, so that neighbor cells are missing around them
+        grid = fem.Grid3D(bounds_lo=wp.vec3(0.0), bounds_hi=wp.vec3(4.0), res=wp.vec3i(4))
+        cell_ijk = np.floor(positions).astype(int)
+        cell_mask = np.zeros(4**3, dtype=np.int32)
+        cell_mask[(cell_ijk[:, 0] * 4 + cell_ijk[:, 1]) * 4 + cell_ijk[:, 2]] = 1
+        sparse = fem.Cells(fem.ExplicitGeometryPartition(grid, wp.array(cell_mask, dtype=int)))
+        test.assertLess(sparse.element_count(), sparse.geometry_element_count())
+        gmls = _transfer_to_cell_points(sparse, positions, hencky, volume, 1)
+        test.assertAlmostEqual(float(gmls["volume"].sum()), float(volume.sum()), delta=1.0e-5 * volume.sum())
+        active = gmls["volume"] > 0.0
+        np.testing.assert_allclose(
+            gmls["strain"][active], np.broadcast_to(uniform, gmls["strain"][active].shape), atol=1.0e-6
+        )
+        np.testing.assert_allclose(
+            gmls["stress"][active], np.broadcast_to(1.0e3 * uniform, gmls["stress"][active].shape), atol=1.0e-3
+        )
+
+        res = 6
+        positions = rng.uniform(0.0, res, size=(8 * res**3, 3))
+        dense = fem.Cells(fem.Grid3D(bounds_lo=wp.vec3(0.0), bounds_hi=wp.vec3(float(res)), res=wp.vec3i(res)))
+        gradient = 0.01 * rng.normal(size=(3, 3, 3))
+        gradient = gradient + gradient.transpose(1, 0, 2)
+        offset = np.diag([0.01, -0.02, 0.005])
+        hencky = offset + np.einsum("ijk,pk->pij", gradient, positions)
+        volume = np.full(positions.shape[0], 1.0 / 8.0)
+        gmls = _transfer_to_cell_points(dense, positions, hencky, volume, 2)
+        expected = offset + np.einsum("ijk,pk->pij", gradient, gmls["position"])
+        # Points whose kernel support lies within the particles
+        interior = np.all((gmls["position"] > 1.5) & (gmls["position"] < res - 1.5), axis=1)
+        test.assertGreater(int(interior.sum()), 0)
+        np.testing.assert_allclose(gmls["strain"][interior], expected[interior], atol=1.0e-5)
+        np.testing.assert_allclose(gmls["stress"][interior], 1.0e3 * expected[interior], atol=1.0e-2)
+        test.assertAlmostEqual(float(gmls["volume"].sum()), float(volume.sum()), delta=1.0e-3 * volume.sum())
 
 
 def test_cell_quadrature_weights(test, device):
@@ -1565,17 +1726,97 @@ def test_cell_integration_rejects_unsupported(test, device):
         ({"strain_basis": "Q1"}, ValueError),
         ({"strain_basis": "pic8"}, ValueError),
         ({"velocity_basis": "B2"}, NotImplementedError),
-        ({"critical_fraction": 0.5}, NotImplementedError),
     ):
         with test.subTest(**options):
             config = SolverImplicitMPM.Config(voxel_size=0.1, grid_type="dense", integration_scheme="cell", **options)
             with test.assertRaises(error):
                 SolverImplicitMPM(model, config)
 
-    model.mpm.hardening.fill_(1.0)
-    model_config = SolverImplicitMPM.Config(voxel_size=0.1, grid_type="dense", integration_scheme="cell")
-    with test.assertRaises(NotImplementedError):
-        SolverImplicitMPM(model, model_config)
+
+def _make_cell_granular_model(device, kinematic_velocity=None, spacing=0.05):
+    """Granular block on the ground, or resting on a layer of kinematic particles moving at ``kinematic_velocity``."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -9.81, 0.0))
+    SolverImplicitMPM.register_custom_attributes(builder)
+    attributes = {"mpm:young_modulus": 1.0e5, "mpm:poisson_ratio": 0.3, "mpm:friction": 0.6}
+    grid = {"rot": wp.quat_identity(), "cell_x": spacing, "cell_y": spacing, "cell_z": spacing, "jitter": 0.0}
+    block_base = 0.5 * spacing
+    if kinematic_velocity is not None:
+        # Zero mass makes these particles kinematic
+        builder.add_particle_grid(
+            pos=wp.vec3(0.5 * spacing),
+            vel=wp.vec3(kinematic_velocity),
+            dim_x=6,
+            dim_y=2,
+            dim_z=6,
+            mass=0.0,
+            radius_mean=0.5 * spacing,
+            custom_attributes=attributes,
+            **grid,
+        )
+        block_base += 2.0 * spacing
+    builder.add_particle_grid(
+        pos=wp.vec3(0.5 * spacing, block_base, 0.5 * spacing),
+        vel=wp.vec3(0.0),
+        dim_x=6,
+        dim_y=4,
+        dim_z=6,
+        mass=1000.0 * spacing**3,
+        radius_mean=0.5 * spacing,
+        custom_attributes=attributes,
+        **grid,
+    )
+    if kinematic_velocity is None:
+        builder.add_ground_plane()
+    return builder.finalize(device=device)
+
+
+def test_cell_integration_material_options(test, device):
+    """Verify cell integration with hardening, dilatancy, a critical fraction, and kinematic particles.
+
+    A granular block settles on the ground and stays finite with each option;
+    hardening and dilatancy change the plastic volume ratio ``Jp``. A block on
+    a layer of kinematic (zero-density) particles stays above that layer and
+    is dragged along with it, while the layer keeps its prescribed velocity.
+    """
+    for strain_basis in ("P0", "P1d"):
+        config = SolverImplicitMPM.Config(
+            voxel_size=0.1,
+            grid_type="dense",
+            strain_basis=strain_basis,
+            integration_scheme="cell",
+            solver="gs",
+            max_iterations=50,
+            tolerance=1.0e-6,
+        )
+        for option in ("hardening", "dilatancy", "critical_fraction"):
+            with test.subTest(strain_basis=strain_basis, option=option):
+                model = _make_cell_granular_model(device)
+                if option == "hardening":
+                    model.mpm.hardening.fill_(5.0)
+                    model.mpm.yield_pressure.fill_(1.0e4)
+                elif option == "dilatancy":
+                    model.mpm.dilatancy.fill_(0.5)
+                config.critical_fraction = 0.6 if option == "critical_fraction" else 0.0
+                _, state = _step_mpm(model, config, step_count=10)
+                positions = state.particle_q.numpy()
+                test.assertTrue(np.all(np.isfinite(positions)))
+                test.assertGreater(float(positions[:, 1].min()), -0.05)
+                if option in ("hardening", "dilatancy"):
+                    test.assertGreater(float(np.abs(state.mpm.particle_Jp.numpy() - 1.0).max()), 1.0e-6)
+
+        with test.subTest(strain_basis=strain_basis, option="kinematic"):
+            config.critical_fraction = 0.0
+            layer_velocity = np.array((0.5, 0.0, 0.0))
+            model = _make_cell_granular_model(device, kinematic_velocity=layer_velocity)
+            _, state = _step_mpm(model, config, step_count=10)
+            kinematic = model.particle_mass.numpy() == 0.0
+            positions = state.particle_q.numpy()
+            velocities = state.particle_qd.numpy()
+            np.testing.assert_allclose(
+                velocities[kinematic], np.broadcast_to(layer_velocity, (kinematic.sum(), 3)), atol=0.05
+            )
+            test.assertGreater(float(positions[~kinematic, 1].min()), float(positions[kinematic, 1].max()))
+            test.assertGreater(float(velocities[~kinematic, 0].mean()), 0.1)
 
 
 def test_sand_cube_on_plane(test, device):
@@ -2179,7 +2420,17 @@ add_function_test(
     test_cell_integration_rejects_unsupported,
     devices=devices,
 )
+add_function_test(
+    TestImplicitMPM,
+    "test_cell_integration_material_options",
+    test_cell_integration_material_options,
+    devices=devices,
+)
 add_function_test(TestImplicitMPM, "test_cell_quadrature_weights", test_cell_quadrature_weights, devices=devices)
+add_function_test(TestImplicitMPM, "test_cell_gmls_transfer", test_cell_gmls_transfer, devices=devices)
+add_function_test(
+    TestImplicitMPM, "test_cell_integration_separate_worlds", test_cell_integration_separate_worlds, devices=devices
+)
 add_function_test(
     TestImplicitMPM, "test_cell_integration_viscosity_decay", test_cell_integration_viscosity_decay, devices=devices
 )
