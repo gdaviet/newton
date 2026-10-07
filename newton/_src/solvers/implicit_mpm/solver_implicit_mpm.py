@@ -33,6 +33,23 @@ from .cell_quadrature import (
     CellQuadrature,
     cell_stencil_points,
 )
+from .density_measurement import (
+    DensityMeasurement as _DensityMeasurement,
+)
+from .density_measurement import (
+    add_available_density_offset,
+    add_overpacking_offset,
+    cell_density_offset,
+    finalize_reference_masks,
+    make_capacity_kernel,
+    make_density_neighbor_kernel,
+    make_density_support_points_kernel,
+    make_deposition_kernel,
+    make_particle_density_kernel,
+    make_reference_mask_kernel,
+    make_reference_samples_kernel,
+    particle_density_offset,
+)
 from .implicit_mpm_model import ImplicitMPMModel
 from .particle_surface_colliders import extrapolate_surface_sdf_into_colliders
 from .rasterized_collisions import (
@@ -62,6 +79,7 @@ from .implicit_mpm_solver_kernels import (
     compute_density_strain_offset,
     compute_eigenvalues,
     compute_unilateral_strain_offset,
+    discontinuous_cell_color,
     fill_uniform_color_block_indices,
     filter_p0_strain_mass,
     free_velocity,
@@ -76,6 +94,7 @@ from .implicit_mpm_solver_kernels import (
     inverse_scale_sym_tensor,
     inverse_scale_vector,
     make_cell_color_kernel,
+    make_contact_cell_keys_kernel,
     make_dynamic_color_block_indices_kernel,
     make_inverse_rotate_vectors,
     make_rotate_vectors,
@@ -823,6 +842,8 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             or particles that are not stored contiguously by world.
     """
 
+    DensityMeasurement = _DensityMeasurement
+
     @dataclass
     class Config:
         """Configuration for :class:`SolverImplicitMPM`.
@@ -965,16 +986,36 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         the existing activation distance. This parameter may change without
         prior notice.
         """
-        density_strain_fraction: float = 0.0
-        """Fraction of the particle volume-filling error corrected per step.
+        density_measurement: _DensityMeasurement = _DensityMeasurement.CELL
+        """Experimental measurement for :attr:`density_strain_fraction`.
 
-        Values in ``[0, 1]`` add the signed offset
-        ``fraction * (available_node_volume - particle_node_volume)`` to the
+        ``CELL`` uses the existing critical-fraction integration. ``BOX``
+        deposits exact particle-cube overlaps into cells. ``BSPLINE`` uses
+        cell-centered quadratic B-splines and matching solid exclusion over
+        their full support. ``PARTICLE`` gathers particle-centered kernel
+        densities through the existing PIC cell lists, with matching wall
+        quadrature, then integrates the density error against the selected
+        strain test functions. Fixed grids require at least two cells of
+        padding. Sparse grids evaluate wall quadrature in missing cells
+        directly, so they require no padding. Smooth modes require PIC integration; BOX also requires
+        particle radii at most half a voxel. They change only the RHS
+        measurement, retaining the selected strain basis and solver.
+
+        .. experimental::
+
+            Smooth density measurements may change without prior notice.
+        """
+        density_strain_fraction: float = 0.0
+        """Fraction of particle overpacking corrected per step.
+
+        Values in ``[0, 1]`` add the nonpositive offset
+        ``fraction * min(available_node_volume - particle_node_volume, 0)`` to the
         divergence constraint. The default measurement uses the same
         integration as :attr:`critical_fraction`, including collider volume
         subtraction.
         The target filling fraction is one. Overfilled nodes produce negative
-        offsets, requesting expansion. Zero disables this feedback.
+        offsets, requesting expansion. Underfilled nodes receive no correction,
+        so stabilization never requests contraction. Zero disables this feedback.
 
         This correction does not require residual deformation history.
 
@@ -1011,6 +1052,12 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         .. experimental::
 
             Passive residual-strain diagnostics may change without prior notice.
+        """
+        gs_colored_contacts: bool = False
+        """Experimental: solve particle contacts sequentially inside each colored cell.
+
+        Requires P0/P1d particle integration, Q1 velocity, standard GS, and prescribed colliders.
+        Uses the eight strain-cell colors and skips cells without active contacts.
         """
         collider_normal_from_sdf_gradient: bool = False
         """Compute collider normals from sdf gradient rather than closest point"""
@@ -1568,6 +1615,25 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         self.density_strain_fraction = float(config.density_strain_fraction)
         if not math.isfinite(self.density_strain_fraction) or not 0.0 <= self.density_strain_fraction <= 1.0:
             raise ValueError("density_strain_fraction must be finite and in [0, 1]")
+        self.density_measurement = _DensityMeasurement(config.density_measurement)
+        self._density_capacity_cache = None
+        self._density_particle_capacity_cache = None
+        self._density_neighbor_cache = None
+        self._density_support_cache = None
+        self._density_static_colliders = None
+        if self.density_strain_fraction > 0 and self.density_measurement != _DensityMeasurement.CELL:
+            if config.integration_scheme != "pic":
+                raise ValueError("Smooth density measurements require PIC integration")
+            if (
+                self.density_measurement == _DensityMeasurement.PARTICLE
+                and config.grid_type != "sparse"
+                and config.grid_padding < 2
+            ):
+                raise ValueError("PARTICLE density measurement on fixed grids requires grid_padding >= 2")
+            if self.density_measurement == _DensityMeasurement.BOX:
+                if np.max(self._mpm_model.particle_radius.numpy(), initial=0) > 0.5 * config.voxel_size:
+                    raise ValueError("BOX density measurement requires particle radii at most half a voxel")
+
         self.velocity_basis = "Q1"
         self.strain_basis = config.strain_basis
         self.velocity_basis = config.velocity_basis
@@ -1627,6 +1693,17 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             self._cell_kinematic_update = True
         self.collider_normal_from_sdf_gradient = config.collider_normal_from_sdf_gradient
         self.collider_basis = config.collider_basis
+        self.gs_colored_contacts = bool(config.gs_colored_contacts)
+        if self.gs_colored_contacts and not (
+            config.integration_scheme == "pic"
+            and config.strain_basis in ("P0", "P1d")
+            and config.velocity_basis == "Q1"
+            and config.collider_basis.startswith("pic")
+            and config.solver in ("gs", "gauss-seidel")
+        ):
+            raise ValueError(
+                "Colored contact requires P0/P1d particle integration, Q1 velocity, particle contact and standard GS"
+            )
         self.collider_stabilization_fraction = float(config.collider_stabilization_fraction)
         self.collider_contact_gap = float(config.collider_contact_gap)
         if (
@@ -1745,6 +1822,12 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             body_q=body_q,
             collider_world_ids=collider_world_ids,
         )
+
+        self._density_capacity_cache = None
+        self._density_particle_capacity_cache = None
+        self._density_neighbor_cache = None
+        self._density_support_cache = None
+        self._density_static_colliders = None
 
         self._last_step_data.save_collider_current_position(self._mpm_model.collider_body_q)
 
@@ -3473,17 +3556,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             scratch.unilateral_strain_offset.zero_()
 
         if self.density_strain_fraction > 0.0:
-            wp.launch(
-                compute_density_strain_offset,
-                dim=scratch.strain_node_count,
-                inputs=[
-                    self.density_strain_fraction,
-                    scratch.strain_node_particle_volume,
-                    scratch.strain_node_collider_volume,
-                    scratch.strain_node_volume,
-                    scratch.unilateral_strain_offset,
-                ],
-            )
+            self._build_density_strain_offset(state_in, scratch, pic)
 
         if self.residual_strain_fraction > 0.0:
             with self._timer("Residual strain offset"):
@@ -3523,6 +3596,313 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                     "construction": "auto",
                     "prune_numerical_zeros": self._velocity_nodes_per_strain_sample < 0,
                 },
+            )
+
+    def _build_density_strain_offset(
+        self, state_in: newton.State, scratch: ImplicitMPMScratchpad, pic: fem.PicQuadrature
+    ):
+        """Measure packing independently of the mass and strain quadrature."""
+        if self.density_measurement == _DensityMeasurement.CELL:
+            wp.launch(
+                compute_density_strain_offset,
+                dim=scratch.strain_node_count,
+                inputs=[
+                    self.density_strain_fraction,
+                    scratch.strain_node_particle_volume,
+                    scratch.strain_node_collider_volume,
+                    scratch.strain_node_volume,
+                    scratch.unilateral_strain_offset,
+                ],
+            )
+            return
+
+        if self.density_measurement == _DensityMeasurement.PARTICLE:
+            self._build_particle_density_offset(state_in, scratch, pic)
+            return
+
+        grid = scratch.grid
+        model = self._mpm_model
+        device = state_in.particle_q.device
+        mode = 1 if self.density_measurement == _DensityMeasurement.BOX else 2
+        measured = fem.borrow_temporary(self.temporary_store, shape=grid.cell_count(), dtype=float, device=device)
+        measured.zero_()
+        wp.launch(
+            make_deposition_kernel(grid),
+            dim=state_in.particle_q.shape[0],
+            inputs=[
+                grid.cell_arg_value(device),
+                state_in.particle_q,
+                model.particle_radius,
+                model.material_particle_volume,
+                model.material_particle_flags,
+                self._particle_environment if self._separate_worlds else None,
+                model.voxel_size,
+                mode,
+                measured,
+            ],
+            device=device,
+        )
+        domain = scratch.divergence_test.domain
+        capacity = measured  # Unused in BOX mode.
+        if mode == 2:
+            if self._density_static_colliders is None:
+                collider = model.collider
+                self._density_static_colliders = (
+                    not np.any(collider.collider_body_index.numpy() >= 0)
+                    and collider.collider_particle_ids.shape[0] == 0
+                )
+            # Rebuildable grids mutate cell numbering in place. Their previous
+            # geometry cannot locate cached entries by the old cell positions.
+            previous = None if self._sparse_rebuildable else self._density_capacity_cache
+            if previous is not None and previous[0] is grid:
+                capacity = previous[1]
+            else:
+                capacity = wp.full(grid.cell_count(), -1.0, dtype=float, device=device)
+            previous_grid, previous_capacity = previous if previous is not None else (grid, capacity)
+            collider = model.collider
+            old_query_distance = collider.query_max_dist
+            collider.query_max_dist = max(old_query_distance, 2.598077 * model.voxel_size)
+            try:
+                wp.launch(
+                    make_capacity_kernel(grid, domain),
+                    dim=domain.element_count(),
+                    inputs=[
+                        grid.cell_arg_value(device),
+                        previous_grid.cell_arg_value(device),
+                        domain.element_index_arg_value(device),
+                        previous_capacity,
+                        collider,
+                        state_in.body_q,
+                        None,
+                        None,
+                        self._separate_worlds,
+                        self._density_static_colliders,
+                        model.voxel_size,
+                        capacity,
+                    ],
+                    device=device,
+                )
+            finally:
+                collider.query_max_dist = old_query_distance
+            self._density_capacity_cache = (grid, capacity)
+        density_offset = scratch.unilateral_strain_offset
+        if mode == 1:
+            density_offset = fem.borrow_temporary_like(scratch.unilateral_strain_offset, self.temporary_store)
+            density_offset.zero_()
+            wp.launch(
+                add_available_density_offset,
+                dim=scratch.strain_node_count,
+                inputs=[
+                    scratch.strain_node_volume,
+                    scratch.strain_node_collider_volume,
+                    self.density_strain_fraction,
+                    density_offset,
+                ],
+                device=device,
+            )
+        fem.integrate(
+            cell_density_offset,
+            fields={"tau": scratch.divergence_test},
+            values={
+                "measured_volume": measured,
+                "available_volume": capacity,
+                "fraction": self.density_strain_fraction,
+                "mode": mode,
+                "inv_cell_volume": 1.0 / model.voxel_size**3,
+            },
+            output=density_offset,
+            add=True,
+            temporary_store=self.temporary_store,
+        )
+
+        if mode == 1:
+            wp.launch(
+                add_overpacking_offset,
+                dim=scratch.strain_node_count,
+                inputs=[density_offset, scratch.unilateral_strain_offset],
+                device=device,
+            )
+
+    def _build_density_support_grid(self, grid, device):
+        """Cache wall quadrature once per support cell, without padding the solve."""
+        cached = self._density_support_cache
+        if cached is None or cached[0] is not grid:
+            count = 125 * grid.cell_count()
+            points = wp.empty(count, dtype=wp.vec3i, device=device)
+            environments = wp.empty(count, dtype=int, device=device)
+            valid = wp.empty(count, dtype=int, device=device)
+            status = wp.zeros(1, dtype=wp.uint32, device=device)
+        else:
+            _, support, points, environments, valid, status = cached
+        wp.launch(
+            make_density_support_points_kernel(grid),
+            dim=points.shape[0],
+            inputs=[grid.cell_arg_value(device), points, environments, valid],
+            device=device,
+        )
+        if cached is None or cached[0] is not grid:
+            capacities = _rebuild_capacity(
+                points,
+                self._mpm_model.voxel_size,
+                4.0,
+                8 * grid.cell_count(),
+                point_mask=valid,
+                point_environment=environments,
+                environment_count=self._environment_count,
+                temporary_store=self.temporary_store,
+            )
+            support = fem.Nanogrid.from_environment_voxels(
+                points,
+                environments,
+                self._environment_count,
+                point_mask=valid,
+                voxel_size=self._mpm_model.voxel_size,
+                temporary_store=self.temporary_store,
+                device=device,
+                rebuildable=True,
+                status=status,
+                **capacities,
+            )
+            self._density_support_cache = (grid, support, points, environments, valid, status)
+        else:
+            support.rebuild(points, point_envs=environments, point_mask=valid, status=status)
+        wp.launch(
+            record_volume_rebuild_status,
+            dim=1,
+            inputs=[status, self._grid_accumulated_status],
+            device=device,
+        )
+        return support
+
+    def _build_particle_density_offset(
+        self, state_in: newton.State, scratch: ImplicitMPMScratchpad, pic: fem.PicQuadrature
+    ):
+        grid = scratch.grid
+        model = self._mpm_model
+        device = state_in.particle_q.device
+        if self._density_static_colliders is None:
+            collider = model.collider
+            self._density_static_colliders = (
+                not np.any(collider.collider_body_index.numpy() >= 0) and collider.collider_particle_ids.shape[0] == 0
+            )
+        support_grid = self._build_density_support_grid(grid, device) if self._sparse_rebuildable else None
+        mask_grid = support_grid if support_grid is not None else grid
+        cached = self._density_particle_capacity_cache
+        # Keep the mask allocation alive through graph capture, but recompute
+        # its contents when sparse cell numbering or collider poses change.
+        masks = (
+            cached[1]
+            if cached is not None and cached[0] is mask_grid
+            else wp.empty(mask_grid.cell_count(), dtype=wp.uint32, device=device)
+        )
+        previous = None if self._sparse_rebuildable else cached
+        if not (previous is not None and previous[0] is mask_grid and self._density_static_colliders):
+            previous_grid, previous_masks = previous if previous is not None else (mask_grid, masks)
+            wp.launch(
+                make_reference_mask_kernel(mask_grid, center_only=self._sparse_rebuildable),
+                dim=mask_grid.cell_count(),
+                inputs=[
+                    mask_grid.cell_arg_value(device),
+                    previous_grid.cell_arg_value(device),
+                    previous_masks,
+                    model.collider,
+                    state_in.body_q,
+                    None,
+                    None,
+                    self._separate_worlds,
+                    previous is not None and self._density_static_colliders,
+                    model.voxel_size,
+                    masks,
+                ],
+                device=device,
+            )
+            if self._sparse_rebuildable:
+                wp.launch(
+                    make_reference_samples_kernel(mask_grid),
+                    dim=(mask_grid.cell_count(), 8),
+                    inputs=[
+                        mask_grid.cell_arg_value(device),
+                        model.collider,
+                        state_in.body_q,
+                        None,
+                        None,
+                        self._separate_worlds,
+                        model.voxel_size,
+                        masks,
+                    ],
+                    device=device,
+                )
+                wp.launch(finalize_reference_masks, dim=masks.shape[0], inputs=[masks], device=device)
+            self._density_particle_capacity_cache = (mask_grid, masks)
+        neighbor_cells = None
+        neighbor_masks = None
+        if support_grid is not None:
+            neighbor_cache = self._density_neighbor_cache
+            if neighbor_cache is None or neighbor_cache[0] is not grid:
+                neighbor_cells = wp.empty((grid.cell_count(), 125), dtype=int, device=device)
+                neighbor_masks = wp.empty((grid.cell_count(), 125), dtype=wp.uint32, device=device)
+                self._density_neighbor_cache = (grid, neighbor_cells, neighbor_masks)
+            else:
+                _, neighbor_cells, neighbor_masks = neighbor_cache
+            wp.launch(
+                make_density_neighbor_kernel(pic, support_grid),
+                dim=125 * grid.cell_count(),
+                inputs=[
+                    grid.cell_arg_value(device),
+                    pic.domain.element_index_arg_value(device),
+                    support_grid.cell_arg_value(device),
+                    masks,
+                    neighbor_cells,
+                    neighbor_masks,
+                ],
+                device=device,
+            )
+        particle_count = state_in.particle_q.shape[0]
+        density = fem.borrow_temporary(self.temporary_store, shape=particle_count, dtype=float, device=device)
+        capacity = fem.borrow_temporary(self.temporary_store, shape=particle_count, dtype=float, device=device)
+        error = fem.borrow_temporary(self.temporary_store, shape=particle_count, dtype=float, device=device)
+        with self._timer("Particle density measurement"):
+            wp.launch(
+                make_particle_density_kernel(pic, support_grid, cache_neighbors=support_grid is not None),
+                dim=particle_count,
+                inputs=[
+                    grid.cell_arg_value(device),
+                    pic.domain.element_index_arg_value(device),
+                    pic.cell_particle_offsets,
+                    pic.cell_particle_indices,
+                    state_in.particle_q,
+                    model.material_particle_volume,
+                    model.material_particle_flags,
+                    self._particle_environment if self._separate_worlds else None,
+                    masks,
+                    model.voxel_size,
+                    model.collider,
+                    state_in.body_q,
+                    None,
+                    None,
+                    self._separate_worlds,
+                    mask_grid.cell_arg_value(device),
+                    neighbor_cells,
+                    neighbor_masks,
+                    density,
+                    capacity,
+                    error,
+                ],
+                device=device,
+            )
+            fem.integrate(
+                particle_density_offset,
+                quadrature=pic,
+                fields={"tau": scratch.divergence_test},
+                values={
+                    "error": error,
+                    "flags": model.material_particle_flags,
+                    "fraction": self.density_strain_fraction,
+                    "inv_cell_volume": 1.0 / model.voxel_size**3,
+                },
+                output=scratch.unilateral_strain_offset,
+                add=True,
+                temporary_store=self.temporary_store,
             )
 
     def _build_strain_eigenbasis(
@@ -3629,7 +4009,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             B = scratch.strain_matrix
             strain_mat_tmp = wp.empty_like(B.values)
             wp.launch(rotate_matrix_rows, dim=B.nnz, inputs=[M_ev, B.offsets, B.columns, B.values, strain_mat_tmp])
-            B.values = strain_mat_tmp
+            # Captured assembly retains this pointer; replacing it can free the
+            # warm-up allocation before the first graph replay.
+            wp.copy(B.values, strain_mat_tmp)
 
             C = scratch.compliance_matrix
             compliance_mat_tmp = wp.empty_like(C.values)
@@ -3768,6 +4150,37 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 has_dilatancy=self._mpm_model.has_dilatancy,
                 strain_velocity_node_count=-1 if self._separate_worlds else self._velocity_nodes_per_strain_sample,
             )
+            contact_temporaries = []
+            contact_cell_offsets = None
+            contact_cell_rows = None
+            if self.gs_colored_contacts:
+                partition = scratch._strain_space_restriction.space_partition
+                cell_count = partition.node_count() // scratch.strain_nodes_per_element
+                node_count = scratch.collider_node_count
+                contact_cell_offsets = fem.borrow_temporary(self.temporary_store, shape=cell_count + 1, dtype=int)
+                keys = fem.borrow_temporary(self.temporary_store, shape=2 * node_count, dtype=int)
+                contact_cell_rows = fem.borrow_temporary(self.temporary_store, shape=2 * node_count, dtype=int)
+                contact_temporaries = [contact_cell_offsets, keys, contact_cell_rows]
+                contact_cell_offsets.zero_()
+                wp.launch(
+                    make_contact_cell_keys_kernel(
+                        pic.domain, partition, scratch.strain_nodes_per_element, pic._use_domain_element_indices
+                    ),
+                    dim=node_count,
+                    inputs=[
+                        pic.domain.element_index_arg_value(device=self.model.device),
+                        partition.partition_arg_value(device=self.model.device),
+                        scratch._collision_space_restriction.space_partition.space_node_indices(),
+                        pic.cell_particle_indices,
+                        pic.cell_indices,
+                        scratch.collider_matrix.offsets,
+                        keys,
+                        contact_cell_rows,
+                        contact_cell_offsets,
+                    ],
+                )
+                wp.utils.radix_sort_pairs(keys=keys, values=contact_cell_rows, count=node_count)
+                wp.utils.array_scan(contact_cell_offsets, contact_cell_offsets, inclusive=True)
             collision_data = CollisionData(
                 collider_mat=scratch.collider_matrix,
                 transposed_collider_mat=scratch.transposed_collider_matrix,
@@ -3778,6 +4191,8 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 rigidity_operator=rigidity_operator,
                 collider_impulse=scratch.impulse_field.dof_values,
                 has_colliders=self._mpm_model.collider.collider_mesh.shape[0] > 0,
+                colored_cell_offsets=contact_cell_offsets,
+                colored_cell_rows=contact_cell_rows,
             )
 
             # Retain graph to avoid immediate CPU sync
@@ -3793,6 +4208,8 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 verbose=self.verbose,
             )
 
+        for temporary in contact_temporaries:
+            temporary.release()
         self._unapply_strain_eigenbasis(scratch, M_ev)
 
         return solve_graph
@@ -4081,18 +4498,27 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
             colors = fem.borrow_temporary(self.temporary_store, shape=colored_element_count * 2 + 1, dtype=int)
             color_indices = scratch.color_indices.flatten()
-            wp.launch(
-                make_cell_color_kernel(space_partition.geo_partition),
-                dim=colored_element_count,
-                inputs=[
-                    partition_arg,
-                    stencil_size,
-                    voxels,
-                    res,
-                    colors,
-                    color_indices,
-                ],
-            )
+            if is_pic:
+                wp.launch(
+                    make_cell_color_kernel(space_partition.geo_partition),
+                    dim=colored_element_count,
+                    inputs=[partition_arg, stencil_size, voxels, res, colors, color_indices],
+                )
+            else:
+                # Environment-first DOFs need not follow geometry partition cell order.
+                wp.launch(
+                    discontinuous_cell_color,
+                    dim=colored_element_count,
+                    inputs=[
+                        space_partition.space_node_indices(),
+                        nodes_per_color_element,
+                        stencil_size,
+                        voxels,
+                        res,
+                        colors,
+                        color_indices,
+                    ],
+                )
 
         elif self.strain_basis == "Q1":
             nodes_per_color_element = 1

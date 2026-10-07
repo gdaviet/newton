@@ -331,9 +331,9 @@ def compute_density_strain_offset(
     unilateral_strain_offset: wp.array[float],
 ):
     i = wp.tid()
-    # Preserve the overpacking error that the ordinary void allowance clamps away.
+    # Correct overpacking only; empty volume must not attract particles.
     volume_error = node_volume[i] - collider_volume[i] - particle_volume[i]
-    unilateral_strain_offset[i] += fraction * volume_error
+    unilateral_strain_offset[i] += fraction * wp.min(volume_error, 0.0)
 
 
 @fem.integrand
@@ -987,6 +987,33 @@ def node_color(
     color_indices[nid] = nid
 
 
+@wp.kernel
+def discontinuous_cell_color(
+    space_node_indices: wp.array[int],
+    nodes_per_cell: int,
+    stencil_size: int,
+    voxels: wp.array[wp.vec3i],
+    res: wp.vec3i,
+    colors: wp.array[int],
+    color_indices: wp.array[int],
+):
+    pid = wp.tid()
+    node = space_node_indices[pid * nodes_per_cell]
+    color_indices[pid] = pid
+    if node == fem.NULL_NODE_INDEX:
+        colors[pid] = _NULL_COLOR
+        return
+    cell = node // nodes_per_cell
+    c = fem.Grid3D.get_cell(res, cell)
+    if voxels:
+        c = voxels[cell]
+    colors[pid] = (
+        positive_modn(c[0], stencil_size) * stencil_size * stencil_size
+        + positive_modn(c[1], stencil_size) * stencil_size
+        + positive_modn(c[2], stencil_size)
+    )
+
+
 def make_cell_color_kernel(geo_partition: fem.GeometryPartition):
     @fem.cache.dynamic_kernel(geo_partition.name)
     def cell_color(
@@ -1127,3 +1154,40 @@ def scatter_field_dof_values(
 
 wp.overload(scatter_field_dof_values, {"src": wp.array[wp.vec3], "dest": wp.array[wp.vec3]})
 wp.overload(scatter_field_dof_values, {"src": wp.array[vec6], "dest": wp.array[vec6]})
+
+
+def make_contact_cell_keys_kernel(
+    domain: fem.GeometryDomain, partition: fem.SpacePartition, nodes_per_cell: int, domain_indices: bool
+):
+    @fem.cache.dynamic_kernel(suffix=(domain.name, partition.name, nodes_per_cell, domain_indices))
+    def contact_cell_keys(
+        domain_arg: domain.ElementIndexArg,
+        partition_arg: partition.PartitionArg,
+        space_node_indices: wp.array[int],
+        evaluation_particles: wp.array[int],
+        particle_cells: wp.array[int],
+        contact_offsets: wp.array[int],
+        keys: wp.array[int],
+        rows: wp.array[int],
+        cell_offsets: wp.array[int],
+    ):
+        i = wp.tid()
+        cell_count = cell_offsets.shape[0] - 1
+        cell = cell_count
+        node = space_node_indices[i]
+        if node >= 0 and contact_offsets[i] != contact_offsets[i + 1]:
+            particle = evaluation_particles[node]
+            domain_cell = particle_cells[particle]
+            if domain_cell >= 0:
+                geometry_cell = domain_cell
+                if wp.static(domain_indices):
+                    geometry_cell = domain.element_index(domain_arg, domain_cell)
+                node_index = partition.partition_node_index(partition_arg, geometry_cell * nodes_per_cell)
+                candidate = wp.where(node_index >= 0, node_index // nodes_per_cell, -1)
+                if candidate >= 0 and candidate < cell_count:
+                    cell = candidate
+                    wp.atomic_add(cell_offsets, cell + 1, 1)
+        keys[i] = cell
+        rows[i] = i
+
+    return contact_cell_keys

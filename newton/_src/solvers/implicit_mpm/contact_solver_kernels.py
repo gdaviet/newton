@@ -278,3 +278,198 @@ def solve_subgrid_friction(
 
     impulse[i] += delta_lambda
     delta_impulse[i] = delta_lambda
+
+
+@wp.kernel
+def compute_collider_unsplit_diagonal(
+    offsets: wp.array[int],
+    columns: wp.array[int],
+    values: wp.array[float],
+    inv_volume: wp.array[float],
+    diagonal: wp.array[float],
+):
+    i = wp.tid()
+    w = float(0.0)
+    for b in range(offsets[i], offsets[i + 1]):
+        w += values[b] * values[b] * inv_volume[columns[b]]
+    diagonal[i] = w
+
+
+@wp.func
+def _solve_cell_contacts_gs_generic(
+    cell: int,
+    cell_offsets: wp.array[int],
+    cell_rows: wp.array[int],
+    offsets: wp.array[int],
+    columns: wp.array[int],
+    values: wp.array[float],
+    friction: wp.array[float],
+    adhesion: wp.array[float],
+    normal: wp.array[wp.vec3],
+    diagonal: wp.array[float],
+    boundary_velocity: wp.array[wp.vec3],
+    inv_volume: wp.array[float],
+    velocity: wp.array[wp.vec3],
+    impulse: wp.array[wp.vec3],
+):
+    # Same-cell contacts overlap, so update them sequentially with the true diagonal.
+    for entry in range(cell_offsets[cell], cell_offsets[cell + 1]):
+        i = cell_rows[entry]
+        w = diagonal[i]
+        if w > 0.0 and friction[i] >= 0.0:
+            u0 = -boundary_velocity[i]
+            for b in range(offsets[i], offsets[i + 1]):
+                u0 += values[b] * velocity[columns[b]]
+            n = normal[i]
+            u = solve_coulomb_isotropic(friction[i], n, u0 - (impulse[i] + adhesion[i] * n) * w)
+            delta = (u - u0) / w
+            impulse[i] += delta
+            for b in range(offsets[i], offsets[i + 1]):
+                node = columns[b]
+                velocity[node] += inv_volume[node] * values[b] * delta
+
+
+_ContactScalar8 = wp.types.vector(length=8, dtype=float)
+_ContactIndex8 = wp.types.vector(length=8, dtype=int)
+
+
+@wp.func
+def solve_cell_contacts_gs(
+    cell: int,
+    cell_offsets: wp.array[int],
+    cell_rows: wp.array[int],
+    offsets: wp.array[int],
+    columns: wp.array[int],
+    values: wp.array[float],
+    friction: wp.array[float],
+    adhesion: wp.array[float],
+    normal: wp.array[wp.vec3],
+    diagonal: wp.array[float],
+    boundary_velocity: wp.array[wp.vec3],
+    inv_volume: wp.array[float],
+    velocity: wp.array[wp.vec3],
+    impulse: wp.array[wp.vec3],
+):
+    beg = cell_offsets[cell]
+    end = cell_offsets[cell + 1]
+    if beg == end:
+        return
+
+    first = cell_rows[beg]
+    full_rows = bool(True)
+    for entry in range(beg, end):
+        row = cell_rows[entry]
+        if offsets[row + 1] - offsets[row] != 8:
+            full_rows = False
+    if not full_rows:
+        _solve_cell_contacts_gs_generic(
+            cell,
+            cell_offsets,
+            cell_rows,
+            offsets,
+            columns,
+            values,
+            friction,
+            adhesion,
+            normal,
+            diagonal,
+            boundary_velocity,
+            inv_volume,
+            velocity,
+            impulse,
+        )
+        return
+
+    # Direct Q1 contact rows in one cell share its eight sorted velocity nodes.
+    # Cache them across the sequential local contacts, scattering only once.
+    nodes = _ContactIndex8()
+    mass = _ContactScalar8()
+    vx = _ContactScalar8()
+    vy = _ContactScalar8()
+    vz = _ContactScalar8()
+    for k in range(8):
+        node = columns[offsets[first] + k]
+        nodes[k] = node
+        mass[k] = inv_volume[node]
+        v = velocity[node]
+        vx[k] = v[0]
+        vy[k] = v[1]
+        vz[k] = v[2]
+
+    for entry in range(beg, end):
+        i = cell_rows[entry]
+        w = diagonal[i]
+        if w > 0.0 and friction[i] >= 0.0:
+            weights = _ContactScalar8()
+            for k in range(8):
+                weights[k] = values[offsets[i] + k]
+            u0 = wp.vec3(wp.dot(weights, vx), wp.dot(weights, vy), wp.dot(weights, vz)) - boundary_velocity[i]
+            n = normal[i]
+            u = solve_coulomb_isotropic(friction[i], n, u0 - (impulse[i] + adhesion[i] * n) * w)
+            delta = (u - u0) / w
+            impulse[i] += delta
+            mw = wp.cw_mul(mass, weights)
+            vx += mw * delta[0]
+            vy += mw * delta[1]
+            vz += mw * delta[2]
+
+    for k in range(8):
+        velocity[nodes[k]] = wp.vec3(vx[k], vy[k], vz[k])
+
+
+@wp.kernel
+def build_boundary_cell_colors(
+    color_offsets: wp.array[int],
+    color_blocks: wp.array2d[int],
+    cell_offsets: wp.array[int],
+    boundary_counts: wp.array[int],
+    boundary_cells: wp.array2d[int],
+):
+    color, thread = wp.tid()
+    for b in range(color_offsets[color] + thread, color_offsets[color + 1], 256):
+        beg, end = color_blocks[0, b], color_blocks[1, b]
+        if end > beg:
+            cell = beg // (end - beg)
+            if cell_offsets[cell + 1] > cell_offsets[cell]:
+                slot = wp.atomic_add(boundary_counts, color, 1)
+                boundary_cells[color, slot] = cell
+
+
+# Match the material GS kernel: avoid precise-divide slow paths in the
+# repeated Coulomb solve while retaining the same cell and contact ordering.
+@wp.kernel(module="unique", module_options={"fast_math": True, "enable_backward": False})
+def solve_boundary_contacts_gs(
+    color: int,
+    boundary_counts: wp.array[int],
+    boundary_cells: wp.array2d[int],
+    cell_offsets: wp.array[int],
+    cell_rows: wp.array[int],
+    offsets: wp.array[int],
+    columns: wp.array[int],
+    values: wp.array[float],
+    friction: wp.array[float],
+    adhesion: wp.array[float],
+    normal: wp.array[wp.vec3],
+    diagonal: wp.array[float],
+    boundary_velocity: wp.array[wp.vec3],
+    impulse: wp.array[wp.vec3],
+    inv_volume: wp.array[float],
+    velocity: wp.array[wp.vec3],
+):
+    for b in range(wp.tid(), boundary_counts[color], 256):
+        solve_cell_contacts_gs(
+            boundary_cells[color, b],
+            cell_offsets,
+            cell_rows,
+            offsets,
+            columns,
+            values,
+            friction,
+            adhesion,
+            normal,
+            diagonal,
+            boundary_velocity,
+            inv_volume,
+            velocity,
+            impulse,
+        )

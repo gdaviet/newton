@@ -20,8 +20,11 @@ from .contact_solver_kernels import (
     apply_nodal_impulse_warmstart,
     apply_subgrid_impulse,
     apply_subgrid_impulse_warmstart,
+    build_boundary_cell_colors,
     compute_collider_delassus_diagonal,
     compute_collider_inv_mass,
+    compute_collider_unsplit_diagonal,
+    solve_boundary_contacts_gs,
     solve_nodal_friction,
     solve_subgrid_friction,
 )
@@ -420,6 +423,8 @@ class CollisionData:
     rigidity_operator: tuple[sp.BsrMatrix, sp.BsrMatrix] | None
     collider_impulse: wp.array[wp.vec3]
     has_colliders: bool = False
+    colored_cell_offsets: wp.array[int] | None = None
+    colored_cell_rows: wp.array[int] | None = None
 
 
 class _DelassusOperator:
@@ -685,6 +690,7 @@ class _GaussSeidelSolver(_RheologySolver):
         self,
         delassus_operator: _DelassusOperator,
         temporary_store: fem.TemporaryStore | None = None,
+        contact_solver=None,
     ) -> None:
         super().__init__(delassus_operator, split_mass=False, temporary_store=temporary_store)
 
@@ -726,6 +732,54 @@ class _GaussSeidelSolver(_RheologySolver):
             has_compliance_mat=self.rheology.compliance_mat.nnz > 0,
             strain_velocity_node_count=self.rheology.strain_velocity_node_count,
         )
+        self.contact_launch = None
+        self.boundary_counts = None
+        self.boundary_cells = None
+        if contact_solver is not None:
+            c = contact_solver.collision
+            contact_inputs = [
+                c.colored_cell_offsets,
+                c.colored_cell_rows,
+                c.collider_mat.offsets,
+                c.collider_mat.columns,
+                c.collider_mat.values,
+                c.collider_friction,
+                c.collider_adhesion,
+                c.collider_normals,
+                contact_solver.collider_delassus_diagonal,
+                c.collider_velocities,
+                c.collider_impulse,
+            ]
+            self.boundary_counts = fem.borrow_temporary(temporary_store, shape=self.color_count, dtype=int)
+            self.boundary_cells = fem.borrow_temporary(
+                temporary_store, shape=(self.color_count, c.colored_cell_offsets.shape[0] - 1), dtype=int
+            )
+            self.boundary_counts.zero_()
+            wp.launch(
+                build_boundary_cell_colors,
+                dim=(self.color_count, 256),
+                inputs=[
+                    self.rheology.color_offsets,
+                    self.rheology.color_blocks,
+                    c.colored_cell_offsets,
+                    self.boundary_counts,
+                    self.boundary_cells,
+                ],
+            )
+            self.contact_launch = wp.launch(
+                solve_boundary_contacts_gs,
+                dim=256,
+                block_dim=1,
+                inputs=[
+                    0,
+                    self.boundary_counts,
+                    self.boundary_cells,
+                    *contact_inputs,
+                    self.momentum.inv_volume,
+                    self.momentum.velocity,
+                ],
+                record_cmd=True,
+            )
         self.solve_local_launch = wp.launch(
             kernel=gs_kernel,
             dim=color_launch_dim,
@@ -772,8 +826,17 @@ class _GaussSeidelSolver(_RheologySolver):
 
     def solve(self):
         for color in range(self.color_count):
+            if self.contact_launch is not None:
+                self.contact_launch.set_param_at_index(0, color)
+                self.contact_launch.launch()
             self.solve_local_launch.set_param_at_index(0, color)
             self.solve_local_launch.launch()
+
+    def release(self):
+        if self.boundary_counts is not None:
+            self.boundary_counts.release()
+            self.boundary_cells.release()
+        super().release()
 
 
 class _ReorderedGaussSeidelSolver(_RheologySolver):
@@ -1718,6 +1781,21 @@ class _SubgridContactSolver(_ContactSolver):
             ],
         )
 
+        if self.collision.colored_cell_offsets is not None:
+            if self.collision.rigidity_operator is not None:
+                raise ValueError("Colored cell contact currently requires prescribed colliders")
+            wp.launch(
+                compute_collider_unsplit_diagonal,
+                dim=self.collision.collider_impulse.shape[0],
+                inputs=[
+                    self.collision.collider_mat.offsets,
+                    self.collision.collider_mat.columns,
+                    self.collision.collider_mat.values,
+                    self.momentum.inv_volume,
+                    self.collider_delassus_diagonal,
+                ],
+            )
+
         # define solve operation
         self.apply_collider_impulse_launch = wp.launch(
             apply_subgrid_impulse,
@@ -1768,6 +1846,8 @@ class _SubgridContactSolver(_ContactSolver):
         self.apply_rigidity_operator()
 
     def solve(self):
+        if self.collision.colored_cell_offsets is not None:
+            return
         self.solve_collider_launch.launch()
         self.apply_collider_impulse_launch.launch()
         self.apply_rigidity_operator()
@@ -2047,7 +2127,12 @@ def solve_rheology(
     if rheology_solver_class is None:
         raise ValueError(f"Invalid solver {solvers[0]!r}. Accepted values: {list(_RHEOLOGY_SOLVERS)}.")
 
-    rheology_solver = rheology_solver_class(delassus_operator, temporary_store)
+    if collision.colored_cell_offsets is not None:
+        if rheology_solver_class is not _GaussSeidelSolver:
+            raise ValueError("Colored cell contact requires the standard GS solver")
+        rheology_solver = rheology_solver_class(delassus_operator, temporary_store, contact_solver=contact_solver)
+    else:
+        rheology_solver = rheology_solver_class(delassus_operator, temporary_store)
     rheology_solver.apply_initial_guess()
 
     solve_graph = _run_solver_loop(
