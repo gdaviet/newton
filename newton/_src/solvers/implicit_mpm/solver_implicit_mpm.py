@@ -273,6 +273,9 @@ def _resolve_solver_spec(
     solvers = (solver,) if isinstance(solver, str) else tuple(solver)
     if len(solvers) == 0:
         raise ValueError("Solver sequence must contain at least one solver.")
+    if solvers == ("auto",) and velocity_basis == "RT1":
+        # Face fluxes couple only two cells each, which Gauss-Seidel alone propagates slowly
+        return ("cg", "gs")
 
     def resolve_auto(solver_name: _RheologySolverName) -> str:
         if solver_name == "auto":
@@ -949,8 +952,8 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         """Tolerance for the rheology solver."""
         solver: _RheologySolverName | Sequence[_RheologySolverName] = "auto"
         """Solver to use for the rheology solver. ``"auto"`` selects ``"gs"``
-        for Q1 velocity basis and ``"gs-batched"`` for higher-order bases
-        (B2, B3).  Accepted values: ``"auto"``, ``"gs"`` (or
+        for Q1 velocity basis, ``"gs-batched"`` for higher-order bases
+        (B2, B3), and ``("cg", "gs")`` for the RT1 basis.  Accepted values: ``"auto"``, ``"gs"`` (or
         ``"gauss-seidel"``), ``"gs-soa"`` (or ``"gauss-seidel-soa"``),
         ``"gs-batched"`` (or ``"gauss-seidel-batched"``), ``"jacobi"``,
         ``"conjugate-gradient"`` (or ``"cg"``), ``"conjugate-residual"``

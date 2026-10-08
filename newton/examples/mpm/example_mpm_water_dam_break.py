@@ -118,7 +118,7 @@ class Example:
         mpm_config.velocity_basis = args.velocity_basis
         mpm_config.integration_scheme = args.integration_scheme
         mpm_config.transfer_scheme = args.transfer_scheme
-        mpm_config.solver = args.solver
+        mpm_config.solver = tuple(args.solver.split(",")) if "," in args.solver else args.solver
         mpm_config.density_strain_fraction = args.density_strain_fraction
         mpm_config.residual_strain_fraction = args.residual_strain_fraction
         mpm_config.residual_strain_tracking = args.residual_strain_tracking
@@ -525,7 +525,12 @@ class Example:
             default="pic",
             help="Strain integration; experimental cell mode uses two-hop transfers and requires Q1, or RT1 with P0",
         )
-        parser.add_argument("--solver", type=str, default="auto", help="Rheology solver, e.g. gs or jacobi")
+        parser.add_argument(
+            "--solver",
+            type=str,
+            default="auto",
+            help="Rheology solver, e.g. gs or jacobi, or a comma-separated warm-start chain such as cg,gs",
+        )
         parser.add_argument(
             "--transfer-scheme",
             choices=["apic", "pic"],

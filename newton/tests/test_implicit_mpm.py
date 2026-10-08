@@ -2049,6 +2049,13 @@ def test_linear_solve_leaves_inviscid_shear_free(test, device):
             np.testing.assert_allclose(velocities["cg"], velocities["gs"], atol=1.0e-3)
 
 
+def test_face_velocity_auto_solver(test, device):
+    """Warm-start Gauss-Seidel with conjugate gradients by default for face-flux velocities."""
+    model = _make_fluid_block(device, gravity=(0.0, 0.0, 0.0))
+    test.assertEqual(SolverImplicitMPM(model, _face_velocity_config(solver="auto")).solver, ("cg", "gs"))
+    test.assertEqual(SolverImplicitMPM(model, _face_velocity_config("Q1", solver="auto")).solver, ("gs",))
+
+
 def test_face_velocity_rejects_unsupported(test, device):
     """Reject configurations and materials that the Raviart-Thomas velocity basis does not support."""
     model = _make_fluid_block(device, gravity=(0.0, 0.0, 0.0))
@@ -2782,6 +2789,9 @@ add_function_test(
     "test_linear_solve_leaves_inviscid_shear_free",
     test_linear_solve_leaves_inviscid_shear_free,
     devices=devices,
+)
+add_function_test(
+    TestImplicitMPM, "test_face_velocity_auto_solver", test_face_velocity_auto_solver, devices=basic_devices
 )
 add_function_test(
     TestImplicitMPM, "test_face_velocity_rejects_unsupported", test_face_velocity_rejects_unsupported, devices=devices
