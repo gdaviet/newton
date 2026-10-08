@@ -123,6 +123,22 @@ def _query_collision_sdf(
     projection_threshold[i] = collider.material_projection_threshold[material_id]
 
 
+@wp.kernel
+def _query_collision_distance(
+    positions: wp.array[wp.vec3],
+    collider: Collider,
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_q_prev: wp.array[wp.transform],
+    distances: wp.array[float],
+):
+    i = wp.tid()
+    sdf, _normal, _velocity, _collider_id, _material_id = collision_sdf(
+        positions[i], _ALL_COLLIDER_WORLDS, collider, body_q, body_qd, body_q_prev, 0.01
+    )
+    distances[i] = sdf
+
+
 def _make_box_collider_mesh(device, half_extent=0.5, center=(0.0, 0.0, 0.0)):
     box = newton.Mesh.create_box(
         half_extent,
@@ -859,6 +875,47 @@ def test_multiworld_collider_world_validation(test, device):
     face_counts = [mesh.indices.shape[0] // 3 for mesh in meshes]
     expected_face_offsets = np.cumsum((0, *face_counts[:-1]))
     np.testing.assert_array_equal(collider.collider_face_offset.numpy(), expected_face_offsets)
+
+
+def test_collision_sdf_sign_with_sliver_faces(test, device):
+    """Keep the sign of a floor's distance where flipped sliver triangles line one of its edges.
+
+    Bevelled meshes such as the dam-break tank leave near-zero-area triangles
+    along the edges of their floor fan. Facing either way, they leave the
+    orientation of the floor at those edges unchanged.
+    """
+    model = _make_mpm_particle_builder(gravity=(0.0, 0.0, 0.0)).finalize(device=device)
+    solver = SolverImplicitMPM(model, _make_mpm_config())
+
+    # Floor at y = 0 facing up, from two triangles sharing the diagonal from vertex 0 to vertex 2
+    points = [(-1.0, 0.0, -1.0), (1.0, 0.0, -1.0), (1.0, 0.0, 1.0), (-1.0, 0.0, 1.0)]
+    indices = [0, 2, 1, 0, 3, 2]
+    # Four slivers along that diagonal facing down, outnumbering the two floor faces
+    for k in range(4):
+        points.append((1.0 + 2.5e-7 * (k + 1), 0.0, 1.0))
+        indices.extend((0, len(points) - 1, 2))
+    points = wp.array(points, dtype=wp.vec3, device=device)
+    mesh = wp.Mesh(points, wp.array(indices, dtype=int, device=device), wp.zeros_like(points))
+    solver.setup_collider(collider_meshes=[mesh])
+    collider = solver._mpm_model.collider
+    collider.query_max_dist = 1.0
+
+    # Points above and below the diagonal, and away from it
+    queries = np.array(((0.5, 0.05, 0.5), (-0.3, 0.05, -0.3), (0.5, -0.05, 0.5), (0.5, 0.05, -0.2)), dtype=np.float32)
+    distances = wp.empty(len(queries), dtype=float, device=device)
+    state = model.state()
+    wp.launch(
+        _query_collision_distance,
+        dim=len(queries),
+        inputs=[wp.array(queries, dtype=wp.vec3, device=device), collider, state.body_q, state.body_qd, None],
+        outputs=[distances],
+        device=device,
+    )
+    above_diagonal, above_elsewhere, below_diagonal, above_away = distances.numpy()
+    test.assertGreater(above_away, 0.04)
+    test.assertAlmostEqual(above_diagonal, above_away, delta=1.0e-5)
+    test.assertAlmostEqual(above_elsewhere, above_away, delta=1.0e-5)
+    test.assertLess(below_diagonal, -0.04)
 
 
 def test_multiworld_collision_sdf_filters_stable_colliders(test, device):
@@ -2566,6 +2623,13 @@ add_function_test(
     TestImplicitMPM,
     "test_multiworld_collision_sdf_filters_stable_colliders",
     test_multiworld_collision_sdf_filters_stable_colliders,
+    devices=basic_devices,
+)
+
+add_function_test(
+    TestImplicitMPM,
+    "test_collision_sdf_sign_with_sliver_faces",
+    test_collision_sdf_sign_with_sliver_faces,
     devices=basic_devices,
 )
 

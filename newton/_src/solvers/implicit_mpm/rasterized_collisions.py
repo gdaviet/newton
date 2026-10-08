@@ -142,7 +142,8 @@ def get_average_face_normal(
     point: wp.vec3,
 ):
     """Computes the average face normal at a point on a mesh.
-    (average of face normals within an epsilon-distance of the point)
+    (area-weighted average of face normals within an epsilon-distance of the point,
+    so that sliver triangles along an edge leave its orientation unchanged)
 
     Args:
         mesh_id: The mesh to query.
@@ -168,7 +169,8 @@ def get_average_face_normal(
 
         sq_dist = _sq_dist_point_tri_at_origin(point - V0, V1 - V0, V2 - V0)
         if sq_dist < eps_sq:
-            face_normal += wp.mesh_eval_face_normal(mesh_id, face_index)
+            # Twice the face area times its unit normal
+            face_normal += wp.cross(V1 - V0, V2 - V0)
 
     return wp.normalize(face_normal)
 
