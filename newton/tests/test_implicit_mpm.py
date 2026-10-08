@@ -2027,6 +2027,28 @@ def test_face_collider_fluid_at_rest(test, device):
                 np.testing.assert_allclose(state_0.particle_q.numpy(), initial_positions, atol=2.0e-3)
 
 
+def test_linear_solve_leaves_inviscid_shear_free(test, device):
+    """Match nonlinear solves with conjugate gradients on inviscid fluids, whose stress is a pressure.
+
+    Without cohesion, friction, or viscosity, the linear solve keeps the
+    deviatoric stress at zero, so that the fluid shears freely instead of
+    moving rigidly, for vector and face-flux velocities.
+    """
+
+    def random_velocity(positions):
+        return np.random.default_rng(7).normal(size=positions.shape)
+
+    for velocity_basis in ("Q1", "RT1"):
+        with test.subTest(velocity_basis=velocity_basis):
+            velocities = {}
+            for solver_name in ("gs", "cg"):
+                model = _make_fluid_block(device, gravity=(0.0, 0.0, 0.0), velocity=random_velocity)
+                _, state = _step_mpm(model, _face_velocity_config(velocity_basis, solver=solver_name), step_count=1)
+                velocities[solver_name] = state.particle_qd.numpy()
+            test.assertGreater(np.abs(velocities["gs"]).max(), 0.1)
+            np.testing.assert_allclose(velocities["cg"], velocities["gs"], atol=1.0e-3)
+
+
 def test_face_velocity_rejects_unsupported(test, device):
     """Reject configurations and materials that the Raviart-Thomas velocity basis does not support."""
     model = _make_fluid_block(device, gravity=(0.0, 0.0, 0.0))
@@ -2754,6 +2776,12 @@ add_function_test(
 )
 add_function_test(
     TestImplicitMPM, "test_face_collider_fluid_at_rest", test_face_collider_fluid_at_rest, devices=devices
+)
+add_function_test(
+    TestImplicitMPM,
+    "test_linear_solve_leaves_inviscid_shear_free",
+    test_linear_solve_leaves_inviscid_shear_free,
+    devices=devices,
 )
 add_function_test(
     TestImplicitMPM, "test_face_velocity_rejects_unsupported", test_face_velocity_rejects_unsupported, devices=devices

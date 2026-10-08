@@ -51,6 +51,7 @@ from .rheology_solver_kernels import (
     mat55,
     postprocess_stress_and_strain,
     preprocess_stress_and_strain,
+    project_shear_free_stress,
     reorder_strain_mat,
     vec6,
 )
@@ -1510,6 +1511,7 @@ class _LinearSolver:
 
         # z += C x
         sp.bsr_mv(self.rheology.compliance_mat, x, z, alpha=alpha, beta=1.0)
+        self._project_shear_free(z)
 
     def _preconditioner_matvec(self, x, y, z, alpha, beta):
         wp.launch(
@@ -1524,6 +1526,15 @@ class _LinearSolver:
                 alpha,
                 beta,
             ],
+        )
+        self._project_shear_free(z)
+
+    def _project_shear_free(self, stress: wp.array[vec6]):
+        # Keeping every iterate in this subspace keeps the projected operator symmetric
+        wp.launch(
+            kernel=project_shear_free_stress,
+            dim=self.delassus_operator.size,
+            inputs=[self.rheology.yield_params, stress],
         )
 
     def _scale_batched_system(self, tolerance_scales: wp.array[float], inverse: bool):
@@ -1558,6 +1569,9 @@ class _LinearSolver:
             alpha=-1.0,
             beta=-1.0,
         )
+        # Nodes without deviatoric yield stress solve for their normal stress only, leaving shear free
+        self._project_shear_free(self.rheology.plastic_strain_delta)
+        self._project_shear_free(self.rheology.stress)
 
         is_batched = self._batch_offsets is not None
         if is_batched:

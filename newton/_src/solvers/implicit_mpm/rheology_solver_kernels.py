@@ -1483,6 +1483,19 @@ def batched_scatter(
 
 
 @wp.kernel
+def project_shear_free_stress(yield_params: wp.array[YieldParamVec], stress: wp.array[vec6]):
+    """Keep only the normal stress of strain nodes whose yield surface admits no deviatoric stress.
+
+    Without cohesion, friction, or viscosity, the deviatoric stress is zero, so
+    that linear solves of these nodes leave shear free, as inviscid fluids do.
+    """
+    i = wp.tid()
+    yield_param = yield_params[i]
+    if yield_param[2] <= 0.0 and yield_param[3] <= 0.0 and yield_param[5] <= 0.0:
+        stress[i] = vec6(stress[i][0], 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
+@wp.kernel
 def jacobi_preconditioner(
     delassus_diagonal: wp.array[vec6],
     delassus_rotation: wp.array[mat55],
