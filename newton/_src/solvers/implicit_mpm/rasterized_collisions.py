@@ -507,6 +507,49 @@ def rasterize_collider_kernel(
     collider_velocity[i] = sdf_vel
 
 
+@wp.kernel
+def collider_open_fraction_kernel(
+    collider: Collider,
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_q_prev: wp.array[wp.transform],
+    voxel_size: float,
+    node_positions: wp.array[wp.vec3],
+    node_environment_offsets: wp.array[int],
+    collider_friction: wp.array[float],
+    open_fraction: wp.array[float],
+):
+    """Part of the voxel-sized cube centered at each active node that lies outside colliders.
+
+    Averages a linear ramp of the signed distance over the cube's 2x2x2 sub-cubes, which
+    is exact for axis-aligned planar boundaries and counts edges and corners between
+    colliders. Inactive nodes are fully open.
+    """
+    i = wp.tid()
+    if collider_friction[i] < 0.0:
+        open_fraction[i] = 1.0
+        return
+
+    environment_index = int(_ALL_COLLIDER_WORLDS)
+    if node_environment_offsets:
+        environment_index = environment_from_offsets(i, node_environment_offsets)
+
+    x = node_positions[i]
+    sub_size = 0.5 * voxel_size
+    fraction = float(0.0)
+    for k in range(8):
+        offset = sub_size * wp.vec3(
+            float(k & 1) - 0.5,
+            float((k >> 1) & 1) - 0.5,
+            float((k >> 2) & 1) - 0.5,
+        )
+        sdf, _grad, _vel, _collider_id, _material_id = collision_sdf(
+            x + offset, environment_index, collider, body_q, body_qd, body_q_prev, 1.0
+        )
+        fraction += wp.clamp(0.5 + sdf / sub_size, 0.0, 1.0)
+    open_fraction[i] = 0.125 * fraction
+
+
 @wp.func
 def collider_is_deformable(collider_id: int, collider: Collider):
     if collider_id < 0:

@@ -38,6 +38,7 @@ from .particle_surface_colliders import extrapolate_surface_sdf_into_colliders
 from .rasterized_collisions import (
     Collider,
     build_rigidity_operator,
+    collider_open_fraction_kernel,
     interpolate_collider_normals,
     project_outside_collider,
     rasterize_collider,
@@ -55,6 +56,7 @@ from .implicit_mpm_solver_kernels import (
     _rebuild_capacity,
     allocate_by_voxels,
     average_element_yield_parameters,
+    blocked_face_flux,
     build_active_particle_mask,
     collision_weight_field,
     compute_bounds,
@@ -62,12 +64,17 @@ from .implicit_mpm_solver_kernels import (
     compute_density_strain_offset,
     compute_eigenvalues,
     compute_unilateral_strain_offset,
+    face_collision_weight_field,
+    face_open_fractions,
+    fill_face_center_points,
     fill_uniform_color_block_indices,
     filter_p0_strain_mass,
     free_velocity,
+    full_strain_delta_form,
     integrate_active_fraction,
     integrate_collider_fraction,
     integrate_collider_fraction_apic,
+    integrate_face_mass,
     integrate_fraction,
     integrate_mass,
     integrate_particle_stress,
@@ -84,7 +91,9 @@ from .implicit_mpm_solver_kernels import (
     mass_form,
     mat11,
     mat13,
+    mat16,
     mat31,
+    mat61,
     mat66,
     node_color,
     normalize_strain_yield_parameters,
@@ -96,9 +105,11 @@ from .implicit_mpm_solver_kernels import (
     residual_strain_offset,
     rotate_matrix_columns,
     rotate_matrix_rows,
+    scale_face_strain_columns,
     scatter_field_dof_values,
     strain_delta_form,
     update_particle_frames,
+    vec6,
     voxel_coordinates,
 )
 
@@ -178,15 +189,17 @@ def _validate_sparse_grid_node_capacity(name: str, value: int) -> int:
 
 def _parse_grid_basis_name(basis_str: str) -> tuple[str, int, bool]:
     """Parse and validate Newton's compact grid-basis spelling."""
-    match = re.fullmatch(r"([BQSP])([0-9]+)(d?)", basis_str)
+    match = re.fullmatch(r"(RT|[BQSP])([0-9]+)(d?)", basis_str)
     if match is None:
         raise ValueError(
             f"Unsupported basis: {basis_str}. Expected format: B<degree>[d], Q<degree>[d], "
-            "S<degree>[d], P0, or P<positive-degree>d."
+            "S<degree>[d], P0, P<positive-degree>d, or RT1."
         )
 
     basis_type, degree_text, discontinuous_suffix = match.groups()
     degree = int(degree_text)
+    if basis_type == "RT" and (degree != 1 or discontinuous_suffix):
+        raise ValueError(f"Unsupported basis: {basis_str}. Raviart-Thomas velocities support RT1 only.")
     discontinuous = degree == 0 or discontinuous_suffix == "d"
     if basis_type == "P" and not discontinuous:
         raise ValueError(f"Unsupported basis: {basis_str}. Non-conforming polynomial (P) bases must be discontinuous.")
@@ -204,6 +217,8 @@ def _make_grid_basis_space(grid: fem.Geometry, basis_str: str, family: fem.Polyn
         element_basis = fem.ElementBasis.SERENDIPITY
     elif basis_type == "P":
         element_basis = fem.ElementBasis.NONCONFORMING_POLYNOMIAL
+    elif basis_type == "RT":
+        element_basis = fem.ElementBasis.RAVIART_THOMAS
 
     return fem.make_polynomial_basis_space(
         grid, degree=degree, element_basis=element_basis, family=family, discontinuous=discontinuous
@@ -217,6 +232,17 @@ def _make_pic_basis_space(pic: fem.PicQuadrature, basis_str: str):
         max_points_per_cell = -1
 
     return fem.PointBasisSpace(pic, max_nodes_per_element=max_points_per_cell, use_evaluation_point_index=True)
+
+
+_FACES_PER_CELL = 6
+_FACE_COLLIDER_GAP_FRACTION = 0.5
+"""Distance to colliders, in voxels, below which face-center contact rows activate."""
+
+
+def _make_face_point_basis_space(domain: fem.GeometryDomain, coords: wp.array2d, weights: wp.array2d):
+    """Point basis with one node at each face center of each domain cell, for face-flux collider rows."""
+    quadrature = fem.ExplicitQuadrature(domain, points=coords, weights=weights)
+    return fem.PointBasisSpace(quadrature, max_nodes_per_element=_FACES_PER_CELL, use_evaluation_point_index=True)
 
 
 _RheologySolverName = Literal[
@@ -235,9 +261,9 @@ _RheologySolverName = Literal[
     "gmres",
     "generalized-minimal-residual",
 ]
-_MPMVelocityBasisName = Literal["Q1", "B2", "B3"]
+_MPMVelocityBasisName = Literal["Q1", "B2", "B3", "RT1"]
 # Python typing cannot express the accepted ``"pic"`` / ``"picN"`` basis family.
-_MPMColliderBasisName = Literal["Q1", "S2", "pic", "pic8", "pic27"] | str
+_MPMColliderBasisName = Literal["Q1", "S2", "RT1", "pic", "pic8", "pic27"] | str
 _MPMStrainBasisName = Literal["P0", "P1d", "Q1", "Q1d", "pic", "pic8", "pic27"] | str
 
 
@@ -311,6 +337,17 @@ class ImplicitMPMScratchpad:
         self.collider_environment_offsets = None
         self.strain_environment_offsets = None
 
+        self.face_velocity = False
+        """Velocity dofs are scalar face fluxes (Raviart-Thomas basis) instead of vec3 node values."""
+        self.face_collider = False
+        """Collider rows sit at face centers and each constrains the normal flux of its face."""
+        self._face_point_coords = None
+        self._face_point_weights = None
+        self.face_open_fraction = None
+        """Part of each face cell outside colliders, which weighs the face flux in the strain."""
+        self.face_solid_flux = None
+        """Collider flux through each face, in face flux units."""
+
     def rebuild_function_spaces(
         self,
         pic: fem.PicQuadrature,
@@ -324,9 +361,13 @@ class ImplicitMPMScratchpad:
         """Define velocity and strain function spaces over the given geometry."""
 
         self.domain = pic.domain
+        self._set_face_velocity(velocity_basis_str[:2] == "RT")
 
         use_pic_collider_basis = collider_basis_str[:3] == "pic"
         use_pic_strain_basis = strain_basis_str[:3] == "pic"
+        # Face-flux velocities with a matching collider basis get one contact row per face
+        self.face_collider = self.face_velocity and collider_basis_str == velocity_basis_str
+        use_point_collider_basis = use_pic_collider_basis or self.face_collider
 
         # The rebuildable sparse grid (like the fixed grid) reuses the same geometry object
         # across steps, so refresh retained topologies before rebuilding their partitions.
@@ -340,7 +381,7 @@ class ImplicitMPMScratchpad:
             if not use_pic_strain_basis:
                 self._strain_basis = _make_grid_basis_space(self.grid, strain_basis_str)
 
-            if not use_pic_collider_basis:
+            if not use_point_collider_basis:
                 self._collision_basis = _make_grid_basis_space(
                     self.grid, collider_basis_str, family=fem.Polynomial.EQUISPACED_CLOSED
                 )
@@ -348,7 +389,7 @@ class ImplicitMPMScratchpad:
             topologies = {id(self._velocity_basis.topology): self._velocity_basis.topology}
             if not use_pic_strain_basis:
                 topologies[id(self._strain_basis.topology)] = self._strain_basis.topology
-            if not use_pic_collider_basis:
+            if not use_point_collider_basis:
                 topologies[id(self._collision_basis.topology)] = self._collision_basis.topology
             for topology in topologies.values():
                 if hasattr(topology, "rebuild"):
@@ -359,10 +400,48 @@ class ImplicitMPMScratchpad:
             self._strain_basis = _make_pic_basis_space(pic, strain_basis_str)
         if use_pic_collider_basis:
             self._collision_basis = _make_pic_basis_space(pic, collider_basis_str)
+        elif self.face_collider:
+            self._collision_basis = self._make_face_collider_basis(pic)
 
         self._create_velocity_function_space(temporary_store, max_cell_count, environment_first)
         self._create_collider_function_space(temporary_store, max_cell_count, environment_first)
         self._create_strain_function_space(temporary_store, max_cell_count, environment_first)
+
+    def _make_face_collider_basis(self, pic: fem.PicQuadrature):
+        """Collider points at the face centers of the domain cells; their coordinates are the same in every cell."""
+        shape = (self.domain.element_count(), _FACES_PER_CELL)
+        device = pic.cell_indices.device
+        if (
+            self._face_point_coords is None
+            or self._face_point_coords.shape != shape
+            or self._face_point_coords.device != device
+        ):
+            self._face_point_coords = wp.empty(shape, dtype=fem.Coords, device=device)
+            self._face_point_weights = wp.empty(shape, dtype=float, device=device)
+            wp.launch(
+                fill_face_center_points,
+                dim=shape,
+                outputs=[self._face_point_coords, self._face_point_weights],
+                device=device,
+            )
+        return _make_face_point_basis_space(self.domain, self._face_point_coords, self._face_point_weights)
+
+    def _set_face_velocity(self, face_velocity: bool):
+        """Select strain and collider matrix block types for vec3 node or scalar face velocity dofs."""
+        if face_velocity == self.face_velocity:
+            return
+        self.face_velocity = face_velocity
+        if face_velocity:
+            # Full symmetric strain per face flux, and vector basis values per collider node
+            self.strain_matrix = wps.bsr_zeros(0, 0, mat61)
+            self.transposed_strain_matrix = wps.bsr_zeros(0, 0, mat16)
+            self.collider_matrix = wps.bsr_zeros(0, 0, block_type=mat31)
+            self.transposed_collider_matrix = wps.bsr_zeros(0, 0, block_type=mat13)
+        else:
+            self.strain_matrix = wps.bsr_zeros(0, 0, mat13)
+            self.transposed_strain_matrix = wps.bsr_zeros(0, 0, mat31)
+            self.collider_matrix = wps.bsr_zeros(0, 0, block_type=float)
+            self.transposed_collider_matrix = wps.bsr_zeros(0, 0, block_type=float)
 
     def _create_velocity_function_space(
         self, temporary_store: fem.TemporaryStore, max_cell_count: int, environment_first: bool
@@ -370,7 +449,10 @@ class ImplicitMPMScratchpad:
         """Create velocity and fraction spaces and their partition/restriction."""
         domain = self.domain
 
-        velocity_space = fem.make_collocated_function_space(self._velocity_basis, dtype=wp.vec3)
+        if self.face_velocity:
+            velocity_space = fem.make_contravariant_function_space(self._velocity_basis)
+        else:
+            velocity_space = fem.make_collocated_function_space(self._velocity_basis, dtype=wp.vec3)
 
         # overly conservative
         max_vel_node_count = (
@@ -477,6 +559,21 @@ class ImplicitMPMScratchpad:
         ):
             return
 
+        if self.face_velocity:
+            # Face fluxes have no scalar counterpart; masses come from the velocity test field
+            if has_compliant_particles:
+                raise NotImplementedError("Raviart-Thomas velocities support inviscid fluids only.")
+            if self.velocity_test is None:
+                self.velocity_test = fem.make_test(
+                    velocity_space, domain=domain, space_restriction=vel_space_restriction
+                )
+                self.velocity_trial = fem.make_trial(velocity_space, domain=domain, space_partition=vel_space_partition)
+            else:
+                self.velocity_test.rebind(velocity_space, vel_space_restriction)
+                self.velocity_trial.rebind(velocity_space, vel_space_partition, domain)
+            self.velocity_field = velocity_space.make_field(space_partition=vel_space_partition)
+            return
+
         fraction_space = fem.make_collocated_function_space(velocity_basis, dtype=float)
 
         # test, trial and discrete fields
@@ -520,8 +617,12 @@ class ImplicitMPMScratchpad:
             return
         collider_fraction_space = fem.make_collocated_function_space(collision_basis, dtype=float)
 
-        # test, trial and discrete fields
-        if self.collider_fraction_test is None:
+        # test, trial and discrete fields; face-center point spaces change type when their cells
+        # start or stop covering the whole grid, which needs new fields
+        if (
+            self.collider_fraction_test is None
+            or self.collider_fraction_test.space.name != collider_fraction_space.name
+        ):
             self.collider_fraction_test = fem.make_test(
                 collider_fraction_space, space_restriction=collision_space_restriction
             )
@@ -652,6 +753,10 @@ class ImplicitMPMScratchpad:
         if has_compliant_bodies:
             self.collider_total_volumes = fem.borrow_temporary(temporary_store, shape=collider_count, dtype=float)
 
+        if self.face_collider:
+            self.face_open_fraction = fem.borrow_temporary(temporary_store, shape=vel_node_count, dtype=float)
+            self.face_solid_flux = fem.borrow_temporary(temporary_store, shape=vel_node_count, dtype=float)
+
         if max_colors > 0:
             # Cell-based coloring sorts one entry per partition cell, and cells without
             # particles make that count exceed the particle-based strain node count.
@@ -676,6 +781,12 @@ class ImplicitMPMScratchpad:
 
         if self.collider_total_volumes is not None:
             self.collider_total_volumes.release()
+
+        if self.face_open_fraction is not None:
+            self.face_open_fraction.release()
+            self.face_solid_flux.release()
+            self.face_open_fraction = None
+            self.face_solid_flux = None
 
         if self.color_indices is not None:
             self.color_indices.release()
@@ -929,7 +1040,8 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
           the cell centers with trilinear weights on the lattice of points;
         - particles move with the grid velocity and gradient sampled at the
           cell centers, and particle-based collider bases constrain that same
-          velocity;
+          velocity; with ``"RT1"`` velocities, both use the face-flux field at
+          the particles, which keeps the advection velocity divergence-free;
         - for ``"P1d"``, solver strain results, which are affine in each cell,
           return to particles through the moving least-squares cell frames;
           other bases return them with trilinear weights on the lattice of
@@ -942,7 +1054,8 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
         .. experimental::
 
-            ``"cell"`` requires the ``"Q1"`` velocity basis.
+            ``"cell"`` requires the ``"Q1"`` velocity basis, or ``"RT1"``
+            with the ``"P0"`` strain basis.
         """
 
         # material / background
@@ -1024,14 +1137,41 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         ``"Q1"`` (trilinear), ``"S2"`` (quadratic serendipity), or
         ``"pic"``, ``"pic8"``, ``"pic27"``
         (particle-based with optional max points per cell). Any ``"picN"``
-        form with integer ``N`` is accepted."""
+        form with integer ``N`` is accepted.
+
+        With ``"RT1"`` velocities, ``"RT1"`` places one contact point at each
+        face center, constraining the normal flux of that face as for solid
+        faces on a MAC grid; each point constrains one normal flux, so these
+        contacts are frictionless. Colliders also cut cells as in variational
+        pressure solves: the strain sees the open part of each face, sampled
+        over the voxel-sized cube centered on the face, at the face flux, and
+        the blocked part at the collider velocity. Fluid next to walls that
+        cross grid cells then keeps the hydrostatic pressure of full cells.
+
+        .. experimental::
+
+            ``"RT1"`` collider points require the ``"RT1"`` velocity basis.
+        """
         strain_basis: _MPMStrainBasisName = "P0"
         """Strain basis function. Common values are ``"P0"``, ``"P1d"``,
         ``"Q1"``, ``"Q1d"``, or particle-based ``"pic"``, ``"pic8"``,
         ``"pic27"``. Any ``"picN"`` form with integer ``N`` is accepted."""
         velocity_basis: _MPMVelocityBasisName = "Q1"
         """Velocity basis function. Common values are ``"Q1"``, ``"B2"``,
-        or ``"B3"``."""
+        or ``"B3"``.
+
+        ``"RT1"`` uses lowest-order Raviart-Thomas velocities, one normal
+        flux per cell face as on a MAC grid. Their divergence is constant in
+        each cell, so an incompressible ``"P0"`` solve makes the velocity that
+        advects particles divergence-free at every point. Their gradient has
+        no shear within a cell, so only inviscid fluids are supported.
+
+        .. experimental::
+
+            ``"RT1"`` requires the ``"P0"`` strain basis, the ``"pic"``
+            integration scheme, Gauss-Seidel, Jacobi or Krylov solvers, and
+            materials without elasticity.
+        """
 
         separate_worlds: bool = False
         """Use independent FEM environments for each world in a multi-world model.
@@ -1609,6 +1749,8 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         if config.integration_scheme not in ("pic", "gimp", "cell"):
             raise ValueError(f"Invalid integration scheme: {config.integration_scheme}")
         self.gimp = config.integration_scheme == "gimp"
+        if self.velocity_basis == "RT1":
+            self._validate_face_velocity_config(config)
         self._cell_quadrature = None
         self._cell_transfer_quadrature = None
         self._cell_kinematic_update = False
@@ -1643,10 +1785,14 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             raise ValueError("collider_stabilization_fraction must be finite and in [0, 1]")
         if not math.isfinite(self.collider_contact_gap) or self.collider_contact_gap < 0.0:
             raise ValueError("collider_contact_gap must be finite and nonnegative")
-        if (
-            self.collider_stabilization_fraction > 0.0 or self.collider_contact_gap > 0.0
-        ) and not self.collider_basis.startswith("pic"):
-            raise ValueError("Contact stabilization and predictive gaps require a particle collider basis")
+        if self.collider_basis == "RT1" and self.velocity_basis != "RT1":
+            raise ValueError(
+                "collider_basis='RT1' places contact rows on face fluxes and requires velocity_basis='RT1'."
+            )
+        if (self.collider_stabilization_fraction > 0.0 or self.collider_contact_gap > 0.0) and not (
+            self.collider_basis.startswith("pic") or self.collider_basis == "RT1"
+        ):
+            raise ValueError("Contact stabilization and predictive gaps require a particle or face collider basis")
 
         if config.collider_velocity_mode not in ("forward", "backward"):
             raise ValueError(f"Invalid collider velocity mode: {config.collider_velocity_mode}")
@@ -1943,6 +2089,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             strict=True,
         ):
             if field is None:
+                continue
+            if field is self._last_step_data.ws_impulse_field and self._scratchpad.face_collider:
+                # Face-center contact impulses restart from zero every step
                 continue
             if world_mask is None:
                 field.dof_values.zero_()
@@ -2861,11 +3010,30 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
         return scratch
 
+    def _validate_face_velocity_config(self, config: Config):
+        """Validate the ``"RT1"`` (face flux) velocity basis, an experimental option for inviscid fluids."""
+        if config.strain_basis != "P0":
+            raise NotImplementedError(f"velocity_basis='RT1' requires strain_basis='P0', got {config.strain_basis!r}.")
+        if config.integration_scheme not in ("pic", "cell"):
+            raise NotImplementedError(
+                f"velocity_basis='RT1' requires integration_scheme='pic' or 'cell', got {config.integration_scheme!r}."
+            )
+        supported_solvers = ("gs", "gauss-seidel", "jacobi", "cg", "conjugate-gradient", "cr", "conjugate-residual")
+        unsupported = [solver for solver in self.solver if solver not in supported_solvers]
+        if unsupported:
+            raise NotImplementedError(
+                f"velocity_basis='RT1' supports the {supported_solvers} solvers, got {unsupported}."
+            )
+
     def _cell_points_per_axis(self, config: Config) -> int:
         """Validate the ``"cell"`` integration scheme and return its points per cell axis."""
-        if config.velocity_basis != "Q1":
+        if config.velocity_basis not in ("Q1", "RT1"):
             raise NotImplementedError(
-                f"Config.integration_scheme='cell' requires velocity_basis='Q1', got {config.velocity_basis!r}."
+                f"Config.integration_scheme='cell' requires velocity_basis='Q1' or 'RT1', got {config.velocity_basis!r}."
+            )
+        if config.velocity_basis == "RT1" and config.strain_basis != "P0":
+            raise NotImplementedError(
+                "Config.integration_scheme='cell' with velocity_basis='RT1' requires strain_basis='P0'."
             )
         if self.residual_strain_tracking:
             raise NotImplementedError(
@@ -3163,7 +3331,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                     "particle_flags": transfer_flags,
                     "inv_cell_volume": inv_cell_volume,
                 },
-                output_dtype=wp.vec3,
+                output_dtype=float if scratch.face_velocity else wp.vec3,
                 temporary_store=self.temporary_store,
             )
 
@@ -3183,20 +3351,37 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                     temporary_store=self.temporary_store,
                 )
 
-            node_particle_mass = fem.integrate(
-                integrate_mass,
-                quadrature=transfer_quadrature,
-                fields={"phi": scratch.fraction_test},
-                values={
-                    "inv_cell_volume": inv_cell_volume,
-                    "particle_density": transfer_density,
-                    "particle_flags": transfer_flags,
-                },
-                output_dtype=float,
-                temporary_store=self.temporary_store,
-            )
-
             drag = mpm_model.air_drag * dt
+            if scratch.face_velocity:
+                # Face flux dofs scale with the face area, and their masses with its inverse square
+                inv_face_area = 1.0 / mpm_model.voxel_size**2
+                node_particle_mass = fem.integrate(
+                    integrate_face_mass,
+                    quadrature=transfer_quadrature,
+                    fields={"u": scratch.velocity_test},
+                    values={
+                        "inv_cell_volume": inv_cell_volume,
+                        "inv_face_area": inv_face_area,
+                        "particle_density": transfer_density,
+                        "particle_flags": transfer_flags,
+                    },
+                    output_dtype=float,
+                    temporary_store=self.temporary_store,
+                )
+                drag *= inv_face_area * inv_face_area
+            else:
+                node_particle_mass = fem.integrate(
+                    integrate_mass,
+                    quadrature=transfer_quadrature,
+                    fields={"phi": scratch.fraction_test},
+                    values={
+                        "inv_cell_volume": inv_cell_volume,
+                        "particle_density": transfer_density,
+                        "particle_flags": transfer_flags,
+                    },
+                    output_dtype=float,
+                    temporary_store=self.temporary_store,
+                )
 
             wp.launch(
                 free_velocity,
@@ -3224,10 +3409,14 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         collider_node_count = scratch.collider_node_count
         vel_node_count = scratch.velocity_node_count
 
+        # Face rows activate within half a voxel, which includes faces on a grid-aligned collider surface,
+        # and close their gap within the step
+        contact_gap = self.collider_contact_gap
+        if scratch.face_collider:
+            contact_gap = max(contact_gap, _FACE_COLLIDER_GAP_FRACTION * self._mpm_model.voxel_size)
+
         with self._timer("Rasterize collider"):
-            self._mpm_model.collider.query_max_dist = max(
-                self._mpm_model.collider.query_max_dist, self.collider_contact_gap
-            )
+            self._mpm_model.collider.query_max_dist = max(self._mpm_model.collider.query_max_dist, contact_gap)
             # volume associated to each collider node
             fem.integrate(
                 integrate_fraction,
@@ -3257,7 +3446,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 scratch.collider_ids,
                 temporary_store=self.temporary_store,
                 node_environment_offsets=scratch.collider_environment_offsets,
-                contact_gap=self.collider_contact_gap,
+                contact_gap=contact_gap,
             )
 
             # normal interpolation
@@ -3269,7 +3458,81 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                     temporary_store=self.temporary_store,
                 )
 
-            if self.collider_stabilization_fraction > 0.0 or self.collider_contact_gap > 0.0:
+            # Subgrid collisions
+            if (
+                self._cell_two_hop_transfers
+                and not scratch.face_velocity
+                and isinstance(scratch.collider_fraction_test.space.basis, fem.PointBasisSpace)
+            ):
+                self._cell_transfer_quadrature.build_collider_matrix(
+                    scratch.collider_matrix,
+                    collider_partition=scratch.collider_fraction_test.space_restriction.space_partition,
+                    velocity_trial=scratch.fraction_trial,
+                    velocity_node_count=vel_node_count,
+                    collider_normals=scratch.collider_normal_field.dof_values,
+                    temporary_store=self.temporary_store,
+                )
+            elif scratch.face_velocity or self.collider_basis != self.velocity_basis:
+                #  Map from collider nodes to velocity nodes
+                wps.bsr_set_zero(
+                    scratch.collider_matrix, rows_of_blocks=collider_node_count, cols_of_blocks=vel_node_count
+                )
+                weight_integrand = collision_weight_field
+                if scratch.face_velocity:
+                    # Vector basis values of the face fluxes at the collider nodes
+                    weight_space = scratch.collider_velocity_field.space
+                    weight_trial = scratch.velocity_trial
+                    if scratch.face_collider:
+                        weight_integrand = face_collision_weight_field
+                else:
+                    weight_space = scratch.collider_fraction_test.space
+                    weight_trial = scratch.fraction_trial
+                fem.interpolate(
+                    weight_integrand,
+                    dest=scratch.collider_matrix,
+                    dest_space=weight_space,
+                    at=scratch.collider_fraction_test.space_restriction,
+                    reduction="first",
+                    fields={"trial": weight_trial, "normal": scratch.collider_normal_field},
+                    temporary_store=self.temporary_store,
+                    bsr_options={"construction": "auto"},
+                )
+
+            if scratch.face_collider:
+                # Faces cut by colliders, with the collider velocity before gap closing
+                scratch.face_open_fraction.fill_(1.0)
+                scratch.face_solid_flux.zero_()
+                row_open_fraction = fem.borrow_temporary(self.temporary_store, shape=collider_node_count, dtype=float)
+                wp.launch(
+                    collider_open_fraction_kernel,
+                    dim=collider_node_count,
+                    inputs=[
+                        self._mpm_model.collider,
+                        state_in.body_q,
+                        None,
+                        None,
+                        self._mpm_model.voxel_size,
+                        scratch.collider_position_field.dof_values,
+                        scratch.collider_environment_offsets,
+                        scratch.collider_friction,
+                    ],
+                    outputs=[row_open_fraction],
+                )
+                wp.launch(
+                    face_open_fractions,
+                    dim=collider_node_count,
+                    inputs=[
+                        scratch.collider_matrix.offsets,
+                        scratch.collider_matrix.columns,
+                        scratch.collider_matrix.values.view(dtype=wp.vec3),
+                        row_open_fraction,
+                        scratch.collider_velocity,
+                    ],
+                    outputs=[scratch.face_open_fraction, scratch.face_solid_flux],
+                )
+                row_open_fraction.release()
+
+            if self.collider_stabilization_fraction > 0.0 or contact_gap > 0.0:
                 wp.launch(
                     stabilize_collider_velocity,
                     dim=collider_node_count,
@@ -3280,34 +3543,6 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                         scratch.collider_normal_field.dof_values,
                         scratch.collider_velocity,
                     ],
-                )
-
-            # Subgrid collisions
-            if self._cell_two_hop_transfers and isinstance(
-                scratch.collider_fraction_test.space.basis, fem.PointBasisSpace
-            ):
-                self._cell_transfer_quadrature.build_collider_matrix(
-                    scratch.collider_matrix,
-                    collider_partition=scratch.collider_fraction_test.space_restriction.space_partition,
-                    velocity_trial=scratch.fraction_trial,
-                    velocity_node_count=vel_node_count,
-                    collider_normals=scratch.collider_normal_field.dof_values,
-                    temporary_store=self.temporary_store,
-                )
-            elif self.collider_basis != self.velocity_basis:
-                #  Map from collider nodes to velocity nodes
-                wps.bsr_set_zero(
-                    scratch.collider_matrix, rows_of_blocks=collider_node_count, cols_of_blocks=vel_node_count
-                )
-                fem.interpolate(
-                    collision_weight_field,
-                    dest=scratch.collider_matrix,
-                    dest_space=scratch.collider_fraction_test.space,
-                    at=scratch.collider_fraction_test.space_restriction,
-                    reduction="first",
-                    fields={"trial": scratch.fraction_trial, "normal": scratch.collider_normal_field},
-                    temporary_store=self.temporary_store,
-                    bsr_options={"construction": "auto"},
                 )
 
     def _build_collider_rigidity_operator(
@@ -3512,11 +3747,11 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         # Strain jacobian
         with self._timer("Strain matrix"):
             fem.integrate(
-                strain_delta_form,
+                full_strain_delta_form if scratch.face_velocity else strain_delta_form,
                 quadrature=strain_quadrature,
                 fields={
                     "u": scratch.velocity_trial,
-                    "tau": scratch.divergence_test,
+                    "tau": scratch.sym_strain_test if scratch.face_velocity else scratch.divergence_test,
                 },
                 values={
                     "dt": dt,
@@ -3531,6 +3766,29 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                     "prune_numerical_zeros": self._velocity_nodes_per_strain_sample < 0,
                 },
             )
+
+        if scratch.face_collider:
+            with self._timer("Cut faces"):
+                # Variational cut cells: the strain sees the open part of each face at the face flux,
+                # and the blocked part at the collider flux
+                strain_values = scratch.strain_matrix.values.view(dtype=vec6)
+                wp.launch(
+                    blocked_face_flux,
+                    dim=scratch.velocity_node_count,
+                    inputs=[scratch.face_open_fraction, scratch.face_solid_flux],
+                )
+                wps.bsr_mv(
+                    scratch.strain_matrix,
+                    scratch.face_solid_flux,
+                    scratch.elastic_strain_delta_field.dof_values,
+                    alpha=1.0,
+                    beta=1.0,
+                )
+                wp.launch(
+                    scale_face_strain_columns,
+                    dim=scratch.strain_matrix.nnz,
+                    inputs=[scratch.face_open_fraction, scratch.strain_matrix.columns, strain_values],
+                )
 
     def _build_strain_eigenbasis(
         self,
@@ -3881,7 +4139,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 "vel_grad": state_out.mpm.particle_qd_grad,
                 "temporary_store": self.temporary_store,
             }
-            if self._cell_two_hop_transfers:
+            if self._cell_two_hop_transfers and not scratch.face_velocity:
                 self._cell_transfer_quadrature.advect_particles(dt, **advection_inputs)
             else:
                 particle_quadrature.advect_particles(
@@ -3982,7 +4240,10 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         # particle/point paths below still apply since they go through the PIC quadrature.
         grid_to_grid_warmstart = not self._sparse_rebuildable
 
-        if isinstance(prev_impulse_field.space.basis, fem.PointBasisSpace):
+        if scratch.face_collider:
+            # Face-center rows follow the active cells, and their impulses start from zero
+            scratch.impulse_field.dof_values.zero_()
+        elif isinstance(prev_impulse_field.space.basis, fem.PointBasisSpace):
             # point-based collisions, simply copy the previous impulses
             scratch.impulse_field.dof_values.assign(prev_impulse_field.dof_values[pic.cell_particle_indices])
         elif grid_to_grid_warmstart:
@@ -4024,24 +4285,26 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         self, scratch: ImplicitMPMScratchpad, pic: fem.PicQuadrature, last_step_data: LastStepData
     ):
         with self._timer("Save warmstart fields"):
-            last_step_data.rebind_collision_space_fields(scratch)
+            # Face-center contact impulses restart from zero every step
+            if not scratch.face_collider:
+                last_step_data.rebind_collision_space_fields(scratch)
 
-            if isinstance(last_step_data.ws_impulse_field.space.basis, fem.PointBasisSpace):
-                # point-based collisions, simply copy the previous impulses
-                last_step_data.ws_impulse_field.dof_values[pic.cell_particle_indices].assign(
-                    scratch.impulse_field.dof_values
-                )
-            else:
-                last_step_data.ws_impulse_field.dof_values.zero_()
-                wp.launch(
-                    scatter_field_dof_values,
-                    dim=scratch.impulse_field.space_partition.node_count(),
-                    inputs=[
-                        scratch.impulse_field.space_partition.space_node_indices(),
-                        scratch.impulse_field.dof_values,
-                        last_step_data.ws_impulse_field.dof_values,
-                    ],
-                )
+                if isinstance(last_step_data.ws_impulse_field.space.basis, fem.PointBasisSpace):
+                    # point-based collisions, simply copy the previous impulses
+                    last_step_data.ws_impulse_field.dof_values[pic.cell_particle_indices].assign(
+                        scratch.impulse_field.dof_values
+                    )
+                else:
+                    last_step_data.ws_impulse_field.dof_values.zero_()
+                    wp.launch(
+                        scatter_field_dof_values,
+                        dim=scratch.impulse_field.space_partition.node_count(),
+                        inputs=[
+                            scratch.impulse_field.space_partition.space_node_indices(),
+                            scratch.impulse_field.dof_values,
+                            last_step_data.ws_impulse_field.dof_values,
+                        ],
+                    )
 
             last_step_data.rebind_strain_space_fields(scratch, smoothed=self._stress_warmstart == "smoothed")
             if isinstance(last_step_data.ws_stress_field.space.basis, fem.PointBasisSpace):
@@ -4059,7 +4322,11 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
     def _max_colors(self):
         if not self.coloring:
             return 0
-        return 27 if self.strain_basis == "Q1" else self._scratchpad.velocity_nodes_per_element
+        if self.strain_basis == "Q1":
+            return 27
+        # Cell coloring uses a cubic stencil fitting the velocity nodes of each cell
+        stencil_size = int(np.round(np.cbrt(self._scratchpad.velocity_nodes_per_element)))
+        return stencil_size**3
 
     def _compute_coloring(
         self,

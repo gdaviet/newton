@@ -523,7 +523,7 @@ class Example:
             "--integration-scheme",
             choices=["pic", "gimp", "cell"],
             default="pic",
-            help="Strain integration; experimental cell mode uses two-hop transfers and requires Q1 and one world",
+            help="Strain integration; experimental cell mode uses two-hop transfers and requires Q1, or RT1 with P0",
         )
         parser.add_argument("--solver", type=str, default="auto", help="Rheology solver, e.g. gs or jacobi")
         parser.add_argument(

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Any
+
 import warp as wp
 import warp.sparse as sp
 
@@ -169,14 +171,36 @@ def solve_nodal_friction(
     velocities[i] += inv_mass[i] * delta_lambda
 
 
+@wp.func
+def _collider_transposed_op(weight: float, impulse: wp.vec3):
+    return weight * impulse
+
+
+@wp.func
+def _collider_transposed_op(weight: wp.vec3, impulse: wp.vec3):
+    """Generalized force on a scalar velocity dof, whose collider block is the vector value of its basis function."""
+    return wp.dot(weight, impulse)
+
+
+@wp.func
+def _collider_weight_sq(weight: float):
+    return weight * weight
+
+
+@wp.func
+def _collider_weight_sq(weight: wp.vec3):
+    # Trace of the anisotropic contribution, bounding its largest eigenvalue
+    return wp.dot(weight, weight)
+
+
 @wp.kernel
 def apply_subgrid_impulse(
     tr_collider_mat_offsets: wp.array[int],
     tr_collider_mat_columns: wp.array[int],
-    tr_collider_mat_values: wp.array[float],
+    tr_collider_mat_values: wp.array[Any],
     inv_mass: wp.array[float],
     impulses: wp.array[wp.vec3],
-    velocities: wp.array[wp.vec3],
+    velocities: wp.array[Any],
 ):
     """
     Applies pre-computed impulses to particles and colliders.
@@ -186,9 +210,9 @@ def apply_subgrid_impulse(
     block_beg = tr_collider_mat_offsets[u_i]
     block_end = tr_collider_mat_offsets[u_i + 1]
 
-    delta_f = wp.vec3(0.0)
+    delta_f = velocities[u_i] * 0.0
     for b in range(block_beg, block_end):
-        delta_f += tr_collider_mat_values[b] * impulses[tr_collider_mat_columns[b]]
+        delta_f += _collider_transposed_op(tr_collider_mat_values[b], impulses[tr_collider_mat_columns[b]])
 
     velocities[u_i] += inv_mass[u_i] * delta_f
 
@@ -215,7 +239,7 @@ def apply_subgrid_impulse_warmstart(
 def compute_collider_delassus_diagonal(
     collider_mat_offsets: wp.array[int],
     collider_mat_columns: wp.array[int],
-    collider_mat_values: wp.array[float],
+    collider_mat_values: wp.array[Any],
     collider_inv_mass: wp.array[float],
     transposed_collider_mat_offsets: wp.array[int],
     inv_volume: wp.array[float],
@@ -235,17 +259,17 @@ def compute_collider_delassus_diagonal(
 
         multiplicity = transposed_collider_mat_offsets[u_i + 1] - transposed_collider_mat_offsets[u_i]
 
-        w += weight * weight * inv_volume[u_i] * float(multiplicity)
+        w += _collider_weight_sq(weight) * inv_volume[u_i] * float(multiplicity)
 
     delassus_diagonal[i] = w
 
 
 @wp.kernel
 def solve_subgrid_friction(
-    velocity: wp.array[wp.vec3],
+    velocity: wp.array[Any],
     collider_mat_offsets: wp.array[int],
     collider_mat_columns: wp.array[int],
-    collider_mat_values: wp.array[float],
+    collider_mat_values: wp.array[Any],
     collider_friction: wp.array[float],
     collider_adhesion: wp.array[float],
     collider_normals: wp.array[wp.vec3],

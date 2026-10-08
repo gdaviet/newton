@@ -127,8 +127,33 @@ def _symmetric_part_op(b: wp.vec3, u: wp.vec3):
 
 
 @wp.func
+def _symmetric_part_op(b: vec6, u: float):
+    """Strain of a scalar velocity dof, whose strain block holds the full symmetric strain of its basis function."""
+    return b * u
+
+
+@wp.func
 def _symmetric_part_transposed_op(b: wp.vec3, sig: vec6):
     return fem.SymmetricTensorMapper.dof_to_value_3d(sig) @ (b * 0.5)
+
+
+@wp.func
+def _symmetric_part_transposed_op(b: vec6, sig: vec6):
+    return 0.5 * wp.dot(b, sig)
+
+
+@wp.func
+def _delassus_block(b: wp.vec3):
+    """Contribution of one velocity node's strain block to the Delassus diagonal block, before mass scaling."""
+    b_v0 = _symmetric_part_op(b, wp.vec3(1.0, 0.0, 0.0))
+    b_v1 = _symmetric_part_op(b, wp.vec3(0.0, 1.0, 0.0))
+    b_v2 = _symmetric_part_op(b, wp.vec3(0.0, 0.0, 1.0))
+    return wp.outer(b_v0, b_v0) + wp.outer(b_v1, b_v1) + wp.outer(b_v2, b_v2)
+
+
+@wp.func
+def _delassus_block(b: vec6):
+    return wp.outer(b, b)
 
 
 @wp.kernel
@@ -163,7 +188,7 @@ def compute_vel_node_multiplicity(
 def compute_delassus_diagonal(
     strain_mat_offsets: wp.array[int],
     strain_mat_columns: wp.array[int],
-    strain_mat_values: wp.array[mat13],
+    strain_mat_values: wp.array[Any],
     inv_volume: wp.array[float],
     compliance_mat_offsets: wp.array[int],
     compliance_mat_columns: wp.array[int],
@@ -212,15 +237,8 @@ def compute_delassus_diagonal(
         if has_multiplicity:
             mass_ratio = mass_multiplicity[bi, u_i]
 
-        b_val = strain_mat_values[b]
         inv_frac = inv_volume[u_i] * mass_ratio
-
-        b_v0 = _symmetric_part_op(b_val, wp.vec3(1.0, 0.0, 0.0))
-        diag_block += inv_frac * wp.outer(b_v0, b_v0)
-        b_v1 = _symmetric_part_op(b_val, wp.vec3(0.0, 1.0, 0.0))
-        diag_block += inv_frac * wp.outer(b_v1, b_v1)
-        b_v2 = _symmetric_part_op(b_val, wp.vec3(0.0, 0.0, 1.0))
-        diag_block += inv_frac * wp.outer(b_v2, b_v2)
+        diag_block += inv_frac * _delassus_block(strain_mat_values[b])
 
     diag_block += _DELASSUS_PROXIMAL_REG * wp.identity(n=6, dtype=float)
 
@@ -288,7 +306,7 @@ def postprocess_stress_and_strain(
     compliance_mat_values: wp.array[mat66],
     strain_mat_offsets: wp.array[int],
     strain_mat_columns: wp.array[int],
-    strain_mat_values: wp.array[mat13],
+    strain_mat_values: wp.array[Any],
     delassus_diagonal: wp.array[vec6],
     delassus_rotation: wp.array[mat55],
     unilateral_strain_offset: wp.array[float],
@@ -296,7 +314,7 @@ def postprocess_stress_and_strain(
     strain_node_volume: wp.array[float],
     strain_rhs: wp.array[vec6],
     stress: wp.array[vec6],
-    velocity: wp.array[wp.vec3],
+    velocity: wp.array[Any],
     elastic_strain: wp.array[vec6],
     plastic_strain: wp.array[vec6],
 ):
@@ -705,9 +723,9 @@ def make_apply_stress_delta(strain_velocity_node_count: int = -1):
         delta_stress: vec6,
         strain_mat_offsets: wp.array[int],
         strain_mat_columns: wp.array[int],
-        strain_mat_values: wp.array[mat13],
+        strain_mat_values: wp.array[Any],
         inv_mass_matrix: wp.array[float],
-        velocities: wp.array[wp.vec3],
+        velocities: wp.array[Any],
     ):
         """Updates particle velocities from a local stress delta."""
 
@@ -732,10 +750,10 @@ def make_apply_stress_delta(strain_velocity_node_count: int = -1):
 def apply_stress_delta_jacobi(
     transposed_strain_mat_offsets: wp.array[int],
     transposed_strain_mat_columns: wp.array[int],
-    transposed_strain_mat_values: wp.array[mat13],
+    transposed_strain_mat_values: wp.array[Any],
     inv_mass_matrix: wp.array[float],
     stress: wp.array[vec6],
-    velocities: wp.array[wp.vec3],
+    velocities: wp.array[Any],
 ):
     """Updates particle velocities from a local stress delta."""
 
@@ -746,7 +764,7 @@ def apply_stress_delta_jacobi(
     block_beg = transposed_strain_mat_offsets[u_i]
     block_end = transposed_strain_mat_offsets[u_i + 1]
 
-    delta_u = wp.vec3(0.0)
+    delta_u = velocities[u_i] * 0.0
     for b in range(block_beg, block_end):
         tau_i = transposed_strain_mat_columns[b]
         delta_stress = stress[tau_i]
@@ -761,8 +779,8 @@ def apply_velocity_delta(
     beta: float,
     strain_mat_offsets: wp.array[int],
     strain_mat_columns: wp.array[int],
-    strain_mat_values: wp.array[mat13],
-    velocity_delta: wp.array[wp.vec3],
+    strain_mat_values: wp.array[Any],
+    velocity_delta: wp.array[Any],
     strain_prev: wp.array[vec6],
     strain: wp.array[vec6],
 ):
@@ -793,10 +811,10 @@ def apply_stress_gs(
     color_blocks: wp.array2d[int],
     strain_mat_offsets: wp.array[int],
     strain_mat_columns: wp.array[int],
-    strain_mat_values: wp.array[mat13],
+    strain_mat_values: wp.array[Any],
     inv_mass_matrix: wp.array[float],  # Note: Likely inv_volume in context
     stress: wp.array[vec6],
-    velocities: wp.array[wp.vec3],
+    velocities: wp.array[Any],
 ):
     """
     Update particle velocities from the current stress. Uses a coloring approach to
@@ -833,9 +851,9 @@ def make_compute_local_strain(has_compliance_mat: bool = True, strain_velocity_n
         compliance_mat_values: wp.array[mat66],
         strain_mat_offsets: wp.array[int],
         strain_mat_columns: wp.array[int],
-        strain_mat_values: wp.array[mat13],
+        strain_mat_values: wp.array[Any],
         local_strain_rhs: wp.array[vec6],
-        velocities: wp.array[wp.vec3],
+        velocities: wp.array[Any],
         local_stress: wp.array[vec6],
     ):
         """Computes the local strain based on the current stress and velocities."""
@@ -937,11 +955,11 @@ def make_jacobi_solve_kernel(
         local_compliance_mat_values: wp.array[mat66],
         strain_mat_offsets: wp.array[int],
         strain_mat_columns: wp.array[int],
-        strain_mat_values: wp.array[mat13],
+        strain_mat_values: wp.array[Any],
         delassus_diagonal: wp.array[vec6],
         delassus_rotation: wp.array[mat55],
         local_strain_rhs: wp.array[vec6],
-        velocities: wp.array[wp.vec3],
+        velocities: wp.array[Any],
         local_stress: wp.array[vec6],
         delta_correction: wp.array[vec6],
     ):
@@ -1006,12 +1024,12 @@ def make_gs_solve_kernel(
         compliance_mat_values: wp.array[mat66],
         strain_mat_offsets: wp.array[int],
         strain_mat_columns: wp.array[int],
-        strain_mat_values: wp.array[mat13],
+        strain_mat_values: wp.array[Any],
         delassus_diagonal: wp.array[vec6],
         delassus_rotation: wp.array[mat55],
         inv_mass_matrix: wp.array[float],
         local_strain_rhs: wp.array[vec6],
-        velocities: wp.array[wp.vec3],
+        velocities: wp.array[Any],
         local_stress: wp.array[vec6],
         delta_correction: wp.array[vec6],
     ):

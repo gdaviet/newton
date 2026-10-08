@@ -59,6 +59,28 @@ _TILED_SUM_BLOCK_DIM = 512
 _STRESS_DOF_COUNT = 6
 
 
+def _strain_block_values(matrix: sp.BsrMatrix) -> wp.array:
+    """Strain-matrix blocks: weighted scalar shape gradients (mat13) for vec3 velocity dofs,
+    or full symmetric strains (vec6) for scalar velocity dofs such as face fluxes."""
+    rows, cols = matrix.block_shape
+    if rows * cols == _STRESS_DOF_COUNT:
+        return matrix.values.view(dtype=vec6)
+    return matrix.values.view(dtype=mat13)
+
+
+def _collider_block_values(matrix: sp.BsrMatrix) -> wp.array:
+    """Collider-matrix blocks: scalar weights for vec3 velocity dofs, or basis vector values for scalar dofs."""
+    rows, cols = matrix.block_shape
+    if rows * cols == 3:
+        return matrix.values.view(dtype=wp.vec3)
+    return matrix.values
+
+
+def _has_scalar_velocity_dofs(collision: CollisionData) -> bool:
+    rows, cols = collision.collider_mat.block_shape
+    return rows * cols == 3
+
+
 @wp.kernel
 def _tiled_sum_kernel(
     data: wp.array2d[float],
@@ -498,7 +520,7 @@ class _DelassusOperator:
             batch_map = wp.zeros(shape=(0,), dtype=int, device=device)
             mult = wp.zeros(shape=(0, 0), dtype=float, device=device)
 
-        strain_mat_values = self.rheology.strain_mat.values.view(dtype=mat13)
+        strain_mat_values = _strain_block_values(self.rheology.strain_mat)
         wp.launch(
             kernel=compute_delassus_diagonal,
             dim=self.size,
@@ -556,7 +578,7 @@ class _DelassusOperator:
             inputs=[
                 self.rheology.transposed_strain_mat.offsets,
                 self.rheology.transposed_strain_mat.columns,
-                self.rheology.transposed_strain_mat.values.view(dtype=mat13),
+                _strain_block_values(self.rheology.transposed_strain_mat),
                 self.momentum.inv_volume,
                 stress_delta,
             ],
@@ -577,11 +599,12 @@ class _DelassusOperator:
             kernel=apply_velocity_delta,
             dim=self.size,
             inputs=[
-                alpha,
-                beta,
+                # The kernel is generic over velocity types, so scalars keep their exact type
+                float(alpha),
+                float(beta),
                 self.rheology.strain_mat.offsets,
                 self.rheology.strain_mat.columns,
-                self.rheology.strain_mat.values.view(dtype=mat13),
+                _strain_block_values(self.rheology.strain_mat),
                 velocity_delta,
                 strain_prev,
             ],
@@ -603,7 +626,7 @@ class _DelassusOperator:
                 self.rheology.compliance_mat.values,
                 self.rheology.strain_mat.offsets,
                 self.rheology.strain_mat.columns,
-                self.rheology.strain_mat.values.view(dtype=mat13),
+                _strain_block_values(self.rheology.strain_mat),
                 self.delassus_diagonal,
                 self.delassus_rotation,
                 self.rheology.unilateral_strain_offset,
@@ -707,7 +730,7 @@ class _GaussSeidelSolver(_RheologySolver):
                 self.rheology.color_blocks,
                 self.rheology.strain_mat.offsets,
                 self.rheology.strain_mat.columns,
-                self.rheology.strain_mat.values.view(dtype=mat13),
+                _strain_block_values(self.rheology.strain_mat),
                 self.momentum.inv_volume,
                 self.rheology.stress,
             ],
@@ -741,7 +764,7 @@ class _GaussSeidelSolver(_RheologySolver):
                 self.rheology.compliance_mat.values,
                 self.rheology.strain_mat.offsets,
                 self.rheology.strain_mat.columns,
-                self.rheology.strain_mat.values.view(dtype=mat13),
+                _strain_block_values(self.rheology.strain_mat),
                 self.delassus_operator.delassus_diagonal,
                 self.delassus_operator.delassus_rotation,
                 self.momentum.inv_volume,
@@ -878,7 +901,7 @@ class _ReorderedGaussSeidelSolver(_RheologySolver):
                 self._flat_constraint_ids,
                 self.rheology.strain_mat.offsets,
                 self.rheology.strain_mat.columns,
-                self.rheology.strain_mat.values.view(dtype=mat13),
+                _strain_block_values(self.rheology.strain_mat),
                 self._reordered_cols,
                 self._reordered_vals_x,
                 self._reordered_vals_y,
@@ -908,7 +931,7 @@ class _ReorderedGaussSeidelSolver(_RheologySolver):
                 self.rheology.color_blocks,
                 self.rheology.strain_mat.offsets,
                 self.rheology.strain_mat.columns,
-                self.rheology.strain_mat.values.view(dtype=mat13),
+                _strain_block_values(self.rheology.strain_mat),
                 self.momentum.inv_volume,
                 self.rheology.stress,
             ],
@@ -1083,7 +1106,7 @@ class _BatchedGaussSeidelSolver(_RheologySolver):
                 self._flat_constraint_ids,
                 self.rheology.strain_mat.offsets,
                 self.rheology.strain_mat.columns,
-                self.rheology.strain_mat.values.view(dtype=mat13),
+                _strain_block_values(self.rheology.strain_mat),
                 self._reordered_cols,
                 self._reordered_vals_x,
                 self._reordered_vals_y,
@@ -1349,7 +1372,7 @@ class _JacobiSolver(_RheologySolver):
                 self.rheology.compliance_mat.values,
                 self.rheology.strain_mat.offsets,
                 self.rheology.strain_mat.columns,
-                self.rheology.strain_mat.values.view(dtype=mat13),
+                _strain_block_values(self.rheology.strain_mat),
                 self.delassus_operator.delassus_diagonal,
                 self.delassus_operator.delassus_rotation,
                 self.rheology.elastic_strain_delta,
@@ -1708,7 +1731,7 @@ class _SubgridContactSolver(_ContactSolver):
             inputs=[
                 self.collision.collider_mat.offsets,
                 self.collision.collider_mat.columns,
-                self.collision.collider_mat.values,
+                _collider_block_values(self.collision.collider_mat),
                 self.collider_inv_mass,
                 self.collision.transposed_collider_mat.offsets,
                 self.momentum.inv_volume,
@@ -1725,7 +1748,7 @@ class _SubgridContactSolver(_ContactSolver):
             inputs=[
                 self.collision.transposed_collider_mat.offsets,
                 self.collision.transposed_collider_mat.columns,
-                self.collision.transposed_collider_mat.values,
+                _collider_block_values(self.collision.transposed_collider_mat),
                 self.momentum.inv_volume,
                 self.delta_impulse,
                 self.momentum.velocity,
@@ -1740,7 +1763,7 @@ class _SubgridContactSolver(_ContactSolver):
                 self.momentum.velocity,
                 self.collision.collider_mat.offsets,
                 self.collision.collider_mat.columns,
-                self.collision.collider_mat.values,
+                _collider_block_values(self.collision.collider_mat),
                 self.collision.collider_friction,
                 self.collision.collider_adhesion,
                 self.collision.collider_normals,
@@ -1967,7 +1990,8 @@ def solve_rheology(
     """
 
     verbose = verbose if verbose is not None else wp.config.log_level <= wp.LOG_DEBUG
-    subgrid_collisions = collision.collider_mat.nnz > 0
+    # Scalar velocity dofs live on faces, which collider nodes reach through the collider matrix only
+    subgrid_collisions = collision.collider_mat.nnz > 0 or _has_scalar_velocity_dofs(collision)
     if subgrid_collisions:
         contact_solver = _SubgridContactSolver(momentum, collision, temporary_store)
     else:

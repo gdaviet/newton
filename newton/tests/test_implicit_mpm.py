@@ -1825,6 +1825,171 @@ def test_cell_integration_viscosity_elastic_history(test, device):
         np.testing.assert_allclose(strains[1], strains[0], atol=2.0e-5, rtol=0.0)
 
 
+@fem.integrand
+def _sample_divergence(s: fem.Sample, v: fem.Field, divergence: wp.array[float]):
+    divergence[s.qp_index] = fem.div(v, s)
+
+
+def _make_fluid_block(device, gravity, velocity=None, origin=0.025, dims=(8, 8, 8)):
+    """Water block of particles at 0.05 spacing, the first one at ``origin`` on each axis."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=gravity)
+    SolverImplicitMPM.register_custom_attributes(builder)
+    builder.add_particle_grid(
+        pos=wp.vec3(origin),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=dims[0],
+        dim_y=dims[1],
+        dim_z=dims[2],
+        cell_x=0.05,
+        cell_y=0.05,
+        cell_z=0.05,
+        mass=0.125,
+        jitter=0.0,
+        radius_mean=0.025,
+        # Water resisting both compression and tension, so that full cells stay divergence-free
+        custom_attributes={"mpm:friction": 0.0, "mpm:tensile_yield_ratio": 1.0},
+    )
+    model = builder.finalize(device=device)
+    if velocity is not None:
+        positions = model.particle_q.numpy()
+        model.particle_qd.assign(velocity(positions))
+    return model
+
+
+def _face_velocity_config(velocity_basis="RT1", **options):
+    config = SolverImplicitMPM.Config(
+        voxel_size=0.1,
+        grid_type="dense",
+        velocity_basis=velocity_basis,
+        strain_basis="P0",
+        solver="gs",
+        max_iterations=2000,
+        tolerance=1.0e-8,
+        air_drag=1.0e-6,
+        warmstart_mode="none",
+    )
+    for name, value in options.items():
+        setattr(config, name, value)
+    return config
+
+
+def test_face_velocity_inviscid_fluid(test, device):
+    """Check the experimental Raviart-Thomas (face flux) velocity basis on an inviscid fluid block.
+
+    With particle and cell integration, a freely falling block keeps a
+    uniform velocity, and from random particle velocities the incompressible
+    grid velocity is divergence-free at every interior particle, not only on
+    average over cells as with Q1 velocities, so that particles advect without
+    compressing.
+    """
+    dt = 0.01
+
+    def random_velocity(positions):
+        return np.random.default_rng(4).normal(size=positions.shape)
+
+    divergence_at_particles = {}
+    for velocity_basis, integration_scheme in (("RT1", "pic"), ("RT1", "cell"), ("Q1", "pic")):
+        config = _face_velocity_config(velocity_basis, integration_scheme=integration_scheme)
+        if velocity_basis == "RT1":
+            with test.subTest(integration_scheme=integration_scheme, check="free fall"):
+                model = _make_fluid_block(device, gravity=(0.0, -10.0, 0.0))
+                _, state = _step_mpm(model, config, step_count=3, dt=dt)
+                np.testing.assert_allclose(
+                    state.particle_qd.numpy(), np.broadcast_to((0.0, -0.3, 0.0), (model.particle_count, 3)), atol=1.0e-4
+                )
+
+        model = _make_fluid_block(device, gravity=(0.0, 0.0, 0.0), velocity=random_velocity)
+        initial_positions = model.particle_q.numpy()
+        _, state = _step_mpm(model, config, step_count=1, dt=dt)
+        field = state.velocity_field
+        with wp.ScopedDevice(device):
+            positions = wp.array(initial_positions, dtype=wp.vec3)
+            pic = fem.PicQuadrature(fem.Cells(field.space.geometry), positions)
+            divergence = wp.zeros(model.particle_count, dtype=float)
+            fem.interpolate(_sample_divergence, at=pic, fields={"v": field}, values={"divergence": divergence})
+        # Particles away from the free surface of the block
+        centered = np.abs(initial_positions - initial_positions.mean(axis=0))
+        interior = np.all(centered < 0.1, axis=1)
+        divergence_at_particles[velocity_basis, integration_scheme] = np.abs(divergence.numpy()[interior]).max()
+
+    # Random unit velocities at 0.05 spacing have divergences of order 10
+    test.assertLess(divergence_at_particles["RT1", "pic"], 1.0e-3)
+    test.assertLess(divergence_at_particles["RT1", "cell"], 1.0e-3)
+    test.assertGreater(divergence_at_particles["Q1", "pic"], 1.0e-2)
+
+
+def _make_cuboid_collider_mesh(device, center, half_extents):
+    box = newton.Mesh.create_box(
+        *half_extents,
+        duplicate_vertices=False,
+        compute_normals=False,
+        compute_uvs=False,
+        compute_inertia=False,
+    )
+    points = wp.array(box.vertices + np.asarray(center), dtype=wp.vec3, device=device)
+    indices = wp.array(box.indices, dtype=int, device=device)
+    return wp.Mesh(points, indices, wp.zeros_like(points))
+
+
+def test_face_collider_fluid_at_rest(test, device):
+    """Keep water at rest in a box whose floor and walls cut the grid cells in half.
+
+    Face-center collider rows hold the face fluxes through the box, and the
+    strain counts only the part of each face cell that lies outside the box,
+    so that cut cells match the hydrostatic pressure of full cells. The box
+    walls then enter the strain operator itself, which also holds the fluid
+    in conjugate-gradient warm starts.
+    """
+    # Water filling [0.05, 0.45] x [0.05, 0.35] x [0.05, 0.45], between grid planes 0.1 apart
+    model = _make_fluid_block(device, gravity=(0.0, -10.0, 0.0), origin=0.075, dims=(8, 6, 8))
+    initial_positions = model.particle_q.numpy()
+    meshes = [
+        _make_cuboid_collider_mesh(device, (0.25, -0.05, 0.25), (0.45, 0.1, 0.45)),
+        _make_cuboid_collider_mesh(device, (-0.05, 0.25, 0.25), (0.1, 0.3, 0.45)),
+        _make_cuboid_collider_mesh(device, (0.55, 0.25, 0.25), (0.1, 0.3, 0.45)),
+        _make_cuboid_collider_mesh(device, (0.25, 0.25, -0.05), (0.45, 0.3, 0.1)),
+        _make_cuboid_collider_mesh(device, (0.25, 0.25, 0.55), (0.45, 0.3, 0.1)),
+    ]
+    for integration_scheme in ("pic", "cell"):
+        for solver_spec in ("gs", ("cg", "gs")):
+            with test.subTest(integration_scheme=integration_scheme, solver=solver_spec):
+                config = _face_velocity_config(
+                    collider_basis="RT1", integration_scheme=integration_scheme, solver=solver_spec
+                )
+                solver = SolverImplicitMPM(model, config)
+                solver.setup_collider(collider_meshes=meshes, collider_friction=[0.0] * len(meshes))
+                state_0 = model.state()
+                state_1 = model.state()
+                for _ in range(10):
+                    solver.step(state_0, state_1, control=None, contacts=None, dt=0.01)
+                    state_0, state_1 = state_1, state_0
+                # Falling freely for these 0.1 s would reach 1 m/s
+                speed = np.linalg.norm(state_0.particle_qd.numpy(), axis=1)
+                test.assertLess(speed.max(), 0.03)
+                np.testing.assert_allclose(state_0.particle_q.numpy(), initial_positions, atol=2.0e-3)
+
+
+def test_face_velocity_rejects_unsupported(test, device):
+    """Reject configurations and materials that the Raviart-Thomas velocity basis does not support."""
+    model = _make_fluid_block(device, gravity=(0.0, 0.0, 0.0))
+    with test.assertRaises(ValueError):
+        SolverImplicitMPM(model, _face_velocity_config("Q1", collider_basis="RT1"))
+    for options in (
+        {"strain_basis": "P1d"},
+        {"strain_basis": "P1d", "integration_scheme": "cell"},
+        {"integration_scheme": "gimp"},
+        {"solver": "gs-soa"},
+    ):
+        with test.subTest(**options):
+            with test.assertRaises(NotImplementedError):
+                SolverImplicitMPM(model, _face_velocity_config(**options))
+
+    model.mpm.young_modulus.fill_(1.0e5)
+    with test.assertRaises(NotImplementedError):
+        SolverImplicitMPM(model, _face_velocity_config())
+
+
 def test_cell_integration_rejects_unsupported(test, device):
     """Reject configurations and materials that cell quadrature does not support."""
     model = _make_mpm_particle_builder().finalize(device=device)
@@ -2519,6 +2684,15 @@ add_function_test(
     "test_cell_integration_particle_contact_rows",
     test_cell_integration_particle_contact_rows,
     devices=devices,
+)
+add_function_test(
+    TestImplicitMPM, "test_face_velocity_inviscid_fluid", test_face_velocity_inviscid_fluid, devices=devices
+)
+add_function_test(
+    TestImplicitMPM, "test_face_collider_fluid_at_rest", test_face_collider_fluid_at_rest, devices=devices
+)
+add_function_test(
+    TestImplicitMPM, "test_face_velocity_rejects_unsupported", test_face_velocity_rejects_unsupported, devices=devices
 )
 add_function_test(
     TestImplicitMPM,

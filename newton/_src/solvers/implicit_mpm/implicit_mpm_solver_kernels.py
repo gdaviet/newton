@@ -34,6 +34,8 @@ mat63 = wp.types.matrix(shape=(6, 3), dtype=wp.float32)
 mat36 = wp.types.matrix(shape=(3, 6), dtype=wp.float32)
 mat13 = wp.types.matrix(shape=(1, 3), dtype=wp.float32)
 mat31 = wp.types.matrix(shape=(3, 1), dtype=wp.float32)
+mat16 = wp.types.matrix(shape=(1, 6), dtype=wp.float32)
+mat61 = wp.types.matrix(shape=(6, 1), dtype=wp.float32)
 mat11 = wp.types.matrix(shape=(1, 1), dtype=wp.float32)
 
 YIELD_PARAM_LENGTH = type_size(YieldParamVec)
@@ -126,6 +128,32 @@ def integrate_mass(
 
 
 @fem.integrand
+def integrate_face_mass(
+    s: fem.Sample,
+    u: fem.Field,
+    domain: fem.Domain,
+    inv_cell_volume: float,
+    inv_face_area: float,
+    particle_density: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+):
+    """Lumped mass of face-flux (Raviart-Thomas) velocity dofs.
+
+    On axis-aligned cells, each basis function has a single nonzero
+    component: a hat along its face normal over the face area. Lumping its
+    row of the consistent mass matrix over the faces normal to the same axis,
+    whose hats sum to one, weights the particle mass by the basis magnitude
+    over the face area.
+    """
+    if ~particle_flags[s.qp_index] & newton.ParticleFlags.ACTIVE:
+        return 0.0
+
+    density = wp.where(particle_density[s.qp_index] > 0.0, particle_density[s.qp_index], INFINITY)
+    w = u(s)
+    return (wp.abs(w[0]) + wp.abs(w[1]) + wp.abs(w[2])) * density * inv_cell_volume * inv_face_area
+
+
+@fem.integrand
 def integrate_velocity(
     s: fem.Sample,
     domain: fem.Domain,
@@ -178,11 +206,11 @@ def integrate_velocity_apic(
 
 @wp.kernel
 def free_velocity(
-    velocity_int: wp.array[wp.vec3],
+    velocity_int: wp.array[Any],
     node_particle_mass: wp.array[float],
     drag: float,
     inv_mass_matrix: wp.array[float],
-    velocity_avg: wp.array[wp.vec3],
+    velocity_avg: wp.array[Any],
 ):
     i = wp.tid()
 
@@ -307,6 +335,23 @@ def strain_delta_form(
     return fem.div(u, s) * tau(s) * (dt * inv_cell_volume)
 
 
+@fem.integrand
+def full_strain_delta_form(
+    s: fem.Sample,
+    u: fem.Field,
+    tau: fem.Field,
+    dt: float,
+    domain: fem.Domain,
+    inv_cell_volume: float,
+    particle_flags: wp.array[wp.int32],
+):
+    """Strain matrix with full symmetric strain blocks, for vector-valued velocity basis functions."""
+    if ~particle_flags[s.qp_index] & newton.ParticleFlags.ACTIVE:
+        return 0.0
+
+    return wp.ddot(fem.D(u, s), tau(s)) * (dt * inv_cell_volume)
+
+
 @wp.kernel
 def compute_unilateral_strain_offset(
     max_fraction: float,
@@ -359,12 +404,83 @@ def collision_weight_field(
     normal: fem.Field,
     trial: fem.Field,
 ):
-    n = normal(s)
-    if wp.length_sq(n) == 0.0:
-        # invalid normal, contact is disabled
-        return 0.0
+    # An invalid (zero) normal disables contact
+    enabled = wp.where(wp.length_sq(normal(s)) == 0.0, 0.0, 1.0)
+    return enabled * trial(s)
 
-    return trial(s)
+
+@fem.integrand
+def face_collision_weight_field(
+    s: fem.Sample,
+    normal: fem.Field,
+    trial: fem.Field,
+):
+    """Normal velocity of the face carrying a face-center collider point, one face flux per contact row."""
+    enabled = wp.where(wp.length_sq(normal(s)) == 0.0, 0.0, 1.0)
+    # The carrying face is the one where the grid-aligned reference coordinate is 0 or 1
+    offset = wp.abs(s.element_coords - fem.Coords(0.5))
+    axis = wp.vec3(0.0)
+    if offset[0] >= wp.max(offset[1], offset[2]):
+        axis[0] = 1.0
+    elif offset[1] >= offset[2]:
+        axis[1] = 1.0
+    else:
+        axis[2] = 1.0
+    return enabled * wp.dot(trial(s), axis) * axis
+
+
+@wp.kernel
+def face_open_fractions(
+    collider_mat_offsets: wp.array[int],
+    collider_mat_columns: wp.array[int],
+    collider_mat_values: wp.array[wp.vec3],
+    collider_open_fraction: wp.array[float],
+    collider_velocities: wp.array[wp.vec3],
+    open_fraction: wp.array[float],
+    solid_flux: wp.array[float],
+):
+    """Open fraction and collider flux of the face carrying each face-center contact point.
+
+    The open fraction is the part of the voxel-sized cube centered on the face
+    that lies outside colliders. The collider flux is the collider velocity
+    component along the face normal, in face flux units.
+    """
+    i = wp.tid()
+    beg = collider_mat_offsets[i]
+    if collider_mat_offsets[i + 1] - beg != 1:
+        return
+    face = collider_mat_columns[beg]
+    weight = collider_mat_values[beg]
+    open_fraction[face] = collider_open_fraction[i]
+    solid_flux[face] = wp.dot(collider_velocities[i], weight) / wp.length_sq(weight)
+
+
+@wp.kernel
+def blocked_face_flux(open_fraction: wp.array[float], solid_flux: wp.array[float]):
+    """Collider flux through the blocked part of each face."""
+    f = wp.tid()
+    solid_flux[f] = (1.0 - open_fraction[f]) * solid_flux[f]
+
+
+@wp.kernel
+def scale_face_strain_columns(
+    open_fraction: wp.array[float],
+    strain_mat_columns: wp.array[int],
+    strain_mat_values: wp.array[vec6],
+):
+    """Restrict each face flux's strain contribution to the open part of the face."""
+    b = wp.tid()
+    strain_mat_values[b] = open_fraction[strain_mat_columns[b]] * strain_mat_values[b]
+
+
+@wp.kernel
+def fill_face_center_points(coords: wp.array2d[fem.Coords], weights: wp.array2d[float]):
+    """Place one point at the center of each of the six faces of every cell, sharing the cell volume."""
+    cell, face = wp.tid()
+    point = fem.Coords(0.5, 0.5, 0.5)
+    point[face // 2] = float(face % 2)
+    coords[cell, face] = point
+    weights[cell, face] = 1.0 / 6.0
 
 
 @fem.integrand
