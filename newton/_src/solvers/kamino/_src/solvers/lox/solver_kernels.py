@@ -417,6 +417,7 @@ def _finalize_world_iteration(
     iteration_count: wp.array[wp.int32],
     structural_residual: wp.array[wp.float32],
     effort_residual: wp.array[wp.float32],
+    deformable_residual: wp.array[wp.float32],
     world_active: wp.array[wp.bool],
     world_converged: wp.array[wp.bool],
     iteration_condition: wp.array[wp.int32],
@@ -424,8 +425,8 @@ def _finalize_world_iteration(
 ):
     """Count the iteration, deactivate the converged and failed worlds, and request another iteration for the others.
 
-    The structural and effort residuals accumulate during the multiplier updates of an iteration;
-    this check consumes and clears them.
+    The structural, effort, and deformable residuals accumulate during the
+    multiplier updates of an iteration; this check consumes and clears them.
     """
     wid = wp.tid()
     if not world_active[wid]:
@@ -446,6 +447,9 @@ def _finalize_world_iteration(
     if effort_residual:
         total = wp.max(total, effort_residual[wid])
         effort_residual[wid] = 0.0
+    if deformable_residual:
+        total = wp.max(total, deformable_residual[wid])
+        deformable_residual[wid] = 0.0
     total = wp.max(total, unilateral_residual[wid])
     residual_total[wid] = total
     if total <= 1.0:
