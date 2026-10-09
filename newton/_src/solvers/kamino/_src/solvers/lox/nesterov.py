@@ -17,6 +17,8 @@ iterations, the change ``v - v_previous`` of the last sweep carries over to
 the warm start of the next projection, whose candidate twist differs.
 
 The kernels run over the stacked reaction vector ``[box rows | contacts]``.
+With deformable bodies, the particle contact rows and the projected particle
+velocities follow the same extrapolation, in separate launches.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from .contact import (
     spatial_friction_scaling,
 )
 from .projection_kernels import is_active_row
+from .types import ParticleContactStatus
 
 if TYPE_CHECKING:
     from .types import LOXProblemData, NesterovData
@@ -402,8 +405,8 @@ def _extrapolate_reactions_and_twists(
     contact_world: wp.array[wp.int32],
     contact_local: wp.array[wp.int32],
     world_contact_count: wp.array[wp.int32],
+    body_count: wp.int32,
     body_world: wp.array[wp.int32],
-    world_body_offset: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
     world_failed: wp.array[wp.bool],
     read: wp.int32,
@@ -425,7 +428,7 @@ def _extrapolate_reactions_and_twists(
     """Extrapolate each reaction and each body twist by the momentum of its world.
 
     Every thread derives the momentum of its world from the ``read`` buffers of ``theta`` and ``restart_dot``;
-    the first body of each world writes the next ``theta`` and clears the restart dot of the next sweep, in the
+    one trailing thread per world writes the next ``theta`` and clears the restart dot of the next sweep, in the
     other buffers.
     """
     tid = wp.tid()
@@ -453,13 +456,17 @@ def _extrapolate_reactions_and_twists(
             )
         return
     bid = cid - contact_capacity
-    wid = body_world[bid]
+    if bid < body_count:
+        wid = body_world[bid]
+        if world_active[wid] and not world_failed[wid]:
+            _next_theta, beta = nesterov_momentum(theta[read, wid], restart_dot[read, wid])
+            extrapolate_body_twist(bid, beta, projected_twist, twist_previous)
+        return
+    wid = bid - body_count
     if world_active[wid] and not world_failed[wid]:
-        next_theta, beta = nesterov_momentum(theta[read, wid], restart_dot[read, wid])
-        extrapolate_body_twist(bid, beta, projected_twist, twist_previous)
-        if bid == world_body_offset[wid]:
-            theta[1 - read, wid] = next_theta
-            restart_dot[1 - read, wid] = 0.0
+        next_theta, _beta = nesterov_momentum(theta[read, wid], restart_dot[read, wid])
+        theta[1 - read, wid] = next_theta
+        restart_dot[1 - read, wid] = 0.0
 
 
 @wp.kernel
@@ -477,6 +484,127 @@ def _difference_twists(
     wid = body_world[bid]
     if world_active[wid] and not world_failed[wid]:
         twist_previous[bid] = projected_twist[bid] - twist_previous[bid]
+
+
+@wp.kernel
+def _initialize_particle_reactions(
+    # Inputs:
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    friction: wp.array[wp.float32],
+    world_active: wp.array[wp.bool],
+    recycle: wp.bool,
+    history: wp.array[wp.int32],
+    # Outputs:
+    reaction: wp.array[wp.vec3f],
+    trial: wp.array[wp.vec3f],
+    previous: wp.array[wp.vec3f],
+):
+    """Project the warm-start reaction of each particle contact row onto its cone and reset its momentum.
+
+    With ``recycle``, the worlds that hold the row history of the previous splitting iteration keep it.
+    """
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        return
+    wid = row_world[row]
+    if not world_active[wid] or (recycle and history[wid] == 1):
+        return
+    value = project_to_coulomb_cone(reaction[row], friction[row])
+    reaction[row] = value
+    trial[row] = value
+    previous[row] = value
+
+
+@wp.kernel
+def _accumulate_particle_restart_dot(
+    # Inputs:
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    reaction: wp.array[wp.vec3f],
+    trial: wp.array[wp.vec3f],
+    previous: wp.array[wp.vec3f],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    read: wp.int32,
+    # Outputs:
+    restart_dot: wp.array2d[wp.float32],
+):
+    """Accumulate ``(lambda - trial) . (lambda - previous)`` of the particle contact rows per world."""
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        return
+    wid = row_world[row]
+    if not world_active[wid] or world_failed[wid]:
+        return
+    current = reaction[row]
+    wp.atomic_add(restart_dot, read, wid, wp.dot(current - trial[row], current - previous[row]))
+
+
+@wp.kernel
+def _extrapolate_particle_reactions_and_velocities(
+    # Inputs:
+    row_capacity: wp.int32,
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    particle_world: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    read: wp.int32,
+    theta: wp.array2d[wp.float32],
+    restart_dot: wp.array2d[wp.float32],
+    # Outputs:
+    reaction: wp.array[wp.vec3f],
+    trial: wp.array[wp.vec3f],
+    previous: wp.array[wp.vec3f],
+    projected_velocity: wp.array[wp.vec3f],
+    velocity_previous: wp.array[wp.vec3f],
+):
+    """Extrapolate each particle contact reaction and each projected particle velocity by the momentum of its
+    world.
+
+    The particle velocities are affine in the reactions, with weights fixed over a LOX solve, so they follow
+    the same extrapolation, with no impulse scatter.
+    """
+    tid = wp.tid()
+    if tid < row_capacity:
+        row = tid
+        if row_status[row] != ParticleContactStatus.ACTIVE:
+            return
+        wid = row_world[row]
+        if not world_active[wid] or world_failed[wid]:
+            return
+        _next_theta, beta = nesterov_momentum(theta[read, wid], restart_dot[read, wid])
+        current = reaction[row]
+        extrapolated = current + beta * (current - previous[row])
+        previous[row] = current
+        trial[row] = extrapolated
+        reaction[row] = extrapolated
+        return
+    pid = tid - row_capacity
+    wid = particle_world[pid]
+    if world_active[wid] and not world_failed[wid]:
+        _next_theta, beta = nesterov_momentum(theta[read, wid], restart_dot[read, wid])
+        current = projected_velocity[pid]
+        projected_velocity[pid] = current + beta * (current - velocity_previous[pid])
+        velocity_previous[pid] = current
+
+
+@wp.kernel
+def _difference_velocities(
+    # Inputs:
+    particle_world: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    projected_velocity: wp.array[wp.vec3f],
+    # Outputs:
+    velocity_previous: wp.array[wp.vec3f],
+):
+    """Replace each previous particle velocity by its difference with the projected velocity."""
+    pid = wp.tid()
+    wid = particle_world[pid]
+    if world_active[wid] and not world_failed[wid]:
+        velocity_previous[pid] = projected_velocity[pid] - velocity_previous[pid]
 
 
 ###
@@ -517,6 +645,8 @@ class NesterovAcceleration:
         self._data.theta.fill_(1.0)
         self._data.history.zero_()
         self._data.twist_previous.zero_()
+        if self._data.velocity_previous is not None:
+            self._data.velocity_previous.zero_()
 
     def begin(self, world_active: wp.array[wp.bool], extrapolations: int, recycle: bool = False) -> None:
         """Clamp the warm-start reactions and restart the row history.
@@ -537,6 +667,15 @@ class NesterovAcceleration:
         angular_reaction, angular_friction, _frame = self._spatial_arrays()
         if self._capacity > 0:
             self._initialize_reactions(world_active, recycle, angular_reaction, angular_friction)
+        rows = p.particle_contact_rows
+        if rows is not None and rows.capacity > 0:
+            wp.launch(
+                _initialize_particle_reactions,
+                dim=rows.capacity,
+                inputs=[rows.world, rows.status, rows.friction, world_active, recycle, self._data.history],
+                outputs=[rows.reaction, self._data.particle_trial, self._data.particle_previous],
+                device=p.device,
+            )
         # After the rows, which read the history flags of the previous splitting iteration
         wp.launch(
             _initialize_worlds,
@@ -590,16 +729,22 @@ class NesterovAcceleration:
         world_failed: wp.array[wp.bool],
         recycle: bool,
         projected_twist: wp.array[vec6f],
+        projected_velocity: wp.array[wp.vec3f] | None = None,
     ) -> None:
-        """Set the previous twists of the warm-started reactions, after the warm start.
+        """Set the previous twists and particle velocities of the warm-started reactions, after the warm start.
 
-        With ``recycle``, the previous twists hold the change of the last sweep of the previous splitting
-        iteration (:meth:`end_twists`), and become the warm-started twists minus that change.
+        With ``recycle``, the previous twists and velocities hold the change of the last sweep of the previous
+        splitting iteration (:meth:`end_twists`), and become the warm-started ones minus that change.
         """
+        particles = self._has_particles(projected_velocity)
         if not recycle:
             wp.copy(self._data.twist_previous, projected_twist)
+            if particles:
+                wp.copy(self._data.velocity_previous, projected_velocity)
             return
         self._difference_twists(body_world, world_active, world_failed, projected_twist)
+        if particles:
+            self._difference_velocities(world_active, world_failed, projected_velocity)
 
     def end_twists(
         self,
@@ -607,9 +752,13 @@ class NesterovAcceleration:
         world_active: wp.array[wp.bool],
         world_failed: wp.array[wp.bool],
         projected_twist: wp.array[vec6f],
+        projected_velocity: wp.array[wp.vec3f] | None = None,
     ) -> None:
-        """Keep the twist change of the last sweep, for the deferred extrapolation of a recycled projection."""
+        """Keep the twist and particle velocity changes of the last sweep, for the deferred extrapolation of a
+        recycled projection."""
         self._difference_twists(body_world, world_active, world_failed, projected_twist)
+        if self._has_particles(projected_velocity):
+            self._difference_velocities(world_active, world_failed, projected_velocity)
 
     def extrapolate(
         self,
@@ -617,17 +766,65 @@ class NesterovAcceleration:
         world_active: wp.array[wp.bool],
         world_failed: wp.array[wp.bool],
         projected_twist: wp.array[vec6f],
+        projected_velocity: wp.array[wp.vec3f] | None = None,
     ) -> None:
-        """Update the momentum and extrapolate the reactions and the body twists of the last sweep."""
+        """Update the momentum and extrapolate the reactions, the body twists, and the particle velocities of the
+        last sweep."""
         p = self.problem_data
         read = (self._extrapolations + self._extrapolation) % 2
         self._extrapolation += 1
         angular_reaction, angular_friction, _frame = self._spatial_arrays()
         if self._capacity > 0:
             self._accumulate_restart_dot(world_active, world_failed, read, angular_reaction, angular_friction)
+        rows = p.particle_contact_rows
+        row_capacity = rows.capacity if rows is not None else 0
+        if row_capacity > 0:
+            wp.launch(
+                _accumulate_particle_restart_dot,
+                dim=row_capacity,
+                inputs=[
+                    rows.world,
+                    rows.status,
+                    rows.reaction,
+                    self._data.particle_trial,
+                    self._data.particle_previous,
+                    world_active,
+                    world_failed,
+                    read,
+                ],
+                outputs=[self._data.restart_dot],
+                device=p.device,
+            )
+        # Reads the momentum buffers before the launch below writes the next ones
+        if self._has_particles(projected_velocity) or row_capacity > 0:
+            particle_count = projected_velocity.shape[0] if projected_velocity is not None else 0
+            wp.launch(
+                _extrapolate_particle_reactions_and_velocities,
+                dim=row_capacity + particle_count,
+                inputs=[
+                    row_capacity,
+                    rows.world,
+                    rows.status,
+                    p.particle_world,
+                    world_active,
+                    world_failed,
+                    read,
+                    self._data.theta,
+                    self._data.restart_dot,
+                ],
+                outputs=[
+                    rows.reaction,
+                    self._data.particle_trial,
+                    self._data.particle_previous,
+                    projected_velocity,
+                    self._data.velocity_previous,
+                ],
+                device=p.device,
+            )
+        body_count = projected_twist.shape[0]
         wp.launch(
             _extrapolate_reactions_and_twists,
-            dim=self._capacity + projected_twist.shape[0],
+            dim=self._capacity + body_count + p.num_worlds,
             inputs=[
                 p.box_rows.capacity,
                 p.box_rows.world,
@@ -637,8 +834,8 @@ class NesterovAcceleration:
                 p.contact_rows.world,
                 p.contact_rows.local,
                 p.contact_rows.world_count,
+                body_count,
                 body_world,
-                p.world_body_offset,
                 world_active,
                 world_failed,
                 read,
@@ -703,6 +900,18 @@ class NesterovAcceleration:
             dim=projected_twist.shape[0],
             inputs=[body_world, world_active, world_failed, projected_twist],
             outputs=[self._data.twist_previous],
+            device=self.problem_data.device,
+        )
+
+    def _has_particles(self, projected_velocity: wp.array[wp.vec3f] | None) -> bool:
+        return projected_velocity is not None and projected_velocity.shape[0] > 0
+
+    def _difference_velocities(self, world_active, world_failed, projected_velocity) -> None:
+        wp.launch(
+            _difference_velocities,
+            dim=projected_velocity.shape[0],
+            inputs=[self.problem_data.particle_world, world_active, world_failed, projected_velocity],
+            outputs=[self._data.velocity_previous],
             device=self.problem_data.device,
         )
 

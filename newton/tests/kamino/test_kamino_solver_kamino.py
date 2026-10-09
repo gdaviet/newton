@@ -569,6 +569,12 @@ class TestSolverKaminoConfig(NewtonTestCase):
             ({"contact_proximal_regularization": -0.01}, "contact_proximal_regularization"),
             ({"contact_proximal_warmstart_scale": 1.5}, "contact_proximal_warmstart_scale"),
             ({"contact_proximal_warmstart_window": float("nan")}, "contact_proximal_warmstart_window"),
+            ({"deformable_weight_beta": 0.5}, "deformable_weight_beta"),
+            ({"deformable_weight_beta": float("nan")}, "deformable_weight_beta"),
+            ({"deformable_consensus_fraction": 1.1}, "deformable_consensus_fraction"),
+            ({"deformable_consensus_fraction": float("nan")}, "deformable_consensus_fraction"),
+            ({"deformable_projected_velocity_fraction": 1.1}, "deformable_projected_velocity_fraction"),
+            ({"deformable_projected_velocity_fraction": float("nan")}, "deformable_projected_velocity_fraction"),
         )
         for kwargs, message in invalid_values:
             with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, message):
