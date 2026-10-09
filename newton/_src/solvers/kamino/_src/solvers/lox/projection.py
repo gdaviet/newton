@@ -12,6 +12,8 @@ result, e.g. between identical contacts of a symmetric body.
 
 Each sweep is one row-parallel launch. When the worlds fill the device or their
 rows are few, one thread block runs every sweep of a world, in a single launch.
+With deformable bodies, the sweeps also project the particle contact rows, which
+share the colors and the body corrections of the rigid rows.
 """
 
 from __future__ import annotations
@@ -25,13 +27,18 @@ from .anderson import AndersonProjection
 from .apgd import APGDAcceleration
 from .coloring import RowColoring
 from .projection_kernels import (
+    _apply_particle_delta,
     _apply_twist_delta,
     _prepare_box_blocks,
     _prepare_contact_blocks,
+    _prepare_particle_contact_responses,
+    _prepare_particle_contacts,
+    _prepare_physical_particle_contacts,
     _prepare_physical_spatial_contacts,
     _prepare_spatial_contacts,
     _warmstart_box_rows,
     _warmstart_contacts,
+    _warmstart_particle_contacts,
     _warmstart_spatial_contacts,
     make_sweep_kernel,
 )
@@ -108,13 +115,21 @@ class ProjectionSchedule:
         self.apgd = APGDAcceleration(problem_data, data.apgd) if data.apgd is not None else None
         self.anderson = AndersonProjection(problem_data, data.anderson) if data.anderson is not None else None
 
+        particle_rows = problem_data.particle_contact_rows
+        self._particles = particle_rows is not None
         row_capacity = problem_data.box_rows.capacity + problem_data.contact_rows.capacity
+        if self._particles:
+            row_capacity += particle_rows.capacity
         blocks_per_sm = _COLORED_BLOCKS_PER_SM if colored else _JACOBI_BLOCKS_PER_SM
         self._worker_count = row_capacity
         if self.device.is_cuda:
             max_workers = max(_SWEEP_BLOCK_DIM, self.device.sm_count * blocks_per_sm * _SWEEP_BLOCK_DIM)
             self._worker_count = min(row_capacity, max_workers)
-        if colored:
+        if self._particles:
+            # The per-world kernels sweep the rigid rows of each world only
+            self._world_block_dim = _COLORED_WORLD_BLOCK_DIM if colored else _JACOBI_WORLD_BLOCK_DIM
+            self._by_world = False
+        elif colored:
             self._world_block_dim = _COLORED_WORLD_BLOCK_DIM
             self._by_world = can_project_by_world(
                 self.device,
@@ -153,28 +168,67 @@ class ProjectionSchedule:
     # Public API
     ###
 
-    def prepare(self, inverse_weight: wp.array[mat66f], world_failed: wp.array[wp.bool]) -> None:
-        """Color the rows and prepare the local blocks for the current body weights.
+    def prepare(
+        self,
+        inverse_weight: wp.array[mat66f],
+        world_failed: wp.array[wp.bool],
+        particle_inverse_weight: wp.array[wp.float32] | None = None,
+    ) -> None:
+        """Color the rows and prepare the local blocks for the current body and particle weights.
 
         Args:
             inverse_weight: Inverse body weight ``W^-1`` of each body.
             world_failed: Failure flag of each world, set for worlds with an invalid local block.
+            particle_inverse_weight: Inverse weight ``w^-1`` of each packed particle, with deformable bodies.
         """
         p = self.problem_data
         self._weights = self._prepare_weights(inverse_weight)
+        self._particle_inverse_weight = particle_inverse_weight
+        coloring = self._data.coloring
         if self.coloring is not None:
             self.coloring.build()
             # The colored sweeps split each body over the rows of a color, the smoothing sweep over all its rows
             self._prepare_blocks(
                 inverse_weight,
-                self._data.coloring.occupancy,
-                self._data.coloring.box.color,
-                self._data.coloring.contact.color,
+                coloring.occupancy,
+                coloring.box.color,
+                coloring.contact.color,
                 p.body_incidence,
                 world_failed,
             )
+            if self._particles:
+                self._prepare_particle_blocks(
+                    inverse_weight,
+                    coloring.occupancy,
+                    coloring.particle.color,
+                    coloring.particle_weight_sum,
+                    particle_inverse_weight,
+                    self._data.particle_delassus,
+                    world_failed,
+                )
+                self._prepare_particle_blocks(
+                    inverse_weight,
+                    p.body_incidence,
+                    None,
+                    p.particle_weight_sum,
+                    particle_inverse_weight,
+                    self._data.particle_smoothing_delassus,
+                    world_failed,
+                )
         else:
             self._prepare_blocks(inverse_weight, p.body_incidence, None, None, None, world_failed)
+            if self._particles:
+                self._prepare_particle_blocks(
+                    inverse_weight,
+                    p.body_incidence,
+                    None,
+                    p.particle_weight_sum,
+                    particle_inverse_weight,
+                    self._data.particle_delassus,
+                    world_failed,
+                )
+        if self._particles:
+            self._prepare_physical_particle_blocks(particle_inverse_weight)
         if self.anderson is not None:
             self.anderson.reset()
         if self.apgd is not None:
@@ -188,6 +242,7 @@ class ProjectionSchedule:
         world_failed: wp.array[wp.bool],
         body_world: wp.array[wp.int32],
         projected_twist: wp.array[vec6f],
+        projected_velocity: wp.array[wp.vec3f] | None = None,
     ) -> None:
         """Warm start with the current reactions and run the projection sweeps with the weights of :meth:`prepare`.
 
@@ -201,38 +256,62 @@ class ProjectionSchedule:
             world_failed: Failure flag of each world.
             body_world: World of each body.
             projected_twist: Projected body twists, updated in place.
+            projected_velocity: Projected particle velocities, updated in place, with deformable bodies.
         """
         self._begin_outer_iteration(world_active, recycle=recycle)
         if self._by_world:
             self._project_by_world(iterations, recycle, world_active, self._weights, projected_twist, world_failed)
             return
 
+        weights = (self._weights, self._particle_inverse_weight)
+        velocities = (projected_twist, projected_velocity)
         if self.apgd is not None:
             self.apgd.begin(world_active, recycle=recycle)
-        self._warmstart(world_active, self._weights, world_failed)
-        self._apply(body_world, world_active, world_failed, projected_twist)
+        self._warmstart(world_active, weights, world_failed)
+        self._apply(body_world, world_active, world_failed, velocities)
         if self.apgd is not None and recycle:
             # The extrapolation deferred from the last sweep of the previous splitting iteration;
             # a world without row history restarts its momentum here and stays at its warm start
-            self.apgd.extrapolate(world_active, world_failed, self._weights, self._data.twist_delta)
-            self._apply(body_world, world_active, world_failed, projected_twist)
+            self.apgd.extrapolate(
+                world_active,
+                world_failed,
+                self._weights,
+                self._data.twist_delta,
+                self._particle_inverse_weight,
+                self._data.particle_delta,
+            )
+            self._apply(body_world, world_active, world_failed, velocities)
 
         if self.anderson is not None:
             self.anderson.begin_map(world_active, world_failed)
         for iteration in range(iterations):
             for color in range(self.color_count):
-                self._sweep(color, world_active, self._weights, projected_twist, world_failed)
-                self._apply(body_world, world_active, world_failed, projected_twist)
+                self._sweep(color, world_active, weights, velocities, world_failed)
+                self._apply(body_world, world_active, world_failed, velocities)
             if self.anderson is not None:
-                self.anderson.finish_map(world_active, world_failed, self._weights, self._data.twist_delta)
-                self._apply(body_world, world_active, world_failed, projected_twist)
+                self.anderson.finish_map(
+                    world_active,
+                    world_failed,
+                    self._weights,
+                    self._data.twist_delta,
+                    self._particle_inverse_weight,
+                    self._data.particle_delta,
+                )
+                self._apply(body_world, world_active, world_failed, velocities)
             if self.apgd is not None and iteration + 1 < iterations:
-                self.apgd.extrapolate(world_active, world_failed, self._weights, self._data.twist_delta)
-                self._apply(body_world, world_active, world_failed, projected_twist)
+                self.apgd.extrapolate(
+                    world_active,
+                    world_failed,
+                    self._weights,
+                    self._data.twist_delta,
+                    self._particle_inverse_weight,
+                    self._data.particle_delta,
+                )
+                self._apply(body_world, world_active, world_failed, velocities)
         if self.coloring is not None:
             # An order-independent Jacobi sweep restores the symmetry lost to the color ordering.
-            self._sweep(0, world_active, self._weights, projected_twist, world_failed, smoothing=True)
-            self._apply(body_world, world_active, world_failed, projected_twist)
+            self._sweep(0, world_active, weights, velocities, world_failed, smoothing=True)
+            self._apply(body_world, world_active, world_failed, velocities)
 
     ###
     # Internals
@@ -244,12 +323,26 @@ class ProjectionSchedule:
             self.anderson.begin_outer_iteration(world_active, recycle=recycle)
 
     def _prepare_weights(self, inverse_weight: wp.array[mat66f]) -> ProjectionWeights:
-        """Return the weights of the projection kernels; :meth:`_prepare_blocks` fills the twist responses."""
+        """Return the weights of the projection kernels and prepare the twist responses of the particle contact rows.
+
+        :meth:`_prepare_blocks` fills the twist responses of the rigid rows.
+        """
         p = self.problem_data
         weights = ProjectionWeights()
         weights.inverse_weight = inverse_weight
         weights.box_response = p.box_rows.response
         weights.contact_response = p.contact_rows.response
+        if self._particles:
+            rows = p.particle_contact_rows
+            if rows.capacity > 0:
+                wp.launch(
+                    _prepare_particle_contact_responses,
+                    dim=rows.capacity,
+                    inputs=[rows.status, rows.body, rows.body_jacobian, inverse_weight],
+                    outputs=[rows.response],
+                    device=self.device,
+                )
+            weights.particle_contact_response = rows.response
         return weights
 
     def _prepare_blocks(self, inverse_weight, occupancy, box_color, contact_color, smoothing_occupancy, world_failed):
@@ -374,8 +467,87 @@ class ProjectionSchedule:
             device=self.device,
         )
 
+    def _prepare_physical_particle_blocks(self, particle_inverse_weight: wp.array[wp.float32]) -> None:
+        """Prepare the unsplit Delassus blocks of the particle contact rows, which scale their convergence residuals."""
+        rows = self.problem_data.particle_contact_rows
+        if rows.capacity == 0:
+            return
+        wp.launch(
+            _prepare_physical_particle_contacts,
+            dim=rows.capacity,
+            inputs=[
+                rows.status,
+                rows.particle,
+                rows.coefficient,
+                rows.body,
+                rows.body_jacobian,
+                particle_inverse_weight,
+                rows.response,
+            ],
+            outputs=[rows.physical_delassus],
+            device=self.device,
+        )
+
+    def _prepare_particle_blocks(
+        self,
+        inverse_weight,
+        occupancy,
+        particle_color,
+        particle_weight_sum,
+        particle_inverse_weight,
+        particle_delassus,
+        world_failed,
+    ):
+        rows = self.problem_data.particle_contact_rows
+        if rows.capacity == 0:
+            return
+        wp.launch(
+            _prepare_particle_contacts,
+            dim=rows.capacity,
+            inputs=[
+                rows.world,
+                rows.status,
+                particle_color,
+                rows.particle,
+                rows.coefficient,
+                rows.body,
+                rows.body_jacobian,
+                rows.bias,
+                rows.friction,
+                particle_weight_sum,
+                particle_inverse_weight,
+                occupancy,
+                rows.response,
+            ],
+            outputs=[particle_delassus, world_failed],
+            device=self.device,
+        )
+
     def _warmstart(self, world_active, weights, world_failed) -> None:
         p = self.problem_data
+        weights, particle_inverse_weight = weights
+        if self._particles and p.particle_contact_rows.capacity > 0:
+            rows = p.particle_contact_rows
+            wp.launch(
+                _warmstart_particle_contacts,
+                dim=rows.capacity,
+                inputs=[
+                    rows.world,
+                    rows.status,
+                    rows.particle,
+                    rows.coefficient,
+                    rows.body,
+                    rows.frame,
+                    rows.body_jacobian,
+                    rows.reaction,
+                    world_active,
+                    world_failed,
+                    particle_inverse_weight,
+                    weights,
+                ],
+                outputs=[self._data.particle_delta, self._data.twist_delta],
+                device=self.device,
+            )
         if p.box_rows.capacity > 0:
             wp.launch(
                 _warmstart_box_rows,
@@ -442,16 +614,24 @@ class ProjectionSchedule:
                 device=self.device,
             )
 
-    def _sweep(self, color, world_active, weights, projected_twist, world_failed, smoothing=False) -> None:
+    def _sweep(self, color, world_active, weights, velocities, world_failed, smoothing=False) -> None:
         p = self.problem_data
         if self._worker_count == 0:
             return
+        weights, particle_inverse_weight = weights
+        projected_twist, projected_velocity = velocities
         colored = self.coloring is not None and not smoothing
         box = self._data.coloring.box if colored else None
         contact = self._data.coloring.contact if colored else None
         spatial = self._data.spatial_smoothing_blocks if smoothing else self._data.spatial_blocks
+        particles = self._particles
+        rows = p.particle_contact_rows
+        particle = self._data.coloring.particle if colored and particles else None
+        if particles:
+            particle_delassus = self._data.particle_smoothing_delassus if smoothing else self._data.particle_delassus
+            particle_occupancy = self._data.coloring.particle_occupancy if colored else p.particle_incidence
         wp.launch(
-            make_sweep_kernel(spatial is not None),
+            make_sweep_kernel(spatial is not None, particles),
             dim=self._worker_count,
             inputs=[
                 self._worker_count,
@@ -490,6 +670,22 @@ class ProjectionSchedule:
                 spatial.delassus if spatial is not None else None,
                 spatial.eigenvectors if spatial is not None else None,
                 spatial.eigenvalues if spatial is not None else None,
+                particle.order if particle is not None else None,
+                particle.color_offset if particle is not None else None,
+                particle.color_count if particle is not None else None,
+                rows.world if particles else None,
+                rows.status if particles else None,
+                rows.particle if particles else None,
+                rows.coefficient if particles else None,
+                rows.body if particles else None,
+                rows.frame if particles else None,
+                rows.body_jacobian if particles else None,
+                rows.bias if particles else None,
+                rows.friction if particles else None,
+                particle_delassus if particles else None,
+                particle_inverse_weight,
+                particle_occupancy if particles else None,
+                projected_velocity,
                 world_active,
                 weights,
                 self._data.coloring.occupancy if colored else p.body_incidence,
@@ -499,14 +695,17 @@ class ProjectionSchedule:
                 p.box_rows.reaction,
                 p.contact_rows.reaction,
                 p.contact_rows.angular_reaction,
+                rows.reaction if particles else None,
                 self._data.twist_delta,
+                self._data.particle_delta,
                 world_failed,
             ],
             device=self.device,
             block_dim=_SWEEP_BLOCK_DIM,
         )
 
-    def _apply(self, body_world, world_active, world_failed, projected_twist) -> None:
+    def _apply(self, body_world, world_active, world_failed, velocities) -> None:
+        projected_twist, projected_velocity = velocities
         wp.launch(
             _apply_twist_delta,
             dim=projected_twist.shape[0],
@@ -514,6 +713,14 @@ class ProjectionSchedule:
             outputs=[self._data.twist_delta, projected_twist],
             device=self.device,
         )
+        if self._particles and projected_velocity.shape[0] > 0:
+            wp.launch(
+                _apply_particle_delta,
+                dim=projected_velocity.shape[0],
+                inputs=[self.problem_data.particle_world, world_active, world_failed],
+                outputs=[self._data.particle_delta, projected_velocity],
+                device=self.device,
+            )
 
     def _project_by_world(self, iterations, recycle, world_active, weights, projected_twist, world_failed) -> None:
         p = self.problem_data

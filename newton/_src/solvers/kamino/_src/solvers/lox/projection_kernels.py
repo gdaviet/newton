@@ -8,6 +8,10 @@ The unilateral rows come in two families that share the same per-world layout:
 - box rows (joint friction and joint limits) with ``lower <= lambda <= upper``;
 - contacts, with a normal-last ``(tangent_x, tangent_y, normal_z)`` Coulomb cone.
 
+With deformable bodies, a third family holds the particle contacts: each row couples up to
+four particles and at most one body through the same Coulomb cone, and accumulates
+``w^-1 c F delta_lambda`` into a per-particle delta.
+
 A row update solves one row against the current projected twist ``p`` and
 accumulates ``W^-1 J^T delta_lambda`` into a per-body delta. Bodies shared by
 ``m`` rows of the same sweep scale their inverse weight by ``m`` (mass
@@ -53,31 +57,41 @@ from .contact import (
 )
 from .solver_kernels import atomic_max_nonnegative, compute_body_iteration_residuals
 from .system_kernels import ProjectionWeights, apply_body_weight
+from .types import ParticleContactStatus
 
 ###
 # Module interface
 ###
 
 __all__ = [
+    "_apply_particle_delta",
     "_apply_twist_delta",
     "_compute_box_residuals",
+    "_compute_particle_contact_residuals",
     "_prepare_box_blocks",
     "_prepare_contact_blocks",
+    "_prepare_particle_contact_responses",
+    "_prepare_particle_contacts",
+    "_prepare_physical_particle_contacts",
     "_prepare_physical_spatial_contacts",
     "_prepare_spatial_contacts",
     "_project_box_row",
     "_project_contact_row",
+    "_project_particle_contact_row",
     "_project_spatial_contact_row",
     "_warmstart_box_rows",
     "_warmstart_contacts",
+    "_warmstart_particle_contacts",
     "_warmstart_spatial_contacts",
     "is_active_row",
     "make_contact_residuals_kernel",
     "make_iteration_residuals_kernel",
     "make_sweep_kernel",
+    "particle_contact_velocity",
     "row_color",
     "scatter_box_impulse",
     "scatter_contact_impulse",
+    "scatter_particle_contact_impulse",
 ]
 
 ###
@@ -102,6 +116,10 @@ _CONTACT_EIGENVALUE_FLOOR = 1.0e-6
 
 _UNRESOLVED_RESIDUAL = 1.0e30
 """Residual reported for a spatial contact whose residual is not finite."""
+
+
+PARTICLE_COEFFICIENT_TOLERANCE = 1.0e-5
+"""Smallest absolute interpolation coefficient of a particle that splits its inverse weight between rows."""
 
 
 ###
@@ -610,6 +628,148 @@ def scatter_contact_impulse(
         wp.atomic_add(twist_delta, bid_b, wp.transpose(weights.contact_response[cid, 1]) @ impulse)
 
 
+@wp.func
+def particle_contact_velocity(
+    row: wp.int32,
+    particle: wp.array2d[wp.int32],
+    coefficient: wp.array2d[wp.float32],
+    body: wp.array[wp.int32],
+    frame: wp.array[wp.mat33f],
+    body_jacobian: wp.array[mat36f],
+    projected_velocity: wp.array[wp.vec3f],
+    projected_twist: wp.array[vec6f],
+) -> wp.vec3f:
+    """Return the velocity ``sum_i c_i F^T p_i + J v_b`` of one particle contact row, without its bias."""
+    frame_transpose = wp.transpose(frame[row])
+    velocity = wp.vec3f(0.0)
+    for slot in range(4):
+        pid = particle[row, slot]
+        if pid >= 0:
+            velocity += coefficient[row, slot] * (frame_transpose @ projected_velocity[pid])
+    bid = body[row]
+    if bid >= 0:
+        velocity += body_jacobian[row] @ projected_twist[bid]
+    return velocity
+
+
+@wp.func
+def _particle_weight_term(
+    row: wp.int32,
+    color: wp.int32,
+    particle: wp.array2d[wp.int32],
+    coefficient: wp.array2d[wp.float32],
+    particle_inverse_weight: wp.array[wp.float32],
+    particle_weight_sum: wp.array2d[wp.float32],
+) -> wp.float32:
+    """Return the particle term ``sum_i |c_i| s_i w_i^-1`` of the mass-split Delassus block of one row.
+
+    ``s_i`` sums the absolute coefficients of particle ``i`` over the rows of the sweep, which
+    weights the Cauchy--Schwarz split ``c_i^2 w_i^-1 / omega_i`` with ``omega_i = |c_i| / s_i``.
+    """
+    value = wp.float32(0.0)
+    for slot in range(4):
+        pid = particle[row, slot]
+        weight = wp.abs(coefficient[row, slot])
+        if pid >= 0 and weight > PARTICLE_COEFFICIENT_TOLERANCE:
+            value += weight * particle_weight_sum[pid, color] * particle_inverse_weight[pid]
+    return value
+
+
+@wp.func
+def _accumulate_particle_delta(
+    pid: wp.int32,
+    color: wp.int32,
+    delta: wp.vec3f,
+    particle_occupancy: wp.array2d[wp.int32],
+    particle_delta: wp.array[wp.vec3f],
+):
+    # A plain add suffices for a particle touched by a single row of this sweep.
+    if particle_occupancy[pid, color] == 1:
+        particle_delta[pid] += delta
+    else:
+        wp.atomic_add(particle_delta, pid, delta)
+
+
+@wp.func
+def _project_particle_contact_row(
+    row: wp.int32,
+    color: wp.int32,
+    particle: wp.array2d[wp.int32],
+    coefficient: wp.array2d[wp.float32],
+    body: wp.array[wp.int32],
+    frame: wp.array[wp.mat33f],
+    body_jacobian: wp.array[mat36f],
+    bias: wp.array[wp.vec3f],
+    friction: wp.array[wp.float32],
+    delassus: wp.array[wp.mat33f],
+    reaction: wp.array[wp.vec3f],
+    particle_inverse_weight: wp.array[wp.float32],
+    weights: ProjectionWeights,
+    particle_occupancy: wp.array2d[wp.int32],
+    occupancy: wp.array2d[wp.int32],
+    projected_velocity: wp.array[wp.vec3f],
+    projected_twist: wp.array[vec6f],
+    particle_delta: wp.array[wp.vec3f],
+    twist_delta: wp.array[vec6f],
+):
+    """Project one particle contact row and accumulate its weighted particle and body corrections.
+
+    A non-finite reaction reaches the particle velocities, which fail the world.
+    """
+    velocity = bias[row] + particle_contact_velocity(
+        row, particle, coefficient, body, frame, body_jacobian, projected_velocity, projected_twist
+    )
+    reaction_old = reaction[row]
+    # An unloaded contact that is not approaching stays unloaded.
+    if _is_zero_vec3(reaction_old) and velocity[2] >= 0.0:
+        return
+    reaction_new = _project_contact_local(velocity, reaction_old, delassus[row], friction[row])
+    reaction[row] = reaction_new
+    delta = reaction_new - reaction_old
+    if _is_zero_vec3(delta):
+        return
+    world_delta = frame[row] @ delta
+    for slot in range(4):
+        pid = particle[row, slot]
+        if pid >= 0:
+            correction = particle_inverse_weight[pid] * coefficient[row, slot] * world_delta
+            _accumulate_particle_delta(pid, color, correction, particle_occupancy, particle_delta)
+    bid = body[row]
+    if bid >= 0:
+        body_correction = wp.transpose(weights.particle_contact_response[row]) @ delta
+        _accumulate_body_delta(bid, color, body_correction, occupancy, twist_delta)
+
+
+@wp.func
+def scatter_particle_contact_impulse(
+    row: wp.int32,
+    particle: wp.array2d[wp.int32],
+    coefficient: wp.array2d[wp.float32],
+    body: wp.array[wp.int32],
+    frame: wp.array[wp.mat33f],
+    body_jacobian: wp.array[mat36f],
+    impulse: wp.vec3f,
+    particle_inverse_weight: wp.array[wp.float32],
+    weights: ProjectionWeights,
+    particle_delta: wp.array[wp.vec3f],
+    twist_delta: wp.array[vec6f],
+):
+    """Accumulate the velocity changes ``w^-1 c F impulse`` and ``W^-1 J^T impulse`` of one particle contact row.
+
+    The body change comes from the prepared response of the row.
+    """
+    if _is_zero_vec3(impulse):
+        return
+    world_impulse = frame[row] @ impulse
+    for slot in range(4):
+        pid = particle[row, slot]
+        if pid >= 0:
+            wp.atomic_add(particle_delta, pid, particle_inverse_weight[pid] * coefficient[row, slot] * world_impulse)
+    bid = body[row]
+    if bid >= 0:
+        wp.atomic_add(twist_delta, bid, wp.transpose(weights.particle_contact_response[row]) @ impulse)
+
+
 ###
 # Kernels
 ###
@@ -675,6 +835,31 @@ def _split_contact_delassus(
     )
     delassus[2, 2] += _contact_normal_compliance(cid, compliance)
     return delassus, valid
+
+
+@wp.kernel
+def _prepare_particle_contact_responses(
+    # Inputs:
+    row_status: wp.array[wp.int32],
+    body: wp.array[wp.int32],
+    body_jacobian: wp.array[mat36f],
+    inverse_weight: wp.array[mat66f],
+    # Outputs:
+    response: wp.array[mat36f],
+):
+    """Prepare the transposed twist response ``J W^-1`` of each particle contact row on its body.
+
+    The response of a row without a body is zero.
+    """
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        return
+    bid = body[row]
+    value = mat36f(0.0)
+    if bid >= 0:
+        for axis in range(3):
+            value[axis] = apply_body_weight(inverse_weight[bid], body_jacobian[row][axis])
+    response[row] = value
 
 
 @wp.kernel
@@ -1034,6 +1219,215 @@ def _warmstart_spatial_contacts(
 
 
 @wp.kernel
+def _prepare_particle_contacts(
+    # Inputs:
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    row_color_index: wp.array[wp.int32],
+    particle: wp.array2d[wp.int32],
+    coefficient: wp.array2d[wp.float32],
+    body: wp.array[wp.int32],
+    body_jacobian: wp.array[mat36f],
+    bias: wp.array[wp.vec3f],
+    friction: wp.array[wp.float32],
+    particle_weight_sum: wp.array2d[wp.float32],
+    particle_inverse_weight: wp.array[wp.float32],
+    occupancy: wp.array2d[wp.int32],
+    response: wp.array[mat36f],
+    # Outputs:
+    particle_delassus: wp.array[wp.mat33f],
+    world_failed: wp.array[wp.bool],
+):
+    """Prepare the mass-split, regularized local Delassus block of each particle contact row.
+
+    A contact between the particles or the bodies of different worlds fails its world.
+    """
+    row = wp.tid()
+    status = row_status[row]
+    if status == ParticleContactStatus.CROSS_WORLD and row_world[row] >= 0:
+        world_failed[row_world[row]] = True
+    if status != ParticleContactStatus.ACTIVE:
+        return
+    color = row_color(row, row_color_index)
+    value = _particle_weight_term(
+        row, color, particle, coefficient, particle_inverse_weight, particle_weight_sum
+    ) * wp.identity(3, dtype=wp.float32)
+    bid = body[row]
+    if bid >= 0:
+        value += _compute_contact_delassus(
+            body_jacobian[row], response[row], _split_factor(bid, color, occupancy), mat36f(0.0), mat36f(0.0), 0.0
+        )
+    delassus, valid = _regularize_contact_delassus(value, bias[row], friction[row])
+    particle_delassus[row] = delassus
+    if not valid:
+        world_failed[row_world[row]] = True
+
+
+@wp.kernel
+def _prepare_physical_particle_contacts(
+    # Inputs:
+    row_status: wp.array[wp.int32],
+    particle: wp.array2d[wp.int32],
+    coefficient: wp.array2d[wp.float32],
+    body: wp.array[wp.int32],
+    body_jacobian: wp.array[mat36f],
+    particle_inverse_weight: wp.array[wp.float32],
+    response: wp.array[mat36f],
+    # Outputs:
+    physical_delassus: wp.array[wp.mat33f],
+):
+    """Prepare the unsplit Delassus block of each particle contact row, used by the residuals."""
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        return
+    particle_term = wp.float32(0.0)
+    for slot in range(4):
+        pid = particle[row, slot]
+        unique = pid >= 0
+        for previous in range(slot):
+            unique = unique and particle[row, previous] != pid
+        if unique:
+            # Repeated particles of a row add their coefficients
+            total = coefficient[row, slot]
+            for later in range(slot + 1, 4):
+                if particle[row, later] == pid:
+                    total += coefficient[row, later]
+            particle_term += total * total * particle_inverse_weight[pid]
+    delassus = particle_term * wp.identity(3, dtype=wp.float32)
+    bid = body[row]
+    if bid >= 0:
+        delassus += _compute_contact_delassus(body_jacobian[row], response[row], 1.0, mat36f(0.0), mat36f(0.0), 0.0)
+    physical_delassus[row] = delassus
+
+
+@wp.kernel
+def _warmstart_particle_contacts(
+    # Inputs:
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    particle: wp.array2d[wp.int32],
+    coefficient: wp.array2d[wp.float32],
+    body: wp.array[wp.int32],
+    frame: wp.array[wp.mat33f],
+    body_jacobian: wp.array[mat36f],
+    reaction: wp.array[wp.vec3f],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    particle_inverse_weight: wp.array[wp.float32],
+    weights: ProjectionWeights,
+    # Outputs:
+    particle_delta: wp.array[wp.vec3f],
+    twist_delta: wp.array[vec6f],
+):
+    """Apply the current reaction of each particle contact row to the particle and body deltas."""
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        return
+    wid = row_world[row]
+    if not world_active[wid] or world_failed[wid]:
+        return
+    scatter_particle_contact_impulse(
+        row,
+        particle,
+        coefficient,
+        body,
+        frame,
+        body_jacobian,
+        reaction[row],
+        particle_inverse_weight,
+        weights,
+        particle_delta,
+        twist_delta,
+    )
+
+
+@wp.kernel
+def _apply_particle_delta(
+    # Inputs:
+    particle_world: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    # Outputs:
+    particle_delta: wp.array[wp.vec3f],
+    projected_velocity: wp.array[wp.vec3f],
+):
+    pid = wp.tid()
+    wid = particle_world[pid]
+    if world_active[wid] and not world_failed[wid]:
+        projected_velocity[pid] += particle_delta[pid]
+    particle_delta[pid] = wp.vec3f(0.0)
+
+
+@wp.kernel
+def _compute_particle_contact_residuals(
+    # Inputs:
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    particle: wp.array2d[wp.int32],
+    coefficient: wp.array2d[wp.float32],
+    body: wp.array[wp.int32],
+    frame: wp.array[wp.mat33f],
+    body_jacobian: wp.array[mat36f],
+    bias: wp.array[wp.vec3f],
+    friction: wp.array[wp.float32],
+    reaction: wp.array[wp.vec3f],
+    physical_delassus: wp.array[wp.mat33f],
+    projected_velocity: wp.array[wp.vec3f],
+    global_velocity: wp.array[wp.vec3f],
+    projected_velocity_previous: wp.array[wp.vec3f],
+    projected_twist: wp.array[vec6f],
+    global_twist: wp.array[vec6f],
+    projected_twist_previous: wp.array[vec6f],
+    inverse_velocity_tolerance: wp.float32,
+    # Outputs:
+    world_residual_max: wp.array[wp.float32],
+    world_velocity_residual: wp.array[wp.float32],
+    world_lagged_residual: wp.array[wp.float32],
+):
+    """Evaluate the Delassus-scaled Alart--Curnier residual of each particle contact row.
+
+    With ``world_velocity_residual``, also reduce the residual mapped back to velocity by the
+    Delassus scale, relative to the velocity tolerance. With ``world_lagged_residual``, also
+    reduce the change of the row velocity over the last iteration, relative to the velocity
+    tolerance.
+    """
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        return
+    wid = row_world[row]
+    if (world_active and not world_active[wid]) or world_failed[wid]:
+        return
+    velocity = particle_contact_velocity(
+        row, particle, coefficient, body, frame, body_jacobian, projected_velocity, projected_twist
+    )
+    delassus = physical_delassus[row]
+    residual_vector = compute_contact_scaled_alart_curnier_residual(
+        delassus, reaction[row], velocity + bias[row], friction[row]
+    )
+    residual = wp.max(wp.abs(residual_vector))
+    atomic_max_nonnegative(world_residual_max, wid, residual)
+    if world_velocity_residual:
+        velocity_residual = residual * compute_contact_delassus_scale(delassus) * inverse_velocity_tolerance
+        atomic_max_nonnegative(world_velocity_residual, wid, velocity_residual)
+    if world_lagged_residual:
+        lagged = particle_contact_velocity(
+            row, particle, coefficient, body, frame, body_jacobian, global_velocity, global_twist
+        ) - particle_contact_velocity(
+            row,
+            particle,
+            coefficient,
+            body,
+            frame,
+            body_jacobian,
+            projected_velocity_previous,
+            projected_twist_previous,
+        )
+        atomic_max_nonnegative(world_lagged_residual, wid, wp.max(wp.abs(lagged)) * inverse_velocity_tolerance)
+
+
+@wp.kernel
 def _apply_twist_delta(
     # Inputs:
     body_world: wp.array[wp.int32],
@@ -1051,8 +1445,9 @@ def _apply_twist_delta(
 
 
 @cache
-def make_sweep_kernel(spatial: bool):
-    """Build the sweep kernel, projecting contacts as spatial contacts with angular friction."""
+def make_sweep_kernel(spatial: bool, particles: bool = False):
+    """Build the sweep kernel, projecting contacts as spatial contacts with angular friction,
+    and projecting the particle contact rows of the deformable bodies."""
 
     @wp.kernel(module="unique", enable_backward=False)
     def sweep(
@@ -1094,6 +1489,23 @@ def make_sweep_kernel(spatial: bool):
         spatial_delassus: wp.array[mat66f],
         spatial_eigenvectors: wp.array[mat55f],
         spatial_eigenvalues: wp.array[vec5f],
+        # Particle contacts (with deformable bodies):
+        particle_order: wp.array[wp.int32],
+        particle_color_offset: wp.array[wp.int32],
+        particle_color_count: wp.array[wp.int32],
+        particle_row_world: wp.array[wp.int32],
+        particle_row_status: wp.array[wp.int32],
+        particle_index: wp.array2d[wp.int32],
+        particle_coefficient: wp.array2d[wp.float32],
+        particle_body: wp.array[wp.int32],
+        particle_frame: wp.array[wp.mat33f],
+        particle_body_jacobian: wp.array[mat36f],
+        particle_bias: wp.array[wp.vec3f],
+        particle_friction: wp.array[wp.float32],
+        particle_delassus: wp.array[wp.mat33f],
+        particle_inverse_weight: wp.array[wp.float32],
+        particle_occupancy: wp.array2d[wp.int32],
+        projected_velocity: wp.array[wp.vec3f],
         # Common:
         world_active: wp.array[wp.bool],
         weights: ProjectionWeights,
@@ -1103,7 +1515,9 @@ def make_sweep_kernel(spatial: bool):
         box_reaction: wp.array[wp.float32],
         contact_reaction: wp.array[wp.vec3f],
         angular_reaction: wp.array[wp.vec3f],
+        particle_reaction: wp.array[wp.vec3f],
         twist_delta: wp.array[vec6f],
+        particle_delta: wp.array[wp.vec3f],
         world_failed: wp.array[wp.bool],
     ):
         """Project every row of one color, or every row when no order is given (Jacobi)."""
@@ -1198,6 +1612,43 @@ def make_sweep_kernel(spatial: bool):
                     weights,
                     occupancy,
                     projected_twist,
+                    twist_delta,
+                )
+
+        if wp.static(particles):
+            begin = wp.int32(0)
+            end = particle_row_world.shape[0]
+            if particle_order:
+                begin = particle_color_offset[color]
+                end = begin + particle_color_count[color]
+            for ordered in range(begin + tid, end, worker_count):
+                row = ordered
+                if particle_order:
+                    row = particle_order[ordered]
+                if particle_row_status[row] != ParticleContactStatus.ACTIVE:
+                    continue
+                wid = particle_row_world[row]
+                if not world_active[wid] or world_failed[wid]:
+                    continue
+                _project_particle_contact_row(
+                    row,
+                    color,
+                    particle_index,
+                    particle_coefficient,
+                    particle_body,
+                    particle_frame,
+                    particle_body_jacobian,
+                    particle_bias,
+                    particle_friction,
+                    particle_delassus,
+                    particle_reaction,
+                    particle_inverse_weight,
+                    weights,
+                    particle_occupancy,
+                    occupancy,
+                    projected_velocity,
+                    projected_twist,
+                    particle_delta,
                     twist_delta,
                 )
 

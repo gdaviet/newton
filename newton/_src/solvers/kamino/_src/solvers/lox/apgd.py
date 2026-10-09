@@ -30,8 +30,14 @@ from .contact import (
     scatter_spatial_impulse,
     spatial_friction_scaling,
 )
-from .projection_kernels import is_active_row, scatter_box_impulse, scatter_contact_impulse
+from .projection_kernels import (
+    is_active_row,
+    scatter_box_impulse,
+    scatter_contact_impulse,
+    scatter_particle_contact_impulse,
+)
 from .system_kernels import ProjectionWeights
+from .types import ParticleContactStatus
 
 if TYPE_CHECKING:
     from .types import APGDData, LOXProblemData
@@ -510,6 +516,109 @@ def _extrapolate_reactions(
         )
 
 
+@wp.kernel
+def _initialize_particle_reactions(
+    # Inputs:
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    friction: wp.array[wp.float32],
+    world_active: wp.array[wp.bool],
+    recycle: wp.bool,
+    history: wp.array[wp.int32],
+    # Outputs:
+    reaction: wp.array[wp.vec3f],
+    trial: wp.array[wp.vec3f],
+    previous: wp.array[wp.vec3f],
+):
+    """Project the warm-start reaction of each particle contact row onto its cone and reset its momentum.
+
+    With ``recycle``, the worlds that hold the row history of the previous splitting iteration keep it.
+    """
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        return
+    wid = row_world[row]
+    if not world_active[wid] or (recycle and history[wid] == 1):
+        return
+    value = project_to_coulomb_cone(reaction[row], friction[row])
+    reaction[row] = value
+    trial[row] = value
+    previous[row] = value
+
+
+@wp.kernel
+def _accumulate_particle_restart_dot(
+    # Inputs:
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    reaction: wp.array[wp.vec3f],
+    trial: wp.array[wp.vec3f],
+    previous: wp.array[wp.vec3f],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    # Outputs:
+    restart_dot: wp.array[wp.float32],
+):
+    """Accumulate ``(lambda - trial) . (lambda - previous)`` of the particle contact rows per world."""
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        return
+    wid = row_world[row]
+    if not world_active[wid] or world_failed[wid]:
+        return
+    current = reaction[row]
+    wp.atomic_add(restart_dot, wid, wp.dot(current - trial[row], current - previous[row]))
+
+
+@wp.kernel
+def _extrapolate_particle_reactions(
+    # Inputs:
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    particle: wp.array2d[wp.int32],
+    coefficient: wp.array2d[wp.float32],
+    body: wp.array[wp.int32],
+    frame: wp.array[wp.mat33f],
+    body_jacobian: wp.array[mat36f],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    beta: wp.array[wp.float32],
+    particle_inverse_weight: wp.array[wp.float32],
+    weights: ProjectionWeights,
+    # Outputs:
+    reaction: wp.array[wp.vec3f],
+    trial: wp.array[wp.vec3f],
+    previous: wp.array[wp.vec3f],
+    particle_delta: wp.array[wp.vec3f],
+    twist_delta: wp.array[vec6f],
+):
+    """Extrapolate the reaction of each particle contact row and accumulate its weighted corrections."""
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        return
+    wid = row_world[row]
+    if not world_active[wid] or world_failed[wid]:
+        return
+    current = reaction[row]
+    extrapolated = current + beta[wid] * (current - previous[row])
+    previous[row] = current
+    trial[row] = extrapolated
+    reaction[row] = extrapolated
+    scatter_particle_contact_impulse(
+        row,
+        particle,
+        coefficient,
+        body,
+        frame,
+        body_jacobian,
+        extrapolated - current,
+        particle_inverse_weight,
+        weights,
+        particle_delta,
+        twist_delta,
+    )
+
+
 ###
 # Interfaces
 ###
@@ -549,6 +658,15 @@ class APGDAcceleration:
         angular_reaction, angular_friction, _frame = self._spatial_arrays()
         if self._capacity > 0:
             self._initialize_reactions(world_active, recycle, angular_reaction, angular_friction)
+        rows = p.particle_contact_rows
+        if rows is not None and rows.capacity > 0:
+            wp.launch(
+                _initialize_particle_reactions,
+                dim=rows.capacity,
+                inputs=[rows.world, rows.status, rows.friction, world_active, recycle, self._data.history],
+                outputs=[rows.reaction, self._data.particle_trial, self._data.particle_previous],
+                device=p.device,
+            )
         # After the rows, which read the history flags of the previous splitting iteration
         wp.launch(
             _initialize_worlds,
@@ -601,10 +719,30 @@ class APGDAcceleration:
         world_failed: wp.array[wp.bool],
         weights: ProjectionWeights,
         twist_delta: wp.array[vec6f],
+        particle_inverse_weight: wp.array[wp.float32] | None = None,
+        particle_delta: wp.array[wp.vec3f] | None = None,
     ) -> None:
-        """Update the momentum and accumulate the extrapolation into ``twist_delta``."""
+        """Update the momentum and accumulate the extrapolation into ``twist_delta`` and ``particle_delta``."""
         p = self.problem_data
         angular_reaction, angular_friction, frame = self._spatial_arrays()
+        rows = p.particle_contact_rows
+        particles = rows is not None and rows.capacity > 0
+        if particles:
+            wp.launch(
+                _accumulate_particle_restart_dot,
+                dim=rows.capacity,
+                inputs=[
+                    rows.world,
+                    rows.status,
+                    rows.reaction,
+                    self._data.particle_trial,
+                    self._data.particle_previous,
+                    world_active,
+                    world_failed,
+                ],
+                outputs=[self._data.restart_dot],
+                device=p.device,
+            )
         if self._capacity > 0:
             wp.launch(
                 _accumulate_restart_dot,
@@ -641,6 +779,33 @@ class APGDAcceleration:
             outputs=[self._data.restart_dot, self._data.theta, self._data.beta],
             device=p.device,
         )
+        if particles:
+            wp.launch(
+                _extrapolate_particle_reactions,
+                dim=rows.capacity,
+                inputs=[
+                    rows.world,
+                    rows.status,
+                    rows.particle,
+                    rows.coefficient,
+                    rows.body,
+                    rows.frame,
+                    rows.body_jacobian,
+                    world_active,
+                    world_failed,
+                    self._data.beta,
+                    particle_inverse_weight,
+                    weights,
+                ],
+                outputs=[
+                    rows.reaction,
+                    self._data.particle_trial,
+                    self._data.particle_previous,
+                    particle_delta,
+                    twist_delta,
+                ],
+                device=p.device,
+            )
         if self._capacity == 0:
             return
         wp.launch(

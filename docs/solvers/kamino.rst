@@ -10,7 +10,8 @@ kinematic loops, under- or overactuation, joint limits, hard frictional
 contacts, and restitutive impacts.
 
 Unlike the other maximal-coordinate solvers, Kamino focuses on constrained
-rigid mechanical assemblies rather than particle or deformable simulation.
+rigid mechanical assemblies. Its experimental LOX backend additionally supports
+rod joints and cloth and tetrahedral deformable bodies.
 Kamino is currently in BETA 1, and Newton users are discouraged from depending
 on it. Evaluate it only when kinematic loops and hard contact constraints are
 primary requirements and an experimental solver is acceptable.
@@ -198,6 +199,49 @@ of each rod is its joint target, ``Control.joint_target_q``, whose angular part
 sets the rest bend and twist. The constraints are linearized at the beginning
 of each time step. Rod joints require zero armature, joint damping, and joint
 friction, unbounded joint limits, no target mode, and ``use_fk_solver=False``.
+
+LOX deformables
+---------------
+
+LOX simulates the particles of Newton cloth and tetrahedral meshes, such as
+those built by :meth:`newton.ModelBuilder.add_cloth_grid` and
+:meth:`newton.ModelBuilder.add_soft_grid`, in the same splitting iterations as
+the rigid bodies. Triangles add a stable membrane energy, bending edges a
+dihedral bending energy, and tetrahedra a stable Neo-Hookean energy, with the
+stiffness and damping coefficients of the model. Particles with zero mass or
+without the ``ACTIVE`` flag are prescribed. The particle velocities join the
+consensus and change residuals of the terminal status.
+
+Each time step assembles one frozen smooth particle system. Its candidate
+solves run ``config.lox.deformable_cr_iterations`` preconditioned
+conjugate-residual iterations, with the preconditioner of
+``config.lox.deformable_preconditioner``, and solve the components of at most
+``config.lox.deformable_direct_max_particles`` particles with a dense Cholesky
+factorization. ``config.lox.deformable_linear_solver="cudss"`` solves the
+whole system with a cuDSS factorization, which requires the
+``nvmath-python`` package and ``config.lox.fixed_iterations=True``;
+``"cudss_then_cr"`` solves the first candidate of each step with cuDSS and the
+next ones with conjugate residuals. ``config.lox.deformable_proximal_iterations``
+sets the local iterations of the nonlinear membrane and tetrahedron
+corrections. The projection weight of each particle comes from the Schur
+complements of the particle in a patch of at most eight particles of its
+elements, and ``config.lox.deformable_consensus_fraction`` sets the fraction of
+the weights in the particle solve, the counterpart of
+``config.lox.consensus_fraction``.
+
+The soft contacts of the ``contacts`` argument of
+:meth:`~newton.solvers.SolverKamino.step`, between particle features and the
+shapes of the collision pipeline, share the unilateral projection with the
+rigid contacts and transfer their reactions to dynamic bodies. Set
+``config.lox.deformable_enable_self_contact=True`` to also project the
+vertex-triangle and edge-edge self-contacts of the deformable surfaces, and
+``config.lox.deformable_enable_penetration_free_contact=True`` to truncate the
+particle steps against the self-contact candidates so that the surfaces keep
+their sides.
+
+LOX deformables support particles, triangles, bending edges, and tetrahedra;
+models with springs or muscles are rejected. Global particles require a single
+world, and models with particles use the Euler integrator.
 
 Inspecting terminal status
 --------------------------
