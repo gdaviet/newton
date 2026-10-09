@@ -912,6 +912,7 @@ class SolverKamino(SolverBase, CouplingInterface):
             contacts=self._contacts_kamino,
             config=self._config,
         )
+        self._has_particles = self._config.dynamics_solver == "lox" and model.particle_count > 0
 
         # Initialize the internal Kamino control wrapper
         self._control_kamino = self._kamino.ControlKamino()
@@ -1007,8 +1008,8 @@ class SolverKamino(SolverBase, CouplingInterface):
             world_mask: Optional array of per-world masks indicating which
                 worlds should be reset. Shape ``(world_count + 1,)``, with the
                 final entry representing global world ``-1``. The global entry
-                is a no-op because Kamino does not support global dynamic
-                objects.
+                selects the global particles of the LOX deformable bodies;
+                Kamino rigid bodies belong to local worlds.
             flags: Optional :class:`~newton.StateFlags` or ``int`` bitmask controlling
                 which state attributes need to be reset.  If ``None``, all
                 state attributes are reset.
@@ -1081,6 +1082,8 @@ class SolverKamino(SolverBase, CouplingInterface):
             config=config,
             success_mask=success_mask,
         )
+        if self._has_particles:
+            self._solver_kamino.solver_fd.reset_particles(state, state_flags, world_mask)
 
         if state.body_qdd is not None:
             self._kamino.reset_body_acceleration(
@@ -1211,11 +1214,18 @@ class SolverKamino(SolverBase, CouplingInterface):
                     cull_speculative_contacts=self._solver_kamino.cull_speculative_contacts,
                     kinematic_only_immovable=self._config.dynamics_solver == "lox",
                 )
+            elif self._contacts_kamino is not None:
+                # Models without bodies only have the soft contacts of their particles
+                self._contacts_kamino.clear()
         else:
             self._detector = None
             # Clear the internal contacts container to avoid using stale contacts from previous steps.
             if self._contacts_kamino is not None:
                 self._contacts_kamino.clear()
+
+        # LOX integrates the particles from the Newton states and reads their soft contacts
+        if self._has_particles:
+            self._solver_kamino.solver_fd.bind_particle_step(state_in, state_out, contacts)
 
         # Convert Newton body-frame poses to Kamino CoM-frame poses
         self._kamino.convert_body_origin_to_com(
@@ -1506,9 +1516,8 @@ class SolverKamino(SolverBase, CouplingInterface):
     def _validate_model_compatibility(model: Model, config: SolverKamino.Config):
         """
         Validates that the model does not contain components unsupported by SolverKamino:
-        - particles
+        - particles, triangles, edges, and tetrahedra with non-LOX backends
         - springs
-        - triangles, edges, tetrahedra
         - muscles
         - distance joints, and rod joints with non-LOX backends
         - bodies with singular inertial properties that are attached to movable bodies for non-LOX backends
@@ -1522,20 +1531,28 @@ class SolverKamino(SolverBase, CouplingInterface):
 
         unsupported_features = []
         use_lox = config.dynamics_solver == "lox"
+        lox_deformables = use_lox and model.particle_count > 0
         if use_lox:
             from ._src.solvers.lox.rod import validate_rod_model  # noqa: PLC0415
 
             validate_rod_model(model)
-        if model.particle_count > 0:
+        if lox_deformables:
+            from ._src.solvers.lox.deformable.system import validate_deformable_model  # noqa: PLC0415
+
+            validate_deformable_model(model)
+            if config.integrator == "moreau":
+                unsupported_features.append("the Moreau integrator with LOX deformable particles")
+        elif model.particle_count > 0:
             unsupported_features.append(f"particles (found {model.particle_count})")
         if model.spring_count > 0:
             unsupported_features.append(f"springs (found {model.spring_count})")
-        if model.tri_count > 0:
-            unsupported_features.append(f"triangle elements (found {model.tri_count})")
-        if model.edge_count > 0:
-            unsupported_features.append(f"edge elements (found {model.edge_count})")
-        if model.tet_count > 0:
-            unsupported_features.append(f"tetrahedral elements (found {model.tet_count})")
+        if not lox_deformables:
+            if model.tri_count > 0:
+                unsupported_features.append(f"triangle elements (found {model.tri_count})")
+            if model.edge_count > 0:
+                unsupported_features.append(f"edge elements (found {model.edge_count})")
+            if model.tet_count > 0:
+                unsupported_features.append(f"tetrahedral elements (found {model.tet_count})")
         if model.muscle_count > 0:
             unsupported_features.append(f"muscles (found {model.muscle_count})")
 

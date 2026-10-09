@@ -7,7 +7,9 @@
 constraint rows loaded from Kamino, and ``system`` assembles and factorizes the
 body system with Kamino's RCM-reordered blocked LLT, whose solves ``llt`` runs
 over the nonzero tiles of the factor. ``rod`` adds the smooth material rows of
-the rod joints to the body system. ``projection`` runs the
+the rod joints to the body system, and the ``deformable`` subpackage the
+particles of the cloth and tetrahedral soft bodies, whose contact rows the
+projection sweeps with the rigid rows. ``projection`` runs the
 unilateral sweeps over joint limits, joint friction and contacts as Jacobi or
 colored Gauss--Seidel sweeps (colored by ``coloring``), optionally accelerated
 by ``apgd`` or ``anderson``; ``contact`` holds the local contact laws and

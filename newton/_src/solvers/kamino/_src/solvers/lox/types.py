@@ -41,6 +41,9 @@ __all__ = [
     "LOXResiduals",
     "LOXStatus",
     "LOXSystemData",
+    "ParticleContactRows",
+    "ParticleContactStatus",
+    "ParticleSplittingState",
     "ProjectionAcceleration",
     "ProjectionData",
     "RodRows",
@@ -88,6 +91,25 @@ class ProjectionAcceleration(IntEnum):
     def __repr__(self):
         """Returns a string representation of the ProjectionAcceleration."""
         return self.__str__()
+
+
+class ParticleContactStatus(IntEnum):
+    """Status of a particle contact row."""
+
+    UNUSED = 0
+    """Row beyond the detected contacts."""
+
+    ACTIVE = 1
+    """Row of the projection."""
+
+    MALFORMED = 2
+    """Row with invalid particle indices, coefficients, or geometry; the projection skips it and its world proceeds."""
+
+    CROSS_WORLD = 3
+    """Row whose endpoints belong to different worlds; it fails its world."""
+
+    PRESCRIBED = 4
+    """Row whose endpoints are all prescribed, which leaves no response to solve for."""
 
 
 ###
@@ -636,6 +658,66 @@ class RodRows:
         """Largest scaled proximal residual of each world, with proximal relaxation."""
 
 
+class ParticleContactRows:
+    """Contact rows of the particles of the deformable bodies.
+
+    Each row couples up to four particles, with interpolation coefficients, and at most one
+    body. The rigid-soft contacts take the first :attr:`rigid_capacity` rows and the
+    self-contacts of the deformable surfaces the others. The rows use the normal-last frame of
+    :class:`ContactRows`: the velocity of a row is ``u = bias + sum_i c_i F^T p_i + J v_b`` for
+    the projected velocities ``p_i`` of its particles, its frame ``F``, and the projected twist
+    ``v_b`` of its body. The reactions are impulses that restart from zero at each time step.
+
+    Args:
+        rigid_capacity: Number of rigid-soft contact rows.
+        self_capacity: Number of self-contact rows.
+        num_worlds: Number of worlds.
+        device: Device of the arrays.
+    """
+
+    def __init__(self, rigid_capacity: int, self_capacity: int, num_worlds: int, device: wp.DeviceLike):
+        self.rigid_capacity = rigid_capacity
+        """Number of rigid-soft contact rows."""
+        self.self_capacity = self_capacity
+        """Number of self-contact rows."""
+        self.capacity = rigid_capacity + self_capacity
+        """Total number of rows."""
+        capacity = self.capacity
+        self.world = wp.full(capacity, -1, dtype=wp.int32, device=device)
+        """World of each row, or ``-1``."""
+        self.status = wp.zeros(capacity, dtype=wp.int32, device=device)
+        """:class:`ParticleContactStatus` of each row."""
+        self.particle = wp.full((capacity, 4), -1, dtype=wp.int32, device=device)
+        """Particles of each row, or ``-1``."""
+        self.coefficient = wp.zeros((capacity, 4), dtype=wp.float32, device=device)
+        """Interpolation coefficient of each particle of each row."""
+        self.body = wp.full(capacity, -1, dtype=wp.int32, device=device)
+        """Body of each row, or ``-1``."""
+        self.shape = wp.full(capacity, -1, dtype=wp.int32, device=device)
+        """Collider shape of each rigid-soft row, or ``-1``."""
+        self.frame = wp.zeros(capacity, dtype=wp.mat33f, device=device)
+        """Contact frame ``(tangent_0, tangent_1, normal)`` of each row as matrix columns."""
+        self.body_jacobian = wp.zeros(capacity, dtype=mat36f, device=device)
+        """Normal-last Jacobian of each row with respect to the twist of its body."""
+        self.response = wp.zeros(capacity, dtype=mat36f, device=device)
+        """Transposed twist response ``J W^-1`` of each row on its body, prepared with the body weights; zero
+        without a body."""
+        self.gap = wp.zeros(capacity, dtype=wp.float32, device=device)
+        """Signed contact distance of each row at the beginning of the time step [m]."""
+        self.bias = wp.zeros(capacity, dtype=wp.vec3f, device=device)
+        """Velocity bias of each row (penetration and restitution targets)."""
+        self.friction = wp.zeros(capacity, dtype=wp.float32, device=device)
+        """Coulomb friction coefficient of each row."""
+        self.reaction = wp.zeros(capacity, dtype=wp.vec3f, device=device)
+        """Normal-last impulse of each row."""
+        self.physical_delassus = wp.zeros(capacity, dtype=wp.mat33f, device=device)
+        """Unsplit Delassus block of each row, which scales its residual."""
+        self.world_count = wp.zeros(num_worlds, dtype=wp.int32, device=device)
+        """Number of active rows of each world."""
+        self.world_residual_max = wp.zeros(num_worlds, dtype=wp.float32, device=device)
+        """Largest particle contact residual of each world."""
+
+
 class SplittingState:
     """Body and world state of the LOX splitting iterations.
 
@@ -669,6 +751,40 @@ class SplittingState:
         """Number of splitting iterations of each world."""
         self.world_failed = wp.zeros(num_worlds, dtype=wp.bool, device=device)
         """Whether the solve of each world failed: an invalid local block or a non-finite update."""
+
+
+class ParticleSplittingState:
+    """Particle state of the LOX splitting iterations, the counterpart of the body twists of :class:`SplittingState`.
+
+    The particles of the deformable bodies are packed by solve world; their worlds share the
+    activity, convergence, and failure flags of :class:`SplittingState`.
+
+    Args:
+        particle_world: World of each packed particle.
+        num_worlds: Number of worlds.
+        device: Device of the arrays.
+    """
+
+    def __init__(self, particle_world: wp.array[wp.int32], num_worlds: int, device: wp.DeviceLike):
+        num_particles = particle_world.shape[0]
+        self.num_particles = num_particles
+        """Number of packed particles."""
+        self.particle_world = particle_world
+        """World of each packed particle."""
+        self.projected_velocity = wp.zeros(num_particles, dtype=wp.vec3f, device=device)
+        """Projected velocity ``p`` of each particle."""
+        self.projected_velocity_previous = wp.zeros(num_particles, dtype=wp.vec3f, device=device)
+        """Projected velocity of each particle at the previous iteration."""
+        self.global_velocity = wp.zeros(num_particles, dtype=wp.vec3f, device=device)
+        """Candidate velocity ``v`` of each particle from the smooth solve."""
+        self.global_velocity_previous = wp.zeros(num_particles, dtype=wp.vec3f, device=device)
+        """Candidate velocity of each particle at the previous iteration."""
+        self.splitting_dual = wp.zeros(num_particles, dtype=wp.vec3f, device=device)
+        """Scaled splitting dual ``u`` of each particle."""
+        self.consensus_center = wp.zeros(num_particles, dtype=wp.vec3f, device=device)
+        """Splitting target ``p + u`` of the candidate solve of each particle."""
+        self.deformable_residual = wp.zeros(num_worlds, dtype=wp.float32, device=device)
+        """Scaled residual of the element updates and of the candidate solve of each world."""
 
 
 class LOXProblemData:
@@ -716,6 +832,17 @@ class LOXProblemData:
         """Bounded actuator-effort corrections of the dynamic rows."""
         self.rod_rows: RodRows | None = None
         """Smooth material rows of the rod joints."""
+        self.num_particles = 0
+        """Number of packed particles of the deformable bodies."""
+        self.particle_world: wp.array[wp.int32] | None = None
+        """World of each packed particle, with deformable bodies."""
+        self.particle_contact_rows: ParticleContactRows | None = None
+        """Contact rows of the particles, with deformable bodies."""
+        self.particle_incidence: wp.array2d[wp.int32] | None = None
+        """Number of active particle contact rows touching each particle, with deformable bodies."""
+        self.particle_weight_sum: wp.array2d[wp.float32] | None = None
+        """Sum of the absolute coefficients of the active particle contact rows of each particle, which
+        splits its inverse weight between the rows of a Jacobi sweep, with deformable bodies."""
         self.box_rows: BoxRows | None = None
         """Joint friction and joint limit rows."""
         self.contact_rows: ContactRows | None = None
@@ -806,7 +933,9 @@ class ColoringData:
         device = problem_data.device
         box_capacity = problem_data.box_rows.capacity
         contact_capacity = problem_data.contact_rows.capacity
-        self.color_count = max(1, min(color_count, box_capacity + contact_capacity))
+        particle_rows = problem_data.particle_contact_rows
+        particle_capacity = particle_rows.capacity if particle_rows is not None else 0
+        self.color_count = max(1, min(color_count, box_capacity + contact_capacity + particle_capacity))
         """Number of colors."""
         self.occupancy = wp.zeros((problem_data.num_bodies, self.color_count), dtype=wp.int32, device=device)
         """Number of active rows of each color touching each body."""
@@ -829,6 +958,21 @@ class ColoringData:
         """Colors of the box rows."""
         self.contact = ColoredRowsData(contact_capacity, self.color_count, device)
         """Colors of the contacts."""
+        particles = particle_rows is not None
+        num_particles = problem_data.num_particles
+        self.particle = ColoredRowsData(particle_capacity, self.color_count, device) if particles else None
+        """Colors of the particle contact rows, with deformable bodies."""
+        self.particle_occupancy = (
+            wp.zeros((num_particles, self.color_count), dtype=wp.int32, device=device) if particles else None
+        )
+        """Number of active particle contact rows of each color touching each particle, with deformable bodies."""
+        self.particle_weight_sum = (
+            wp.zeros((num_particles, self.color_count), dtype=wp.float32, device=device) if particles else None
+        )
+        """Sum of the absolute coefficients of the particle contact rows of each color of each particle,
+        with deformable bodies."""
+        self.particle_lock = wp.zeros(num_particles, dtype=wp.int32, device=device) if particles else None
+        """Repair lock of each particle, reset before every repair pass, with deformable bodies."""
 
 
 class AndersonRowsData:
@@ -872,10 +1016,18 @@ class AndersonData:
         """Secant vectors of the contacts."""
         self.angular = AndersonRowsData(rows.capacity, wp.vec3f, device) if rows.angular_reaction is not None else None
         """Secant vectors of the angular contact reactions, with spatial friction."""
+        particle_rows = problem_data.particle_contact_rows
+        self.particle = (
+            AndersonRowsData(particle_rows.capacity, wp.vec3f, device) if particle_rows is not None else None
+        )
+        """Secant vectors of the particle contact rows, with deformable bodies."""
         self.capacity = self.box.capacity + self.contact.capacity
-        """Number of rows."""
-        self.global_reduction = world_count == 1 and self.capacity > 0 and wp.get_device(device).is_cuda
-        """Whether one thread block reduces the secant terms of the single world; atomics reduce them otherwise."""
+        """Number of box and contact rows."""
+        self.global_reduction = (
+            world_count == 1 and self.capacity > 0 and self.particle is None and wp.get_device(device).is_cuda
+        )
+        """Whether one thread block reduces the secant terms of the single world; atomics reduce them otherwise,
+        and always with particle contact rows."""
         self.terms = wp.zeros(self.capacity, dtype=wp.vec3f, device=device) if self.global_reduction else None
         """Per-row terms of the secant reductions, with the single-world block reduction."""
         self.gram = wp.zeros(world_count, dtype=wp.float32, device=device)
@@ -927,6 +1079,13 @@ class APGDData:
         """Extrapolated trial angular reaction of each contact, with spatial friction."""
         self.angular_previous = wp.zeros(rows.capacity, dtype=wp.vec3f, device=device) if spatial else None
         """Angular reaction of each contact at the previous sweep, with spatial friction."""
+        particle_rows = problem_data.particle_contact_rows
+        particle_capacity = particle_rows.capacity if particle_rows is not None else 0
+        particles = particle_rows is not None
+        self.particle_trial = wp.zeros(particle_capacity, dtype=wp.vec3f, device=device) if particles else None
+        """Extrapolated trial reaction of each particle contact row, with deformable bodies."""
+        self.particle_previous = wp.zeros(particle_capacity, dtype=wp.vec3f, device=device) if particles else None
+        """Reaction of each particle contact row at the previous sweep, with deformable bodies."""
 
 
 class ProjectionData:
@@ -965,6 +1124,18 @@ class ProjectionData:
         """Spatial contact metrics of the final smoothing sweep, with angular friction."""
         self.twist_delta = wp.zeros(problem_data.num_bodies, dtype=vec6f, device=device)
         """Per-body correction accumulated by one sweep, zero between sweeps."""
+        particle_rows = problem_data.particle_contact_rows
+        particles = particle_rows is not None
+        particle_capacity = particle_rows.capacity if particles else 0
+        self.particle_delassus = wp.zeros(particle_capacity, dtype=wp.mat33f, device=device) if particles else None
+        """Mass-split, regularized local Delassus block of each particle contact row, with deformable bodies."""
+        self.particle_smoothing_delassus = (
+            wp.zeros(particle_capacity, dtype=wp.mat33f, device=device) if particles and colored else None
+        )
+        """Jacobi Delassus block of each particle contact row for the final smoothing sweep, with deformable
+        bodies."""
+        self.particle_delta = wp.zeros(problem_data.num_particles, dtype=wp.vec3f, device=device) if particles else None
+        """Per-particle correction accumulated by one sweep, zero between sweeps, with deformable bodies."""
         self.anderson = AndersonData(problem_data) if acceleration == ProjectionAcceleration.ANDERSON else None
         """Anderson acceleration state, if selected."""
         self.apgd = APGDData(problem_data) if acceleration == ProjectionAcceleration.APGD else None
@@ -1099,6 +1270,7 @@ class LOXData:
         solution: Dual solution container for the solution metrics, or ``None`` without them.
         initial_joint_penalty_scale: Initial dimensionless structural ALM penalty scale of every body.
         device: Device of the arrays.
+        particle_world: World of each packed particle of the deformable bodies, or ``None`` without them.
     """
 
     def __init__(
@@ -1107,10 +1279,23 @@ class LOXData:
         solution: DualSolution | None,
         initial_joint_penalty_scale: float,
         device: wp.DeviceLike,
+        particle_world: wp.array[wp.int32] | None = None,
     ):
         num_worlds = len(body_counts)
         self.state = SplittingState(body_counts, device)
         """Body and world state of the splitting iterations."""
+        self.particles = (
+            ParticleSplittingState(particle_world, num_worlds, device) if particle_world is not None else None
+        )
+        """Particle state of the splitting iterations, with deformable bodies."""
+        self.particle_dual_force = (
+            wp.zeros(particle_world.shape[0], dtype=wp.vec3f, device=device) if particle_world is not None else None
+        )
+        """Splitting dual of each particle as the force ``w u / dt`` [N], kept across time steps, with deformable
+        bodies.
+
+        Accepted worlds store their dual; failed worlds keep the dual of their last accepted time step.
+        """
         self.residuals = LOXResiduals(num_worlds, device)
         """Per-world residuals of the splitting iterations."""
         self.status = wp.empty(num_worlds, dtype=LOXStatus, device=device)

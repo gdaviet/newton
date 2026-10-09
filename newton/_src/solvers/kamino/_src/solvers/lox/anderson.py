@@ -19,8 +19,14 @@ from .contact import (
     pack_spatial_friction,
     scatter_spatial_impulse,
 )
-from .projection_kernels import is_active_row, scatter_box_impulse, scatter_contact_impulse
+from .projection_kernels import (
+    is_active_row,
+    scatter_box_impulse,
+    scatter_contact_impulse,
+    scatter_particle_contact_impulse,
+)
 from .system_kernels import ProjectionWeights
+from .types import ParticleContactStatus
 
 if TYPE_CHECKING:
     from .types import AndersonData, LOXProblemData
@@ -704,6 +710,129 @@ def _mix_anderson_reactions(
         )
 
 
+@wp.kernel
+def _store_particle_map_input(
+    # Inputs:
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    reaction: wp.array[wp.vec3f],
+    # Outputs:
+    map_input: wp.array[wp.vec3f],
+):
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        return
+    wid = row_world[row]
+    if world_active[wid] and not world_failed[wid]:
+        map_input[row] = reaction[row]
+
+
+@wp.kernel
+def _store_particle_anderson_samples(
+    # Inputs:
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    sample_valid: wp.array[wp.int32],
+    direction_valid: wp.array[wp.int32],
+    reaction: wp.array[wp.vec3f],
+    map_input: wp.array[wp.vec3f],
+    # Outputs:
+    sample_residual: wp.array[wp.vec3f],
+    sample_image: wp.array[wp.vec3f],
+    direction_residual: wp.array[wp.vec3f],
+    direction_image: wp.array[wp.vec3f],
+    gram: wp.array[wp.float32],
+    rhs: wp.array[wp.float32],
+    residual_norm: wp.array[wp.float32],
+):
+    """Store the newest map residual and image of each particle contact row, and reduce its secant terms per world."""
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        return
+    wid = row_world[row]
+    if not world_active[wid] or world_failed[wid]:
+        return
+    had_sample = sample_valid[wid] == 1
+    current = reaction[row]
+    current_residual = current - map_input[row]
+    term = _store_vector_anderson_sample(
+        current,
+        map_input[row],
+        sample_residual[row],
+        direction_residual[row],
+        had_sample,
+        direction_valid[wid] == 1,
+        wp.vec3f(1.0),
+    )
+    if had_sample:
+        direction_residual[row] = sample_residual[row] - current_residual
+        direction_image[row] = sample_image[row] - current
+    sample_residual[row] = current_residual
+    sample_image[row] = current
+    wp.atomic_add(gram, wid, term[0])
+    wp.atomic_add(rhs, wid, term[1])
+    wp.atomic_add(residual_norm, wid, term[2])
+
+
+@wp.kernel
+def _mix_particle_anderson_reactions(
+    # Inputs:
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    particle: wp.array2d[wp.int32],
+    particle_coefficient: wp.array2d[wp.float32],
+    body: wp.array[wp.int32],
+    frame: wp.array[wp.mat33f],
+    body_jacobian: wp.array[mat36f],
+    friction: wp.array[wp.float32],
+    direction_image: wp.array[wp.vec3f],
+    world_active: wp.array[wp.bool],
+    world_failed: wp.array[wp.bool],
+    coefficient: wp.array[wp.float32],
+    particle_inverse_weight: wp.array[wp.float32],
+    weights: ProjectionWeights,
+    # Outputs:
+    map_input: wp.array[wp.vec3f],
+    reaction: wp.array[wp.vec3f],
+    particle_delta: wp.array[wp.vec3f],
+    body_delta: wp.array[vec6f],
+):
+    """Mix the map image of each particle contact row along the stored direction, project it onto its cone,
+    and scatter the change."""
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        return
+    wid = row_world[row]
+    if not world_active[wid] or world_failed[wid]:
+        return
+    current = reaction[row]
+    mixing = coefficient[wid]
+    if mixing == 0.0:
+        # The image is the next input; the direction may be stale, from a failed solve
+        map_input[row] = current
+        return
+    mixed = project_to_coulomb_cone(current + mixing * direction_image[row], friction[row])
+    map_input[row] = mixed
+    reaction[row] = mixed
+    scatter_particle_contact_impulse(
+        row,
+        particle,
+        particle_coefficient,
+        body,
+        frame,
+        body_jacobian,
+        mixed - current,
+        particle_inverse_weight,
+        weights,
+        particle_delta,
+        body_delta,
+    )
+
+
 ###
 # Interfaces
 ###
@@ -763,9 +892,18 @@ class AndersonProjection:
 
     def begin_map(self, world_active: wp.array[wp.bool], world_failed: wp.array[wp.bool]) -> None:
         """Store the reaction input of one complete projection map."""
+        p = self.problem_data
+        rows = p.particle_contact_rows
+        if rows is not None and rows.capacity > 0:
+            wp.launch(
+                _store_particle_map_input,
+                dim=rows.capacity,
+                inputs=[rows.world, rows.status, world_active, world_failed, rows.reaction],
+                outputs=[self._data.particle.map_input],
+                device=self.device,
+            )
         if self._data.capacity == 0:
             return
-        p = self.problem_data
         wp.launch(
             _store_map_input,
             dim=self._data.capacity,
@@ -793,10 +931,41 @@ class AndersonProjection:
         world_failed: wp.array[wp.bool],
         weights: ProjectionWeights,
         body_delta: wp.array[vec6f],
+        particle_inverse_weight: wp.array[wp.float32] | None = None,
+        particle_delta: wp.array[wp.vec3f] | None = None,
     ) -> None:
-        """Form one secant, solve the scalar system, and accumulate the mixed image into ``body_delta``."""
+        """Form one secant, solve the scalar system, and accumulate the mixed image into ``body_delta``
+        and ``particle_delta``."""
         p = self.problem_data
         rows = p.contact_rows
+        particle_rows = p.particle_contact_rows
+        particles = particle_rows is not None and particle_rows.capacity > 0
+        if particles:
+            secant = self._data.particle
+            wp.launch(
+                _store_particle_anderson_samples,
+                dim=particle_rows.capacity,
+                inputs=[
+                    particle_rows.world,
+                    particle_rows.status,
+                    world_active,
+                    world_failed,
+                    self._data.sample_valid,
+                    self._data.direction_valid,
+                    particle_rows.reaction,
+                    secant.map_input,
+                ],
+                outputs=[
+                    secant.sample_residual,
+                    secant.sample_image,
+                    secant.direction_residual,
+                    secant.direction_image,
+                    self._data.gram,
+                    self._data.rhs,
+                    self._data.residual_norm,
+                ],
+                device=self.device,
+            )
         if self._data.capacity > 0:
             wp.launch(
                 _store_anderson_samples,
@@ -864,6 +1033,29 @@ class AndersonProjection:
                 dim=p.num_worlds,
                 inputs=[world_active, world_failed],
                 outputs=[self._data.gram, self._data.rhs, self._data.residual_norm, *coefficient_outputs],
+                device=self.device,
+            )
+        if particles:
+            wp.launch(
+                _mix_particle_anderson_reactions,
+                dim=particle_rows.capacity,
+                inputs=[
+                    particle_rows.world,
+                    particle_rows.status,
+                    particle_rows.particle,
+                    particle_rows.coefficient,
+                    particle_rows.body,
+                    particle_rows.frame,
+                    particle_rows.body_jacobian,
+                    particle_rows.friction,
+                    self._data.particle.direction_image,
+                    world_active,
+                    world_failed,
+                    self._data.coefficient,
+                    particle_inverse_weight,
+                    weights,
+                ],
+                outputs=[self._data.particle.map_input, particle_rows.reaction, particle_delta, body_delta],
                 device=self.device,
             )
         if self._data.capacity == 0:

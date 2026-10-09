@@ -458,6 +458,12 @@ class TestSolverKaminoConfig(unittest.TestCase):
             ({"projected_twist_fraction": float("nan")}, "projected_twist_fraction"),
             ({"weight_beta": 0.5}, "weight_beta"),
             ({"max_joint_penalty_ratio": 50.0}, "max_joint_penalty_ratio"),
+            ({"deformable_weight_beta": 0.5}, "deformable_weight_beta"),
+            ({"deformable_weight_beta": float("nan")}, "deformable_weight_beta"),
+            ({"deformable_consensus_fraction": 1.1}, "deformable_consensus_fraction"),
+            ({"deformable_consensus_fraction": float("nan")}, "deformable_consensus_fraction"),
+            ({"deformable_projected_velocity_fraction": 1.1}, "deformable_projected_velocity_fraction"),
+            ({"deformable_projected_velocity_fraction": float("nan")}, "deformable_projected_velocity_fraction"),
         )
         for kwargs, message in invalid_values:
             with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, message):
