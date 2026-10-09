@@ -59,11 +59,13 @@ the solver and requires no deformation history. It also works with ordinary
 PIC and GIMP integration.
 
 ``collider_stabilization_fraction`` requests an outward relative normal
-velocity of ``fraction * penetration / dt``. ``collider_contact_gap`` activates
-separated PIC contacts within the specified distance in meters. Their normal
-target permits closing the current gap during the step, rather than forcing
-zero approach velocity. Both controls support ``"pic"`` and ``"picN"`` collider
-bases and default to zero. They do not change collider tangential velocity.
+velocity of ``fraction * penetration / dt`` for particle and RT1 face collider
+bases. ``collider_contact_gap`` activates separated contacts within the
+specified distance in meters for any supported collider basis, including
+grid bases such as ``"Q1"``, ``"S2"``, and ``"S3"``. Their normal target permits
+closing the current gap during the step, rather than forcing zero approach
+velocity. Both controls default to zero and preserve collider tangential
+velocity.
 Choose a contact distance large enough to cover expected relative motion
 within one step; this is a finite predictive range.
 

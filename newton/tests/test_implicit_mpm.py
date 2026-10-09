@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -21,7 +22,7 @@ from newton._src.solvers.implicit_mpm.rasterized_collisions import (
     collision_sdf,
     rasterize_collider_kernel,
 )
-from newton._src.solvers.implicit_mpm.rheology_solver_kernels import YieldParamVec
+from newton._src.solvers.implicit_mpm.rheology_solver_kernels import YieldParamVec, project_shear_free_stress
 from newton._src.solvers.implicit_mpm.solve_rheology import (
     _ITERATIVE_LINEAR_SOLVERS,
     ArraySquaredNorm,
@@ -2049,6 +2050,63 @@ def test_linear_solve_leaves_inviscid_shear_free(test, device):
             np.testing.assert_allclose(velocities["cg"], velocities["gs"], atol=1.0e-3)
 
 
+def test_linear_solve_skips_unused_shear_projection(test, device):
+    """Skip projection launches for shear-resisting materials and retain them for inviscid mixtures."""
+
+    def step_and_count(solver, state, capture=False):
+        with patch("warp.launch", wraps=wp.launch) as launch:
+            if capture:
+                with wp.ScopedCapture(device=device) as scope:
+                    solver.step(state, state, control=None, contacts=None, dt=0.01)
+            else:
+                solver.step(state, state, control=None, contacts=None, dt=0.01)
+        if capture:
+            wp.capture_launch(scope.graph)
+        return sum(
+            (call.args[0] if call.args else call.kwargs["kernel"]) is project_shear_free_stress
+            for call in launch.call_args_list
+        )
+
+    cases = (
+        ("inviscid", {}, True),
+        ("viscous", {"viscosity": 0.001}, False),
+        ("frictional", {"friction": 0.5}, False),
+        ("cohesive", {"yield_stress": 1000.0}, False),
+        ("zero_pressure", {"friction": 0.5, "yield_pressure": 0.0}, True),
+        ("hardening", {"friction": 0.5, "hardening": 1.0}, True),
+        ("mixed", {"viscosity": 0.001}, True),
+    )
+    for name, parameters, needs_projection in cases:
+        with test.subTest(material=name):
+            model = _make_fluid_block(device, gravity=(0.0, 0.0, 0.0), dims=(4, 4, 4))
+            for parameter, value in parameters.items():
+                getattr(model.mpm, parameter).fill_(value)
+            if name == "mixed":
+                viscosity = model.mpm.viscosity.numpy()
+                viscosity[: model.particle_count // 2] = 0.0
+                model.mpm.viscosity.assign(viscosity)
+            config = _face_velocity_config(
+                "Q1",
+                solver="cg",
+                max_iterations=4,
+                tolerance=0.0,
+                grid_type="fixed",
+                grid_padding=2,
+                max_active_cell_count=512,
+            )
+            solver = SolverImplicitMPM(model, config)
+            state = model.state()
+            test.assertEqual(step_and_count(solver, state) > 0, needs_projection)
+            if wp.get_device(device).is_cuda:
+                test.assertEqual(step_and_count(solver, state, capture=True) > 0, needs_projection)
+            test.assertTrue(np.isfinite(state.particle_qd.numpy()).all())
+
+            if name == "viscous":
+                model.mpm.viscosity.zero_()
+                solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
+                test.assertGreater(step_and_count(solver, state), 0)
+
+
 def test_face_velocity_auto_solver(test, device):
     """Warm-start Gauss-Seidel with conjugate gradients by default for face-flux velocities."""
     model = _make_fluid_block(device, gravity=(0.0, 0.0, 0.0))
@@ -2788,6 +2846,12 @@ add_function_test(
     TestImplicitMPM,
     "test_linear_solve_leaves_inviscid_shear_free",
     test_linear_solve_leaves_inviscid_shear_free,
+    devices=devices,
+)
+add_function_test(
+    TestImplicitMPM,
+    "test_linear_solve_skips_unused_shear_projection",
+    test_linear_solve_skips_unused_shear_projection,
     devices=devices,
 )
 add_function_test(

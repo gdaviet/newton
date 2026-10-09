@@ -86,6 +86,7 @@ from .implicit_mpm_solver_kernels import (
     make_dynamic_color_block_indices_kernel,
     make_inverse_rotate_vectors,
     make_rotate_vectors,
+    make_sparse_p0_warmstart_kernels,
     mark_active_cells,
     mark_active_cells_by_environment,
     mass_form,
@@ -807,6 +808,8 @@ class LastStepData:
     def __init__(self):
         self.ws_impulse_field = None  # Warmstart for collision impulses
         self.ws_stress_field = None  # Warmstart for stress field
+        self.ws_cell_position = None
+        self.ws_cell_environment = None
         self.body_q_prev = None  # Previous body transforms for finite-difference velocities
 
     def _ws_stress_space(self, scratch: ImplicitMPMScratchpad, smoothed: bool):
@@ -904,7 +907,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
     A sparse grid is rebuildable when :attr:`Config.max_active_cell_count` is
     positive, :attr:`Config.grid_padding` is zero, the velocity basis is
-    ``"Q1"``, and the strain and collider bases support rebuilding. Cell and
+    ``"Q1"`` or ``"RT1"``, and the strain and collider bases support rebuilding. Cell and
     node capacities are totals across all FEM environments, and resolved
     capacities must satisfy ``upper <= lower <= leaf <= active``.
 
@@ -964,10 +967,12 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         warmstart_mode: Literal["none", "auto", "particles", "grid", "smoothed"] = "auto"
         """Warmstart mode to use for the rheology solver.
 
-        ``"auto"`` uses particle-backed stress for rebuildable sparse grids
-        and ``P1d``/``Q1d`` strain bases, and grid-backed stress otherwise.
-        Grid-backed ``"grid"`` and ``"smoothed"`` modes are not supported for
-        rebuildable sparse grids because their topology changes in place.
+        ``"auto"`` retains grid-backed stress for RT1/P0, including rebuildable
+        sparse grids. Other rebuildable sparse grids and ``P1d``/``Q1d`` strain
+        bases use particle-backed stress; other configurations use grid-backed
+        stress. Rebuildable sparse grids support explicit ``"grid"`` only with
+        P0 strain, matching previous cells by position and environment. Their
+        ``"smoothed"`` mode remains unsupported.
         """
         collider_velocity_mode: Literal["forward", "backward"] = "forward"
         """Collider velocity computation mode. ``'forward'`` uses the current velocity,
@@ -1079,11 +1084,11 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         collider_contact_gap: float = 0.0
         """Experimental predictive contact activation distance [m].
 
-        Positive values activate PIC contacts before penetration. Separated
-        particles may approach at ``gap / dt`` so they can reach the surface
-        during the step. Requires a particle collider basis. Zero retains
-        the existing activation distance. This parameter may change without
-        prior notice.
+        Positive values activate contacts before penetration for any
+        supported collider basis. Separated collider samples may approach
+        at ``gap / dt`` so they can reach the surface during the step.
+        Zero retains the existing activation distance. This parameter may
+        change without prior notice.
         """
         density_strain_fraction: float = 0.0
         """Fraction of the particle volume-filling error corrected per step.
@@ -1171,8 +1176,8 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
         .. experimental::
 
-            ``"RT1"`` requires the ``"P0"`` strain basis, the ``"pic"``
-            integration scheme, Gauss-Seidel, Jacobi or Krylov solvers, and
+            ``"RT1"`` requires the ``"P0"`` strain basis, ``"pic"`` or ``"cell"``
+            integration, Gauss-Seidel, Jacobi or Krylov solvers, and
             materials without elasticity.
         """
 
@@ -1734,12 +1739,12 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         strain_basis = config.strain_basis
         collider_basis = config.collider_basis
         strain_rebuild_safe = strain_basis[:3] == "pic" or strain_basis in ("P0", "P1d", "Q1d", "Q1")
-        collider_rebuild_safe = collider_basis[:3] == "pic" or collider_basis in ("Q1", "S2", "S3")
+        collider_rebuild_safe = collider_basis[:3] == "pic" or collider_basis in ("Q1", "S2", "S3", "RT1")
         self._sparse_rebuildable = (
             self.grid_type == "sparse"
             and self.max_active_cell_count > 0
             and self.grid_padding == 0
-            and self.velocity_basis == "Q1"
+            and self.velocity_basis in ("Q1", "RT1")
             and strain_rebuild_safe
             and collider_rebuild_safe
         )
@@ -1792,10 +1797,10 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             raise ValueError(
                 "collider_basis='RT1' places contact rows on face fluxes and requires velocity_basis='RT1'."
             )
-        if (self.collider_stabilization_fraction > 0.0 or self.collider_contact_gap > 0.0) and not (
+        if self.collider_stabilization_fraction > 0.0 and not (
             self.collider_basis.startswith("pic") or self.collider_basis == "RT1"
         ):
-            raise ValueError("Contact stabilization and predictive gaps require a particle or face collider basis")
+            raise ValueError("Contact stabilization requires a particle or face collider basis")
 
         if config.collider_velocity_mode not in ("forward", "backward"):
             raise ValueError(f"Invalid collider velocity mode: {config.collider_velocity_mode}")
@@ -1804,12 +1809,20 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         warmstart_mode = config.warmstart_mode
         if warmstart_mode not in ("none", "auto", "particles", "grid", "smoothed"):
             raise ValueError(f"Invalid warmstart mode: {warmstart_mode}")
+        sparse_p0_grid_warmstart = self._sparse_rebuildable and self.strain_basis == "P0"
         if warmstart_mode == "auto":
-            warmstart_mode = "particles" if self._sparse_rebuildable or self.strain_basis in ("P1d", "Q1d") else "grid"
-        if self._sparse_rebuildable and warmstart_mode in ("grid", "smoothed"):
+            if sparse_p0_grid_warmstart and self.velocity_basis == "RT1":
+                warmstart_mode = "grid"
+            else:
+                warmstart_mode = (
+                    "particles" if self._sparse_rebuildable or self.strain_basis in ("P1d", "Q1d") else "grid"
+                )
+        if self._sparse_rebuildable and (
+            warmstart_mode == "smoothed" or (warmstart_mode == "grid" and not sparse_p0_grid_warmstart)
+        ):
             raise ValueError(
                 f"Config.warmstart_mode={config.warmstart_mode!r} is not supported with rebuildable sparse grids "
-                "because their topology changes in place; use 'none', 'auto', or 'particles'."
+                "unless using unsmoothed P0 grid stress; use 'none', 'auto', or 'particles'."
             )
         self._stress_warmstart = "" if warmstart_mode == "none" else warmstart_mode
 
@@ -4034,6 +4047,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 strain_environment_offsets=scratch.strain_environment_offsets,
                 has_viscosity=self._mpm_model.has_viscosity,
                 has_dilatancy=self._mpm_model.has_dilatancy,
+                has_shear_free_material=self._mpm_model.has_shear_free_material,
                 strain_velocity_node_count=-1 if self._separate_worlds else self._velocity_nodes_per_strain_sample,
             )
             collision_data = CollisionData(
@@ -4187,6 +4201,11 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         """Ensure strain-space fields exist and match current spaces."""
         scratch.require_strain_space_fields()
         last_step_data.require_strain_space_fields(scratch, smoothed=self._stress_warmstart == "smoothed")
+        if self._sparse_rebuildable and self._stress_warmstart == "grid" and last_step_data.ws_cell_position is None:
+            device = self.model.device
+            cell_count = scratch.grid.cell_count()
+            last_step_data.ws_cell_position = wp.empty(cell_count, dtype=wp.vec3, device=device)
+            last_step_data.ws_cell_environment = wp.full(cell_count, -1, dtype=int, device=device)
 
     def _load_warmstart(
         self,
@@ -4240,7 +4259,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         # The rebuildable sparse grid is refreshed in place, so the previous step's grid
         # topology no longer exists: a grid-to-grid (nonconforming) warmstart would read
         # stale cells. Skip those transfers (they only accelerate convergence); the
-        # particle/point paths below still apply since they go through the PIC quadrature.
+        # Particle/point paths and the P0 cell-location snapshot remain valid.
         grid_to_grid_warmstart = not self._sparse_rebuildable
 
         if scratch.face_collider:
@@ -4267,6 +4286,24 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         # Interpolate previous stress
         if isinstance(prev_stress_field.space.basis, fem.PointBasisSpace):
             scratch.stress_field.dof_values.assign(prev_stress_field.dof_values[pic.cell_particle_indices])
+        elif self._sparse_rebuildable and self._stress_warmstart == "grid":
+            scratch.stress_field.dof_values.zero_()
+            strain_partition = scratch.stress_field.space_partition
+            _, load_stresses = make_sparse_p0_warmstart_kernels(domain, strain_partition)
+            wp.launch(
+                load_stresses,
+                dim=last_step_data.ws_cell_position.shape[0],
+                inputs=[
+                    domain.element_arg_value(self.model.device),
+                    domain.element_index_arg_value(self.model.device),
+                    strain_partition.partition_arg_value(self.model.device),
+                    last_step_data.ws_cell_position,
+                    last_step_data.ws_cell_environment,
+                    prev_stress_field.dof_values,
+                    scratch.stress_field.dof_values,
+                ],
+                device=self.model.device,
+            )
         elif self._stress_warmstart in ("grid", "smoothed") and grid_to_grid_warmstart:
             prev_stress_field = fem.NonconformingField(
                 domain, prev_stress_field, background=scratch.background_stress_field
@@ -4320,6 +4357,22 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 fem.interpolate(
                     scratch.stress_field,
                     dest=last_step_data.ws_stress_field,
+                )
+
+            if self._sparse_rebuildable and self._stress_warmstart == "grid":
+                domain = scratch.sym_strain_test.domain
+                save_locations, _ = make_sparse_p0_warmstart_kernels(domain, scratch.stress_field.space_partition)
+                last_step_data.ws_cell_environment.fill_(-1)
+                wp.launch(
+                    save_locations,
+                    dim=domain.element_count(),
+                    inputs=[
+                        domain.element_arg_value(self.model.device),
+                        domain.element_index_arg_value(self.model.device),
+                        last_step_data.ws_cell_position,
+                        last_step_data.ws_cell_environment,
+                    ],
+                    device=self.model.device,
                 )
 
     def _max_colors(self):

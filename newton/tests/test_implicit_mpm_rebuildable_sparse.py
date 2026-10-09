@@ -43,7 +43,7 @@ def _make_sparse_solver(
         voxel_size=voxel_size,
         max_active_cell_count=max_active_cell_count,
         velocity_basis="Q1",
-        strain_basis="P0",
+        strain_basis=config_kwargs.pop("strain_basis", "P0"),
         collider_basis=collider_basis,
         max_iterations=2,
         warmstart_mode=warmstart_mode,
@@ -60,14 +60,14 @@ def test_rebuildable_sparse_s2_is_enabled(test, device):
 
 
 def test_rebuildable_sparse_rejects_grid_warmstart(test, device):
-    """Verify rebuildable sparse grids reject grid-backed warm starts."""
+    """Reject unsupported grid warmstarts for higher-order sparse strain spaces."""
     model = _make_particle_model(device, [(0.01, 0.01, 0.01)])
     for warmstart_mode in ("grid", "smoothed"):
         with (
             test.subTest(warmstart_mode=warmstart_mode),
             test.assertRaisesRegex(ValueError, f"warmstart_mode={warmstart_mode!r}"),
         ):
-            _make_sparse_solver(model, max_active_cell_count=4, warmstart_mode=warmstart_mode)
+            _make_sparse_solver(model, max_active_cell_count=4, warmstart_mode=warmstart_mode, strain_basis="P1d")
 
 
 def test_rebuildable_sparse_auto_uses_particle_warmstart(test, device):
@@ -412,6 +412,205 @@ def test_rebuildable_sparse_cuda_graph_reports_overflow(test, device):
     solver.check_sparse_grid_rebuild_status()
 
 
+def _check_rt1_sparse_cuda_graph(test, device, integration_scheme, world_count, solver_spec):
+    """Compare eager and captured RT1 steps while refreshing cell and face topology."""
+    local = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverImplicitMPM.register_custom_attributes(local)
+    local.add_particle_grid(
+        pos=wp.vec3(0.05, 0.2, 0.05),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(25.0, 0.0, 0.0),
+        dim_x=2,
+        dim_y=2,
+        dim_z=2,
+        cell_x=0.05,
+        cell_y=0.05,
+        cell_z=0.05,
+        mass=0.125,
+        radius_mean=0.025,
+        jitter=0.0,
+        custom_attributes={
+            "mpm:young_modulus": 1.0e15,
+            "mpm:friction": 0.0,
+            "mpm:tensile_yield_ratio": 1.0,
+        },
+    )
+    local.add_ground_plane(height=0.18, cfg=newton.ModelBuilder.ShapeConfig(mu=0.0))
+    if world_count == 1:
+        builder = local
+    else:
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        SolverImplicitMPM.register_custom_attributes(builder)
+        builder.add_world(local)
+        builder.add_world(local)
+        builder.add_world(newton.ModelBuilder(up_axis=newton.Axis.Y))
+    model = builder.finalize(device=device)
+    if world_count > 1:
+        velocity = model.particle_qd.numpy()
+        begin, end = model.particle_world_start.numpy()[1:3]
+        velocity[begin:end, 0] *= -1.0
+        model.particle_qd.assign(velocity)
+
+    config = SolverImplicitMPM.Config(
+        grid_type="sparse",
+        voxel_size=0.1,
+        max_active_cell_count=256,
+        velocity_basis="RT1",
+        strain_basis="P0",
+        collider_basis="RT1",
+        collider_contact_gap=0.05,
+        separate_worlds=True,
+        integration_scheme=integration_scheme,
+        transfer_scheme="apic",
+        solver=solver_spec,
+        max_iterations=10,
+        tolerance=0.0,
+        warmstart_mode="auto",
+    )
+    eager = SolverImplicitMPM(model, config)
+    captured = SolverImplicitMPM(model, config)
+    eager_state = model.state()
+    captured_state = model.state()
+    dt = 0.005
+    eager.step(eager_state, eager_state, None, None, dt)
+    captured.step(captured_state, captured_state, None, None, dt)
+    grid = captured._scratchpad.grid
+    cell_id = grid.cell_grid.id
+    face_grid = grid._get_topology_face_grid()[0]
+    face_id = face_grid.id
+
+    def active_voxels(volume):
+        count = volume.get_active_stats().voxel_count
+        return {tuple(ijk) for ijk in volume.get_voxels().numpy()[:count]}
+
+    initial_cells = active_voxels(grid.cell_grid)
+    initial_faces = active_voxels(face_grid)
+    with wp.ScopedCapture(device=device) as capture:
+        captured.step(captured_state, captured_state, None, None, dt)
+        captured.step(captured_state, captured_state, None, None, dt)
+    for _ in range(3):
+        eager.step(eager_state, eager_state, None, None, dt)
+        eager.step(eager_state, eager_state, None, None, dt)
+        wp.capture_launch(capture.graph)
+        captured.check_sparse_grid_rebuild_status()
+        for name in ("particle_q", "particle_qd"):
+            np.testing.assert_allclose(
+                getattr(captured_state, name).numpy(),
+                getattr(eager_state, name).numpy(),
+                rtol=1.0e-4,
+                atol=2.0e-5,
+                err_msg=f"Captured {name} differs from eager RT1 execution",
+            )
+        for name in ("particle_qd_grad", "particle_stress", "particle_Jp"):
+            test.assertTrue(np.isfinite(getattr(captured_state.mpm, name).numpy()).all())
+    test.assertTrue(captured._sparse_rebuildable)
+    test.assertEqual(captured._separate_worlds, world_count > 1)
+    test.assertEqual(captured._stress_warmstart, "grid")
+    test.assertEqual(grid.cell_grid.id, cell_id)
+    test.assertEqual(grid._get_topology_face_grid()[0].id, face_id)
+    test.assertNotEqual(active_voxels(grid.cell_grid), initial_cells)
+    test.assertNotEqual(active_voxels(face_grid), initial_faces)
+
+
+def test_rt1_rebuildable_sparse_cuda_graph(test, device):
+    """Capture RT1 sparse-grid contact solves with changing topology and isolated worlds."""
+    if not wp.is_mempool_enabled(device) or not wp.is_conditional_graph_supported():
+        test.skipTest("CUDA graph capture requires memory pools and conditional graphs")
+    for integration_scheme in ("pic", "cell"):
+        for world_count in (1, 3):
+            for solver_spec in ("gs", ("cg", "gs")):
+                with test.subTest(integration=integration_scheme, worlds=world_count, solver=solver_spec):
+                    _check_rt1_sparse_cuda_graph(test, device, integration_scheme, world_count, solver_spec)
+
+
+def _check_sparse_p0_grid_warmstart_preserves_cells(test, device, velocity_basis):
+    """Preserve P0 grid stresses by cell position and world across captured sparse rebuilds."""
+    local = newton.ModelBuilder()
+    SolverImplicitMPM.register_custom_attributes(local)
+    local.add_particle(wp.vec3(0.01, 0.01, 0.01), wp.vec3(0.0), mass=1.0)
+    builder = newton.ModelBuilder()
+    SolverImplicitMPM.register_custom_attributes(builder)
+    builder.add_world(local)
+    builder.add_world(local)
+    model = builder.finalize(device=device)
+    config = SolverImplicitMPM.Config(
+        grid_type="sparse",
+        max_active_cell_count=64,
+        voxel_size=0.1,
+        velocity_basis=velocity_basis,
+        strain_basis="P0",
+        collider_basis=velocity_basis,
+        integration_scheme="cell",
+        separate_worlds=True,
+        warmstart_mode="grid",
+        solver="gs",
+        max_iterations=2,
+    )
+    solver = SolverImplicitMPM(model, config, verbose=False)
+    state = model.state()
+    solver.step(state, state, None, None, 0.001)
+    scratch = solver._scratchpad
+    values = np.zeros((*scratch.stress_field.dof_values.shape, 6), dtype=np.float32)
+    offsets = scratch.strain_environment_offsets.numpy()
+    for world in range(2):
+        values[offsets[world] : offsets[world + 1], 0] = 10.0 * (world + 1)
+    scratch.stress_field.dof_values.assign(values)
+    pic = solver._cell_quadrature.pic
+    solver._save_for_next_warmstart(scratch, pic, solver._last_step_data)
+    history = solver._last_step_data
+    old_pos = history.ws_cell_position.numpy()
+    old_env = history.ws_cell_environment.numpy()
+    old_stress = history.ws_stress_field.dof_values.numpy()
+    old = {
+        (world, *np.round(pos / 0.1).astype(int)): stress
+        for world, pos, stress in zip(old_env, old_pos, old_stress, strict=True)
+        if world >= 0
+    }
+    moved = model.particle_q.numpy()
+    moved[0, 0] += 0.1
+    moved[1, 0] -= 0.1
+    state.particle_q.assign(moved)
+
+    def rebuild_and_load():
+        pic = solver._particles_to_cells(state.particle_q)
+        scratch = solver._rebuild_scratchpad(pic)
+        solver._require_collision_space_fields(scratch, history)
+        solver._require_strain_space_fields(scratch, history)
+        solver._warmstart_fields(history, scratch, pic)
+
+    rebuild_and_load()
+    with wp.ScopedCapture(device=device) as capture:
+        rebuild_and_load()
+    wp.capture_launch(capture.graph)
+    solver.check_sparse_grid_rebuild_status()
+    scratch = solver._scratchpad
+    # Snapshot the new coordinates without changing the loaded stresses.
+    actual = scratch.stress_field.dof_values.numpy()
+    solver._save_for_next_warmstart(scratch, solver._cell_quadrature.pic, history)
+    new_pos = history.ws_cell_position.numpy()
+    new_env = history.ws_cell_environment.numpy()
+    indices = scratch.stress_field.space_partition.space_node_indices().numpy()
+    expected = np.zeros_like(actual)
+    matched = 0
+    for node, cell in enumerate(indices):
+        if cell < 0:
+            continue
+        key = (new_env[cell], *np.round(new_pos[cell] / 0.1).astype(int))
+        if key in old:
+            expected[node] = old[key]
+            matched += 1
+    test.assertGreater(matched, 0)
+    test.assertLess(matched, int(offsets[-1]))
+    np.testing.assert_allclose(actual, expected, atol=1e-6, rtol=0)
+
+
+def test_rt1_sparse_grid_warmstart_preserves_cells(test, device):
+    """Preserve P0 cell stresses across captured rebuilds with Q1 and RT1 velocities."""
+    for velocity_basis in ("Q1", "RT1"):
+        with test.subTest(velocity_basis=velocity_basis):
+            _check_sparse_p0_grid_warmstart_preserves_cells(test, device, velocity_basis)
+
+
 class TestImplicitMPMRebuildableSparse(unittest.TestCase):
     pass
 
@@ -539,6 +738,23 @@ add_function_test(
     check_output=False,
 )
 
+
+add_function_test(
+    TestImplicitMPMRebuildableSparse,
+    "test_rt1_rebuildable_sparse_cuda_graph",
+    test_rt1_rebuildable_sparse_cuda_graph,
+    devices=cuda_devices,
+    check_output=False,
+)
+
+
+add_function_test(
+    TestImplicitMPMRebuildableSparse,
+    "test_rt1_sparse_grid_warmstart_preserves_cells",
+    test_rt1_sparse_grid_warmstart_preserves_cells,
+    devices=cuda_devices,
+    check_output=False,
+)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)

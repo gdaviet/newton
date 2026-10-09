@@ -1188,8 +1188,11 @@ def _make_point_weight_kernel(domain: fem.GeometryDomain):
     return compute_point_weights
 
 
-_GMLS_KERNEL_VARIANCE = wp.constant(0.25)
-"""Per-axis variance of the quadratic B-spline GMLS kernel, in squared voxels."""
+_GMLS_USE_TRILINEAR_WEIGHTS = wp.constant(False)
+"""Select compact hat weights for GMLS experiments; False retains quadratic B-spline weights."""
+
+_GMLS_KERNEL_VARIANCE = wp.constant(1.0 / 6.0 if _GMLS_USE_TRILINEAR_WEIGHTS else 0.25)
+"""Per-axis variance of the selected GMLS kernel, in squared voxels."""
 
 _GMLS_FULL_SLOPE_VARIANCE = wp.constant(0.02)
 """Kernel-weighted particle offset variance, in squared voxels, above which GMLS uses the full slope.
@@ -1208,6 +1211,11 @@ _CELL_NEIGHBOR_COUNT = wp.constant(27)
 
 
 @wp.func
+def _trilinear_hat(r: float):
+    return wp.max(1.0 - wp.abs(r), 0.0)
+
+
+@wp.func
 def _quadratic_bspline(r: float):
     a = wp.abs(r)
     if a < 0.5:
@@ -1219,7 +1227,9 @@ def _quadratic_bspline(r: float):
 
 @wp.func
 def _gmls_kernel_weight(d: wp.vec3):
-    """Tensor-product quadratic B-spline at offset ``d``, in voxels."""
+    """Evaluate the selected tensor-product GMLS kernel at offset ``d``, in voxels."""
+    if wp.static(_GMLS_USE_TRILINEAR_WEIGHTS):
+        return _trilinear_hat(d[0]) * _trilinear_hat(d[1]) * _trilinear_hat(d[2])
     return _quadratic_bspline(d[0]) * _quadratic_bspline(d[1]) * _quadratic_bspline(d[2])
 
 

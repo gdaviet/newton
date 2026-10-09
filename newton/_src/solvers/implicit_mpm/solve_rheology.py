@@ -387,6 +387,9 @@ class RheologyData:
         strain_environment_offsets: Strain-node offsets delimiting independent
             environments, shape ``[environment_count + 1]``. ``None`` for a
             single shared solve.
+        has_shear_free_material: Whether active material may have zero
+            deviatoric yield stress and viscosity, requiring pressure-only
+            projection in linear solves.
     """
 
     strain_mat: sp.BsrMatrix
@@ -406,6 +409,7 @@ class RheologyData:
 
     has_viscosity: bool = False
     has_dilatancy: bool = False
+    has_shear_free_material: bool = False
     strain_velocity_node_count: int = -1
 
 
@@ -1530,6 +1534,8 @@ class _LinearSolver:
         self._project_shear_free(z)
 
     def _project_shear_free(self, stress: wp.array[vec6]):
+        if not self.rheology.has_shear_free_material:
+            return
         # Keeping every iterate in this subspace keeps the projected operator symmetric
         wp.launch(
             kernel=project_shear_free_stress,

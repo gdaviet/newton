@@ -1103,6 +1103,59 @@ def node_color(
     color_indices[nid] = nid
 
 
+def make_sparse_p0_warmstart_kernels(domain: fem.GeometryDomain, space_partition: fem.SpacePartition):
+    """Save cell locations and scatter P0 stresses into a rebuilt sparse partition."""
+    element_index = domain.element_index
+    element_position = domain.element_position
+    environment_index = domain.element_environment_index
+    cell_lookup = domain.element_partition_lookup
+    multiple_environments = domain.geometry.environment_count() > 1
+
+    @fem.cache.dynamic_kernel(suffix=domain.name)
+    def save_locations(
+        geo_arg: domain.ElementArg,
+        index_arg: domain.ElementIndexArg,
+        positions: wp.array[wp.vec3],
+        environments: wp.array[int],
+    ):
+        cell = element_index(index_arg, wp.tid())
+        if cell == fem.NULL_ELEMENT_INDEX:
+            return
+        sample = fem.make_free_sample(cell, fem.Coords(0.5))
+        positions[cell] = element_position(geo_arg, sample)
+        environments[cell] = environment_index(geo_arg, cell)
+
+    @fem.cache.dynamic_kernel(suffix=f"{domain.name}_{space_partition.name}")
+    def load_stresses(
+        geo_arg: domain.ElementArg,
+        index_arg: domain.ElementIndexArg,
+        partition_arg: space_partition.PartitionArg,
+        positions: wp.array[wp.vec3],
+        environments: wp.array[int],
+        previous: wp.array[vec6],
+        current: wp.array[vec6],
+    ):
+        old_cell = wp.tid()
+        world = environments[old_cell]
+        if world < 0:
+            return
+        domain_arg = domain.DomainArg(geo_arg, index_arg)
+        if wp.static(multiple_environments):
+            sample = cell_lookup(domain_arg, positions[old_cell], world)
+        else:
+            sample = cell_lookup(domain_arg, positions[old_cell])
+        if sample.element_index == fem.NULL_ELEMENT_INDEX:
+            return
+        # A missing sparse cell may return the closest point in a neighboring cell.
+        if wp.max(wp.abs(sample.element_coords - fem.Coords(0.5))) > 1.0e-3:
+            return
+        node = space_partition.partition_node_index(partition_arg, sample.element_index)
+        if node != fem.NULL_NODE_INDEX:
+            current[node] = previous[old_cell]
+
+    return save_locations, load_stresses
+
+
 def make_cell_color_kernel(geo_partition: fem.GeometryPartition):
     @fem.cache.dynamic_kernel(geo_partition.name)
     def cell_color(

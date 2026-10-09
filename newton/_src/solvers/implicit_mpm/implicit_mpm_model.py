@@ -334,8 +334,8 @@ class ImplicitMPMModel:
         - ``particle_radius``, ``particle_volume``, and ``particle_density``,
           from ``model.particle_radius`` and ``model.particle_mass``.
         - Cached extrema (``min_young_modulus``, ``max_hardening``) and feature
-          flags (``has_viscosity``, ``has_dilatancy``) used to toggle code
-          paths without rescanning every step.
+          flags (``has_viscosity``, ``has_dilatancy``, ``has_shear_free_material``)
+          used to toggle code paths without rescanning every step.
         """
         model = self.model
 
@@ -397,15 +397,27 @@ class ImplicitMPMModel:
         self.material_particle_volume = wp.array(material_particle_volume, dtype=float, device=model.device)
 
         if np.any(material_active):
+            hardening = self.material_parameters.hardening.numpy()[material_active]
+            viscosity = self.material_parameters.viscosity.numpy()[material_active]
+            yield_stress = self.material_parameters.yield_stress.numpy()[material_active]
+            friction_limit = (
+                self.material_parameters.friction.numpy()[material_active]
+                * self.material_parameters.yield_pressure.numpy()[material_active]
+            )
             self.min_young_modulus = float(np.min(self.material_parameters.young_modulus.numpy()[material_active]))
-            self.max_hardening = float(np.max(self.material_parameters.hardening.numpy()[material_active]))
-            self.has_viscosity = bool(np.any(self.material_parameters.viscosity.numpy()[material_active] > 0.0))
+            self.max_hardening = float(np.max(hardening))
+            self.has_viscosity = bool(np.any(viscosity > 0.0))
             self.has_dilatancy = bool(np.any(self.material_parameters.dilatancy.numpy()[material_active] > 0.0))
+            # Hardening can reduce both shear limits to zero as plastic volume changes.
+            self.has_shear_free_material = bool(
+                np.any((viscosity <= 0.0) & (((yield_stress <= 0.0) & (friction_limit <= 0.0)) | (hardening != 0.0)))
+            )
         else:
             self.min_young_modulus = math.inf
             self.max_hardening = 0.0
             self.has_viscosity = False
             self.has_dilatancy = False
+            self.has_shear_free_material = False
 
     def notify_collider_changed(self, body_mass: np.ndarray | None = None):
         """Refresh cached extrema for collider parameters.
