@@ -983,8 +983,9 @@ class LOXSolverConfig:
     .. experimental::
 
         The LOX backend, including all of its options, may change without
-        following the normal deprecation policy. It supports rigid bodies
-        and rod joints.
+        following the normal deprecation policy. It supports rigid bodies,
+        rod joints, and deformable particles of cloth and tetrahedral soft
+        bodies.
     """
 
     max_iterations: int = 16
@@ -1087,6 +1088,113 @@ class LOXSolverConfig:
     continuously across angle branches.
     """
 
+    deformable_cr_iterations: int = 4
+    """Preconditioned conjugate-residual iterations per deformable candidate solve."""
+
+    deformable_recycle_cr: bool = True
+    """Whether to augment the conjugate-residual solves with recent candidate corrections.
+
+    The corrections are A-orthogonalized and re-projected against the current right-hand
+    side before each restarted solve, which recycles a small correction subspace across
+    the splitting iterations at a fixed iteration count.
+    """
+
+    deformable_direct_max_particles: int = 128
+    """Largest deformable component solved with a batched direct Cholesky factorization.
+
+    The default gives 384 scalar unknowns, six 64-wide factorization tiles. Zero solves
+    every deformable component with conjugate residuals.
+    """
+
+    deformable_linear_solver: Literal["cr", "cudss", "cudss_then_cr"] = "cr"
+    """Linear solver of the deformable candidate solves.
+
+    ``"cr"`` uses the preconditioned conjugate residuals and the small-component direct
+    solves. ``"cudss"`` uses a global sparse direct solve on CUDA, which analyzes the fixed
+    matrix structure once, factors its values once per time step, and reuses that
+    factorization at every splitting iteration. ``"cudss_then_cr"`` solves the first
+    candidate of each time step with cuDSS and the next ones with warm-started conjugate
+    residuals. Both cuDSS modes require the ``nvmath-python[cu12]`` or ``nvmath-python[cu13]``
+    package for the CUDA version in use; their factorizations and solves support CUDA graph
+    capture with CUDA memory pools, and their analysis runs on the host before capture.
+    ``"cudss"`` requires :attr:`fixed_iterations`, and ``"cudss_then_cr"`` runs its cuDSS
+    candidate before the conditional splitting loop.
+    """
+
+    deformable_proximal_iterations: int = 4
+    """Local Gauss--Newton iterations per nonlinear elastic-element proximal update.
+
+    Zero retains the frozen membrane and tetrahedron linearizations. Positive values
+    refine each element within the splitting iterations, and the convergence check also
+    reads a metric-scaled local stationarity correction. A world whose local budget runs
+    out keeps iterating. Tetrahedral elasticity is inversion tolerant: finite inverted
+    elements stay valid, without a guaranteed positive volume.
+    """
+
+    deformable_proximal_relaxation: float = 1.0
+    """Relaxation factor of the nonlinear elastic-element proximal updates.
+
+    Zero disables the local updates. Positive values below one under-relax their
+    multiplier updates with the same fixed point.
+    """
+
+    deformable_preconditioner: Literal["incomplete_ldlt", "multilevel", "two_level", "block_jacobi"] = "two_level"
+    """Preconditioner of the deformable conjugate-residual solves.
+
+    ``"two_level"`` adds a 3x3 block-Jacobi fine correction to independent dense solves
+    over groups of graph aggregates. ``"multilevel"`` adds a component-global correction
+    above the local coarse blocks. ``"incomplete_ldlt"`` applies a global triangular
+    correction at a higher setup and application cost. ``"block_jacobi"`` keeps the
+    diagonal block of each particle. The alternatives to the default may need more
+    :attr:`deformable_cr_iterations`.
+    """
+
+    deformable_hessian_regularization: float = 1.0e-6
+    """Relative positive pivot or diagonal floor of the deformable preconditioner."""
+
+    deformable_enable_self_contact: bool = False
+    """Whether to detect the vertex-triangle and edge-edge self-contacts of the deformable surfaces."""
+
+    deformable_enable_normal_cone_filtering: bool = True
+    """Whether to keep only the self-contacts whose direction lies in the normal cone of their surface features."""
+
+    deformable_enable_rigid_contact_normal_cone_filtering: bool = False
+    """Whether to keep only the full-surface rigid-soft contacts whose direction lies in the normal cone of their
+    surface feature."""
+
+    deformable_normal_cone_filtering_min_distance: float = 1.0e-4
+    """Separation below which the contacts bypass the normal-cone filters [m]."""
+
+    deformable_self_contact_margin: float = 0.2
+    """Detection margin of the self-contacts [m]."""
+
+    deformable_self_contact_gap: float = 0.001
+    """Speculative self-contact distance [m]."""
+
+    deformable_self_contact_vertex_buffer_size: int = 32
+    """Largest number of candidate triangles of each surface vertex."""
+
+    deformable_self_contact_edge_buffer_size: int = 64
+    """Largest number of candidate edges of each surface edge."""
+
+    deformable_self_contact_topological_filter_threshold: int = 1
+    """Mesh-ring distance within which the self-contact candidates are excluded."""
+
+    deformable_self_contact_rest_exclusion_radius: float = 0.0
+    """Rest-pose distance within which the self-contact candidates are excluded [m]."""
+
+    deformable_self_contact_edge_parallel_epsilon: float = 1.0e-5
+    """Tolerance that classifies nearly parallel surface edges in the self-contact detection."""
+
+    deformable_enable_penetration_free_contact: bool = False
+    """Whether to truncate the deformable self-contact motion within VBD-style penetration-free bounds.
+
+    The truncation applies to the particles of the self-contacts; rigid-soft contacts keep their motion.
+    """
+
+    deformable_penetration_free_contact_relaxation: float = 0.85
+    """Safety relaxation of the deformable directional step bounds."""
+
     position_tolerance: float = 1.0e-5
     """Translational end-of-step convergence tolerance [m].
 
@@ -1132,6 +1240,15 @@ class LOXSolverConfig:
     integrates the smooth twist and recovers the global-twist product-space ADMM update, like
     the other Kamino dynamics solvers. One integrates the projected twist and reconciles the
     structural reactions with it.
+    """
+
+    deformable_projected_velocity_fraction: float = 1.0
+    """Fraction of the projected particle velocity in the accepted particle velocity, in [0, 1].
+
+    The accepted particle velocity, which is integrated and written to the outputs, blends the
+    projected velocity with this weight and the smooth velocity of the last candidate solve with
+    its complement. The default integrates the projected velocity. Zero integrates the smooth
+    velocity, like a zero :attr:`projected_twist_fraction` for the rigid bodies.
     """
 
     joint_warmstart_factor: float = 0.9
@@ -1193,7 +1310,19 @@ class LOXSolverConfig:
     """
 
     weight_sigma: float = 1.0e-3
-    """Smallest fraction of the geometric mean of the patch bounds that the :attr:`weight_beta` cap keeps."""
+    """Smallest fraction of the geometric mean of the patch bounds that the :attr:`weight_beta` and
+    :attr:`deformable_weight_beta` caps keep."""
+
+    deformable_weight_beta: float | None = None
+    """Largest particle weight relative to the free bound of the particle, the particle counterpart of
+    :attr:`weight_beta`.
+
+    The free bound is the smallest eigenvalue of the free patch Schur complement of the particle, at
+    least its mass. The weight stays between the free bound and ``deformable_weight_beta`` times it,
+    and at least :attr:`weight_sigma` times the geometric mean of the patch bounds. The default
+    ``None`` keeps the geometric mean, which keeps the stiff elements of grasped soft bodies valid, and
+    one gives the free bound.
+    """
 
     consensus_fraction: float = 0.5
     """Fraction ``alpha`` of the consensus penalty that the smooth solve takes implicitly, in [0, 1].
@@ -1208,6 +1337,20 @@ class LOXSolverConfig:
     in the matrix of the body and its joint neighbors, which bound ``[(A^-1)_ii]^-1``: from below when
     each neighbor keeps only its joint to the body, and from above when the neighbors keep their full
     rows of ``A`` with the other bodies held fixed, capped by :attr:`weight_beta`.
+    The particles of the deformable bodies take one scalar weight each: the geometric mean of the
+    smallest eigenvalues of the Schur complements of the particle in two matrices of a patch of at
+    most eight particles, grown from the particle along its stiffest elements. In the first, the
+    patch particles keep only the elements within the patch, which bounds ``[(A^-1)_ii]^-1`` from
+    below; in the second, they keep their full rows of ``A``, which bounds it from above. An optional
+    cap, :attr:`deformable_weight_beta`, bounds the particle weights, and the particles take their own
+    fraction, :attr:`deformable_consensus_fraction`.
+    """
+
+    deformable_consensus_fraction: float = 0.5
+    """Fraction ``alpha`` of the consensus penalty of the particles in their smooth solve, in [0, 1].
+
+    The particle counterpart of :attr:`consensus_fraction`: each candidate solve of the deformable
+    bodies solves ``(A + alpha W) v = f + W (u + alpha p)`` with the particle weights ``W``.
     """
 
     @override
@@ -1288,8 +1431,20 @@ class LOXSolverConfig:
             raise ValueError(f"Invalid weight_beta: {self.weight_beta}. Must be None or at least one.")
         if not np.isfinite(self.weight_sigma) or not (0.0 <= self.weight_sigma <= 1.0):
             raise ValueError(f"Invalid weight_sigma: {self.weight_sigma}. Must be in range [0, 1].")
+        if self.deformable_weight_beta is not None and not (
+            np.isfinite(self.deformable_weight_beta) and self.deformable_weight_beta >= 1.0
+        ):
+            raise ValueError(
+                f"Invalid deformable_weight_beta: {self.deformable_weight_beta}. Must be None or at least one."
+            )
         if not np.isfinite(self.consensus_fraction) or not (0.0 <= self.consensus_fraction <= 1.0):
             raise ValueError(f"Invalid consensus_fraction: {self.consensus_fraction}. Must be in range [0, 1].")
+        if not np.isfinite(self.deformable_consensus_fraction) or not (
+            0.0 <= self.deformable_consensus_fraction <= 1.0
+        ):
+            raise ValueError(
+                f"Invalid deformable_consensus_fraction: {self.deformable_consensus_fraction}. Must be in range [0, 1]."
+            )
         if not np.isfinite(self.joint_penalty_condition) or self.joint_penalty_condition <= 1.0:
             raise ValueError(
                 f"Invalid joint_penalty_condition: {self.joint_penalty_condition}. Must be greater than one."
@@ -1313,6 +1468,80 @@ class LOXSolverConfig:
             raise ValueError(
                 f"Invalid inertial_warmstart_fraction: {self.inertial_warmstart_fraction}. Must be in range [0, 1]."
             )
+        if self.deformable_linear_solver not in ("cr", "cudss", "cudss_then_cr"):
+            raise ValueError(
+                f"Invalid deformable_linear_solver: {self.deformable_linear_solver!r}. "
+                "Must be 'cr', 'cudss', or 'cudss_then_cr'."
+            )
+        if self.deformable_linear_solver == "cudss" and not self.fixed_iterations:
+            raise ValueError("deformable_linear_solver='cudss' requires fixed_iterations=True.")
+        if self.deformable_preconditioner not in ("incomplete_ldlt", "multilevel", "two_level", "block_jacobi"):
+            raise ValueError(
+                f"Invalid deformable_preconditioner: {self.deformable_preconditioner!r}. "
+                "Must be 'incomplete_ldlt', 'multilevel', 'two_level', or 'block_jacobi'."
+            )
+        for name, minimum in (
+            ("deformable_cr_iterations", 1),
+            ("deformable_direct_max_particles", 0),
+            ("deformable_proximal_iterations", 0),
+            ("deformable_self_contact_vertex_buffer_size", 1),
+            ("deformable_self_contact_edge_buffer_size", 1),
+            ("deformable_self_contact_topological_filter_threshold", 0),
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                raise ValueError(f"Invalid {name}: {value}. Must be an integer greater than or equal to {minimum}.")
+        for name in (
+            "deformable_recycle_cr",
+            "deformable_enable_self_contact",
+            "deformable_enable_normal_cone_filtering",
+            "deformable_enable_rigid_contact_normal_cone_filtering",
+            "deformable_enable_penetration_free_contact",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"Invalid {name}: {getattr(self, name)}. Must be a boolean.")
+        for name in (
+            "deformable_normal_cone_filtering_min_distance",
+            "deformable_self_contact_margin",
+            "deformable_self_contact_gap",
+            "deformable_self_contact_rest_exclusion_radius",
+        ):
+            if not np.isfinite(getattr(self, name)) or getattr(self, name) < 0.0:
+                raise ValueError(f"Invalid {name}: {getattr(self, name)}. Must be finite and nonnegative.")
+        if (
+            not np.isfinite(self.deformable_self_contact_edge_parallel_epsilon)
+            or self.deformable_self_contact_edge_parallel_epsilon <= 0.0
+        ):
+            raise ValueError(
+                "Invalid deformable_self_contact_edge_parallel_epsilon: "
+                f"{self.deformable_self_contact_edge_parallel_epsilon}. Must be greater than zero."
+            )
+        if self.deformable_self_contact_margin + self.deformable_self_contact_gap <= 0.0:
+            raise ValueError(
+                "The sum of deformable_self_contact_margin and deformable_self_contact_gap must be positive."
+            )
+        if (
+            not np.isfinite(self.deformable_proximal_relaxation)
+            or self.deformable_proximal_relaxation < 0.0
+            or self.deformable_proximal_relaxation > 1.0
+        ):
+            raise ValueError(
+                f"Invalid deformable_proximal_relaxation: {self.deformable_proximal_relaxation}. Must be in range [0, 1]."
+            )
+        if not np.isfinite(self.deformable_hessian_regularization) or self.deformable_hessian_regularization <= 0.0:
+            raise ValueError(
+                f"Invalid deformable_hessian_regularization: {self.deformable_hessian_regularization}. "
+                "Must be greater than zero."
+            )
+        if (
+            not np.isfinite(self.deformable_penetration_free_contact_relaxation)
+            or self.deformable_penetration_free_contact_relaxation <= 0.0
+            or self.deformable_penetration_free_contact_relaxation > 1.0
+        ):
+            raise ValueError(
+                "Invalid deformable_penetration_free_contact_relaxation: "
+                f"{self.deformable_penetration_free_contact_relaxation}. Must be in range (0, 1]."
+            )
 
         if not np.isfinite(self.position_tolerance) or self.position_tolerance <= 0.0:
             raise ValueError(f"Invalid position_tolerance: {self.position_tolerance}. Must be greater than zero.")
@@ -1331,6 +1560,15 @@ class LOXSolverConfig:
         ):
             raise ValueError(
                 f"Invalid projected_twist_fraction: {self.projected_twist_fraction}. Must be in range [0, 1]."
+            )
+        if (
+            not np.isfinite(self.deformable_projected_velocity_fraction)
+            or self.deformable_projected_velocity_fraction < 0.0
+            or self.deformable_projected_velocity_fraction > 1.0
+        ):
+            raise ValueError(
+                "Invalid deformable_projected_velocity_fraction: "
+                f"{self.deformable_projected_velocity_fraction}. Must be in range [0, 1]."
             )
         if (
             not np.isfinite(self.joint_warmstart_factor)

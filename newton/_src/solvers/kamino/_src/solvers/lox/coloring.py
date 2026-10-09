@@ -8,6 +8,8 @@ starts from a hashed color; a few repair passes then move rows to colors that
 strictly decrease ``sum(occupancy^2)``, using per-body locks to serialize the
 moves that touch each body. The result is an ordering of the rows of each
 family by color, plus the per-body and per-world occupancy of each color.
+The particle contact rows of deformable bodies also count their particles,
+with per-particle occupancies and locks.
 """
 
 from __future__ import annotations
@@ -15,6 +17,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import warp as wp
+
+from .projection_kernels import PARTICLE_COEFFICIENT_TOLERANCE
+from .types import ParticleContactStatus
 
 if TYPE_CHECKING:
     from .types import ColoredRowsData, ColoringData, LOXProblemData
@@ -106,6 +111,67 @@ def _choose_color(bid_a: int, bid_b: int, current: int, color_count: int, occupa
     # Moving one incidence adds one to the destination and removes one from
     # the source. This is exactly the strict-improvement condition for sum(m^2).
     if best != current and best_sum + body_count < current_sum:
+        return best
+    return _NO_COLOR
+
+
+@wp.func
+def _is_unique_particle(particle: wp.array2d[wp.int32], row: int, slot: int) -> bool:
+    """Return whether slot ``slot`` of a row holds a particle that no earlier slot of the row holds."""
+    pid = particle[row, slot]
+    unique = pid >= 0
+    for previous in range(slot):
+        unique = unique and particle[row, previous] != pid
+    return unique
+
+
+@wp.func
+def _particle_row_occupancy(
+    particle: wp.array2d[wp.int32],
+    row: int,
+    bid: int,
+    color: int,
+    occupancy: wp.array2d[wp.int32],
+    particle_occupancy: wp.array2d[wp.int32],
+):
+    """Return the sum and the maximum of the color occupancies of the endpoints of a particle contact row."""
+    total = _occupancy(occupancy, bid, color)
+    maximum = total
+    for slot in range(4):
+        if _is_unique_particle(particle, row, slot):
+            value = particle_occupancy[particle[row, slot], color]
+            total += value
+            maximum = wp.max(maximum, value)
+    return total, maximum
+
+
+@wp.func
+def _choose_particle_color(
+    particle: wp.array2d[wp.int32],
+    row: int,
+    bid: int,
+    current: int,
+    color_count: int,
+    occupancy: wp.array2d[wp.int32],
+    particle_occupancy: wp.array2d[wp.int32],
+) -> int:
+    """Return a color that strictly decreases ``sum(occupancy^2)`` over the row endpoints, or ``_NO_COLOR``."""
+    endpoint_count = int(0)
+    if bid >= 0:
+        endpoint_count += 1
+    for slot in range(4):
+        if _is_unique_particle(particle, row, slot):
+            endpoint_count += 1
+    best = current
+    best_sum, best_max = _particle_row_occupancy(particle, row, bid, current, occupancy, particle_occupancy)
+    current_sum = best_sum
+    for color in range(color_count):
+        candidate_sum, candidate_max = _particle_row_occupancy(particle, row, bid, color, occupancy, particle_occupancy)
+        if candidate_sum < best_sum or (candidate_sum == best_sum and candidate_max < best_max):
+            best = color
+            best_sum = candidate_sum
+            best_max = candidate_max
+    if best != current and best_sum + endpoint_count < current_sum:
         return best
     return _NO_COLOR
 
@@ -310,6 +376,156 @@ def _scatter_color_order(
         order[wp.atomic_add(cursors, color, 1)] = row
 
 
+@wp.kernel
+def _assign_initial_particle_colors(
+    # Inputs:
+    family: int,
+    color_count: int,
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    particle: wp.array2d[wp.int32],
+    body: wp.array[wp.int32],
+    # Outputs:
+    row_color: wp.array[wp.int32],
+):
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        row_color[row] = _NO_COLOR
+        return
+    bid_b = particle[row, 1]
+    if bid_b < 0:
+        bid_b = body[row]
+    row_color[row] = _initial_color(row_world[row], row, particle[row, 0], bid_b, family, color_count)
+
+
+@wp.kernel
+def _count_particle_occupancy(
+    # Inputs:
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    particle: wp.array2d[wp.int32],
+    body: wp.array[wp.int32],
+    row_color: wp.array[wp.int32],
+    # Outputs:
+    occupancy: wp.array2d[wp.int32],
+    particle_occupancy: wp.array2d[wp.int32],
+    world_color_count: wp.array2d[wp.int32],
+):
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        return
+    color = row_color[row]
+    if world_color_count:
+        wp.atomic_add(world_color_count, row_world[row], color, 1)
+    bid = body[row]
+    if bid >= 0:
+        wp.atomic_add(occupancy, bid, color, 1)
+    for slot in range(4):
+        if _is_unique_particle(particle, row, slot):
+            wp.atomic_add(particle_occupancy, particle[row, slot], color, 1)
+
+
+@wp.kernel
+def _propose_particle_repairs(
+    # Inputs:
+    color_count: int,
+    key_offset: int,
+    row_status: wp.array[wp.int32],
+    particle: wp.array2d[wp.int32],
+    body: wp.array[wp.int32],
+    row_color: wp.array[wp.int32],
+    occupancy: wp.array2d[wp.int32],
+    particle_occupancy: wp.array2d[wp.int32],
+    # Outputs:
+    proposal: wp.array[wp.int32],
+    body_lock: wp.array[wp.int32],
+    particle_lock: wp.array[wp.int32],
+):
+    """Propose a better color and claim every endpoint with the smallest row key."""
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        proposal[row] = _NO_COLOR
+        return
+    bid = body[row]
+    candidate = _choose_particle_color(particle, row, bid, row_color[row], color_count, occupancy, particle_occupancy)
+    proposal[row] = candidate
+    if candidate < 0:
+        return
+    key = key_offset + row
+    if bid >= 0:
+        wp.atomic_min(body_lock, bid, key)
+    for slot in range(4):
+        if _is_unique_particle(particle, row, slot):
+            wp.atomic_min(particle_lock, particle[row, slot], key)
+
+
+@wp.kernel
+def _commit_particle_repairs(
+    # Inputs:
+    key_offset: int,
+    row_world: wp.array[wp.int32],
+    particle: wp.array2d[wp.int32],
+    body: wp.array[wp.int32],
+    proposal: wp.array[wp.int32],
+    body_lock: wp.array[wp.int32],
+    particle_lock: wp.array[wp.int32],
+    # Outputs:
+    row_color: wp.array[wp.int32],
+    occupancy: wp.array2d[wp.int32],
+    particle_occupancy: wp.array2d[wp.int32],
+    world_color_count: wp.array2d[wp.int32],
+):
+    """Move rows that own the locks of all their endpoints to their proposed color."""
+    row = wp.tid()
+    candidate = proposal[row]
+    if candidate < 0:
+        return
+    key = key_offset + row
+    bid = body[row]
+    owned = bid < 0 or body_lock[bid] == key
+    for slot in range(4):
+        if _is_unique_particle(particle, row, slot):
+            owned = owned and particle_lock[particle[row, slot]] == key
+    if not owned:
+        return
+    current = row_color[row]
+    if world_color_count:
+        wid = row_world[row]
+        wp.atomic_add(world_color_count, wid, current, -1)
+        wp.atomic_add(world_color_count, wid, candidate, 1)
+    if bid >= 0:
+        wp.atomic_add(occupancy, bid, current, -1)
+        wp.atomic_add(occupancy, bid, candidate, 1)
+    for slot in range(4):
+        if _is_unique_particle(particle, row, slot):
+            pid = particle[row, slot]
+            wp.atomic_add(particle_occupancy, pid, current, -1)
+            wp.atomic_add(particle_occupancy, pid, candidate, 1)
+    row_color[row] = candidate
+
+
+@wp.kernel
+def _accumulate_particle_weight_sums(
+    # Inputs:
+    row_status: wp.array[wp.int32],
+    particle: wp.array2d[wp.int32],
+    coefficient: wp.array2d[wp.float32],
+    row_color: wp.array[wp.int32],
+    # Outputs:
+    particle_weight_sum: wp.array2d[wp.float32],
+):
+    """Sum the absolute coefficients of the particle contact rows of each color of each particle."""
+    row = wp.tid()
+    if row_status[row] != ParticleContactStatus.ACTIVE:
+        return
+    color = row_color[row]
+    for slot in range(4):
+        pid = particle[row, slot]
+        weight = wp.abs(coefficient[row, slot])
+        if pid >= 0 and weight > PARTICLE_COEFFICIENT_TOLERANCE:
+            wp.atomic_add(particle_weight_sum, pid, color, weight)
+
+
 ###
 # Launchers
 ###
@@ -359,7 +575,7 @@ def compact_colored_rows(rows: ColoredRowsData, color_count: int, device: wp.Dev
 
 
 class RowColoring:
-    """Fixed-capacity coloring of the box rows and contacts of a LOX problem.
+    """Fixed-capacity coloring of the box rows, the contacts, and the particle contact rows of a LOX problem.
 
     Args:
         problem_data: Rows and body data of the LOX problem.
@@ -378,9 +594,15 @@ class RowColoring:
 
     def build(self) -> None:
         """Color the active rows and sort each family by color."""
+        data = self._data
+        particle_rows = self.problem_data.particle_contact_rows
+        particles = particle_rows is not None and particle_rows.capacity > 0
         self._data.occupancy.zero_()
         if self._data.world_color_count is not None:
             self._data.world_color_count.zero_()
+        if particles:
+            data.particle_occupancy.zero_()
+            data.particle_weight_sum.zero_()
         for family, salt, world, local, count, bid_a, bid_b in self._families():
             if family.capacity == 0:
                 continue
@@ -398,8 +620,38 @@ class RowColoring:
                 outputs=[self._data.occupancy, self._data.world_color_count],
                 device=self.device,
             )
+        if particles:
+            wp.launch(
+                _assign_initial_particle_colors,
+                dim=particle_rows.capacity,
+                inputs=[
+                    2,
+                    self.color_count,
+                    particle_rows.world,
+                    particle_rows.status,
+                    particle_rows.particle,
+                    particle_rows.body,
+                ],
+                outputs=[data.particle.color],
+                device=self.device,
+            )
+            wp.launch(
+                _count_particle_occupancy,
+                dim=particle_rows.capacity,
+                inputs=[
+                    particle_rows.world,
+                    particle_rows.status,
+                    particle_rows.particle,
+                    particle_rows.body,
+                    data.particle.color,
+                ],
+                outputs=[data.occupancy, data.particle_occupancy, data.world_color_count],
+                device=self.device,
+            )
         for _repair in range(_REPAIR_PASSES):
             self._data.body_lock.fill_(_LOCK_FREE)
+            if particles:
+                data.particle_lock.fill_(_LOCK_FREE)
             key_offset = 0
             for family, _salt, world, local, count, bid_a, bid_b in self._families():
                 if family.capacity > 0:
@@ -421,6 +673,24 @@ class RowColoring:
                         device=self.device,
                     )
                 key_offset += family.capacity
+            if particles:
+                wp.launch(
+                    _propose_particle_repairs,
+                    dim=particle_rows.capacity,
+                    inputs=[
+                        self.color_count,
+                        key_offset,
+                        particle_rows.status,
+                        particle_rows.particle,
+                        particle_rows.body,
+                        data.particle.color,
+                        data.occupancy,
+                        data.particle_occupancy,
+                    ],
+                    outputs=[data.particle.proposal, data.body_lock, data.particle_lock],
+                    device=self.device,
+                )
+            particle_key_offset = key_offset
             key_offset = 0
             for family, _salt, world, _local, _count, bid_a, bid_b in self._families():
                 if family.capacity > 0:
@@ -432,8 +702,33 @@ class RowColoring:
                         device=self.device,
                     )
                 key_offset += family.capacity
+            if particles:
+                wp.launch(
+                    _commit_particle_repairs,
+                    dim=particle_rows.capacity,
+                    inputs=[
+                        particle_key_offset,
+                        particle_rows.world,
+                        particle_rows.particle,
+                        particle_rows.body,
+                        data.particle.proposal,
+                        data.body_lock,
+                        data.particle_lock,
+                    ],
+                    outputs=[data.particle.color, data.occupancy, data.particle_occupancy, data.world_color_count],
+                    device=self.device,
+                )
         compact_colored_rows(self._data.box, self.color_count, self.device)
         compact_colored_rows(self._data.contact, self.color_count, self.device)
+        if particles:
+            compact_colored_rows(data.particle, self.color_count, self.device)
+            wp.launch(
+                _accumulate_particle_weight_sums,
+                dim=particle_rows.capacity,
+                inputs=[particle_rows.status, particle_rows.particle, particle_rows.coefficient, data.particle.color],
+                outputs=[data.particle_weight_sum],
+                device=self.device,
+            )
         if self._data.world_order is not None:
             self._build_world_order()
 

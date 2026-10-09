@@ -272,6 +272,7 @@ class SolverKaminoImpl(SolverBase):
                 constraints=self._config.constraints,
                 rotation_correction=self._rotation_correction,
                 compute_solution_metrics=self._problem_fd is not None,
+                materials=self._config.materials,
             )
         elif self._config.dynamics_solver == "padmm":
             self._solver_fd = PADMMSolver(

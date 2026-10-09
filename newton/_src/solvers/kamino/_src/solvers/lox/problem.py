@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 import warp as wp
@@ -73,6 +74,10 @@ from .types import (
     capacity_offsets,
     segment_local_indices,
 )
+
+if TYPE_CHECKING:
+    from ......sim import Contacts, State
+    from .deformable.problem import DeformableProblem
 
 ###
 # Module interface
@@ -164,6 +169,7 @@ class LOXProblem:
         contact_compliance: bool = False,
         contact_restitution: bool = False,
         contact_spatial_friction: bool = False,
+        deformables: DeformableProblem | None = None,
     ):
         self.model = model
         self.kamino_data = data
@@ -184,6 +190,8 @@ class LOXProblem:
         self.contact_compliance = contact_compliance
         self.contact_restitution = contact_restitution
         self.contact_spatial_friction = contact_spatial_friction
+        self.deformables = deformables
+        """Smooth system and contact rows of the particles of the deformable bodies, or ``None``."""
 
         if jacobians._J_cts is None or jacobians._J_dofs is None:
             raise RuntimeError("Sparse Jacobians must be finalized before constructing the LOX problem.")
@@ -198,6 +206,13 @@ class LOXProblem:
             model.info.num_bodies,
             self.device,
         )
+        if deformables is not None:
+            num_particles = deformables.num_particles
+            self._data.num_particles = num_particles
+            self._data.particle_world = deformables.particle_world
+            self._data.particle_incidence = wp.zeros((num_particles, 1), dtype=wp.int32, device=self.device)
+            self._data.particle_weight_sum = wp.zeros((num_particles, 1), dtype=wp.float32, device=self.device)
+            self.refresh_particle_contact_rows()
         self.rebuild_dynamic_body_topology()
 
     ###
@@ -251,6 +266,10 @@ class LOXProblem:
         self._data.rod_rows = self.rods.data
         self.system.validate_body_pairs("rod rows", self._data.rod_rows.body_a, self._data.rod_rows.body_b)
         self._allocate_unilaterals(*self._allocate_joint_frictions())
+
+    def refresh_particle_contact_rows(self) -> None:
+        """Expose the particle contact rows of the deformable bodies after their reallocation."""
+        self._data.particle_contact_rows = self.deformables.contact_rows
 
     def validate_model_changed(self) -> None:
         """Validate LOX constraint topology derived from aliased model values."""
@@ -389,6 +408,8 @@ class LOXProblem:
         contact_stabilization_fraction: float,
         contact_dead_zone: float,
         structural_warmstart_factor: float,
+        particle_state: State | None = None,
+        particle_contacts: Contacts | None = None,
     ) -> None:
         """Load the constraint rows of the time step and import the reactions of the previous time step once.
 
@@ -402,6 +423,9 @@ class LOXProblem:
             contact_dead_zone: Symmetric contact distance dead zone of the stabilization [m].
             structural_warmstart_factor: Scale applied to the structural multipliers of the
                 previous time step.
+            particle_state: Begin-step Newton state of the particles, with deformable bodies;
+                ``None`` loads the rigid rows alone.
+            particle_contacts: Newton contacts with the soft contacts of the particles, with deformable bodies.
         """
         self._joint_max_correction = joint_max_correction
         self._joint_translation_dead_zone = joint_translation_dead_zone
@@ -431,6 +455,16 @@ class LOXProblem:
             contact_stabilization_fraction,
             contact_dead_zone,
         )
+        if self.deformables is not None and particle_state is not None:
+            self.deformables.load_contacts(
+                particle_contacts,
+                particle_state,
+                time_step,
+                contact_stabilization_fraction,
+                contact_dead_zone,
+                self._data,
+                self.system.data.body_vector_index,
+            )
         self._select_weighted_bodies()
 
     def build_smooth_system(
@@ -629,13 +663,16 @@ class LOXProblem:
     def compute_patch_schur_weights(self, beta: float = 0.0, sigma: float = 0.0) -> None:
         """Set the body weights to the geometric means of the free and pinned patch Schur complements in ``A``.
 
-        See :func:`.system_kernels.make_patch_weights_kernel`.
+        See :func:`.system_kernels.make_patch_weights_kernel`. With deformable bodies, also select the patch
+        weights of the particles and factorize their candidate matrix ``A + alpha W``.
 
         Args:
             beta: Largest eigenvalue of each weight relative to the free patch Schur complement of its body,
                 or zero for no cap.
             sigma: Smallest fraction of the geometric mean that the ``beta`` cap keeps.
         """
+        if self.deformables is not None:
+            self.deformables.build_consensus_weights()
         system = self.system
         if system.num_bodies == 0:
             return

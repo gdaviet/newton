@@ -14,10 +14,32 @@ from ....config import LOXSolverConfig
 from ...core.joints import JointCorrectionMode
 from ...core.state import StateKamino
 from ...core.types import vec6f
+from .deformable.problem import DeformableProblem
+from .deformable.solver_kernels import (
+    _blend_accepted_particle_velocity,
+    _compute_particle_consensus_center,
+    _initialize_particles,
+    _prepare_particle_projection,
+    _reduce_deformable_status,
+    _reduce_final_particle_residuals,
+    _reduce_particle_residuals,
+    _reset_particle_dual_force,
+    _reset_particle_state,
+    _restore_particle_dual,
+    _select_global_particle_solve_world,
+    _store_particle_dual_force,
+    _update_particle_splitting_dual,
+    _write_particle_outputs,
+)
 from .metrics import DualSolution
 from .problem import LOXProblem
 from .projection import ProjectionSchedule
-from .projection_kernels import _compute_box_residuals, _compute_contact_residuals, _compute_spatial_contact_residuals
+from .projection_kernels import (
+    _compute_box_residuals,
+    _compute_contact_residuals,
+    _compute_particle_contact_residuals,
+    _compute_spatial_contact_residuals,
+)
 from .solver_kernels import (
     _blend_accepted_twist,
     _finalize_residual_iteration,
@@ -38,7 +60,8 @@ from .solver_kernels import (
 from .types import LOXData, ProjectionAcceleration
 
 if TYPE_CHECKING:
-    from ....config import ConstraintStabilizationConfig
+    from ......sim import Contacts, State
+    from ....config import ConstraintStabilizationConfig, MaterialManagerConfig
     from ...core.data import DataKamino
     from ...core.model import ModelKamino
     from ...dynamics.dual import DualProblem
@@ -129,6 +152,7 @@ class LOXSolver:
         rotation_correction: JointCorrectionMode = JointCorrectionMode.TWOPI,
         *,
         compute_solution_metrics: bool = False,
+        materials: MaterialManagerConfig | None = None,
     ):
         """Creates a LOX solver.
 
@@ -146,6 +170,7 @@ class LOXSolver:
             constraints: The constraint stabilization config to use.
             rotation_correction: The joint rotation correction mode.
             compute_solution_metrics: Whether to allocate the dual solution of the solution metrics.
+            materials: The material mixing config of the particle contacts, or ``None`` for the defaults.
         """
         self._config: LOXSolver.Config | None = None
         self._constraints: ConstraintStabilizationConfig | None = None
@@ -153,6 +178,10 @@ class LOXSolver:
         self._device: wp.DeviceLike = None
         self._problem: LOXProblem | None = None
         self._data: LOXData | None = None
+        self._deformables: DeformableProblem | None = None
+        self._particle_state_in: State | None = None
+        self._particle_state_out: State | None = None
+        self._particle_contacts: Contacts | None = None
 
         if model is not None:
             self.finalize(
@@ -165,6 +194,7 @@ class LOXSolver:
                 constraints,
                 rotation_correction,
                 compute_solution_metrics=compute_solution_metrics,
+                materials=materials,
             )
 
     ###
@@ -183,6 +213,11 @@ class LOXSolver:
         """Returns the constraint rows and the smooth body system."""
         return self._problem
 
+    @property
+    def deformables(self) -> DeformableProblem | None:
+        """Returns the smooth system and the contact rows of the particles, or ``None`` without deformable bodies."""
+        return self._deformables
+
     ###
     # Public API
     ###
@@ -199,6 +234,7 @@ class LOXSolver:
         rotation_correction: JointCorrectionMode = JointCorrectionMode.TWOPI,
         *,
         compute_solution_metrics: bool = False,
+        materials: MaterialManagerConfig | None = None,
     ) -> None:
         """Allocates the solver data structures on the model's device.
 
@@ -212,13 +248,19 @@ class LOXSolver:
             constraints: The constraint stabilization config to use.
             rotation_correction: The joint rotation correction mode.
             compute_solution_metrics: Whether to allocate the dual solution of the solution metrics.
+            materials: The material mixing config of the particle contacts, or ``None`` for the defaults.
         """
-        if model.size.sum_of_num_bodies == 0:
-            raise ValueError("LOX requires at least one rigid body.")
+        source_model = model._model
+        has_particles = source_model is not None and source_model.particle_count > 0
+        if model.size.sum_of_num_bodies == 0 and not has_particles:
+            raise ValueError("LOX requires at least one rigid body or particle.")
         self._config = config
         self._constraints = constraints
         self._model = model
         self._device = model.device
+        self._deformables = None
+        if has_particles:
+            self._deformables = DeformableProblem(source_model, model, data, config, materials)
         self._problem = LOXProblem(
             model=model,
             data=data,
@@ -233,6 +275,7 @@ class LOXSolver:
             contact_compliance=config.contact_compliance,
             contact_restitution=config.contact_restitution,
             contact_spatial_friction=config.contact_spatial_friction,
+            deformables=self._deformables,
         )
         self._problem.prepare_patch_schur()
         self._data = LOXData(
@@ -240,10 +283,35 @@ class LOXSolver:
             DualSolution(model, config) if compute_solution_metrics else None,
             config.joint_penalty_scale,
             self._device,
+            particle_world=self._deformables.particle_world if self._deformables is not None else None,
         )
         self._build_projection_schedule()
         self._iteration_condition = wp.zeros(1, dtype=wp.int32, device=self._device)
+        self._cudss_first_iteration = (
+            self._deformables is not None and config.deformable_linear_solver == "cudss_then_cr"
+        )
+        """Whether the first iteration of each solve runs the cuDSS candidate of the deformable bodies."""
         self._initialize_splitting()
+
+    def bind_particle_step(self, state_in: State, state_out: State, contacts: Contacts | None) -> None:
+        """Bind the Newton particle states and soft contacts of the next solve, with deformable bodies.
+
+        A change of the soft contact capacity reallocates the particle contact rows and the
+        projection schedule.
+
+        Args:
+            state_in: Begin-step Newton state.
+            state_out: Newton state that receives the particle positions and velocities.
+            contacts: Newton contacts with the soft contacts of the time step, or ``None``.
+        """
+        if self._deformables is None:
+            return
+        self._particle_state_in = state_in
+        self._particle_state_out = state_out
+        self._particle_contacts = contacts
+        if self._deformables.ensure_contact_capacity(contacts):
+            self._problem.refresh_particle_contact_rows()
+            self._build_projection_schedule()
 
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh or rebuild the LOX problem after model changes."""
@@ -290,10 +358,65 @@ class LOXSolver:
                 outputs=[self._data.dual_wrench],
                 device=self._device,
             )
+        particles = self._data.particles
+        if particles is not None:
+            if world_mask is None:
+                self._data.particle_dual_force.zero_()
+            else:
+                wp.launch(
+                    _reset_particle_dual_force,
+                    dim=particles.num_particles,
+                    inputs=[particles.particle_world, world_mask],
+                    outputs=[self._data.particle_dual_force],
+                    device=self._device,
+                )
         self._problem.reset_structural_multipliers(world_mask=world_mask)
         self._problem.reset_effort_counters(world_mask=world_mask)
         self._problem.reset_box_reactions(world_mask=world_mask)
         self._problem.reset_angular_contact_reactions(world_mask)
+
+    def reset_particles(self, state: State, flags: int, world_mask: wp.array[wp.bool] | None = None) -> None:
+        """Reset the Newton particle state of the masked worlds and the warm starts of their solve worlds.
+
+        The global particles belong to the first solve world.
+
+        Args:
+            state: Newton state whose particles to reset.
+            flags: :class:`~newton.StateFlags` of the particle attributes to reset.
+            world_mask: Worlds to reset, with the global world in the last entry, or ``None`` for all worlds.
+        """
+        from ......sim import StateFlags  # noqa: PLC0415
+
+        if self._deformables is None:
+            return
+        model = self._deformables.model
+        reset_q = bool(flags & int(StateFlags.PARTICLE_Q))
+        reset_qd = bool(flags & int(StateFlags.PARTICLE_QD))
+        reset_f = bool(flags & int(StateFlags.PARTICLE_F))
+        if world_mask is None:
+            if reset_q:
+                wp.copy(state.particle_q, model.particle_q)
+            if reset_qd:
+                wp.copy(state.particle_qd, model.particle_qd)
+            if reset_f and state.particle_f is not None:
+                state.particle_f.zero_()
+            return
+        wp.launch(
+            _reset_particle_state,
+            dim=model.particle_count,
+            inputs=[model.particle_world, world_mask, model.particle_q, model.particle_qd, reset_q, reset_qd, reset_f],
+            outputs=[state.particle_q, state.particle_qd, state.particle_f],
+            device=self._device,
+        )
+        solve_world_mask = wp.empty(self._model.info.num_worlds, dtype=wp.bool, device=self._device)
+        wp.launch(
+            _select_global_particle_solve_world,
+            dim=self._model.info.num_worlds,
+            inputs=[world_mask],
+            outputs=[solve_world_mask],
+            device=self._device,
+        )
+        self.reset(world_mask=solve_world_mask)
 
     def joint_penalty_scale_seed(self, time_step: float) -> wp.array[wp.float32]:
         """Estimate and apply a timestep-aware structural ALM scale.
@@ -326,7 +449,7 @@ class LOXSolver:
             problem.prepare_joint_penalty_scale_seed(time_step)
             if problem.data.structural_rows.count > 0:
                 self.reset()
-                self._begin_time_step()
+                self._begin_time_step(load_particles=False)
                 try:
                     problem.build_smooth_system(model_time.dt, joint_penalty_scale=None)
                     # Converge every structural mode within a conditioning bound
@@ -360,14 +483,21 @@ class LOXSolver:
         self._update_system()
         self._restore_dual()
 
-        # Iterate until every world converges, fails, or reaches the iteration limit
+        # Iterate until every world converges, fails, or reaches the iteration limit. The cuDSS
+        # candidate of the deformable bodies runs as the first iteration, ahead of the loop
         config = self._config
         use_conditional_loop = not config.fixed_iterations and config.use_graph_conditionals
-        if use_conditional_loop:
+        remaining_iterations = config.max_iterations
+        if self._cudss_first_iteration:
+            self._iterate(conditional=use_conditional_loop, use_cudss=True)
+            remaining_iterations -= 1
+        elif use_conditional_loop:
             self._iteration_condition.fill_(1)
-            wp.capture_while(self._iteration_condition, self._iterate, conditional=True)
+        if use_conditional_loop:
+            if remaining_iterations > 0:
+                wp.capture_while(self._iteration_condition, self._iterate, conditional=True)
         else:
-            for _ in range(config.max_iterations):
+            for _ in range(remaining_iterations):
                 self._iterate(conditional=False)
 
         # Store the terminal status and the final residuals, which also fail the worlds with
@@ -467,6 +597,33 @@ class LOXSolver:
             ],
             device=self._device,
         )
+        particles = self._data.particles
+        if particles is not None:
+            deformables = self._deformables
+            system_data = deformables.system_data
+            wp.launch(
+                _initialize_particles,
+                dim=particles.num_particles,
+                inputs=[
+                    deformables.topology.packed_to_newton,
+                    particles.particle_world,
+                    world_mask,
+                    deformables.model.particle_mass,
+                    system_data.full_inverse_weight,
+                    system_data.velocity_start,
+                    system_data.external_force,
+                    self._data.particle_dual_force,
+                    self._model.time.dt,
+                    inertial_warmstart_fraction,
+                ],
+                outputs=[
+                    particles.projected_velocity,
+                    particles.projected_velocity_previous,
+                    particles.global_velocity,
+                    particles.global_velocity_previous,
+                ],
+                device=self._device,
+            )
         wp.launch(
             _initialize_world_convergence,
             dim=state.num_worlds,
@@ -496,9 +653,20 @@ class LOXSolver:
     # Internals - Time Step
     ###
 
-    def _begin_time_step(self) -> None:
-        """Load the constraint rows of the time step with the configured stabilization and warm start."""
+    def _begin_time_step(self, load_particles: bool = True) -> None:
+        """Load the constraint rows of the time step with the configured stabilization and warm start.
+
+        Args:
+            load_particles: Whether to also assemble the particle system and load the particle contacts,
+                with deformable bodies. The rigid rows alone suit :meth:`joint_penalty_scale_seed`.
+        """
         constraints = self._constraints
+        load_particles = load_particles and self._deformables is not None
+        if load_particles:
+            if self._particle_state_in is None:
+                raise RuntimeError("LOX deformable bodies require bind_particle_step() before each solve.")
+            # The particle contacts read the full particle weights of the frozen linearization
+            self._deformables.begin_time_step(self._particle_state_in, self._model.time.dt)
         self._problem.begin_time_step(
             self._model.time.dt,
             joint_max_correction=self._config.joint_max_correction,
@@ -509,6 +677,8 @@ class LOXSolver:
             contact_stabilization_fraction=constraints.gamma,
             contact_dead_zone=constraints.delta,
             structural_warmstart_factor=self._config.joint_warmstart_factor,
+            particle_state=self._particle_state_in if load_particles else None,
+            particle_contacts=self._particle_contacts if load_particles else None,
         )
 
     def _update_system(self) -> None:
@@ -524,7 +694,13 @@ class LOXSolver:
         if self._config.consensus_fraction > 0.0:
             system.add_weights_to_matrix(self._config.consensus_fraction)
         system.factorize()
-        if system.dynamic_bodies:
+        if self._deformables is not None:
+            self._projection.prepare(
+                system.data.inverse_weight,
+                self._data.state.world_failed,
+                self._deformables.system_data.inverse_weight,
+            )
+        elif system.dynamic_bodies:
             self._projection.prepare(system.data.inverse_weight, self._data.state.world_failed)
 
     def _restore_dual(self) -> None:
@@ -543,15 +719,36 @@ class LOXSolver:
             outputs=[state.splitting_dual],
             device=self._device,
         )
+        particles = self._data.particles
+        if particles is not None:
+            system_data = self._deformables.system_data
+            wp.launch(
+                _restore_particle_dual,
+                dim=particles.num_particles,
+                inputs=[
+                    particles.particle_world,
+                    system_data.consensus_enabled,
+                    self._model.time.dt,
+                    system_data.inverse_weight,
+                    self._data.particle_dual_force,
+                ],
+                outputs=[particles.splitting_dual],
+                device=self._device,
+            )
 
     ###
     # Internals - Iterations
     ###
 
-    def _iterate(self, conditional: bool) -> None:
-        """Perform one splitting iteration."""
+    def _iterate(self, conditional: bool, use_cudss: bool = False) -> None:
+        """Perform one splitting iteration.
+
+        Args:
+            conditional: Whether the iteration updates the condition of the conditional loop.
+            use_cudss: Whether the deformable candidate uses the cuDSS factorization.
+        """
         # Solve the smooth system for the candidate twist
-        self._update_candidate()
+        self._update_candidate(use_cudss)
 
         # Project the candidate onto the unilateral constraints
         self._update_projection()
@@ -562,11 +759,12 @@ class LOXSolver:
         # Check convergence
         self._update_convergence_status(conditional)
 
-    def _update_candidate(self) -> None:
-        """Solve the smooth system for the candidate twist."""
+    def _update_candidate(self, use_cudss: bool = False) -> None:
+        """Solve the smooth system for the candidate twist and the candidate particle velocities."""
         problem = self._problem
         system = self._problem.system
         splitting = self._data.state
+        particles = self._data.particles
         # The splitting dual u = W^-1 J^T r carries the unilateral impulses, and the consensus fraction
         # alpha anchors the solve (A + alpha W) v = f + W (u + alpha p) to the projected twist p
         consensus_fraction = self._config.consensus_fraction
@@ -599,10 +797,45 @@ class LOXSolver:
             ],
             device=self._device,
         )
+        if particles is not None:
+            deformables = self._deformables
+            system_data = deformables.system_data
+            wp.launch(
+                _compute_particle_consensus_center,
+                dim=particles.num_particles,
+                inputs=[
+                    self._config.deformable_consensus_fraction,
+                    particles.projected_velocity,
+                    particles.splitting_dual,
+                ],
+                outputs=[particles.consensus_center],
+                device=self._device,
+            )
+            deformables.solve_candidate(particles.consensus_center, splitting.world_active, use_cudss or None)
+            wp.launch(
+                _prepare_particle_projection,
+                dim=particles.num_particles,
+                inputs=[
+                    particles.particle_world,
+                    splitting.world_active,
+                    system_data.consensus_enabled,
+                    system_data.full_inverse_weight,
+                    system_data.smooth_velocity,
+                ],
+                outputs=[
+                    particles.splitting_dual,
+                    particles.global_velocity_previous,
+                    particles.global_velocity,
+                    particles.projected_velocity_previous,
+                    particles.projected_velocity,
+                ],
+                device=self._device,
+            )
 
     def _update_projection(self) -> None:
-        """Project the candidate twist onto the unilateral constraints."""
-        if not self._problem.system.dynamic_bodies:
+        """Project the candidate twist and particle velocities onto the unilateral constraints."""
+        particles = self._data.particles
+        if not self._problem.system.dynamic_bodies and particles is None:
             return
         self._projection.project(
             self._config.projection_iterations,
@@ -611,7 +844,12 @@ class LOXSolver:
             self._data.state.world_failed,
             self._model.bodies.wid,
             self._data.state.projected_twist,
+            particles.projected_velocity if particles is not None else None,
         )
+        if particles is not None:
+            self._deformables.limit_penetration(
+                particles.projected_velocity, self._data.state.world_active, self._model.time.dt
+            )
 
     def _update_multipliers(self) -> None:
         """Update the splitting dual, the structural multipliers, the effort counters, and the rod proximal rows.
@@ -660,6 +898,50 @@ class LOXSolver:
             splitting.global_twist,
             splitting.world_active,
             splitting.world_failed,
+        )
+        particles = self._data.particles
+        if particles is not None:
+            self._update_particle_multipliers(particles)
+
+    def _update_particle_multipliers(self, particles) -> None:
+        """Update the particle splitting dual, the element corrections of the next candidate, and the
+        deformable failures and residuals."""
+        config = self._config
+        splitting = self._data.state
+        deformables = self._deformables
+        system_data = deformables.system_data
+        if config.fixed_iterations:
+            wp.launch(
+                _update_particle_splitting_dual,
+                dim=particles.num_particles,
+                inputs=[
+                    particles.particle_world,
+                    splitting.world_active,
+                    splitting.world_failed,
+                    system_data.consensus_enabled,
+                    particles.global_velocity,
+                    particles.projected_velocity,
+                ],
+                outputs=[particles.splitting_dual],
+                device=self._device,
+            )
+        deformables.update_proximal(self._model.time.dt)
+        wp.launch(
+            _reduce_deformable_status,
+            dim=splitting.num_worlds,
+            inputs=[
+                config.position_tolerance,
+                config.velocity_tolerance,
+                splitting.world_active,
+                system_data.proximal_failed,
+                system_data.assembly_failed,
+                deformables.preconditioner_status,
+                system_data.proximal_position_residual,
+                system_data.proximal_velocity_residual,
+                system_data.candidate_linear_residual,
+            ],
+            outputs=[splitting.world_failed, particles.deformable_residual],
+            device=self._device,
         )
 
     def _update_convergence_status(self, conditional: bool) -> None:
@@ -721,6 +1003,32 @@ class LOXSolver:
             ],
             device=self._device,
         )
+        particles = self._data.particles
+        if particles is not None:
+            wp.launch(
+                _reduce_particle_residuals,
+                dim=particles.num_particles,
+                inputs=[
+                    self._model.time.dt,
+                    config.position_tolerance,
+                    config.velocity_tolerance,
+                    particles.particle_world,
+                    self._deformables.system_data.consensus_enabled,
+                    particles.global_velocity_previous,
+                    particles.global_velocity,
+                    particles.projected_velocity_previous,
+                    particles.projected_velocity,
+                    splitting.world_active,
+                ],
+                outputs=[
+                    particles.splitting_dual,
+                    splitting.world_failed,
+                    residuals.r_change,
+                    residuals.r_split,
+                    residuals.r_cross_iterate,
+                ],
+                device=self._device,
+            )
         wp.launch(
             _finalize_residual_iteration,
             dim=splitting.num_worlds,
@@ -738,6 +1046,7 @@ class LOXSolver:
                 problem.data.structural_rows.world_residual,
                 problem.data.effort_rows.world_residual_max if self._problem.has_bounded_effort else None,
                 problem.data.rod_rows.world_residual,
+                particles.deformable_residual if particles is not None else None,
                 splitting.world_active,
                 splitting.world_converged,
                 iteration_condition,
@@ -871,6 +1180,38 @@ class LOXSolver:
                 ],
                 device=self._device,
             )
+        particles = self._data.particles
+        particle_rows = problem.data.particle_contact_rows
+        if particles is not None and particle_rows.capacity > 0:
+            # The particle contact residuals join the contact residuals of their worlds
+            wp.launch(
+                _compute_particle_contact_residuals,
+                dim=particle_rows.capacity,
+                inputs=[
+                    world_active,
+                    self._data.state.world_failed,
+                    particle_rows.world,
+                    particle_rows.status,
+                    particle_rows.particle,
+                    particle_rows.coefficient,
+                    particle_rows.body,
+                    particle_rows.frame,
+                    particle_rows.body_jacobian,
+                    particle_rows.bias,
+                    particle_rows.friction,
+                    particle_rows.reaction,
+                    particle_rows.physical_delassus,
+                    particles.projected_velocity,
+                    particles.global_velocity,
+                    particles.projected_velocity_previous,
+                    self._data.state.projected_twist,
+                    splitting.global_twist,
+                    splitting.projected_twist_previous,
+                    inverse_velocity_tolerance,
+                ],
+                outputs=[problem.data.contact_rows.world_residual_max, velocity_residual, lagged_residual],
+                device=self._device,
+            )
 
     ###
     # Internals - Outputs
@@ -893,6 +1234,23 @@ class LOXSolver:
             outputs=[self._data.dual_wrench],
             device=self._device,
         )
+        particles = self._data.particles
+        if particles is not None:
+            system_data = self._deformables.system_data
+            wp.launch(
+                _store_particle_dual_force,
+                dim=particles.num_particles,
+                inputs=[
+                    particles.particle_world,
+                    system_data.consensus_enabled,
+                    state.world_failed,
+                    self._model.time.inv_dt,
+                    system_data.weight,
+                    particles.splitting_dual,
+                ],
+                outputs=[self._data.particle_dual_force],
+                device=self._device,
+            )
 
     def _write_final_status_and_residuals(self) -> None:
         """Store the terminal world status and the final residuals."""
@@ -912,6 +1270,22 @@ class LOXSolver:
             outputs=[state.world_failed, residuals.r_primal, residuals.r_dual],
             device=self._device,
         )
+        particles = self._data.particles
+        if particles is not None:
+            wp.launch(
+                _reduce_final_particle_residuals,
+                dim=particles.num_particles,
+                inputs=[
+                    particles.particle_world,
+                    self._deformables.system_data.weight,
+                    particles.global_velocity_previous,
+                    particles.global_velocity,
+                    particles.projected_velocity,
+                    particles.splitting_dual,
+                ],
+                outputs=[state.world_failed, residuals.r_primal, residuals.r_dual],
+                device=self._device,
+            )
         # The convergence check evaluates the unilateral residuals at the final twists of
         # each world; fixed iterations skip that check and evaluate them once here.
         if self._config.fixed_iterations:
@@ -969,3 +1343,37 @@ class LOXSolver:
             outputs=[problem.kamino_data.bodies.w_i, problem.kamino_data.bodies.u_i],
             device=self._device,
         )
+        particles = self._data.particles
+        if particles is not None:
+            deformables = self._deformables
+            state_in = self._particle_state_in
+            state_out = self._particle_state_out
+            accepted_velocity = particles.projected_velocity
+            particle_fraction = self._config.deformable_projected_velocity_fraction
+            if particle_fraction < 1.0:
+                # The smooth velocity is read again only by the next solve, which reinitializes it
+                wp.launch(
+                    _blend_accepted_particle_velocity,
+                    dim=particles.num_particles,
+                    inputs=[particle_fraction, particles.projected_velocity],
+                    outputs=[particles.global_velocity],
+                    device=self._device,
+                )
+                accepted_velocity = particles.global_velocity
+            wp.launch(
+                _write_particle_outputs,
+                dim=particles.num_particles,
+                inputs=[
+                    deformables.topology.packed_to_newton,
+                    particles.particle_world,
+                    self._data.state.world_failed,
+                    model.time.dt,
+                    deformables.model.particle_mass,
+                    deformables.model.particle_flags,
+                    state_in.particle_q,
+                    state_in.particle_qd,
+                    accepted_velocity,
+                ],
+                outputs=[state_out.particle_q, state_out.particle_qd],
+                device=self._device,
+            )
