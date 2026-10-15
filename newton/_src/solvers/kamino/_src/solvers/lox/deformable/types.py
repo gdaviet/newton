@@ -459,7 +459,7 @@ class DeformableSystemData:
         self.proximal_velocity_residual = wp.zeros(world_count, dtype=wp.float32, device=device)
         """Largest scaled velocity residual of the element proximal updates of each world [m/s]."""
         self.proximal_failed = wp.zeros(world_count, dtype=wp.bool, device=device)
-        """Whether the assembly or an element proximal update of each world failed."""
+        """Whether the assembly or a candidate deformation of the element proximal updates of each world failed."""
         self.assembly_failed = wp.zeros(world_count, dtype=wp.bool, device=device)
         """Whether the assembly of each world failed: a non-finite element contribution."""
         self.candidate_linear_residual = wp.zeros(world_count, dtype=wp.float32, device=device)

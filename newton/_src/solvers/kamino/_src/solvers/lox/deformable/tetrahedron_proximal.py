@@ -8,7 +8,10 @@ Every splitting iteration solves the local proximal problem of each tetrahedron,
 at the deformation of the candidate velocity with the majorizing metric of the
 linearization, by a few damped Gauss-Newton steps, then updates its multiplier and
 scatters the difference to the linearized forces into the right-hand side of the next
-candidate solve.
+candidate solve. The refinement of a tetrahedron requires its frozen penalty to bound the
+local curvature, ``-B <= H(z) <= B``, which keeps the local updates contractive; a tetrahedron
+whose local update fails or leaves that region keeps its linearized response for that
+iteration, and a non-finite candidate deformation fails its world.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import warp as wp
 
 from .energy import mat99f, tet_cofactor, tet_stable_neo_hookean_alpha, tet_vertex_coefficient, vec9f
 from .system_kernels import is_dynamic_particle
+from .tetrahedron_energy import tet_stable_neo_hookean_hessian
 
 if TYPE_CHECKING:
     from .......sim import Model
@@ -253,6 +257,42 @@ def _solve_factored_base(lower: mat99f, right_hand_side: vec9f) -> vec9f:
 
 
 @wp.func
+def _is_positive_definite(matrix: mat99f) -> bool:
+    """Return whether the Cholesky factorization of a symmetric 9-by-9 matrix succeeds."""
+    lower = mat99f(0.0)
+    for row in range(9):
+        for column in range(row + 1):
+            value = matrix[row, column]
+            for inner in range(column):
+                value -= lower[row, inner] * lower[column, inner]
+            if row == column:
+                if not (value > 0.0):
+                    return False
+                lower[row, row] = wp.sqrt(value)
+            else:
+                lower[row, column] = value / lower[column, column]
+    return True
+
+
+@wp.func
+def _penalty_covers_curvature(
+    deformation: wp.mat33,
+    frozen_metric: mat99f,
+    rest_volume: float,
+    mu: float,
+    k_lambda: float,
+    activation: float,
+) -> bool:
+    """Return whether the frozen base ``B``, the metric plus the shear identity, bounds the local Hessian.
+
+    The local updates contract while ``-B <= H(z) <= B``, which the two Cholesky factorizations decide.
+    """
+    hessian = tet_stable_neo_hookean_hessian(deformation, rest_volume, mu, k_lambda, activation)
+    base = frozen_metric + rest_volume * mu * wp.identity(n=9, dtype=float)
+    return _is_positive_definite(base - hessian) and _is_positive_definite(base + hessian)
+
+
+@wp.func
 def _solve_gauss_newton_step(
     right_hand_side: wp.mat33,
     deformation: wp.mat33,
@@ -338,84 +378,65 @@ def _initialize_tetrahedron_proximal(
     multiplier[tetrahedron] = gradient
 
 
-@wp.kernel
-def _update_tetrahedron_proximal(
-    # Inputs:
-    position_start: wp.array[wp.vec3],
-    position_linearized: wp.array[wp.vec3],
-    smooth_velocity: wp.array[wp.vec3],
-    tetrahedron_indices: wp.array2d[wp.int32],
-    model_tet_poses: wp.array[wp.mat33],
-    model_tet_materials: wp.array2d[float],
-    model_tet_activations: wp.array[float],
-    packed_to_newton: wp.array[wp.int32],
-    packed_world: wp.array[wp.int32],
-    model_particle_mass: wp.array[float],
-    model_particle_flags: wp.array[wp.int32],
-    world_active: wp.array[wp.bool],
-    frozen_coordinate: wp.array[wp.mat33],
-    frozen_gradient: wp.array[wp.mat33],
-    frozen_metric: wp.array[mat99f],
-    frozen_factor: wp.array[mat99f],
+@wp.func
+def _keep_linearized_response(
+    tetrahedron: int,
+    center: wp.mat33,
+    frozen_coordinate: wp.mat33,
+    frozen_gradient: wp.mat33,
+    frozen_metric: mat99f,
+    proximal_coordinate: wp.array[wp.mat33],
+    multiplier: wp.array[wp.mat33],
+) -> bool:
+    """Reset a tetrahedron to the linearized stress at the candidate deformation, which zeroes its correction.
+
+    Returns whether the linearized stress is finite; only then does the element state change.
+    """
+    linearized_stress = frozen_gradient + _apply_metric(center - frozen_coordinate, frozen_metric)
+    if not _matrix_is_finite(linearized_stress):
+        return False
+    proximal_coordinate[tetrahedron] = center
+    multiplier[tetrahedron] = linearized_stress
+    return True
+
+
+@wp.func
+def _refine_tetrahedron(
+    tetrahedron: int,
+    wid: int,
+    vertices: wp.vec4i,
+    rest_pose: wp.mat33,
+    center: wp.mat33,
+    previous: wp.mat33,
+    multiplier_value: wp.mat33,
+    frozen_metric_value: mat99f,
+    frozen_factor_value: mat99f,
+    rest_volume: float,
+    mu: float,
+    k_lambda: float,
+    lmbd: float,
+    alpha: float,
+    activation: float,
+    dt: float,
     proximal_iterations: int,
     proximal_relaxation: float,
-    model_time_dt: wp.array[wp.float32],
-    # Outputs:
+    packed_to_newton: wp.array[wp.int32],
+    model_particle_mass: wp.array[float],
+    model_particle_flags: wp.array[wp.int32],
+    frozen_coordinate: wp.array[wp.mat33],
+    frozen_gradient: wp.array[wp.mat33],
     proximal_coordinate: wp.array[wp.mat33],
     multiplier: wp.array[wp.mat33],
     nonlinear_rhs: wp.array[wp.vec3],
     world_position_residual: wp.array[float],
     world_velocity_residual: wp.array[float],
-    world_failed: wp.array[wp.bool],
-):
-    """Evaluate one tetrahedron prox and scatter its next global RHS correction."""
-    tetrahedron = wp.tid()
-    vertices = wp.vec4i(
-        tetrahedron_indices[tetrahedron, 0],
-        tetrahedron_indices[tetrahedron, 1],
-        tetrahedron_indices[tetrahedron, 2],
-        tetrahedron_indices[tetrahedron, 3],
-    )
-    wid = packed_world[vertices[0]]
-    dt = model_time_dt[wid]
-    if not world_active[wid]:
-        return
-    if model_tet_materials[tetrahedron, 0] == 0.0 and model_tet_materials[tetrahedron, 1] == 0.0:
-        return
+) -> bool:
+    """Solve the local prox of one tetrahedron, update its multiplier, and scatter its RHS correction.
 
-    position_0 = position_linearized[vertices[0]]
-    position_1 = position_linearized[vertices[1]]
-    position_2 = position_linearized[vertices[2]]
-    position_3 = position_linearized[vertices[3]]
-    if is_dynamic_particle(vertices[0], packed_to_newton, model_particle_mass, model_particle_flags):
-        position_0 = position_start[vertices[0]] + dt * smooth_velocity[vertices[0]]
-    if is_dynamic_particle(vertices[1], packed_to_newton, model_particle_mass, model_particle_flags):
-        position_1 = position_start[vertices[1]] + dt * smooth_velocity[vertices[1]]
-    if is_dynamic_particle(vertices[2], packed_to_newton, model_particle_mass, model_particle_flags):
-        position_2 = position_start[vertices[2]] + dt * smooth_velocity[vertices[2]]
-    if is_dynamic_particle(vertices[3], packed_to_newton, model_particle_mass, model_particle_flags):
-        position_3 = position_start[vertices[3]] + dt * smooth_velocity[vertices[3]]
-    rest_pose = model_tet_poses[tetrahedron]
-    center = _deformation(
-        position_0,
-        position_1,
-        position_2,
-        position_3,
-        rest_pose,
-    )
-
-    frozen_metric_value = frozen_metric[tetrahedron]
-    frozen_factor_value = frozen_factor[tetrahedron]
-    multiplier_value = multiplier[tetrahedron]
-    previous = proximal_coordinate[tetrahedron]
+    Returns whether every step stayed finite and the frozen penalty bounds the curvature at the local
+    coordinate; a failed update leaves the element state and the RHS unchanged.
+    """
     deformation = previous
-    rest_volume = 1.0 / (6.0 * wp.determinant(rest_pose))
-    mu = model_tet_materials[tetrahedron, 0]
-    k_lambda = model_tet_materials[tetrahedron, 1]
-    lmbd = k_lambda + mu
-    alpha = tet_stable_neo_hookean_alpha(mu, k_lambda)
-    activation = model_tet_activations[tetrahedron]
-
     failed = wp.bool(False)
     for _iteration in range(proximal_iterations):
         current_cofactor = tet_cofactor(deformation)
@@ -488,8 +509,7 @@ def _update_tetrahedron_proximal(
             break
 
     if failed or not _matrix_is_finite(deformation):
-        world_failed[wid] = True
-        return
+        return False
 
     # Measure the stationarity of the local problem against the multiplier that
     # defined it. A finite stalled line search is a soft outcome, and its residual
@@ -509,20 +529,20 @@ def _update_tetrahedron_proximal(
         k_lambda,
     )
     if not stationarity_solve_succeeded:
-        world_failed[wid] = True
-        return
+        return False
+
+    if not _penalty_covers_curvature(deformation, frozen_metric_value, rest_volume, mu, k_lambda, activation):
+        return False
 
     metric_primal = _apply_metric(center - deformation, frozen_metric_value)
     multiplier_new = multiplier_value + proximal_relaxation * metric_primal
     if not _matrix_is_finite(multiplier_new):
-        world_failed[wid] = True
-        return
+        return False
 
     metric_correction = _apply_metric(deformation - frozen_coordinate[tetrahedron], frozen_metric_value)
     correction = metric_correction - multiplier_new + frozen_gradient[tetrahedron]
     if not _matrix_is_finite(correction):
-        world_failed[wid] = True
-        return
+        return False
 
     characteristic_length = wp.pow(rest_volume, 1.0 / 3.0)
     primal_norm = wp.sqrt(_matrix_dot(center - deformation, center - deformation))
@@ -538,8 +558,7 @@ def _update_tetrahedron_proximal(
         or not wp.isfinite(position_residual)
         or not wp.isfinite(velocity_residual)
     ):
-        world_failed[wid] = True
-        return
+        return False
 
     dynamic_0 = is_dynamic_particle(vertices[0], packed_to_newton, model_particle_mass, model_particle_flags)
     dynamic_1 = is_dynamic_particle(vertices[1], packed_to_newton, model_particle_mass, model_particle_flags)
@@ -555,8 +574,7 @@ def _update_tetrahedron_proximal(
         or (dynamic_2 and not _vector_is_finite(scatter_2))
         or (dynamic_3 and not _vector_is_finite(scatter_3))
     ):
-        world_failed[wid] = True
-        return
+        return False
 
     if dynamic_0:
         wp.atomic_add(nonlinear_rhs, vertices[0], scatter_0)
@@ -572,6 +590,131 @@ def _update_tetrahedron_proximal(
 
     wp.atomic_max(world_position_residual, wid, position_residual)
     wp.atomic_max(world_velocity_residual, wid, velocity_residual)
+    return True
+
+
+@wp.kernel
+def _update_tetrahedron_proximal(
+    # Inputs:
+    position_start: wp.array[wp.vec3],
+    position_linearized: wp.array[wp.vec3],
+    smooth_velocity: wp.array[wp.vec3],
+    tetrahedron_indices: wp.array2d[wp.int32],
+    model_tet_poses: wp.array[wp.mat33],
+    model_tet_materials: wp.array2d[float],
+    model_tet_activations: wp.array[float],
+    packed_to_newton: wp.array[wp.int32],
+    packed_world: wp.array[wp.int32],
+    model_particle_mass: wp.array[float],
+    model_particle_flags: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    frozen_coordinate: wp.array[wp.mat33],
+    frozen_gradient: wp.array[wp.mat33],
+    frozen_metric: wp.array[mat99f],
+    frozen_factor: wp.array[mat99f],
+    proximal_iterations: int,
+    proximal_relaxation: float,
+    model_time_dt: wp.array[wp.float32],
+    # Outputs:
+    proximal_coordinate: wp.array[wp.mat33],
+    multiplier: wp.array[wp.mat33],
+    nonlinear_rhs: wp.array[wp.vec3],
+    world_position_residual: wp.array[float],
+    world_velocity_residual: wp.array[float],
+    world_failed: wp.array[wp.bool],
+):
+    """Evaluate one tetrahedron prox and scatter its next global RHS correction."""
+    tetrahedron = wp.tid()
+    vertices = wp.vec4i(
+        tetrahedron_indices[tetrahedron, 0],
+        tetrahedron_indices[tetrahedron, 1],
+        tetrahedron_indices[tetrahedron, 2],
+        tetrahedron_indices[tetrahedron, 3],
+    )
+    wid = packed_world[vertices[0]]
+    dt = model_time_dt[wid]
+    if not world_active[wid]:
+        return
+    if model_tet_materials[tetrahedron, 0] == 0.0 and model_tet_materials[tetrahedron, 1] == 0.0:
+        return
+
+    position_0 = position_linearized[vertices[0]]
+    position_1 = position_linearized[vertices[1]]
+    position_2 = position_linearized[vertices[2]]
+    position_3 = position_linearized[vertices[3]]
+    if is_dynamic_particle(vertices[0], packed_to_newton, model_particle_mass, model_particle_flags):
+        position_0 = position_start[vertices[0]] + dt * smooth_velocity[vertices[0]]
+    if is_dynamic_particle(vertices[1], packed_to_newton, model_particle_mass, model_particle_flags):
+        position_1 = position_start[vertices[1]] + dt * smooth_velocity[vertices[1]]
+    if is_dynamic_particle(vertices[2], packed_to_newton, model_particle_mass, model_particle_flags):
+        position_2 = position_start[vertices[2]] + dt * smooth_velocity[vertices[2]]
+    if is_dynamic_particle(vertices[3], packed_to_newton, model_particle_mass, model_particle_flags):
+        position_3 = position_start[vertices[3]] + dt * smooth_velocity[vertices[3]]
+    rest_pose = model_tet_poses[tetrahedron]
+    center = _deformation(
+        position_0,
+        position_1,
+        position_2,
+        position_3,
+        rest_pose,
+    )
+
+    frozen_metric_value = frozen_metric[tetrahedron]
+    frozen_factor_value = frozen_factor[tetrahedron]
+    multiplier_value = multiplier[tetrahedron]
+    previous = proximal_coordinate[tetrahedron]
+    rest_volume = 1.0 / (6.0 * wp.determinant(rest_pose))
+    mu = model_tet_materials[tetrahedron, 0]
+    k_lambda = model_tet_materials[tetrahedron, 1]
+    lmbd = k_lambda + mu
+    alpha = tet_stable_neo_hookean_alpha(mu, k_lambda)
+    activation = model_tet_activations[tetrahedron]
+
+    if not _matrix_is_finite(center):
+        world_failed[wid] = True
+        return
+
+    # A failed local update keeps the linearized response of the element for this iteration
+    if not _refine_tetrahedron(
+        tetrahedron,
+        wid,
+        vertices,
+        rest_pose,
+        center,
+        previous,
+        multiplier_value,
+        frozen_metric_value,
+        frozen_factor_value,
+        rest_volume,
+        mu,
+        k_lambda,
+        lmbd,
+        alpha,
+        activation,
+        dt,
+        proximal_iterations,
+        proximal_relaxation,
+        packed_to_newton,
+        model_particle_mass,
+        model_particle_flags,
+        frozen_coordinate,
+        frozen_gradient,
+        proximal_coordinate,
+        multiplier,
+        nonlinear_rhs,
+        world_position_residual,
+        world_velocity_residual,
+    ):
+        if not _keep_linearized_response(
+            tetrahedron,
+            center,
+            frozen_coordinate[tetrahedron],
+            frozen_gradient[tetrahedron],
+            frozen_metric_value,
+            proximal_coordinate,
+            multiplier,
+        ):
+            world_failed[wid] = True
 
 
 ###
