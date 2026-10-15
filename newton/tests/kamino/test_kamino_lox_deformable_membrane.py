@@ -373,19 +373,44 @@ class TestLOXDeformableMembrane(unittest.TestCase):
         self.assertGreater(float(position_residual[0]), 1.0e-3)
         np.testing.assert_array_equal(velocity_residual, 0.0)
 
-    def test_invalid_proximal_scatter_is_transactional(self):
-        """Reject all nodal writes when any proximal scatter contribution overflows."""
+    def test_invalid_proximal_scatter_keeps_linearized_response(self):
+        """Keep the linearized response, without nodal writes, when a proximal scatter contribution overflows."""
         geometry = self._geometry((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
         geometry["poses"].assign((wp.mat22(1.0e38, 0.0, 0.0, 1.0e38),))
         materials, activation, arrays = self._initialize_proximal(geometry, (1.0, 0.0, 0.0, 0.0, 0.0))
         arrays["frozen_gradient"].fill_(wp.vec3(1.0e10))
-        coordinate_before = arrays["coordinate"].numpy().copy()
-        multiplier_before = arrays["multiplier"].numpy().copy()
         rhs, position_residual, velocity_residual, failed = self._update_proximal(
             geometry,
             materials,
             activation,
             arrays,
+        )
+
+        np.testing.assert_array_equal(failed, False)
+        np.testing.assert_array_equal(rhs, 0.0)
+        np.testing.assert_array_equal(position_residual, 0.0)
+        np.testing.assert_array_equal(velocity_residual, 0.0)
+        # The degenerate candidate equals the frozen deformation, whose linearized stress is the frozen gradient
+        np.testing.assert_array_equal(arrays["coordinate"].numpy(), arrays["frozen_coordinate"].numpy())
+        np.testing.assert_array_equal(arrays["multiplier"].numpy(), arrays["frozen_gradient"].numpy())
+
+    def test_nonfinite_candidate_fails_world(self):
+        """Fail the world and keep the element state when the candidate deformation is not finite."""
+        geometry = self._geometry((1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+        materials, activation, arrays = self._initialize_proximal(geometry, (2.0, 3.0, 0.0, 0.0, 0.0))
+        coordinate_before = arrays["coordinate"].numpy().copy()
+        multiplier_before = arrays["multiplier"].numpy().copy()
+        velocity = wp.array(
+            np.asarray(((0.0, 0.0, 0.0), (math.nan, 0.0, 0.0), (0.0, 0.0, 0.0)), dtype=np.float32),
+            dtype=wp.vec3,
+            device=self.default_device,
+        )
+        rhs, position_residual, velocity_residual, failed = self._update_proximal(
+            geometry,
+            materials,
+            activation,
+            arrays,
+            velocity=velocity,
         )
 
         np.testing.assert_array_equal(failed, True)
