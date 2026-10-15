@@ -8,7 +8,8 @@ multiplier. Every splitting iteration solves the local proximal problem of each 
 centered at the deformation of the candidate velocity with the fixed metric of the
 linearization, by a few damped Gauss-Newton steps, then updates its multiplier and
 scatters the difference to the linearized membrane forces into the right-hand side of
-the next candidate solve.
+the next candidate solve. A triangle whose local update fails keeps its linearized response
+for that iteration; a non-finite candidate deformation fails its world.
 """
 
 from __future__ import annotations
@@ -323,83 +324,84 @@ def _initialize_membrane_proximal(
     multiplier[triangle, 1] = gradient_1
 
 
-@wp.kernel
-def _update_membrane_proximal(
-    # Inputs:
-    position_start: wp.array[wp.vec3],
-    position_linearized: wp.array[wp.vec3],
-    smooth_velocity: wp.array[wp.vec3],
-    triangle_indices: wp.array2d[wp.int32],
-    model_tri_poses: wp.array[wp.mat22],
-    model_tri_areas: wp.array[float],
-    model_tri_materials: wp.array2d[float],
-    model_tri_activations: wp.array[float],
-    packed_to_newton: wp.array[wp.int32],
-    packed_world: wp.array[wp.int32],
-    model_particle_mass: wp.array[float],
-    model_particle_flags: wp.array[wp.int32],
-    world_active: wp.array[wp.bool],
+@wp.func
+def _keep_linearized_response(
+    triangle: int,
+    center_0: wp.vec3,
+    center_1: wp.vec3,
     frozen_coordinate: wp.array2d[wp.vec3],
     frozen_gradient: wp.array2d[wp.vec3],
-    frozen_area_gradient: wp.array2d[wp.vec3],
+    frozen_area_gradient_0: wp.vec3,
+    frozen_area_gradient_1: wp.vec3,
+    shear_scale: float,
+    area_scale: float,
+    proximal_coordinate: wp.array2d[wp.vec3],
+    multiplier: wp.array2d[wp.vec3],
+) -> bool:
+    """Reset a triangle to the linearized stress at the candidate deformation, which zeroes its correction.
+
+    Returns whether the linearized stress is finite; only then does the element state change.
+    """
+    metric_0, metric_1 = _apply_metric(
+        center_0 - frozen_coordinate[triangle, 0],
+        center_1 - frozen_coordinate[triangle, 1],
+        frozen_area_gradient_0,
+        frozen_area_gradient_1,
+        shear_scale,
+        area_scale,
+    )
+    stress_0 = frozen_gradient[triangle, 0] + metric_0
+    stress_1 = frozen_gradient[triangle, 1] + metric_1
+    if not _pair_is_finite(stress_0, stress_1):
+        return False
+    proximal_coordinate[triangle, 0] = center_0
+    proximal_coordinate[triangle, 1] = center_1
+    multiplier[triangle, 0] = stress_0
+    multiplier[triangle, 1] = stress_1
+    return True
+
+
+@wp.func
+def _refine_triangle(
+    triangle: int,
+    wid: int,
+    center_0: wp.vec3,
+    center_1: wp.vec3,
+    previous_0: wp.vec3,
+    previous_1: wp.vec3,
+    multiplier_0: wp.vec3,
+    multiplier_1: wp.vec3,
+    frozen_area_gradient_0: wp.vec3,
+    frozen_area_gradient_1: wp.vec3,
+    rest_area: float,
+    mu: float,
+    lmbd: float,
+    shear_scale: float,
+    area_scale: float,
+    alpha: float,
+    activation: float,
+    dt: float,
     proximal_iterations: int,
     proximal_relaxation: float,
-    model_time_dt: wp.array[wp.float32],
-    # Outputs:
+    triangle_indices: wp.array2d[wp.int32],
+    model_tri_poses: wp.array[wp.mat22],
+    packed_to_newton: wp.array[wp.int32],
+    model_particle_mass: wp.array[float],
+    model_particle_flags: wp.array[wp.int32],
+    frozen_coordinate: wp.array2d[wp.vec3],
+    frozen_gradient: wp.array2d[wp.vec3],
     proximal_coordinate: wp.array2d[wp.vec3],
     multiplier: wp.array2d[wp.vec3],
     nonlinear_rhs: wp.array[wp.vec3],
     world_position_residual: wp.array[float],
     world_velocity_residual: wp.array[float],
-    world_failed: wp.array[wp.bool],
-):
-    """Evaluate one membrane prox and scatter its next global RHS correction."""
-    triangle = wp.tid()
-    vertex_0 = triangle_indices[triangle, 0]
-    vertex_1 = triangle_indices[triangle, 1]
-    vertex_2 = triangle_indices[triangle, 2]
-    wid = packed_world[vertex_0]
-    dt = model_time_dt[wid]
-    if not world_active[wid]:
-        return
+) -> bool:
+    """Solve the local prox of one triangle, update its multiplier, and scatter its RHS correction.
 
-    mu = model_tri_materials[triangle, 0]
-    lmbd = model_tri_materials[triangle, 1] + mu
-    rest_area = model_tri_areas[triangle]
-    shear_scale = 2.0 * rest_area * mu
-    area_scale = rest_area * lmbd
-    if mu == 0.0 and lmbd == 0.0:
-        return
-
-    position_0 = position_linearized[vertex_0]
-    position_1 = position_linearized[vertex_1]
-    position_2 = position_linearized[vertex_2]
-    if is_dynamic_particle(vertex_0, packed_to_newton, model_particle_mass, model_particle_flags):
-        position_0 = position_start[vertex_0] + dt * smooth_velocity[vertex_0]
-    if is_dynamic_particle(vertex_1, packed_to_newton, model_particle_mass, model_particle_flags):
-        position_1 = position_start[vertex_1] + dt * smooth_velocity[vertex_1]
-    if is_dynamic_particle(vertex_2, packed_to_newton, model_particle_mass, model_particle_flags):
-        position_2 = position_start[vertex_2] + dt * smooth_velocity[vertex_2]
-    center_0, center_1 = _deformation(
-        position_0,
-        position_1,
-        position_2,
-        model_tri_poses[triangle],
-    )
-
-    frozen_area_gradient_0 = frozen_area_gradient[triangle, 0]
-    frozen_area_gradient_1 = frozen_area_gradient[triangle, 1]
-    multiplier_0 = multiplier[triangle, 0]
-    multiplier_1 = multiplier[triangle, 1]
-    previous_0 = proximal_coordinate[triangle, 0]
-    previous_1 = proximal_coordinate[triangle, 1]
+    Returns whether every step stayed finite; a failed update leaves the element state and the RHS unchanged.
+    """
     deformation_0 = previous_0
     deformation_1 = previous_1
-    alpha = 1.0
-    if lmbd > 1.0e-6:
-        alpha = 1.0 + mu / lmbd
-    activation = model_tri_activations[triangle]
-
     failed = wp.bool(False)
     for _iteration in range(proximal_iterations):
         area_ratio, current_area_gradient_0, current_area_gradient_1 = membrane_area_ratio_gradient(
@@ -510,8 +512,7 @@ def _update_membrane_proximal(
             break
 
     if failed or not _pair_is_finite(deformation_0, deformation_1):
-        world_failed[wid] = True
-        return
+        return False
 
     area_ratio, current_area_gradient_0, current_area_gradient_1 = membrane_area_ratio_gradient(
         deformation_0,
@@ -546,13 +547,11 @@ def _update_membrane_proximal(
         or determinant <= _PROXIMAL_EPSILON * determinant_scale
         or not _pair_is_finite(stationarity_correction_0, stationarity_correction_1)
     ):
-        world_failed[wid] = True
-        return
+        return False
     stationarity_correction_norm_0 = wp.length(stationarity_correction_0)
     stationarity_correction_norm_1 = wp.length(stationarity_correction_1)
     if not wp.isfinite(stationarity_correction_norm_0) or not wp.isfinite(stationarity_correction_norm_1):
-        world_failed[wid] = True
-        return
+        return False
     stationarity_correction_norm = wp.max(
         stationarity_correction_norm_0,
         stationarity_correction_norm_1,
@@ -569,8 +568,7 @@ def _update_membrane_proximal(
     multiplier_new_0 = multiplier_0 + proximal_relaxation * metric_primal_0
     multiplier_new_1 = multiplier_1 + proximal_relaxation * metric_primal_1
     if not _pair_is_finite(multiplier_new_0, multiplier_new_1):
-        world_failed[wid] = True
-        return
+        return False
 
     frozen_0 = frozen_coordinate[triangle, 0]
     frozen_1 = frozen_coordinate[triangle, 1]
@@ -585,8 +583,7 @@ def _update_membrane_proximal(
     correction_0 = metric_correction_0 - multiplier_new_0 + frozen_gradient[triangle, 0]
     correction_1 = metric_correction_1 - multiplier_new_1 + frozen_gradient[triangle, 1]
     if not _pair_is_finite(correction_0, correction_1):
-        world_failed[wid] = True
-        return
+        return False
 
     characteristic_length = wp.sqrt(rest_area)
     primal_norm_0 = wp.length(center_0 - deformation_0)
@@ -600,15 +597,13 @@ def _update_membrane_proximal(
         or not wp.isfinite(local_change_norm_0)
         or not wp.isfinite(local_change_norm_1)
     ):
-        world_failed[wid] = True
-        return
+        return False
     primal_norm = wp.max(primal_norm_0, primal_norm_1)
     local_change_norm = wp.max(local_change_norm_0, local_change_norm_1)
     position_residual_value = characteristic_length * wp.max(primal_norm, stationarity_correction_norm)
     velocity_residual_value = characteristic_length * local_change_norm / dt
     if not wp.isfinite(position_residual_value) or not wp.isfinite(velocity_residual_value):
-        world_failed[wid] = True
-        return
+        return False
 
     rest_pose = model_tri_poses[triangle]
     scatter_finite = wp.bool(True)
@@ -619,8 +614,7 @@ def _update_membrane_proximal(
             contribution = dt * (coefficients[0] * correction_0 + coefficients[1] * correction_1)
             scatter_finite = scatter_finite and _vector_is_finite(contribution)
     if not scatter_finite:
-        world_failed[wid] = True
-        return
+        return False
 
     for order in range(3):
         vertex = triangle_indices[triangle, order]
@@ -647,6 +641,137 @@ def _update_membrane_proximal(
         wid,
         velocity_residual_value,
     )
+    return True
+
+
+@wp.kernel
+def _update_membrane_proximal(
+    # Inputs:
+    position_start: wp.array[wp.vec3],
+    position_linearized: wp.array[wp.vec3],
+    smooth_velocity: wp.array[wp.vec3],
+    triangle_indices: wp.array2d[wp.int32],
+    model_tri_poses: wp.array[wp.mat22],
+    model_tri_areas: wp.array[float],
+    model_tri_materials: wp.array2d[float],
+    model_tri_activations: wp.array[float],
+    packed_to_newton: wp.array[wp.int32],
+    packed_world: wp.array[wp.int32],
+    model_particle_mass: wp.array[float],
+    model_particle_flags: wp.array[wp.int32],
+    world_active: wp.array[wp.bool],
+    frozen_coordinate: wp.array2d[wp.vec3],
+    frozen_gradient: wp.array2d[wp.vec3],
+    frozen_area_gradient: wp.array2d[wp.vec3],
+    proximal_iterations: int,
+    proximal_relaxation: float,
+    model_time_dt: wp.array[wp.float32],
+    # Outputs:
+    proximal_coordinate: wp.array2d[wp.vec3],
+    multiplier: wp.array2d[wp.vec3],
+    nonlinear_rhs: wp.array[wp.vec3],
+    world_position_residual: wp.array[float],
+    world_velocity_residual: wp.array[float],
+    world_failed: wp.array[wp.bool],
+):
+    """Evaluate one membrane prox and scatter its next global RHS correction."""
+    triangle = wp.tid()
+    vertex_0 = triangle_indices[triangle, 0]
+    vertex_1 = triangle_indices[triangle, 1]
+    vertex_2 = triangle_indices[triangle, 2]
+    wid = packed_world[vertex_0]
+    dt = model_time_dt[wid]
+    if not world_active[wid]:
+        return
+
+    mu = model_tri_materials[triangle, 0]
+    lmbd = model_tri_materials[triangle, 1] + mu
+    rest_area = model_tri_areas[triangle]
+    shear_scale = 2.0 * rest_area * mu
+    area_scale = rest_area * lmbd
+    if mu == 0.0 and lmbd == 0.0:
+        return
+
+    position_0 = position_linearized[vertex_0]
+    position_1 = position_linearized[vertex_1]
+    position_2 = position_linearized[vertex_2]
+    if is_dynamic_particle(vertex_0, packed_to_newton, model_particle_mass, model_particle_flags):
+        position_0 = position_start[vertex_0] + dt * smooth_velocity[vertex_0]
+    if is_dynamic_particle(vertex_1, packed_to_newton, model_particle_mass, model_particle_flags):
+        position_1 = position_start[vertex_1] + dt * smooth_velocity[vertex_1]
+    if is_dynamic_particle(vertex_2, packed_to_newton, model_particle_mass, model_particle_flags):
+        position_2 = position_start[vertex_2] + dt * smooth_velocity[vertex_2]
+    center_0, center_1 = _deformation(
+        position_0,
+        position_1,
+        position_2,
+        model_tri_poses[triangle],
+    )
+
+    frozen_area_gradient_0 = frozen_area_gradient[triangle, 0]
+    frozen_area_gradient_1 = frozen_area_gradient[triangle, 1]
+    multiplier_0 = multiplier[triangle, 0]
+    multiplier_1 = multiplier[triangle, 1]
+    previous_0 = proximal_coordinate[triangle, 0]
+    previous_1 = proximal_coordinate[triangle, 1]
+    alpha = 1.0
+    if lmbd > 1.0e-6:
+        alpha = 1.0 + mu / lmbd
+    activation = model_tri_activations[triangle]
+
+    if not _pair_is_finite(center_0, center_1):
+        world_failed[wid] = True
+        return
+
+    # A failed local update keeps the linearized response of the element for this iteration
+    if not _refine_triangle(
+        triangle,
+        wid,
+        center_0,
+        center_1,
+        previous_0,
+        previous_1,
+        multiplier_0,
+        multiplier_1,
+        frozen_area_gradient_0,
+        frozen_area_gradient_1,
+        rest_area,
+        mu,
+        lmbd,
+        shear_scale,
+        area_scale,
+        alpha,
+        activation,
+        dt,
+        proximal_iterations,
+        proximal_relaxation,
+        triangle_indices,
+        model_tri_poses,
+        packed_to_newton,
+        model_particle_mass,
+        model_particle_flags,
+        frozen_coordinate,
+        frozen_gradient,
+        proximal_coordinate,
+        multiplier,
+        nonlinear_rhs,
+        world_position_residual,
+        world_velocity_residual,
+    ):
+        if not _keep_linearized_response(
+            triangle,
+            center_0,
+            center_1,
+            frozen_coordinate,
+            frozen_gradient,
+            frozen_area_gradient_0,
+            frozen_area_gradient_1,
+            rest_area * mu,
+            area_scale,
+            proximal_coordinate,
+            multiplier,
+        ):
+            world_failed[wid] = True
 
 
 ###
