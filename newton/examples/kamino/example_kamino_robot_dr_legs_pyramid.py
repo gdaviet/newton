@@ -487,7 +487,7 @@ class Example:
         solver_config.compute_solution_metrics = False
         if self.dynamics_solver == "lox":
             solver_config.lox.max_iterations = args.max_iterations
-            solver_config.lox.projection_sweeps_per_iteration = args.projection_sweeps_per_iteration
+            solver_config.lox.projection_sweeps_per_iteration = args.projection_iterations
             solver_config.lox.deformable_preconditioner = args.deformable_preconditioner
             solver_config.lox.deformable_cr_iterations = args.deformable_cr_iterations
         self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
@@ -781,7 +781,7 @@ class Example:
         )
         parser.add_argument(
             "--deformable-preconditioner",
-            choices=("incomplete_ldlt", "multilevel", "two_level", "block_jacobi"),
+            choices=("fsai", "incomplete_ldlt", "multilevel", "two_level", "block_jacobi"),
             default="incomplete_ldlt",
             help="LOX cloth candidate preconditioner.",
         )
