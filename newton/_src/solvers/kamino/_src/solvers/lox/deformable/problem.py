@@ -87,6 +87,7 @@ class DeformableProblem:
             proximal_iterations=config.deformable_proximal_iterations,
             proximal_relaxation=config.deformable_proximal_relaxation,
             recycle_cr=config.deformable_recycle_cr,
+            coarse_initial_guess=config.deformable_coarse_initial_guess,
             consensus_fraction=config.deformable_consensus_fraction,
             weight_beta=config.deformable_weight_beta or 0.0,
             weight_sigma=config.weight_sigma,
