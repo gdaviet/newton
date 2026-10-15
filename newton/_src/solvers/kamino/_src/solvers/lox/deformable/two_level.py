@@ -582,37 +582,130 @@ class DeformableTwoLevel:
     def factorize(self) -> None:
         """Factor the fine diagonal and block-diagonal Galerkin coarse matrix."""
         self.fine_preconditioner.factorize()
-        self.coarse_matrix.zero_()
+        self._factorize_coarse_level(
+            self.coarse_matrix, self.coarse_slot_base, self.coarse_slot_dimension, self.coarse_solver
+        )
+        if self.global_coarse_solver is not None:
+            self.factorize_global_coarse()
+
+    def factorize_global_coarse(self) -> None:
+        """Factor only the component-global coarse matrix, for :meth:`add_global_coarse_correction`."""
+        self._factorize_coarse_level(
+            self.global_coarse_matrix,
+            self.global_coarse_slot_base,
+            self.global_coarse_slot_dimension,
+            self.global_coarse_solver,
+        )
+
+    def add_global_coarse_correction(self, residual: wp.array[wp.vec3], result: wp.array[wp.vec3]) -> None:
+        """Add the component-global coarse correction ``P A_c^-1 P^T r`` to ``result``.
+
+        With ``r = b - A x``, the correction of ``x`` is the Galerkin projection onto the translations of
+        the coarse particle groups, so it never increases the energy norm of the error of ``x``.
+
+        Args:
+            residual: Residual ``r`` of every packed particle.
+            result: Particle vector to correct in place.
+        """
+        self._solve_coarse(
+            residual,
+            self.global_coarse_block_count,
+            self.global_coarse_group_offsets,
+            self.global_coarse_group_particles,
+            self.global_coarse_group_offset,
+            self.global_coarse_group_world,
+            self.global_coarse_right_hand_side,
+            self.global_coarse_solution,
+            self.global_coarse_solver,
+        )
+        wp.launch(
+            _add_coarse_correction,
+            dim=self.row_count,
+            inputs=[
+                self.global_coarse_solution,
+                self.particle_global_coarse_offset,
+                self.packed_world,
+                self.world_active,
+                self.world_status,
+                1.0,
+            ],
+            outputs=[result],
+            device=self.device,
+        )
+
+    ###
+    # Internals
+    ###
+
+    def _factorize_coarse_level(
+        self,
+        coarse_matrix: wp.array[wp.float32],
+        coarse_slot_base: wp.array[wp.int32],
+        coarse_slot_dimension: wp.array[wp.int32],
+        coarse_solver: LLTBlockedSolver,
+    ) -> None:
+        """Assemble the dense Galerkin matrices of one coarse level and factorize them."""
+        coarse_matrix.zero_()
         wp.launch(
             _assemble_coarse_matrix,
             dim=self.system_matrix.values.shape[0],
             inputs=[
                 self.system_matrix.values,
-                self.coarse_slot_base,
-                self.coarse_slot_dimension,
+                coarse_slot_base,
+                coarse_slot_dimension,
             ],
-            outputs=[self.coarse_matrix],
+            outputs=[coarse_matrix],
             device=self.device,
         )
-        self.coarse_solver.compute(self.coarse_matrix)
-        if self.global_coarse_solver is not None:
-            self.global_coarse_matrix.zero_()
+        coarse_solver.compute(coarse_matrix)
+
+    def _solve_coarse(
+        self,
+        residual: wp.array[wp.vec3],
+        group_count: int,
+        group_offsets: wp.array[wp.int32],
+        group_particles: wp.array[wp.int32],
+        group_coarse_offset: wp.array[wp.int32],
+        group_world: wp.array[wp.int32],
+        coarse_right_hand_side: wp.array[wp.float32],
+        coarse_solution: wp.array[wp.float32],
+        coarse_solver: LLTBlockedSolver,
+    ) -> None:
+        """Restrict a residual to the translations of particle groups and solve their coarse matrices."""
+        if self.device.is_cuda:
             wp.launch(
-                _assemble_coarse_matrix,
-                dim=self.system_matrix.values.shape[0],
+                _restrict_residual_by_aggregate,
+                dim=group_count * _AGGREGATE_BLOCK_DIM,
                 inputs=[
-                    self.system_matrix.values,
-                    self.global_coarse_slot_base,
-                    self.global_coarse_slot_dimension,
+                    residual,
+                    group_offsets,
+                    group_particles,
+                    group_coarse_offset,
+                    group_world,
+                    self.world_active,
+                    self.world_status,
                 ],
-                outputs=[self.global_coarse_matrix],
+                outputs=[coarse_right_hand_side],
+                block_dim=_AGGREGATE_BLOCK_DIM,
                 device=self.device,
             )
-            self.global_coarse_solver.compute(self.global_coarse_matrix)
-
-    ###
-    # Internals
-    ###
+        else:
+            wp.launch(
+                _restrict_residual_by_aggregate_cpu,
+                dim=group_count,
+                inputs=[
+                    residual,
+                    group_offsets,
+                    group_particles,
+                    group_coarse_offset,
+                    group_world,
+                    self.world_active,
+                    self.world_status,
+                ],
+                outputs=[coarse_right_hand_side],
+                device=self.device,
+            )
+        coarse_solver.solve(coarse_right_hand_side, coarse_solution)
 
     def _matvec(
         self,
@@ -623,40 +716,17 @@ class DeformableTwoLevel:
         beta: float,
     ) -> None:
         """Write ``z = alpha M^-1 x + beta y``."""
-        if self.device.is_cuda:
-            wp.launch(
-                _restrict_residual_by_aggregate,
-                dim=self.aggregate_count * _AGGREGATE_BLOCK_DIM,
-                inputs=[
-                    x,
-                    self.aggregate_offsets,
-                    self.aggregate_particles,
-                    self.aggregate_coarse_offset,
-                    self.aggregate_world,
-                    self.world_active,
-                    self.world_status,
-                ],
-                outputs=[self.coarse_right_hand_side],
-                block_dim=_AGGREGATE_BLOCK_DIM,
-                device=self.device,
-            )
-        else:
-            wp.launch(
-                _restrict_residual_by_aggregate_cpu,
-                dim=self.aggregate_count,
-                inputs=[
-                    x,
-                    self.aggregate_offsets,
-                    self.aggregate_particles,
-                    self.aggregate_coarse_offset,
-                    self.aggregate_world,
-                    self.world_active,
-                    self.world_status,
-                ],
-                outputs=[self.coarse_right_hand_side],
-                device=self.device,
-            )
-        self.coarse_solver.solve(self.coarse_right_hand_side, self.coarse_solution)
+        self._solve_coarse(
+            x,
+            self.aggregate_count,
+            self.aggregate_offsets,
+            self.aggregate_particles,
+            self.aggregate_coarse_offset,
+            self.aggregate_world,
+            self.coarse_right_hand_side,
+            self.coarse_solution,
+            self.coarse_solver,
+        )
         wp.launch(
             _apply_two_level,
             dim=self.row_count,
@@ -676,42 +746,16 @@ class DeformableTwoLevel:
             device=self.device,
         )
         if self.global_coarse_solver is not None:
-            if self.device.is_cuda:
-                wp.launch(
-                    _restrict_residual_by_aggregate,
-                    dim=self.global_coarse_block_count * _AGGREGATE_BLOCK_DIM,
-                    inputs=[
-                        x,
-                        self.global_coarse_group_offsets,
-                        self.global_coarse_group_particles,
-                        self.global_coarse_group_offset,
-                        self.global_coarse_group_world,
-                        self.world_active,
-                        self.world_status,
-                    ],
-                    outputs=[self.global_coarse_right_hand_side],
-                    block_dim=_AGGREGATE_BLOCK_DIM,
-                    device=self.device,
-                )
-            else:
-                wp.launch(
-                    _restrict_residual_by_aggregate_cpu,
-                    dim=self.global_coarse_block_count,
-                    inputs=[
-                        x,
-                        self.global_coarse_group_offsets,
-                        self.global_coarse_group_particles,
-                        self.global_coarse_group_offset,
-                        self.global_coarse_group_world,
-                        self.world_active,
-                        self.world_status,
-                    ],
-                    outputs=[self.global_coarse_right_hand_side],
-                    device=self.device,
-                )
-            self.global_coarse_solver.solve(
+            self._solve_coarse(
+                x,
+                self.global_coarse_block_count,
+                self.global_coarse_group_offsets,
+                self.global_coarse_group_particles,
+                self.global_coarse_group_offset,
+                self.global_coarse_group_world,
                 self.global_coarse_right_hand_side,
                 self.global_coarse_solution,
+                self.global_coarse_solver,
             )
             wp.launch(
                 _add_coarse_correction,

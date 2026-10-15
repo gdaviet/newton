@@ -35,6 +35,7 @@ from .consensus_kernels import (
 )
 from .cudss import DeformableCuDSS
 from .direct import DeformableBlockLLT
+from .fsai import DeformableFSAI
 from .jacobi import DeformableJacobi
 from .preconditioner import DeformableIncompleteLDLT
 from .proximal import DeformableMembraneProximal
@@ -525,15 +526,17 @@ class DeformableSystem:
     Args:
         model: Newton model containing the supported deformable subset.
         cr_iterations: Fixed number of preconditioned CR iterations per candidate solve.
-        preconditioner: Deformable preconditioner type: ``"incomplete_ldlt"``, ``"multilevel"``,
-            ``"two_level"``, or ``"block_jacobi"``.
-        preconditioner_regularization: Relative incomplete-factor pivot floor.
+        preconditioner: Deformable preconditioner type: ``"fsai"``, ``"incomplete_ldlt"``,
+            ``"multilevel"``, ``"two_level"``, or ``"block_jacobi"``.
+        preconditioner_regularization: Relative pivot or diagonal floor of the preconditioner.
         direct_max_particles: Largest component solved with blocked Cholesky.
         linear_solver: Deformable global linear solver type: ``"cr"``, ``"cudss"``, or
             ``"cudss_then_cr"``.
         proximal_iterations: Fixed local Gauss-Newton iterations per elastic element prox.
         proximal_relaxation: Relaxation factor for the local multiplier update.
         recycle_cr: Whether to augment CR with recent candidate-solve corrections.
+        coarse_initial_guess: Whether to correct the starting guess of each CR candidate solve with the
+            component-global Galerkin coarse solve of the ``"multilevel"`` preconditioner.
         consensus_fraction: Fraction ``alpha`` of the consensus weights in the matrix of the candidate solves,
             in [0, 1].
         weight_beta: Largest particle weight relative to the free bound of the particle, or zero for no cap.
@@ -546,13 +549,14 @@ class DeformableSystem:
         model: Model,
         *,
         cr_iterations: int = 4,
-        preconditioner: str = "two_level",
+        preconditioner: str = "fsai",
         preconditioner_regularization: float = 1.0e-6,
         direct_max_particles: int = 0,
         linear_solver: str = "cr",
         proximal_iterations: int = 4,
         proximal_relaxation: float = 1.0,
         recycle_cr: bool = False,
+        coarse_initial_guess: bool = False,
         consensus_fraction: float = 0.5,
         weight_beta: float = 0.0,
         weight_sigma: float = 0.0,
@@ -562,9 +566,9 @@ class DeformableSystem:
             raise ValueError(
                 f"LOX deformable CR iterations must be an integer greater than or equal to one, got {cr_iterations}."
             )
-        if preconditioner not in ("incomplete_ldlt", "multilevel", "two_level", "block_jacobi"):
+        if preconditioner not in ("fsai", "incomplete_ldlt", "multilevel", "two_level", "block_jacobi"):
             raise ValueError(
-                "LOX deformable preconditioner must be 'incomplete_ldlt', 'multilevel', "
+                "LOX deformable preconditioner must be 'fsai', 'incomplete_ldlt', 'multilevel', "
                 f"'two_level', or 'block_jacobi', got {preconditioner!r}."
             )
         if (
@@ -587,6 +591,8 @@ class DeformableSystem:
             raise ValueError(f"LOX deformable proximal relaxation must be in [0, 1], got {proximal_relaxation}.")
         if not isinstance(recycle_cr, bool):
             raise ValueError(f"LOX deformable CR recycling must be a boolean, got {recycle_cr}.")
+        if not isinstance(coarse_initial_guess, bool):
+            raise ValueError(f"LOX deformable coarse initial guess must be a boolean, got {coarse_initial_guess}.")
         if not np.isfinite(consensus_fraction) or consensus_fraction < 0.0 or consensus_fraction > 1.0:
             raise ValueError(f"LOX deformable consensus fraction must be in [0, 1], got {consensus_fraction}.")
         if not np.isfinite(weight_beta) or not (weight_beta == 0.0 or weight_beta >= 1.0):
@@ -854,7 +860,17 @@ class DeformableSystem:
             )
         else:
             self.direct_solver = None
-        if self.has_iterative_components and preconditioner == "incomplete_ldlt":
+        if self.has_iterative_components and preconditioner == "fsai":
+            self.preconditioner = DeformableFSAI(
+                data.preconditioner_matrix,
+                data.diagonal_slots,
+                topology.packed_solve_world,
+                data.world_active,
+                topology.component_dof_offsets,
+                regularization=preconditioner_regularization,
+                row_active=data.packed_iterative,
+            )
+        elif self.has_iterative_components and preconditioner == "incomplete_ldlt":
             self.preconditioner = DeformableIncompleteLDLT(
                 data.preconditioner_matrix,
                 topology.packed_solve_world,
@@ -888,6 +904,28 @@ class DeformableSystem:
         else:
             assert self.direct_solver is not None
             self.preconditioner = self.direct_solver
+        self.coarse_corrector: DeformableMultilevel | None = None
+        """Multilevel preconditioner whose component-global coarse solve corrects the starting guess of each
+        CR candidate solve, or ``None``."""
+        if self.has_iterative_components and coarse_initial_guess:
+            if isinstance(self.preconditioner, DeformableMultilevel):
+                self.coarse_corrector = self.preconditioner
+            else:
+                self.coarse_corrector = DeformableMultilevel(
+                    data.preconditioner_matrix,
+                    data.diagonal_slots,
+                    packed_component_np,
+                    topology.packed_solve_world,
+                    data.world_active,
+                    topology.component_dof_offsets,
+                    regularization=preconditioner_regularization,
+                    row_active=data.packed_iterative,
+                )
+        self._coarse_residual = (
+            wp.zeros(self.particle_count, dtype=wp.vec3, device=self.device)
+            if self.coarse_corrector is not None
+            else None
+        )
         if not self.has_iterative_components:
             self.cr_state = None
         elif data.recycling is not None:
@@ -1039,7 +1077,8 @@ class DeformableSystem:
         """Run the fixed-count warm-started preconditioned CR candidate solve.
 
         The candidate velocity is written to :attr:`DeformableSystemData.smooth_velocity`; the
-        particles of inactive worlds keep their velocity.
+        particles of inactive worlds keep their velocity. With :attr:`coarse_corrector`, the
+        component-global Galerkin coarse solve first corrects the warm start.
 
         Args:
             consensus_center: Splitting target ``c = u + alpha p`` of each particle [m/s].
@@ -1103,6 +1142,10 @@ class DeformableSystem:
             return
 
         assert self.cr_state is not None
+        if self.coarse_corrector is not None:
+            # Remove the smooth global error of the warm start, which the local preconditioner resolves slowly.
+            self._system_matvec(data.smooth_velocity, data.candidate_rhs, self._coarse_residual, -1.0, 1.0)
+            self.coarse_corrector.add_global_coarse_correction(self._coarse_residual, data.smooth_velocity)
         self.cr_state(M=self.preconditioner.linear_operator)
         assert self.cr_residual is not None
 
@@ -1425,6 +1468,8 @@ class DeformableSystem:
             self.direct_solver.factorize()
         if self.has_iterative_components:
             self.preconditioner.factorize()
+        if self.coarse_corrector is not None and self.coarse_corrector is not self.preconditioner:
+            self.coarse_corrector.factorize_global_coarse()
 
     def _system_matvec(
         self,

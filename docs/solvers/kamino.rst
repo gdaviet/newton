@@ -155,7 +155,10 @@ consensus and change residuals of the terminal status.
 Each time step assembles one frozen smooth particle system. Its candidate
 solves run ``config.lox.deformable_cr_iterations`` preconditioned
 conjugate-residual iterations, with the preconditioner of
-``config.lox.deformable_preconditioner``, and solve the components of at most
+``config.lox.deformable_preconditioner``, an adaptive factorized sparse
+approximate inverse by default, from a warm start that
+``config.lox.deformable_coarse_initial_guess`` optionally corrects with a
+component-global coarse solve. They solve the components of at most
 ``config.lox.deformable_direct_max_particles`` particles with a dense Cholesky
 factorization. ``config.lox.deformable_linear_solver="cudss"`` solves the
 whole system with a cuDSS factorization, which requires the
