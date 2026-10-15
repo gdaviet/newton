@@ -220,7 +220,7 @@ class Example:
             config.use_collision_detector = False
             config.lox.max_iterations = 25
             config.lox.projection_sweeps_per_iteration = 10
-            config.lox.deformable_preconditioner = str(getattr(args, "deformable_preconditioner", "two_level"))
+            config.lox.deformable_preconditioner = str(getattr(args, "deformable_preconditioner", "fsai"))
             config.lox.deformable_self_contact_margin = self.particle_self_contact_margin
             config.lox.deformable_self_contact_gap = self.particle_self_contact_gap
             self.soft_solver = newton.solvers.SolverKamino(self.model, config=config)
@@ -499,8 +499,8 @@ if __name__ == "__main__":
     parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd")
     parser.add_argument(
         "--deformable-preconditioner",
-        choices=("incomplete_ldlt", "two_level", "block_jacobi"),
-        default="two_level",
+        choices=("fsai", "incomplete_ldlt", "multilevel", "two_level", "block_jacobi"),
+        default="fsai",
     )
     parser.set_defaults(num_frames=1000)
     viewer, args = newton.examples.init(parser)
