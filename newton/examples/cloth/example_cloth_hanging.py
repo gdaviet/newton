@@ -225,7 +225,7 @@ class Example:
         )
         parser.add_argument(
             "--deformable-preconditioner",
-            choices=("incomplete_ldlt", "multilevel", "two_level", "block_jacobi"),
+            choices=("fsai", "incomplete_ldlt", "multilevel", "two_level", "block_jacobi"),
             default="incomplete_ldlt",
             help="LOX cloth candidate preconditioner.",
         )

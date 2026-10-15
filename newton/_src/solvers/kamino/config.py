@@ -1276,15 +1276,28 @@ class LOXSolverConfig:
     multiplier updates with the same fixed point.
     """
 
-    deformable_preconditioner: Literal["incomplete_ldlt", "multilevel", "two_level", "block_jacobi"] = "two_level"
+    deformable_preconditioner: Literal["fsai", "incomplete_ldlt", "multilevel", "two_level", "block_jacobi"] = "fsai"
     """Preconditioner of the deformable conjugate-residual solves.
 
-    ``"two_level"`` adds a 3x3 block-Jacobi fine correction to independent dense solves
-    over groups of graph aggregates. ``"multilevel"`` adds a component-global correction
-    above the local coarse blocks. ``"incomplete_ldlt"`` applies a global triangular
-    correction at a higher setup and application cost. ``"block_jacobi"`` keeps the
-    diagonal block of each particle. The alternatives to the default may need more
-    :attr:`deformable_cr_iterations`.
+    ``"fsai"`` applies an adaptive factorized sparse approximate inverse ``G^T G`` with at
+    most eight scalar entries per row of ``G``; its supports are selected once, from the
+    first factorized system, and refit at every step. ``"two_level"`` adds a 3x3
+    block-Jacobi fine correction to independent dense solves over groups of graph
+    aggregates. ``"multilevel"`` adds a component-global correction above the local coarse
+    blocks. ``"incomplete_ldlt"`` applies a global triangular correction at a higher setup
+    and application cost. ``"block_jacobi"`` keeps the diagonal block of each particle.
+    The alternatives to the default may need more :attr:`deformable_cr_iterations`.
+    """
+
+    deformable_coarse_initial_guess: bool = False
+    """Whether to correct the starting guess of each conjugate-residual candidate solve with
+    the component-global coarse solve of the ``"multilevel"`` preconditioner.
+
+    The Galerkin correction removes the component-wide translational error that a local
+    preconditioner resolves slowly, without increasing the energy norm of the error. It helps
+    stiff bodies with a small :attr:`deformable_consensus_fraction` and prescribed particles
+    that move each step. It costs one coarse factorization per step and one coarse solve and
+    one matrix product per candidate solve.
     """
 
     deformable_hessian_regularization: float = 1.0e-6
@@ -1648,10 +1661,10 @@ class LOXSolverConfig:
             )
         if self.deformable_linear_solver == "cudss" and not self.fixed_iterations:
             raise ValueError("deformable_linear_solver='cudss' requires fixed_iterations=True.")
-        if self.deformable_preconditioner not in ("incomplete_ldlt", "multilevel", "two_level", "block_jacobi"):
+        if self.deformable_preconditioner not in ("fsai", "incomplete_ldlt", "multilevel", "two_level", "block_jacobi"):
             raise ValueError(
                 f"Invalid deformable_preconditioner: {self.deformable_preconditioner!r}. "
-                "Must be 'incomplete_ldlt', 'multilevel', 'two_level', or 'block_jacobi'."
+                "Must be 'fsai', 'incomplete_ldlt', 'multilevel', 'two_level', or 'block_jacobi'."
             )
         for name, minimum in (
             ("deformable_cr_iterations", 1),
@@ -1666,6 +1679,7 @@ class LOXSolverConfig:
                 raise ValueError(f"Invalid {name}: {value}. Must be an integer greater than or equal to {minimum}.")
         for name in (
             "deformable_recycle_cr",
+            "deformable_coarse_initial_guess",
             "deformable_enable_self_contact",
             "deformable_enable_normal_cone_filtering",
             "deformable_enable_rigid_contact_normal_cone_filtering",
