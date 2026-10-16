@@ -863,7 +863,6 @@ class DeformableSystem:
         if self.has_iterative_components and preconditioner == "fsai":
             self.preconditioner = DeformableFSAI(
                 data.preconditioner_matrix,
-                data.diagonal_slots,
                 topology.packed_solve_world,
                 data.world_active,
                 topology.component_dof_offsets,

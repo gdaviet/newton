@@ -80,72 +80,52 @@ def _scalar_matrix(matrix):
     return dense
 
 
-def _dense_factor(fsai):
-    columns = fsai.factor_columns.numpy()
-    values = fsai.factor_values.numpy()
-    factor = np.zeros((columns.shape[0], columns.shape[0]))
-    for row in range(columns.shape[0]):
-        for slot in range(columns.shape[1]):
-            if columns[row, slot] >= 0:
-                factor[row, columns[row, slot]] = values[row, slot]
-    return factor
-
-
 class TestLOXDeformableFSAI(unittest.TestCase):
-    """Verify the FSAI factor, its application, and the coarse correction of the warm start."""
+    """Verify the FSAI preconditioner application, its captured refits, and the coarse correction of the warm start."""
 
     def setUp(self):
         if not test_context.setup_done:
             setup_tests(clear_cache=False)
         self.default_device = wp.get_device(test_context.device)
 
-    def test_factor_rows_solve_local_systems(self):
-        """Store z / sqrt(z_i) for A[S, S] z = e_i on a lower-triangular support of every row."""
+    def test_apply_is_identity_outside_active_rows(self):
+        """Write alpha G^T G x + beta y on CR rows of active worlds and alpha x + beta y elsewhere."""
         with wp.ScopedDevice(self.default_device):
             system = _assembled_system(_build_cloth(self.default_device), preconditioner="fsai")
+            data = system.data
             fsai = system.preconditioner
-            matrix = _scalar_matrix(system.data.preconditioner_matrix)
-            columns = fsai.factor_columns.numpy()
-            values = fsai.factor_values.numpy()
-
-        self.assertIsInstance(fsai, DeformableFSAI)
-        self.assertEqual(int(fsai.pattern_ready.numpy()[0]), 1)
-        np.testing.assert_array_equal(columns[:, 0], np.arange(columns.shape[0]))
-        grown = 0
-        for row in range(columns.shape[0]):
-            support = columns[row][columns[row] >= 0]
-            self.assertEqual(len(np.unique(support)), len(support))
-            self.assertTrue(np.all(support[1:] < row))
-            grown += len(support) > 1
-            local = matrix[np.ix_(support, support)]
-            unit = np.zeros(len(support))
-            unit[0] = 1.0
-            solution = np.linalg.solve(local, unit)
-            np.testing.assert_allclose(values[row, : len(support)], solution / np.sqrt(solution[0]), rtol=2.0e-3)
-            np.testing.assert_array_equal(values[row, len(support) :], 0.0)
-        self.assertGreater(grown, columns.shape[0] // 2)
-
-    def test_apply_matches_dense_product(self):
-        """Write alpha G^T G x + beta y on active worlds and alpha x + beta y on inactive worlds."""
-        with wp.ScopedDevice(self.default_device):
-            system = _assembled_system(_build_cloth(self.default_device), preconditioner="fsai")
-            fsai = system.preconditioner
-            factor = _dense_factor(fsai)
             rng = np.random.default_rng(3)
             x_values = rng.standard_normal((fsai.row_count, 3)).astype(np.float32)
             y_values = rng.standard_normal((fsai.row_count, 3)).astype(np.float32)
             x = wp.array(x_values, dtype=wp.vec3)
             y = wp.array(y_values, dtype=wp.vec3)
             z = wp.zeros_like(x)
+            product = wp.zeros_like(x)
+            fsai.fsai.matvec(x, product, product, 1.0, 0.0)
             fsai.linear_operator.matvec(x, y, z, 0.5, -2.0)
             active = z.numpy()
-            system.data.world_active.fill_(False)
+            row_active = (np.arange(fsai.row_count) % 2).astype(np.int32)
+            masked = DeformableFSAI(
+                data.preconditioner_matrix,
+                system.topology.packed_solve_world,
+                data.world_active,
+                system.topology.component_dof_offsets,
+                row_active=wp.array(row_active, dtype=wp.int32),
+            )
+            masked.factorize()
+            masked.linear_operator.matvec(x, y, z, 0.5, -2.0)
+            rows = z.numpy()
+            data.world_active.fill_(False)
             fsai.linear_operator.matvec(x, y, z, 0.5, -2.0)
             inactive = z.numpy()
 
-        expected = 0.5 * (factor.T @ (factor @ x_values.reshape(-1))) - 2.0 * y_values.reshape(-1)
-        np.testing.assert_allclose(active.reshape(-1), expected, rtol=1.0e-4, atol=1.0e-4)
-        np.testing.assert_allclose(inactive, 0.5 * x_values - 2.0 * y_values, rtol=1.0e-6, atol=1.0e-6)
+        expected = 0.5 * product.numpy() - 2.0 * y_values
+        identity = 0.5 * x_values - 2.0 * y_values
+        self.assertGreater(np.abs(expected - identity).max(), 1.0e-2)
+        np.testing.assert_allclose(active, expected, rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(rows[row_active != 0], expected[row_active != 0], rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(rows[row_active == 0], identity[row_active == 0], rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(inactive, identity, rtol=1.0e-6, atol=1.0e-6)
 
     def test_capture_selects_support_once(self):
         """Select the supports inside the first captured factorization and refit them at later replays."""
@@ -157,32 +137,33 @@ class TestLOXDeformableFSAI(unittest.TestCase):
             data = system.data
             arguments = (
                 data.preconditioner_matrix,
-                data.diagonal_slots,
                 system.topology.packed_solve_world,
                 data.world_active,
                 system.topology.component_dof_offsets,
             )
+            x = wp.array(np.random.default_rng(4).standard_normal((data.preconditioner_matrix.nrow, 3)), dtype=wp.vec3)
             eager = DeformableFSAI(*arguments, row_active=data.packed_iterative)
             eager.factorize()
+            eager_product = wp.zeros_like(x)
+            eager.linear_operator.matvec(x, eager_product, eager_product, 1.0, 0.0)
             captured = DeformableFSAI(*arguments, row_active=data.packed_iterative)
+            captured_product = wp.zeros_like(x)
             with wp.ScopedCapture() as capture:
                 captured.factorize()
+                captured.linear_operator.matvec(x, captured_product, captured_product, 1.0, 0.0)
             self.assertEqual(int(captured.pattern_ready.numpy()[0]), 0)
             wp.capture_launch(capture.graph)
-            first_columns = captured.factor_columns.numpy()
-            first_values = captured.factor_values.numpy()
-            transpose_offsets = captured.transpose_offsets.numpy()
+            first = captured_product.numpy()
             # A later replay refits the same supports to the current values.
             values = data.preconditioner_matrix.values
             values.assign(2.0 * values.numpy())
             wp.capture_launch(capture.graph)
-            scaled_values = captured.factor_values.numpy()
+            scaled = captured_product.numpy()
 
-        np.testing.assert_array_equal(first_columns, eager.factor_columns.numpy())
-        np.testing.assert_allclose(first_values, eager.factor_values.numpy(), rtol=1.0e-6, atol=1.0e-7)
-        np.testing.assert_array_equal(transpose_offsets, eager.transpose_offsets.numpy())
-        np.testing.assert_array_equal(captured.factor_columns.numpy(), first_columns)
-        np.testing.assert_allclose(scaled_values, first_values / np.sqrt(2.0), rtol=1.0e-5, atol=1.0e-7)
+        self.assertEqual(int(captured.pattern_ready.numpy()[0]), 1)
+        np.testing.assert_array_equal(captured.update_status.numpy(), 0)
+        np.testing.assert_allclose(first, eager_product.numpy(), rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(scaled, 0.5 * first, rtol=1.0e-5, atol=1.0e-6)
 
     def test_candidate_converges_faster_than_block_jacobi(self):
         """Reduce the candidate residual of a stiff beam more than block Jacobi in the same iterations."""
