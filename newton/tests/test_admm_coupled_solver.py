@@ -1095,7 +1095,7 @@ class TestAdmmModelJointInterface(unittest.TestCase):
             "joint_friction",
         ):
             np.testing.assert_array_equal(getattr(view, name).numpy(), getattr(reference, name).numpy(), err_msg=name)
-        np.testing.assert_array_equal(view.test.dof_gain.numpy(), np.full(6, 2.5, dtype=np.float32))
+        np.testing.assert_array_equal(view.test.dof_gain.numpy(), np.zeros(6, dtype=np.float32))
 
         # Step from the authored body poses; forward kinematics of the
         # identity-frame ball joint would place both bodies at the origin.

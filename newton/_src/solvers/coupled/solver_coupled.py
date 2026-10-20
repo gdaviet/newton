@@ -302,10 +302,12 @@ def _free_root_joint_template(device) -> Model:
     return template
 
 
-def _attribute_default_value(model: Model, full_name: str, value) -> Any:
-    """Return the builder default for one row of a registered attribute."""
-    if full_name in model._custom_attribute_defaults:
-        return model._custom_attribute_defaults[full_name]
+def _attribute_zero_value(value) -> Any:
+    """Return the zero value for one row of a registered attribute.
+
+    Synthesized FREE root rows use it for custom attributes: the per-joint and per-DOF
+    attributes of the current solvers have no effect on a FREE joint, or default to zero.
+    """
     if isinstance(value, list):
         return ""
     if isinstance(value, wp.array):
@@ -2132,9 +2134,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
 
         Built-in attributes take the values ``ModelBuilder.add_body()``
         assigns to its FREE joint and articulation. Custom attributes take
-        their registered builder default, recorded on the finalized model;
-        attributes added directly to a model take the zero value of their
-        dtype, which is the builder's dtype default.
+        the zero value of their dtype.
         """
         model = self.model
         device = model.device
@@ -2178,7 +2178,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
             if isinstance(template_value, (np.ndarray, list)) and len(template_value) > max(source_rows):
                 entity_values = [template_value[row] for row in source_rows]
             else:
-                entity_values = [_attribute_default_value(model, attribute.name, value)] * len(source_rows)
+                entity_values = [_attribute_zero_value(value)] * len(source_rows)
             rows: list[int] = []
             for group in entity_rows:
                 rows.extend(self._expanded_row_indices(group, width))

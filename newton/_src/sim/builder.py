@@ -15411,7 +15411,6 @@ class ModelBuilder:
 
             # Process custom attributes
             for _full_key, custom_attr in self.custom_attributes.items():
-                m._custom_attribute_defaults[_full_key] = custom_attr.default
                 custom_finalizer = self._custom_attribute_model_finalizers.get(_full_key)
                 if custom_finalizer is not None:
                     custom_finalizer(self, m, custom_attr)
