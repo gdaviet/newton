@@ -1261,6 +1261,44 @@ class TestAdmmJointProxies(unittest.TestCase):
                 np.testing.assert_allclose(body_q, expected_q, atol=2.0e-4)
                 np.testing.assert_allclose(body_qd, expected_qd, atol=2.0e-3)
 
+    def test_proxy_is_a_single_free_rooted_link(self):
+        """Keep one proxy body per cross-solver joint; a reduced view roots it with a FREE joint."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        parent = -1
+        joints = []
+        for _ in range(3):
+            body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01), com=wp.vec3(0.0, 0.0, 0.15))
+            offset = 0.0 if parent < 0 else 0.3
+            joints.append(
+                builder.add_joint_revolute(
+                    parent,
+                    body,
+                    parent_xform=wp.transform(
+                        wp.vec3(0.0, 0.0, offset), wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.3)
+                    ),
+                    axis=newton.Axis.X,
+                )
+            )
+            parent = body
+        builder.add_articulation(joints)
+        model = builder.finalize(device="cpu")
+
+        solver = SolverCoupledADMM(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(name="base", solver=SolverFeatherstone, bodies=[0, 1], joints=[0, 1]),
+                SolverCoupled.Entry(name="tip", solver=SolverFeatherstone, bodies=[2], joints=[]),
+            ],
+            coupling=SolverCoupledADMM.Config(),
+        )
+        # The tip sees only a copy of link 1, rooted by a FREE joint, above its own link through joint 2.
+        tip = solver.view("tip")
+        np.testing.assert_array_equal(solver._entries["tip"].body_local_to_global.numpy(), [1, 2])
+        np.testing.assert_array_equal(
+            tip.joint_type.numpy(), [int(newton.JointType.FREE), int(newton.JointType.REVOLUTE)]
+        )
+        np.testing.assert_array_equal(solver._entries["base"].body_local_to_global.numpy(), [0, 1, 2])
+
     def test_proxied_child_keeps_rotation(self):
         """Accumulate a reduced-coordinate child's rotation through its cross-solver joint across steps."""
         torque = (1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01)

@@ -1,0 +1,1 @@
+Fix experimental `SolverCoupledADMM` joint proxies copying the other entry's whole joint chain down to the world into an entry view; each cross-solver joint now adds one proxy body, which a FREE root joint places when its own joint stays with the other entry.

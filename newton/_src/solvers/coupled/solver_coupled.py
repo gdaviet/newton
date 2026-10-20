@@ -1269,7 +1269,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
         visible_particles = {int(i) for i in cfg.particles} | {int(i) for i in proxy_particle_keep}
         visible_joints = {int(i) for i in cfg.joints} | {int(i) for i in proxy_joint_keep}
         visible_shapes = self._entry_visible_shapes(cfg, visible_bodies)
-        free_root_cuts = self._entry_free_root_cut_joints(cfg, visible_joints)
+        free_root_cuts = self._entry_free_root_cut_joints(visible_bodies, visible_joints)
 
         body_order = self._ordered_world_subset(
             visible_bodies,
@@ -1329,25 +1329,25 @@ class SolverCoupled(SolverBase, CouplingInterface):
         self._apply_compact_entry_view(view, compact)
         return compact
 
-    def _entry_free_root_cut_joints(self, cfg: SolverCoupled.Entry, visible_joints: set[int]) -> set[int]:
-        """Return hidden incoming tree joints of entry-owned bodies that receive a FREE root joint.
+    def _entry_free_root_cut_joints(self, visible_bodies: set[int], visible_joints: set[int]) -> set[int]:
+        """Return hidden incoming tree joints of visible bodies that receive a FREE root joint.
 
         A reduced-coordinate solver moves a body only through its incoming
-        joint, so each entry-owned body whose enabled articulation joint the
-        entry view hides gets a FREE joint to the world. This holds whether
-        the hidden joint is unowned or owned by another entry.
+        joint, so each body in the entry view, owned or kept as a joint proxy,
+        whose enabled articulation joint the view hides gets a FREE joint to
+        the world. This holds whether the hidden joint is unowned or owned by
+        another entry.
         """
         model = self.model
-        if model.joint_count == 0 or model.articulation_count == 0 or not cfg.bodies:
+        if model.joint_count == 0 or model.articulation_count == 0 or not visible_bodies:
             return set()
-        owned_bodies = {int(body) for body in cfg.bodies}
         joint_child = model.joint_child.numpy()
         joint_articulation = model.joint_articulation.numpy()
         joint_enabled = model.joint_enabled.numpy()
         incoming: dict[int, list[int]] = {}
         for joint in np.flatnonzero(joint_articulation >= 0).tolist():
             child = int(joint_child[joint])
-            if child in owned_bodies:
+            if child in visible_bodies:
                 incoming.setdefault(child, []).append(int(joint))
         cuts = set()
         for joints in incoming.values():

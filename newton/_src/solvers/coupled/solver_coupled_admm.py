@@ -860,7 +860,6 @@ class SolverCoupledADMM(SolverCoupled):
                 raise ValueError(f"Unknown ADMM joint proximal destination entries: {sorted(unknown)}")
         body_owner = self._build_owner_map(model.body_count, [entry.bodies for entry in entries])
         joint_owner = self._build_owner_map(model.joint_count, [entry.joints for entry in entries])
-        owned_bodies = {entry.name: {int(body) for body in entry.bodies} for entry in entries}
         body_keep = {entry.name: set() for entry in entries}
         joint_keep = {entry.name: set() for entry in entries}
         pair_bodies: dict[tuple[str, str], set[int]] = {}
@@ -917,16 +916,6 @@ class SolverCoupledADMM(SolverCoupled):
                 add_proxy_body(child_name, parent_name, parent)
                 joint_keep[child_name].add(joint)
 
-        self._add_admm_joint_proxy_topology_paths(
-            model,
-            entry_names,
-            body_owner,
-            owned_bodies,
-            body_keep,
-            joint_keep,
-            pair_bodies,
-        )
-
         self._admm_joint_proxy_body_keep = body_keep
         self._admm_joint_proxy_joint_keep = joint_keep
         self._admm_joint_proxy_mappings = [
@@ -938,56 +927,6 @@ class SolverCoupledADMM(SolverCoupled):
             for (src_name, dst_name), bodies in sorted(pair_bodies.items())
             if bodies
         ]
-
-    def _add_admm_joint_proxy_topology_paths(
-        self,
-        model: Model,
-        entry_names: Sequence[str],
-        body_owner: Sequence[int],
-        owned_bodies: dict[str, set[int]],
-        body_keep: dict[str, set[int]],
-        joint_keep: dict[str, set[int]],
-        pair_bodies: dict[tuple[str, str], set[int]],
-    ) -> None:
-        """Add minimal incoming tree-joint paths needed to instantiate proxy bodies."""
-        if model.joint_count == 0 or model.joint_articulation is None:
-            return
-
-        joint_child = model.joint_child.numpy()
-        joint_parent = model.joint_parent.numpy()
-        joint_articulation = model.joint_articulation.numpy()
-        incoming_tree_joint: dict[int, int] = {}
-        for joint, child in enumerate(joint_child):
-            if int(joint_articulation[joint]) >= 0:
-                incoming_tree_joint.setdefault(int(child), joint)
-
-        def add_path_body(dst_name: str, body: int) -> None:
-            if body < 0 or body >= len(body_owner):
-                return
-            body_keep[dst_name].add(body)
-            owner = int(body_owner[body])
-            if owner >= 0:
-                src_name = entry_names[owner]
-                if src_name != dst_name:
-                    pair_bodies.setdefault((src_name, dst_name), set()).add(body)
-
-        for dst_name in list(body_keep):
-            visible_bodies = set(owned_bodies[dst_name]) | set(body_keep[dst_name])
-            queue = list(body_keep[dst_name])
-            while queue:
-                body = queue.pop()
-                if body in owned_bodies[dst_name]:
-                    continue
-                joint = incoming_tree_joint.get(body)
-                if joint is None:
-                    continue
-                joint_keep[dst_name].add(joint)
-                parent = int(joint_parent[joint])
-                if parent < 0 or parent in visible_bodies:
-                    continue
-                visible_bodies.add(parent)
-                add_path_body(dst_name, parent)
-                queue.append(parent)
 
     def _entry_proxy_body_keep_indices(self, name: str) -> set[int]:
         return set(self._admm_joint_proxy_body_keep.get(name, ()))
