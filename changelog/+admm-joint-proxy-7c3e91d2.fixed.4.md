@@ -1,0 +1,1 @@
+Fix experimental `SolverCoupledADMM` iterations diverging with light joint proxies: a side whose view holds a proxy of the other endpoint now takes only the row's dual force, since the proxy already realizes the row's penalty term.

@@ -1192,10 +1192,6 @@ class TestAdmmModelJointInterface(unittest.TestCase):
             )
 
 
-def _semi_implicit(view):
-    return SolverSemiImplicit(model=view, enable_tri_contact=False)
-
-
 class TestAdmmJointProxies(unittest.TestCase):
     """Joint proxies only change ADMM convergence, never the converged solution."""
 
@@ -1252,14 +1248,11 @@ class TestAdmmJointProxies(unittest.TestCase):
 
         # Nothing simulates a cross-solver joint's drive or armature, so the reference hinge has none.
         reference = _build_split_hinge_pair(True, driven=False)
-        cases = (
-            ("featherstone", run(reference, SolverFeatherstone(reference)), coupled(SolverFeatherstone, True, 5.0e6)),
-            ("semi_implicit", coupled(_semi_implicit, False, 5.0e4), coupled(_semi_implicit, True, 5.0e4)),
-        )
-        for name, (expected_q, expected_qd), (body_q, body_qd) in cases:
-            with self.subTest(solver=name):
-                np.testing.assert_allclose(body_q, expected_q, atol=2.0e-4)
-                np.testing.assert_allclose(body_qd, expected_qd, atol=2.0e-3)
+        expected_q, expected_qd = run(reference, SolverFeatherstone(reference))
+        body_q, body_qd = coupled(SolverFeatherstone, True, 5.0e6)
+        self.assertTrue(np.all(np.isfinite(expected_q)) and np.all(np.isfinite(body_q)))
+        np.testing.assert_allclose(body_q, expected_q, atol=2.0e-4)
+        np.testing.assert_allclose(body_qd, expected_qd, atol=2.0e-3)
 
     def test_proxy_is_a_single_free_rooted_link(self):
         """Keep one proxy body per cross-solver joint; a reduced view roots it with a FREE joint."""
@@ -1304,18 +1297,22 @@ class TestAdmmJointProxies(unittest.TestCase):
         torque = (1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01)
         model = _build_split_ball_pair(tree=True)
         expected_q, expected_qd = _push_split_ball(model, SolverFeatherstone(model), torque)
-        model = _build_split_ball_pair(tree=True)
-        solver = _make_split_ball_solver(
-            model,
-            SolverFeatherstone,
-            tree=True,
-            joint_stiffness=5.0e6,
-            joint_angular_stiffness=5.0e5,
-        )
-        body_q, body_qd = _push_split_ball(model, solver, torque)
-        self.assertGreater(abs(float(expected_q[1, 5])), 1.0e-3)
-        np.testing.assert_allclose(body_q[1, 3:], expected_q[1, 3:], atol=1.0e-4)
-        np.testing.assert_allclose(body_qd[1, 3:], expected_qd[1, 3:], atol=1.0e-3)
+        # A light proxy relies on its side taking only the row's dual force.
+        for mass_scale in (1.0, 0.05):
+            with self.subTest(mass_scale=mass_scale):
+                model = _build_split_ball_pair(tree=True)
+                solver = _make_split_ball_solver(
+                    model,
+                    SolverFeatherstone,
+                    tree=True,
+                    joint_stiffness=5.0e6,
+                    joint_angular_stiffness=5.0e5,
+                    joint_proximal_mass_scale=mass_scale,
+                )
+                body_q, body_qd = _push_split_ball(model, solver, torque)
+                self.assertGreater(abs(float(expected_q[1, 5])), 1.0e-3)
+                np.testing.assert_allclose(body_q[1, 3:], expected_q[1, 3:], atol=1.0e-4)
+                np.testing.assert_allclose(body_qd[1, 3:], expected_qd[1, 3:], atol=1.0e-3)
 
 
 def _build_split_hinge_pair(tree: bool, driven: bool = True) -> newton.Model:

@@ -195,6 +195,8 @@ class _AdmmRigidRigidAttachmentGroup:
     lambda_: wp.array
     Jv: wp.array
     u_target: wp.array
+    proxied_a: wp.array | None = None
+    proxied_b: wp.array | None = None
 
     @property
     def count(self) -> int:
@@ -218,6 +220,8 @@ class _AdmmRigidRigidAngularAttachmentGroup:
     lambda_: wp.array
     Jv: wp.array
     u_target: wp.array
+    proxied_a: wp.array | None = None
+    proxied_b: wp.array | None = None
 
     @property
     def count(self) -> int:
@@ -4155,6 +4159,30 @@ class SolverCoupledADMM(SolverCoupled):
                     device=device,
                 )
 
+    def _admm_proxied_row_flags(
+        self, group: _AdmmRigidRigidAttachmentGroup | _AdmmRigidRigidAngularAttachmentGroup
+    ) -> tuple[wp.array, wp.array]:
+        """Return per-row flags telling which sides hold a joint proxy of the other endpoint.
+
+        A proxied side realizes the row's augmented term through the proxy's inertia, so it only
+        takes the dual force from the row.
+        """
+        if group.proxied_a is None:
+            entry_a = self._entries[group.body_entry_name_a]
+            entry_b = self._entries[group.body_entry_name_b]
+            a_to_global, a_from_global = entry_a.body_local_to_global.numpy(), entry_a.body_global_to_local.numpy()
+            b_to_global, b_from_global = entry_b.body_local_to_global.numpy(), entry_b.body_global_to_local.numpy()
+            body_a, body_b = group.body_ids_a.numpy(), group.body_ids_b.numpy()
+            device = self.model.device
+            proxied = bool(self._admm_joint_proxy_mappings)
+            group.proxied_a = wp.array(
+                [int(proxied and a_from_global[b_to_global[b]] >= 0) for b in body_b], dtype=int, device=device
+            )
+            group.proxied_b = wp.array(
+                [int(proxied and b_from_global[a_to_global[a]] >= 0) for a in body_a], dtype=int, device=device
+            )
+        return group.proxied_a, group.proxied_b
+
     def _admm_joint_proxy_shift_endpoints(
         self, group: _AdmmRigidRigidAttachmentGroup | _AdmmRigidRigidAngularAttachmentGroup
     ) -> tuple[SolverEntry, SolverEntry, wp.array, wp.array]:
@@ -4318,6 +4346,7 @@ class SolverCoupledADMM(SolverCoupled):
                     group.lambda_,
                     group.u,
                     group.Jv,
+                    *self._admm_proxied_row_flags(group),
                 ],
                 outputs=[buf_a.body_f, buf_b.body_f],
                 device=self.model.device,
@@ -4351,6 +4380,7 @@ class SolverCoupledADMM(SolverCoupled):
                     group.lambda_,
                     group.u,
                     group.Jv,
+                    *self._admm_proxied_row_flags(group),
                 ],
                 outputs=[buf_a.body_f, buf_b.body_f],
                 device=self.model.device,
@@ -4389,6 +4419,7 @@ class SolverCoupledADMM(SolverCoupled):
                     group.lambda_,
                     group.u,
                     group.Jv,
+                    *self._admm_proxied_row_flags(group),
                 ],
                 outputs=[buf_a.body_f, buf_b.body_f],
                 device=self.model.device,

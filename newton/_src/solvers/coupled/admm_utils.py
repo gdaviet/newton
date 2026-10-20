@@ -1360,15 +1360,24 @@ def attach_rr_angular_accumulate_forces_kernel(
     lambda_k: wp.array[wp.vec3],
     u_k: wp.array[wp.vec3],
     Jv_k: wp.array[wp.vec3],
+    proxied_a: wp.array[int],
+    proxied_b: wp.array[int],
     body_f_a: wp.array[wp.spatial_vector],
     body_f_b: wp.array[wp.spatial_vector],
 ):
-    """Splat angular attachment torques into both rigid-body force buffers."""
+    """Splat angular attachment torques into both rigid-body force buffers; proxied sides get the dual only."""
     i = wp.tid()
     W_i = W[i]
-    torque_a = W_i * (lambda_k[i] + rho * W_i * (u_k[i] - Jv_k[i]))
+    dual = W_i * lambda_k[i]
+    penalty = W_i * rho * W_i * (u_k[i] - Jv_k[i])
+    torque_a = dual
+    if proxied_a[i] == 0:
+        torque_a = torque_a + penalty
+    torque_b = dual
+    if proxied_b[i] == 0:
+        torque_b = torque_b + penalty
     wp.atomic_add(body_f_a, body_a[i], wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), torque_a))
-    wp.atomic_sub(body_f_b, body_b[i], wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), torque_a))
+    wp.atomic_sub(body_f_b, body_b[i], wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), torque_b))
 
 
 @wp.kernel(enable_backward=False)
@@ -1407,19 +1416,28 @@ def attach_rr_revolute_angular_local_accumulate_forces_kernel(
     lambda_k: wp.array[wp.vec3],
     u_k: wp.array[wp.vec3],
     Jv_k: wp.array[wp.vec3],
+    proxied_a: wp.array[int],
+    proxied_b: wp.array[int],
     body_f_a: wp.array[wp.spatial_vector],
     body_f_b: wp.array[wp.spatial_vector],
 ):
-    """Splat revolute angular constraint torques, leaving the hinge axis free."""
+    """Splat revolute angular constraint torques, leaving the hinge axis free; proxied sides get the dual only."""
     i = wp.tid()
     ba = body_a[i]
     W_i = W[i]
-    torque_local = W_i * (lambda_k[i] + rho * W_i * (u_k[i] - Jv_k[i]))
-    torque_local = wp.vec3(0.0, torque_local[1], torque_local[2])
-    frame_world = body_q_a[ba] * frame_a[i]
-    torque_world = wp.quat_rotate(wp.transform_get_rotation(frame_world), torque_local)
-    wp.atomic_add(body_f_a, ba, wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), torque_world))
-    wp.atomic_sub(body_f_b, body_b[i], wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), torque_world))
+    dual = W_i * lambda_k[i]
+    penalty = W_i * rho * W_i * (u_k[i] - Jv_k[i])
+    torque_local_a = dual
+    if proxied_a[i] == 0:
+        torque_local_a = torque_local_a + penalty
+    torque_local_b = dual
+    if proxied_b[i] == 0:
+        torque_local_b = torque_local_b + penalty
+    rotation = wp.transform_get_rotation(body_q_a[ba] * frame_a[i])
+    torque_a = wp.quat_rotate(rotation, wp.vec3(0.0, torque_local_a[1], torque_local_a[2]))
+    torque_b = wp.quat_rotate(rotation, wp.vec3(0.0, torque_local_b[1], torque_local_b[2]))
+    wp.atomic_add(body_f_a, ba, wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), torque_a))
+    wp.atomic_sub(body_f_b, body_b[i], wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), torque_b))
 
 
 # ----------------------------------------------------------------------
@@ -1477,22 +1495,34 @@ def attach_rr_accumulate_forces_kernel(
     lambda_k: wp.array[wp.vec3],
     u_k: wp.array[wp.vec3],
     Jv_k: wp.array[wp.vec3],
+    proxied_a: wp.array[int],
+    proxied_b: wp.array[int],
     body_f_a: wp.array[wp.spatial_vector],
     body_f_b: wp.array[wp.spatial_vector],
 ):
-    """Splat point-attachment forces for a rigid-rigid row."""
+    """Splat point-attachment forces for a rigid-rigid row.
+
+    A side whose view holds a joint proxy of the other endpoint gets only the dual force: the
+    proxy realizes the row's augmented term exactly.
+    """
     i = wp.tid()
     ba = body_a[i]
     bb = body_b[i]
     W_i = W[i]
-    force_a = W_i * (lambda_k[i] + rho * W_i * (u_k[i] - Jv_k[i]))
+    dual = W_i * lambda_k[i]
+    penalty = W_i * rho * W_i * (u_k[i] - Jv_k[i])
+    force_a = dual
+    if proxied_a[i] == 0:
+        force_a = force_a + penalty
 
     xform_a = body_q_a[ba]
     point_a = wp.transform_point(xform_a, point_a_local[i])
     arm_a = point_a - wp.transform_point(xform_a, body_com_a[ba])
     wp.atomic_add(body_f_a, ba, wp.spatial_vector(force_a, wp.cross(arm_a, force_a)))
 
-    force_b = -force_a
+    force_b = -dual
+    if proxied_b[i] == 0:
+        force_b = force_b - penalty
     xform_b = body_q_b[bb]
     point_b = wp.transform_point(xform_b, point_b_local[i])
     arm_b = point_b - wp.transform_point(xform_b, body_com_b[bb])
