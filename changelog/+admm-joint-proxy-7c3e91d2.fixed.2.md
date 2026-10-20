@@ -1,0 +1,1 @@
+Fix experimental coupled-solver joint proxies applying the model's joint drives, damping, friction, limits, armature, and `Control.joint_f`/`joint_act` inside the entry that holds the proxy; joints kept as proxies now only tie the proxy to the owned body.

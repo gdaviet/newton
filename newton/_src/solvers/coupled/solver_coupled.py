@@ -14,6 +14,7 @@ import numpy as np
 import warp as wp
 
 from ...core.reset import reset_world_selected as _reset_world_selected
+from ...core.types import MAXVAL
 from ...geometry import ParticleFlags, ShapeFlags
 from ...sim import JointType, Model, ModelFlags, StateFlags
 from ..solver import SolverBase
@@ -373,6 +374,38 @@ def _require_supports_coupling(solver: SolverBase) -> None:
         )
 
 
+_PROXY_JOINT_DOF_CLEARED_VALUES = (
+    ("joint_target_ke", 0.0),
+    ("joint_target_kd", 0.0),
+    ("joint_damping", 0.0),
+    ("joint_friction", 0.0),
+    ("joint_armature", 0.0),
+    ("joint_limit_ke", 0.0),
+    ("joint_limit_kd", 0.0),
+    ("joint_limit_lower", -MAXVAL),
+    ("joint_limit_upper", MAXVAL),
+)
+"""Per-DOF joint fields of joint proxies and the values that make them exert no force."""
+
+_PROXY_JOINT_CONTROL_FIELDS = ("joint_f", "joint_act")
+"""Per-DOF control inputs that never act on joint proxies."""
+
+
+@wp.kernel(enable_backward=False)
+def _zero_indexed_float_kernel(indices: wp.array[int], values: wp.array[float]):
+    values[indices[wp.tid()]] = 0.0
+
+
+def _clear_proxy_joint_control(control: Control, dofs: wp.array[int] | None) -> None:
+    """Zero the per-DOF control inputs of joint proxies in an entry-local control."""
+    if dofs is None:
+        return
+    for name in _PROXY_JOINT_CONTROL_FIELDS:
+        values = getattr(control, name, None)
+        if isinstance(values, wp.array) and values.shape[0] > 0:
+            wp.launch(_zero_indexed_float_kernel, dim=dofs.shape[0], inputs=[dofs, values], device=values.device)
+
+
 @dataclass
 class SolverEntry:
     """Runtime state for one sub-solver entry inside ``SolverCoupled``."""
@@ -415,6 +448,7 @@ class SolverEntry:
     body_gravity_acceleration: wp.array[wp.vec3] | None = None
     particle_gravity_acceleration: wp.array[wp.vec3] | None = None
     free_root_joints: _FreeRootJoints | None = None
+    proxy_joint_dof_local_indices: wp.array[int] | None = None
 
 
 _CORE_RESET_STATE_FLAGS = {
@@ -881,6 +915,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
                     wp.array([global_id for _, global_id in owned_pairs], dtype=int, device=device),
                 )
 
+            proxy_joint_dof_local_indices = self._proxy_joint_dof_local_indices(view, proxy_joint_keep, index_lists)
+            self._clear_proxy_joint_forces(view, proxy_joint_dof_local_indices)
             solver = cfg.solver(view)
             _require_supports_coupling(solver)
             self._entries[cfg.name] = SolverEntry(
@@ -898,6 +934,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 joint_dynamics_disabled_local_indices=joint_dynamics_disabled_local_indices,
                 proxy_body_local_indices=proxy_body_local_indices,
                 proxy_particle_local_indices=proxy_particle_local_indices,
+                proxy_joint_dof_local_indices=proxy_joint_dof_local_indices,
                 joint_q_indices=joint_q_indices,
                 joint_qd_indices=joint_qd_indices,
                 shape_indices=shape_indices,
@@ -985,6 +1022,41 @@ class SolverCoupled(SolverBase, CouplingInterface):
         """Return particle indices that should remain dynamic as proxies in one view."""
         del name
         return set()
+
+    def _proxy_joint_dof_local_indices(
+        self,
+        view: ModelView,
+        proxy_joint_keep: set[int],
+        compact: _CompactIndexMaps | None,
+    ) -> wp.array[int] | None:
+        """Return the view-local DOFs of the joints kept as joint proxies, or ``None`` when there are none."""
+        joints = self._global_indices_to_local_array(
+            sorted(proxy_joint_keep), compact, self.model.AttributeFrequency.JOINT
+        )
+        if joints.shape[0] == 0:
+            return None
+        qd_start = view.joint_qd_start.numpy()
+        dofs = [dof for joint in joints.numpy() for dof in range(int(qd_start[joint]), int(qd_start[joint + 1]))]
+        if not dofs:
+            return None
+        return wp.array(dofs, dtype=int, device=self.model.device)
+
+    @staticmethod
+    def _clear_proxy_joint_forces(view: ModelView, dofs: wp.array[int] | None) -> None:
+        """Make joint proxies pure kinematic ties: no drives, damping, friction, limits, or armature.
+
+        Joint proxies keep the model's joint rows in the view; the coupler only needs their kinematics.
+        """
+        if dofs is None:
+            return
+        indices = dofs.numpy()
+        for name, value in _PROXY_JOINT_DOF_CLEARED_VALUES:
+            current = getattr(view, name, None)
+            if not isinstance(current, wp.array) or current.shape[0] == 0:
+                continue
+            values = current.numpy()
+            values[indices] = value
+            setattr(view, name, wp.array(values, dtype=current.dtype, device=current.device))
 
     def _entry_proxy_joint_keep_indices(self, name: str) -> set[int]:
         """Return joint indices that should remain enabled as proxies in one view."""
@@ -3334,6 +3406,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
         if filter_contacts:
             contacts = self._contacts_for_entry(entry, contacts)
         control = _copy_control_to_entry(control, entry)
+        if control is not None and control is entry.control:
+            _clear_proxy_joint_control(control, entry.proxy_joint_dof_local_indices)
         if control_callback is not None:
             control_callback(control)
         entry_observables = None
@@ -3661,6 +3735,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 ModelFlags.JOINT_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_FORCE_PROPERTIES
             ):
                 entry.view.disable_joints(entry.joint_dynamics_disabled_local_indices)
+                self._clear_proxy_joint_forces(entry.view, entry.proxy_joint_dof_local_indices)
 
             if flags & int(ModelFlags.SHAPE_PROPERTIES):
                 cfg = self._entry_configs_by_name[entry.name]

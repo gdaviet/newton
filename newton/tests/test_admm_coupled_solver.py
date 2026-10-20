@@ -1192,6 +1192,10 @@ class TestAdmmModelJointInterface(unittest.TestCase):
             )
 
 
+def _semi_implicit(view):
+    return SolverSemiImplicit(model=view, enable_tri_contact=False)
+
+
 class TestAdmmJointProxies(unittest.TestCase):
     """Joint proxies only change ADMM convergence, never the converged solution."""
 
@@ -1220,6 +1224,43 @@ class TestAdmmJointProxies(unittest.TestCase):
                         # A unit force over 20 steps gives the pair 1/6 N s of momentum.
                         self.assertAlmostEqual(float(body_qd[0, 0] + body_qd[1, 0]), 20.0 / 120.0, delta=1.0e-3)
 
+    def test_proxy_joints_exert_no_drive_or_control(self):
+        """Keep the drive, armature, and joint control of proxied joints out of the coupled solution."""
+        joint_f = np.zeros(7, dtype=np.float32)
+        joint_f[0] = 1.0  # the parent's FREE joint, a proxy path in the child's view
+        wrench = np.zeros((2, 6), dtype=np.float32)
+        wrench[1, 5] = 0.01  # turns the hinge, which a leftover drive would resist
+
+        def run(model: newton.Model, solver):
+            state_0, state_1 = model.state(), model.state()
+            control = model.control()
+            control.joint_f.assign(joint_f)
+            for _ in range(20):
+                state_0.body_f.assign(wrench)
+                solver.step(state_0, state_1, control, None, 1.0 / 120.0)
+                state_0, state_1 = state_1, state_0
+            return state_0.body_q.numpy(), state_0.body_qd.numpy()
+
+        def coupled(make_solver, tree: bool, stiffness: float):
+            model = _build_split_hinge_pair(tree)
+            return run(
+                model,
+                _make_split_ball_solver(
+                    model, make_solver, tree=tree, joint_stiffness=stiffness, joint_angular_stiffness=0.1 * stiffness
+                ),
+            )
+
+        # Nothing simulates a cross-solver joint's drive or armature, so the reference hinge has none.
+        reference = _build_split_hinge_pair(True, driven=False)
+        cases = (
+            ("featherstone", run(reference, SolverFeatherstone(reference)), coupled(SolverFeatherstone, True, 5.0e6)),
+            ("semi_implicit", coupled(_semi_implicit, False, 5.0e4), coupled(_semi_implicit, True, 5.0e4)),
+        )
+        for name, (expected_q, expected_qd), (body_q, body_qd) in cases:
+            with self.subTest(solver=name):
+                np.testing.assert_allclose(body_q, expected_q, atol=2.0e-4)
+                np.testing.assert_allclose(body_qd, expected_qd, atol=2.0e-3)
+
     def test_proxied_child_keeps_rotation(self):
         """Accumulate a reduced-coordinate child's rotation through its cross-solver joint across steps."""
         torque = (1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01)
@@ -1237,6 +1278,30 @@ class TestAdmmJointProxies(unittest.TestCase):
         self.assertGreater(abs(float(expected_q[1, 5])), 1.0e-3)
         np.testing.assert_allclose(body_q[1, 3:], expected_q[1, 3:], atol=1.0e-4)
         np.testing.assert_allclose(body_qd[1, 3:], expected_qd[1, 3:], atol=1.0e-3)
+
+
+def _build_split_hinge_pair(tree: bool, driven: bool = True) -> newton.Model:
+    """Build the split pair of :func:`_build_split_ball_pair` joined by a revolute hinge about z.
+
+    With ``driven`` the hinge has a position drive and armature, which no coupled entry simulates
+    for a cross-solver joint.
+    """
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    inertia = wp.mat33(np.eye(3) * 0.01)
+    parent = builder.add_link(mass=1.0, inertia=inertia)
+    child = builder.add_link(xform=wp.transform(wp.vec3(0.3, 0.0, 0.0), wp.quat_identity()), mass=1.0, inertia=inertia)
+    root = builder.add_joint_free(parent)
+    hinge = {"child_xform": wp.transform(wp.vec3(-0.3, 0.0, 0.0), wp.quat_identity()), "axis": newton.Axis.Z}
+    if driven:
+        hinge.update(target_ke=50.0, target_kd=5.0, armature=0.1)
+    if tree:
+        builder.add_articulation([root, builder.add_joint_revolute(parent, child, **hinge)])
+    else:
+        builder.add_articulation([root])
+        builder.add_articulation([builder.add_joint_free(child)])
+        builder.add_joint_revolute(parent, child, **hinge)
+    builder.color()
+    return builder.finalize(device="cpu")
 
 
 class TestAdmmBodyParticleAttachment(unittest.TestCase):
