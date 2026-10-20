@@ -72,6 +72,11 @@ from .admm_utils import (
     contact_rr_snapshot_by_contact_kernel,
     contact_u_update_kernel,
     joint_box_friction_u_update_kernel,
+    joint_proxy_angular_target_shift_kernel,
+    joint_proxy_cross_drift_kernel,
+    joint_proxy_cross_rotation_kernel,
+    joint_proxy_point_target_shift_kernel,
+    joint_proxy_proximal_wrench_kernel,
     lambda_update_kernel,
     mark_active_global_indices_mask_kernel,
     mark_active_indices_mask_kernel,
@@ -79,6 +84,8 @@ from .admm_utils import (
     mark_global_indices_mask_kernel,
     mark_indices_mask_kernel,
     mark_local_indices_from_global_mask_kernel,
+    masked_copy_body_state_kernel,
+    masked_copy_float_kernel,
     particle_gravity_compensation_lumped_kernel,
     particle_particle_contacts_hashgrid_kernel,
     reset_admm_history_kernel,
@@ -168,6 +175,7 @@ class _AdmmBuffers:
     particle_endpoint_index: wp.array = field(default=None)
     particle_endpoint_local_pos: wp.array = field(default=None)
     particle_effective_mass_local: wp.array = field(default=None)
+    joint_proxy_target_shift: wp.array = field(default=None)
 
 
 @dataclass
@@ -420,6 +428,31 @@ class _AdmmJointProxyMapping:
     proxy_inertia: wp.array | None = None
 
 
+@dataclass
+class _AdmmJointProxySync:
+    """Per-entry state an entry keeps for the joints and bodies of its view that it does not own.
+
+    The coordinates of joints the entry does not own (cross-solver joints and proxy paths) and the
+    proxy body states persist across steps, so owned bodies stay continuous in their own view.
+    """
+
+    joint_coord_mask: wp.array
+    joint_dof_mask: wp.array
+    proxy_body_mask: wp.array
+    joint_q: wp.array
+    joint_qd: wp.array
+    body_q: wp.array
+    body_qd: wp.array
+    drift: wp.array
+    cross_joint: wp.array
+    cross_parent: wp.array
+    cross_child: wp.array
+    cross_proxy_is_child: wp.array
+    cross_mode: wp.array
+    cross_true_rotation: wp.array
+    seeded: bool = False
+
+
 _AdmmQuadraticGroup = (
     _AdmmRigidRigidAttachmentGroup | _AdmmRigidRigidAngularAttachmentGroup | _AdmmRigidParticleAttachmentGroup
 )
@@ -622,11 +655,17 @@ class SolverCoupledADMM(SolverCoupled):
                 joints [N*m*s/rad].
             joint_proximal_bodies: Keep cross-solver joint neighbor bodies
                 dynamic in each subsolver view as local inertial proxies.
+                A proxy is pulled toward its source body's current velocity
+                iterate, shifted by the joint's coupling variable, and feels
+                no external force or gravity. It adds an augmented-Lagrangian
+                term weighted by its inertia that vanishes at convergence, so
+                proxies change the convergence rate, not the solution.
             joint_proximal_destination_entries: Optional entry names that
                 receive cross-solver joint proximal proxy bodies. ``None``
                 keeps the default symmetric visibility.
             joint_proximal_mass_scale: Multiplier applied to source effective
                 masses before installing cross-solver joint proxy inertias.
+                It sets the proxy term's weight and affects convergence only.
             rigid_contact_matching: Frame-to-frame contact matching mode for
                 collision-detected rigid-rigid ADMM contacts. Use
                 ``"disabled"`` to reset dynamic rigid contact state every
@@ -726,6 +765,9 @@ class SolverCoupledADMM(SolverCoupled):
 
         self._setup_admm(coupling)
         self._apply_cached_admm_joint_proxy_effective_masses()
+        self._admm_joint_proxy_syncs: dict[str, _AdmmJointProxySync] = {}
+        self._admm_empty_spatial = wp.zeros(1, dtype=wp.spatial_vector, device=self.model.device)
+        self._setup_admm_joint_proxy_sync()
 
     @classmethod
     def _validate_config(cls, coupling: SolverCoupledADMM.Config) -> None:
@@ -1857,6 +1899,8 @@ class SolverCoupledADMM(SolverCoupled):
     ) -> None:
         """Clear ADMM warm-start and internal contact buffers after reset."""
         super()._reset_coupling_state(state, world_mask=world_mask, flags=flags)
+        for sync in self._admm_joint_proxy_syncs.values():
+            sync.seeded = False
         if self._admm_collision_pipeline is not None:
             self._reset_collision_provider_contact_matching(self._admm_collision_pipeline, world_mask)
         if world_mask is not None:
@@ -2996,7 +3040,9 @@ class SolverCoupledADMM(SolverCoupled):
             self._refresh_admm_proximal_masks()
             self._refresh_admm_proximal_view_overrides(refresh_supported_solvers=True)
 
+        self._admm_step_dt = float(dt)
         for name, entry in self._entries.items():
+            self._sync_admm_joint_proxy_coordinates(entry)
             buf = self._admm_buffers[name]
             if buf.body_q_n is not None:
                 wp.copy(buf.body_q_n, entry.state_0.body_q)
@@ -3014,6 +3060,7 @@ class SolverCoupledADMM(SolverCoupled):
         self._admm_begin_step(dt)
 
         for k in range(iters):
+            self._accumulate_admm_joint_proxy_target_shifts()
             for name, entry in self._entries.items():
                 self._prepare_admm_iteration_state(
                     entry,
@@ -3041,6 +3088,8 @@ class SolverCoupledADMM(SolverCoupled):
                     wp.copy(buf.joint_qd_k, entry.state_1.joint_qd)
 
             self._update_admm_dual(k, dt)
+
+        self._save_admm_joint_proxy_state()
 
     def _refresh_collision_contact_groups(self, state_in: State) -> None:
         if (
@@ -3877,6 +3926,7 @@ class SolverCoupledADMM(SolverCoupled):
                     outputs=[buf.body_f],
                     device=self.model.device,
                 )
+            self._apply_admm_joint_proxy_proximal_wrenches(entry, buf, dt)
         if buf.particle_f is not None:
             if state_in.particle_f is not None:
                 wp.launch(
@@ -3900,6 +3950,323 @@ class SolverCoupledADMM(SolverCoupled):
                     outputs=[buf.particle_f],
                     device=self.model.device,
                 )
+
+    def _setup_admm_joint_proxy_sync(self) -> None:
+        """Allocate joint proxy target shifts and the per-entry coordinate sync data."""
+        device = self.model.device
+        dst_names = {
+            mapping.dst_name for mapping in self._admm_joint_proxy_mappings if mapping.body_ids_local is not None
+        }
+        for name in dst_names:
+            entry = self._entries[name]
+            buf = self._admm_buffers[name]
+            if entry.view.body_count == 0:
+                continue
+            buf.joint_proxy_target_shift = wp.zeros(entry.view.body_count, dtype=wp.spatial_vector, device=device)
+            if not entry.solver.coupling_integrates_joint_coordinates():
+                # Maximal-coordinate views take the proxies' global states each step.
+                continue
+            sync = self._build_admm_joint_proxy_sync(entry)
+            if sync is not None:
+                self._admm_joint_proxy_syncs[name] = sync
+
+    def _build_admm_joint_proxy_sync(self, entry: SolverEntry) -> _AdmmJointProxySync | None:
+        """Mark the joints and bodies the entry does not own and its proxied cross joints."""
+        view = entry.view
+        if view.joint_count == 0 or view.articulation_count == 0:
+            return None
+        device = self.model.device
+        joint_global_to_local = entry.attribute_projections[self.model.AttributeFrequency.JOINT].global_to_local
+        joint_local_to_global = entry.attribute_projections[self.model.AttributeFrequency.JOINT].local_to_global
+        owned_joints = {
+            int(joint_global_to_local[int(joint)])
+            for joint in entry.joint_indices.numpy()
+            if int(joint_global_to_local[int(joint)]) >= 0
+        }
+        body_global_to_local = entry.body_global_to_local.numpy()
+        owned_bodies = {
+            int(body_global_to_local[int(body)])
+            for body in entry.body_indices.numpy()
+            if int(body_global_to_local[int(body)]) >= 0
+        }
+        if len(owned_joints) == view.joint_count:
+            return None
+
+        joint_q_start = view.joint_q_start.numpy()
+        joint_qd_start = view.joint_qd_start.numpy()
+        joint_type = view.joint_type.numpy()
+        joint_parent = view.joint_parent.numpy()
+        joint_child = view.joint_child.numpy()
+        coord_mask = np.zeros(view.joint_coord_count, dtype=np.int32)
+        dof_mask = np.zeros(view.joint_dof_count, dtype=np.int32)
+        cross_modes = {int(JointType.BALL): 0, int(JointType.REVOLUTE): 1, int(JointType.FIXED): 2}
+        cross: list[tuple[int, int, int, int, int]] = []
+        for joint in range(view.joint_count):
+            if joint in owned_joints:
+                continue
+            coord_mask[joint_q_start[joint] : joint_q_start[joint + 1]] = 1
+            dof_mask[joint_qd_start[joint] : joint_qd_start[joint + 1]] = 1
+            parent, child = int(joint_parent[joint]), int(joint_child[joint])
+            global_joint = int(joint_local_to_global[joint])
+            if parent < 0 or global_joint < 0 or self._joint_owner[global_joint] >= 0:
+                continue
+            jtype = int(joint_type[joint])
+            if jtype not in cross_modes:
+                continue
+            # A cross-solver joint ties a proxy to an owned body; its free rotation is the proxy's drift.
+            if (child in owned_bodies) == (parent in owned_bodies):
+                continue
+            cross.append((joint, parent, child, int(child not in owned_bodies), cross_modes[jtype]))
+        proxy_mask = np.zeros(view.body_count, dtype=np.int32)
+        for joint in range(view.joint_count):
+            child = int(joint_child[joint])
+            if joint not in owned_joints and child not in owned_bodies:
+                proxy_mask[child] = 1
+
+        def int_array(values):
+            return wp.array(np.asarray(values, dtype=np.int32), dtype=int, device=device)
+
+        cross_columns = list(zip(*cross, strict=True)) if cross else [[], [], [], [], []]
+        sync = _AdmmJointProxySync(
+            joint_coord_mask=wp.array(coord_mask, dtype=wp.int32, device=device),
+            joint_dof_mask=wp.array(dof_mask, dtype=wp.int32, device=device),
+            proxy_body_mask=wp.array(proxy_mask, dtype=wp.int32, device=device),
+            joint_q=wp.zeros(view.joint_coord_count, dtype=float, device=device),
+            joint_qd=wp.zeros(view.joint_dof_count, dtype=float, device=device),
+            body_q=wp.zeros(view.body_count, dtype=wp.transform, device=device),
+            body_qd=wp.zeros(view.body_count, dtype=wp.spatial_vector, device=device),
+            drift=wp.zeros(view.body_count, dtype=wp.spatial_vector, device=device),
+            cross_joint=int_array(cross_columns[0]),
+            cross_parent=int_array(cross_columns[1]),
+            cross_child=int_array(cross_columns[2]),
+            cross_proxy_is_child=int_array(cross_columns[3]),
+            cross_mode=int_array(cross_columns[4]),
+            cross_true_rotation=wp.zeros(len(cross), dtype=wp.quat, device=device),
+        )
+        return sync
+
+    def _restore_admm_joint_proxy_state(self, entry: SolverEntry, sync: _AdmmJointProxySync) -> None:
+        """Write the entry's own coordinates of joints it does not own and its proxy body states."""
+        state = entry.state_0
+        device = self.model.device
+        wp.launch(
+            masked_copy_float_kernel,
+            dim=sync.joint_q.shape[0],
+            inputs=[sync.joint_coord_mask, sync.joint_q, state.joint_q],
+            device=device,
+        )
+        wp.launch(
+            masked_copy_float_kernel,
+            dim=sync.joint_qd.shape[0],
+            inputs=[sync.joint_dof_mask, sync.joint_qd, state.joint_qd],
+            device=device,
+        )
+        wp.launch(
+            masked_copy_body_state_kernel,
+            dim=sync.body_q.shape[0],
+            inputs=[sync.proxy_body_mask, sync.body_q, sync.body_qd],
+            outputs=[state.body_q, state.body_qd],
+            device=device,
+        )
+
+    def _save_admm_joint_proxy_state(self) -> None:
+        """Keep each entry's end-of-step coordinates and proxy states for the joints and bodies it does not own."""
+        device = self.model.device
+        for name, sync in self._admm_joint_proxy_syncs.items():
+            state = self._entries[name].state_1
+            wp.launch(
+                masked_copy_float_kernel,
+                dim=sync.joint_q.shape[0],
+                inputs=[sync.joint_coord_mask, state.joint_q, sync.joint_q],
+                device=device,
+            )
+            wp.launch(
+                masked_copy_float_kernel,
+                dim=sync.joint_qd.shape[0],
+                inputs=[sync.joint_dof_mask, state.joint_qd, sync.joint_qd],
+                device=device,
+            )
+            wp.launch(
+                masked_copy_body_state_kernel,
+                dim=sync.body_q.shape[0],
+                inputs=[sync.proxy_body_mask, state.body_q, state.body_qd],
+                outputs=[sync.body_q, sync.body_qd],
+                device=device,
+            )
+
+    def _sync_admm_joint_proxy_coordinates(self, entry: SolverEntry) -> None:
+        """Restore the entry's own proxy state over the global copy and measure the proxies' drift.
+
+        The coupler copies every visible row from the global state; the coordinates of joints the
+        entry does not own and the proxy body states are the entry's own and persist across steps,
+        so owned bodies stay continuous and a compliant attachment's gap stays with the proxy. The
+        drift of each proxy's free rotation through its cross-solver joint is measured against the
+        true relative rotation and steers the proxy target at the next iterations.
+        """
+        sync = self._admm_joint_proxy_syncs.get(entry.name)
+        if sync is None:
+            return
+        view = entry.view
+        state = entry.state_0
+        device = self.model.device
+        sync.drift.zero_()
+        if not sync.seeded:
+            # The first step and resets start from the global state, where every joint is consistent.
+            sync.seeded = True
+            return
+        cross_count = sync.cross_joint.shape[0]
+        if cross_count:
+            wp.launch(
+                joint_proxy_cross_rotation_kernel,
+                dim=cross_count,
+                inputs=[
+                    sync.cross_joint,
+                    sync.cross_parent,
+                    sync.cross_child,
+                    view.joint_X_p,
+                    view.joint_X_c,
+                    state.body_q,
+                ],
+                outputs=[sync.cross_true_rotation],
+                device=device,
+            )
+        self._restore_admm_joint_proxy_state(entry, sync)
+        if cross_count:
+            wp.launch(
+                joint_proxy_cross_drift_kernel,
+                dim=cross_count,
+                inputs=[
+                    sync.cross_joint,
+                    sync.cross_parent,
+                    sync.cross_child,
+                    sync.cross_proxy_is_child,
+                    sync.cross_mode,
+                    view.joint_X_p,
+                    view.joint_X_c,
+                    view.joint_axis,
+                    view.joint_qd_start,
+                    sync.cross_true_rotation,
+                    state.body_q,
+                    view.body_com,
+                    float(self._coupling.baumgarte) / self._admm_step_dt,
+                ],
+                outputs=[sync.drift],
+                device=device,
+            )
+
+    def _accumulate_admm_joint_proxy_target_shifts(self) -> None:
+        """Shift every joint proxy target by the split variables ``u^k`` of the rows it closes."""
+        if not self._admm_joint_proxy_syncs and all(
+            buf.joint_proxy_target_shift is None for buf in self._admm_buffers.values()
+        ):
+            return
+        for name, buf in self._admm_buffers.items():
+            if buf.joint_proxy_target_shift is None:
+                continue
+            sync = self._admm_joint_proxy_syncs.get(name)
+            if sync is None:
+                buf.joint_proxy_target_shift.zero_()
+            else:
+                wp.copy(buf.joint_proxy_target_shift, sync.drift)
+        device = self.model.device
+        for group in self._admm_rr_groups:
+            if group.count == 0:
+                continue
+            entry_a, entry_b, shift_a, shift_b = self._admm_joint_proxy_shift_endpoints(group)
+            wp.launch(
+                joint_proxy_point_target_shift_kernel,
+                dim=group.count,
+                inputs=[
+                    group.body_ids_a,
+                    group.body_ids_b,
+                    entry_a.body_local_to_global,
+                    entry_a.body_global_to_local,
+                    entry_b.body_local_to_global,
+                    entry_b.body_global_to_local,
+                    group.u,
+                ],
+                outputs=[shift_a, shift_b],
+                device=device,
+            )
+        for revolute_local, groups in ((0, self._admm_rr_angular_groups), (1, self._admm_rr_revolute_angular_groups)):
+            for group in groups:
+                if group.count == 0:
+                    continue
+                entry_a, entry_b, shift_a, shift_b = self._admm_joint_proxy_shift_endpoints(group)
+                wp.launch(
+                    joint_proxy_angular_target_shift_kernel,
+                    dim=group.count,
+                    inputs=[
+                        group.body_ids_a,
+                        group.frame_a,
+                        group.body_ids_b,
+                        group.frame_b,
+                        revolute_local,
+                        entry_a.body_local_to_global,
+                        entry_a.body_global_to_local,
+                        entry_b.body_local_to_global,
+                        entry_b.body_global_to_local,
+                        entry_a.state_0.body_q,
+                        entry_a.view.body_com,
+                        entry_b.state_0.body_q,
+                        entry_b.view.body_com,
+                        group.u,
+                    ],
+                    outputs=[shift_a, shift_b],
+                    device=device,
+                )
+
+    def _admm_joint_proxy_shift_endpoints(
+        self, group: _AdmmRigidRigidAttachmentGroup | _AdmmRigidRigidAngularAttachmentGroup
+    ) -> tuple[SolverEntry, SolverEntry, wp.array, wp.array]:
+        """Return both entries of a rigid-rigid row group and their proxy target shift buffers.
+
+        An entry without joint proxies hides the other entry's bodies, so its shift is never written
+        and a one-element placeholder stands in for it.
+        """
+        entry_a = self._entries[group.body_entry_name_a]
+        entry_b = self._entries[group.body_entry_name_b]
+        shift_a = self._admm_buffers[group.body_entry_name_a].joint_proxy_target_shift
+        shift_b = self._admm_buffers[group.body_entry_name_b].joint_proxy_target_shift
+        return (
+            entry_a,
+            entry_b,
+            shift_a if shift_a is not None else self._admm_empty_spatial,
+            shift_b if shift_b is not None else self._admm_empty_spatial,
+        )
+
+    def _apply_admm_joint_proxy_proximal_wrenches(self, entry: SolverEntry, buf: _AdmmBuffers, dt: float) -> None:
+        """Drive each joint proxy in ``entry`` toward its source entry's current velocity iterate.
+
+        A joint proxy contributes only a proximal term weighted by its inertia, so the converged
+        coupled solution matches the one without proxies; external forces act on the source body.
+        """
+        for mapping in self._admm_joint_proxy_mappings:
+            if mapping.dst_name != entry.name or mapping.body_ids_local is None or mapping.body_ids_local.shape[0] == 0:
+                continue
+            src = self._entries[mapping.src_name]
+            src_buf = self._admm_buffers[mapping.src_name]
+            if src_buf.body_qd_k is None or buf.joint_proxy_target_shift is None:
+                continue
+            wp.launch(
+                joint_proxy_proximal_wrench_kernel,
+                dim=mapping.body_ids_local.shape[0],
+                inputs=[
+                    mapping.body_ids_local,
+                    mapping.body_ids_global,
+                    src.body_global_to_local,
+                    src_buf.body_qd_k,
+                    buf.joint_proxy_target_shift,
+                    entry.state_0.body_q,
+                    entry.state_0.body_qd,
+                    entry.view.body_mass,
+                    entry.view.body_inertia,
+                    entry.body_gravity_acceleration,
+                    1.0 / dt,
+                ],
+                outputs=[buf.body_f],
+                device=self.model.device,
+            )
 
     def _apply_admm_force_inputs(self, entry: SolverEntry, buf: _AdmmBuffers, dt: float) -> None:
         if entry.body_indices.shape[0] > 0:

@@ -47,6 +47,9 @@ Supported hook signatures are:
     def coupling_supports_full_surface_soft_contacts() -> bool: ...
 
 
+    def coupling_integrates_joint_coordinates() -> bool: ...
+
+
     def coupling_rewind_proxy_body(
         body_local_to_proxy_global, state, coupling_forces, body_gravity_acceleration, dt
     ) -> None: ...
@@ -252,6 +255,15 @@ class CouplingInterface:
         their derived inertial buffers with device work only, should override
         this to return ``True`` and provide a graph-capturable implementation
         of :meth:`notify_model_changed` for BODY_INERTIAL_PROPERTIES.
+        """
+        return False
+
+    def coupling_integrates_joint_coordinates(self) -> bool:
+        """Return whether the solver advances bodies from joint coordinates.
+
+        Reduced-coordinate solvers rebuild body states from :attr:`~newton.State.joint_q` and
+        :attr:`~newton.State.joint_qd`, so a coupler keeps the coordinates of joints they do not own
+        as their own state. Maximal-coordinate solvers integrate body states directly.
         """
         return False
 

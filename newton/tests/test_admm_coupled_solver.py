@@ -876,6 +876,60 @@ class TestAdmmGraphCapture(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(q)))
 
 
+def _build_split_ball_pair(tree: bool) -> newton.Model:
+    """Build two 1 kg bodies joined by a satisfied ball joint, 0.3 m apart along x, without gravity.
+
+    With ``tree`` the ball is the child's articulation joint below the parent's FREE joint; otherwise
+    each body has its own FREE joint and the ball closes a loop.
+    """
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    inertia = wp.mat33(np.eye(3) * 0.01)
+    parent = builder.add_link(mass=1.0, inertia=inertia)
+    child = builder.add_link(xform=wp.transform(wp.vec3(0.3, 0.0, 0.0), wp.quat_identity()), mass=1.0, inertia=inertia)
+    root = builder.add_joint_free(parent)
+    if tree:
+        ball = builder.add_joint_ball(
+            parent, child, child_xform=wp.transform(wp.vec3(-0.3, 0.0, 0.0), wp.quat_identity())
+        )
+        builder.add_articulation([root, ball])
+    else:
+        builder.add_articulation([root])
+        builder.add_articulation([builder.add_joint_free(child)])
+        builder.add_joint_ball(parent, child, child_xform=wp.transform(wp.vec3(-0.3, 0.0, 0.0), wp.quat_identity()))
+    builder.color()
+    return builder.finalize(device="cpu")
+
+
+def _make_split_ball_solver(model: newton.Model, make_solver, tree: bool, **coupling_kwargs) -> SolverCoupledADMM:
+    """Split the ball pair across two entries; a tree-modeled child owns no joint and gets a joint proxy."""
+    return SolverCoupledADMM(
+        model=model,
+        entries=[
+            SolverCoupled.Entry(name="parent", solver=make_solver, bodies=[0], joints=[0]),
+            SolverCoupled.Entry(name="child", solver=make_solver, bodies=[1], joints=[] if tree else [1]),
+        ],
+        coupling=SolverCoupledADMM.Config(
+            iterations=50,
+            rho=40.0,
+            baumgarte=0.5,
+            joint_proximal_bodies=tree,
+            **coupling_kwargs,
+        ),
+    )
+
+
+def _push_split_ball(model: newton.Model, solver, body_f: tuple[float, ...], n_steps: int = 20) -> tuple:
+    """Apply a constant wrench to one body (index 0 of ``body_f``) and return the final body state."""
+    state_0, state_1 = model.state(), model.state()
+    wrench = np.zeros((model.body_count, 6), dtype=np.float32)
+    wrench[int(body_f[0])] = body_f[1:]
+    for _ in range(n_steps):
+        state_0.body_f.assign(wrench)
+        solver.step(state_0, state_1, None, None, 1.0 / 120.0)
+        state_0, state_1 = state_1, state_0
+    return state_0.body_q.numpy(), state_0.body_qd.numpy()
+
+
 class TestAdmmModelJointInterface(unittest.TestCase):
     """Cross-solver model joints are converted to ADMM attachments."""
 
@@ -1136,6 +1190,53 @@ class TestAdmmModelJointInterface(unittest.TestCase):
                 ],
                 coupling=SolverCoupledADMM.Config(),
             )
+
+
+class TestAdmmJointProxies(unittest.TestCase):
+    """Joint proxies only change ADMM convergence, never the converged solution."""
+
+    def test_proxy_mass_keeps_solution(self):
+        """Match the proxy-free solution for any proxy mass, attachment stiffness, and coordinate type."""
+        push = (0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        solvers = {
+            "featherstone": SolverFeatherstone,
+            "semi_implicit": lambda v: SolverSemiImplicit(model=v, enable_tri_contact=False),
+        }
+        for name, make_solver in solvers.items():
+            for stiffness in (5.0e2, 5.0e6):
+                stiffness_kwargs = {"joint_stiffness": stiffness, "joint_angular_stiffness": 0.1 * stiffness}
+                model = _build_split_ball_pair(tree=False)
+                reference, _ = _push_split_ball(
+                    model, _make_split_ball_solver(model, make_solver, tree=False, **stiffness_kwargs), push
+                )
+                for mass_scale in (0.5, 2.0):
+                    with self.subTest(solver=name, stiffness=stiffness, mass_scale=mass_scale):
+                        model = _build_split_ball_pair(tree=True)
+                        solver = _make_split_ball_solver(
+                            model, make_solver, tree=True, joint_proximal_mass_scale=mass_scale, **stiffness_kwargs
+                        )
+                        body_q, body_qd = _push_split_ball(model, solver, push)
+                        np.testing.assert_allclose(body_q[:, :3], reference[:, :3], atol=2.0e-4)
+                        # A unit force over 20 steps gives the pair 1/6 N s of momentum.
+                        self.assertAlmostEqual(float(body_qd[0, 0] + body_qd[1, 0]), 20.0 / 120.0, delta=1.0e-3)
+
+    def test_proxied_child_keeps_rotation(self):
+        """Accumulate a reduced-coordinate child's rotation through its cross-solver joint across steps."""
+        torque = (1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01)
+        model = _build_split_ball_pair(tree=True)
+        expected_q, expected_qd = _push_split_ball(model, SolverFeatherstone(model), torque)
+        model = _build_split_ball_pair(tree=True)
+        solver = _make_split_ball_solver(
+            model,
+            SolverFeatherstone,
+            tree=True,
+            joint_stiffness=5.0e6,
+            joint_angular_stiffness=5.0e5,
+        )
+        body_q, body_qd = _push_split_ball(model, solver, torque)
+        self.assertGreater(abs(float(expected_q[1, 5])), 1.0e-3)
+        np.testing.assert_allclose(body_q[1, 3:], expected_q[1, 3:], atol=1.0e-4)
+        np.testing.assert_allclose(body_qd[1, 3:], expected_qd[1, 3:], atol=1.0e-3)
 
 
 class TestAdmmBodyParticleAttachment(unittest.TestCase):

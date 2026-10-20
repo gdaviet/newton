@@ -394,6 +394,257 @@ def body_gravity_compensation_lumped_kernel(
 
 
 @wp.kernel(enable_backward=False)
+def joint_proxy_proximal_wrench_kernel(
+    proxy_local: wp.array[int],
+    proxy_global: wp.array[int],
+    src_global_to_local: wp.array[int],
+    src_body_qd_k: wp.array[wp.spatial_vector],
+    target_shift: wp.array[wp.spatial_vector],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    body_gravity_acceleration: wp.array[wp.vec3],
+    inv_dt: float,
+    body_f: wp.array[wp.spatial_vector],
+):
+    """Set a joint proxy's force input to the augmented-Lagrangian pull toward its target.
+
+    The target is the source iterate shifted by the coupling split variable ``u^k`` of the rows
+    that tie the proxy to an owned body (see :func:`joint_proxy_point_target_shift_kernel`). The
+    wrench replaces external forces and cancels the gravity the sub-solver applies, so the proxy
+    adds ``1/2 |v - v_target|^2`` in its spatial inertia metric. With the in-view joint holding the
+    proxy to the owned body, this is the a-step term ``rho/2 |W(u^k - J_a v_a - J_b v_b^k)|^2``,
+    which vanishes at the ADMM fixed point.
+    """
+    i = wp.tid()
+    dst = proxy_local[i]
+    src = src_global_to_local[proxy_global[i]]
+    if dst < 0 or src < 0:
+        return
+
+    mass = body_mass[dst]
+    v_k = src_body_qd_k[src] + target_shift[dst]
+    v_in = body_qd[dst]
+    rot = wp.quat_to_matrix(wp.transform_get_rotation(body_q[dst]))
+    inertia_world = rot * body_inertia[dst] * wp.transpose(rot)
+    force = mass * (wp.spatial_top(v_k) - wp.spatial_top(v_in)) * inv_dt - mass * body_gravity_acceleration[dst]
+    torque = inertia_world * (wp.spatial_bottom(v_k) - wp.spatial_bottom(v_in)) * inv_dt
+    body_f[dst] = wp.spatial_vector(force, torque)
+
+
+@wp.func
+def _proxy_index(
+    body_local: int,
+    owner_local_to_global: wp.array[int],
+    view_global_to_local: wp.array[int],
+) -> int:
+    """Return the view-local index of another entry's body, or -1 when the view hides it."""
+    global_body = owner_local_to_global[body_local]
+    if global_body < 0:
+        return -1
+    return view_global_to_local[global_body]
+
+
+@wp.kernel(enable_backward=False)
+def joint_proxy_point_target_shift_kernel(
+    body_a: wp.array[int],
+    body_b: wp.array[int],
+    a_local_to_global: wp.array[int],
+    a_global_to_local: wp.array[int],
+    b_local_to_global: wp.array[int],
+    b_global_to_local: wp.array[int],
+    u: wp.array[wp.vec3],
+    shift_a: wp.array[wp.spatial_vector],
+    shift_b: wp.array[wp.spatial_vector],
+):
+    """Shift joint proxy targets by the split anchor velocity ``u = vel_a - vel_b`` of a point row.
+
+    In entry A's view the proxy of B targets ``vel_b^k + u``; in entry B's view the proxy of A targets
+    ``vel_a^k - u``. Both make the in-view joint reproduce ``J v = u^k``.
+    """
+    i = wp.tid()
+    u_i = u[i]
+    proxy_b = _proxy_index(body_b[i], b_local_to_global, a_global_to_local)
+    if proxy_b >= 0:
+        wp.atomic_add(shift_a, proxy_b, wp.spatial_vector(u_i, wp.vec3(0.0, 0.0, 0.0)))
+    proxy_a = _proxy_index(body_a[i], a_local_to_global, b_global_to_local)
+    if proxy_a >= 0:
+        wp.atomic_add(shift_b, proxy_a, wp.spatial_vector(-u_i, wp.vec3(0.0, 0.0, 0.0)))
+
+
+@wp.func
+def _angular_target_shift(
+    omega: wp.vec3,
+    body_q: wp.transform,
+    body_com: wp.vec3,
+    anchor_local: wp.vec3,
+) -> wp.spatial_vector:
+    """Return a COM twist that adds ``omega`` while keeping the joint anchor velocity unchanged."""
+    anchor = wp.transform_point(body_q, anchor_local)
+    com = wp.transform_point(body_q, body_com)
+    return wp.spatial_vector(-wp.cross(omega, anchor - com), omega)
+
+
+@wp.kernel(enable_backward=False)
+def joint_proxy_angular_target_shift_kernel(
+    body_a: wp.array[int],
+    frame_a: wp.array[wp.transform],
+    body_b: wp.array[int],
+    frame_b: wp.array[wp.transform],
+    revolute_local: int,
+    a_local_to_global: wp.array[int],
+    a_global_to_local: wp.array[int],
+    b_local_to_global: wp.array[int],
+    b_global_to_local: wp.array[int],
+    a_body_q: wp.array[wp.transform],
+    a_body_com: wp.array[wp.vec3],
+    b_body_q: wp.array[wp.transform],
+    b_body_com: wp.array[wp.vec3],
+    u: wp.array[wp.vec3],
+    shift_a: wp.array[wp.spatial_vector],
+    shift_b: wp.array[wp.spatial_vector],
+):
+    """Shift joint proxy targets by the split relative angular velocity ``u = w_a - w_b`` of an angular row.
+
+    Revolute rows store ``u`` in body A's joint frame without the hinge component; other rows store it
+    in world coordinates. The shift rotates each proxy about its joint anchor.
+    """
+    i = wp.tid()
+    ba = body_a[i]
+    bb = body_b[i]
+    u_world = u[i]
+    if revolute_local != 0:
+        frame_world = a_body_q[ba] * frame_a[i]
+        u_world = wp.quat_rotate(wp.transform_get_rotation(frame_world), wp.vec3(0.0, u_world[1], u_world[2]))
+
+    proxy_b = _proxy_index(bb, b_local_to_global, a_global_to_local)
+    if proxy_b >= 0:
+        shift = _angular_target_shift(
+            u_world, a_body_q[proxy_b], a_body_com[proxy_b], wp.transform_get_translation(frame_b[i])
+        )
+        wp.atomic_add(shift_a, proxy_b, shift)
+    proxy_a = _proxy_index(ba, a_local_to_global, b_global_to_local)
+    if proxy_a >= 0:
+        shift = _angular_target_shift(
+            -u_world, b_body_q[proxy_a], b_body_com[proxy_a], wp.transform_get_translation(frame_a[i])
+        )
+        wp.atomic_add(shift_b, proxy_a, shift)
+
+
+@wp.func
+def _cross_joint_relative_rotation(
+    joint: int,
+    parent: int,
+    child: int,
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_q: wp.array[wp.transform],
+) -> wp.quat:
+    """Return the child joint frame's rotation relative to the parent joint frame."""
+    q_parent = wp.transform_get_rotation(body_q[parent] * joint_X_p[joint])
+    q_child = wp.transform_get_rotation(body_q[child] * joint_X_c[joint])
+    return wp.quat_inverse(q_parent) * q_child
+
+
+@wp.kernel(enable_backward=False)
+def joint_proxy_cross_rotation_kernel(
+    cross_joint: wp.array[int],
+    cross_parent: wp.array[int],
+    cross_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_q: wp.array[wp.transform],
+    relative_rotation: wp.array[wp.quat],
+):
+    """Record the relative rotation of each proxied cross-solver joint."""
+    i = wp.tid()
+    relative_rotation[i] = _cross_joint_relative_rotation(
+        cross_joint[i], cross_parent[i], cross_child[i], joint_X_p, joint_X_c, body_q
+    )
+
+
+_CROSS_BALL = wp.constant(0)
+_CROSS_REVOLUTE = wp.constant(1)
+_CROSS_FIXED = wp.constant(2)
+
+
+@wp.kernel(enable_backward=False)
+def joint_proxy_cross_drift_kernel(
+    cross_joint: wp.array[int],
+    cross_parent: wp.array[int],
+    cross_child: wp.array[int],
+    cross_proxy_is_child: wp.array[int],
+    cross_mode: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_qd_start: wp.array[int],
+    true_rotation: wp.array[wp.quat],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    gain: float,
+    drift: wp.array[wp.spatial_vector],
+):
+    """Steer each proxy's free rotation through a cross-solver joint toward the true relative rotation.
+
+    ``gain`` is ``baumgarte / dt``. The correction lives in the joint's free directions (all three for a
+    ball joint, the hinge axis for a revolute joint, none for a fixed joint), so the proxy can follow it
+    exactly and it adds no force on the owned body at the ADMM fixed point.
+    """
+    i = wp.tid()
+    if cross_mode[i] == _CROSS_FIXED:
+        return
+    joint = cross_joint[i]
+    parent = cross_parent[i]
+    child = cross_child[i]
+    current = _cross_joint_relative_rotation(joint, parent, child, joint_X_p, joint_X_c, body_q)
+    error = wp.normalize(true_rotation[i] * wp.quat_inverse(current))
+    if error[3] < 0.0:
+        error = -error
+    axis, angle = wp.quat_to_axis_angle(error)
+    correction = axis * angle
+    if cross_mode[i] == _CROSS_REVOLUTE:
+        hinge = wp.normalize(joint_axis[joint_qd_start[joint]])
+        correction = wp.dot(correction, hinge) * hinge
+    frame_parent = wp.transform_get_rotation(body_q[parent] * joint_X_p[joint])
+    omega = wp.quat_rotate(frame_parent, correction) * gain
+    if cross_proxy_is_child[i] != 0:
+        shift = _angular_target_shift(
+            omega, body_q[child], body_com[child], wp.transform_get_translation(joint_X_c[joint])
+        )
+        wp.atomic_add(drift, child, shift)
+    else:
+        shift = _angular_target_shift(
+            -omega, body_q[parent], body_com[parent], wp.transform_get_translation(joint_X_p[joint])
+        )
+        wp.atomic_add(drift, parent, shift)
+
+
+@wp.kernel(enable_backward=False)
+def masked_copy_float_kernel(mask: wp.array[int], src: wp.array[float], dst: wp.array[float]):
+    """Copy ``src`` into ``dst`` where ``mask`` is nonzero."""
+    i = wp.tid()
+    if mask[i] != 0:
+        dst[i] = src[i]
+
+
+@wp.kernel(enable_backward=False)
+def masked_copy_body_state_kernel(
+    mask: wp.array[int],
+    src_q: wp.array[wp.transform],
+    src_qd: wp.array[wp.spatial_vector],
+    dst_q: wp.array[wp.transform],
+    dst_qd: wp.array[wp.spatial_vector],
+):
+    """Copy body poses and twists where ``mask`` is nonzero."""
+    i = wp.tid()
+    if mask[i] != 0:
+        dst_q[i] = src_q[i]
+        dst_qd[i] = src_qd[i]
+
+
+@wp.kernel(enable_backward=False)
 def particle_gravity_compensation_lumped_kernel(
     proximal_mass: wp.array[float],
     particle_inv_mass: wp.array[float],

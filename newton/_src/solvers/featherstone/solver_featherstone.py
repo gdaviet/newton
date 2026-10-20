@@ -315,12 +315,20 @@ class SolverFeatherstone(SolverBase, CouplingInterface):
                     self.joint_armature_effective = wp.array(joint_armature, dtype=float, device=model.device)
 
     @override
+    def coupling_integrates_joint_coordinates(self) -> bool:
+        """Return ``True``: the solver advances bodies from joint coordinates."""
+        return True
+
+    @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         self._apply_module_options()
         if flags & (
             ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
         ):
             self._update_kinematic_state()
+            self._mass_matrix_dirty = True
+        if flags & ModelFlags.BODY_INERTIAL_PROPERTIES and self.model.body_count:
+            self._update_body_inertial_properties()
             self._mass_matrix_dirty = True
 
     def _compute_articulation_indices(self, model):
@@ -402,23 +410,28 @@ class SolverFeatherstone(SolverBase, CouplingInterface):
             self.body_I_m = wp.empty(
                 (model.body_count,), dtype=wp.spatial_matrix, device=model.device, requires_grad=model.requires_grad
             )
-            wp.launch(
-                compute_spatial_inertia,
-                model.body_count,
-                inputs=[model.body_inertia, model.body_mass],
-                outputs=[self.body_I_m],
-                device=model.device,
-            )
             self.body_X_com = wp.empty(
                 (model.body_count,), dtype=wp.transform, device=model.device, requires_grad=model.requires_grad
             )
-            wp.launch(
-                compute_com_transforms,
-                model.body_count,
-                inputs=[model.body_com],
-                outputs=[self.body_X_com],
-                device=model.device,
-            )
+            self._update_body_inertial_properties()
+
+    def _update_body_inertial_properties(self):
+        """Recompute the spatial inertia and COM transforms derived from the model body properties."""
+        model = self.model
+        wp.launch(
+            compute_spatial_inertia,
+            model.body_count,
+            inputs=[model.body_inertia, model.body_mass],
+            outputs=[self.body_I_m],
+            device=model.device,
+        )
+        wp.launch(
+            compute_com_transforms,
+            model.body_count,
+            inputs=[model.body_com],
+            outputs=[self.body_X_com],
+            device=model.device,
+        )
 
     def _allocate_state_aux_vars(self, model, target, requires_grad):
         # allocate auxiliary variables that vary with state

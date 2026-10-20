@@ -1,0 +1,1 @@
+Add `CouplingInterface.coupling_integrates_joint_coordinates()` so experimental coupled solvers can tell reduced-coordinate sub-solvers from maximal-coordinate ones; `SolverFeatherstone` and `SolverMuJoCo` report `True`.

@@ -5292,6 +5292,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._last_nacon_count.zero_()
 
     @override
+    def coupling_integrates_joint_coordinates(self) -> bool:
+        """Return ``True``: the solver advances bodies from joint coordinates."""
+        return True
+
+    @override
     def coupling_eval_gravity_acceleration(
         self,
         out_body_acceleration: wp.array[wp.vec3] | None,
