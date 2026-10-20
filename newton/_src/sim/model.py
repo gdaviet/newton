@@ -1408,6 +1408,10 @@ class Model:
         self.custom_frequency_label_attributes: dict[str, str] = {}
         """Attribute keys containing labels for custom-frequency rows."""
 
+        self._custom_attribute_defaults: dict[str, Any] = {}
+        # Builder default value per custom attribute key; consumers that add
+        # rows after finalization (such as coupled model views) fill them with it.
+
         self._requested_state_attributes: set[str] = set()
         self._collision_pipeline: CollisionPipeline | None = None
         # cached collision pipeline
