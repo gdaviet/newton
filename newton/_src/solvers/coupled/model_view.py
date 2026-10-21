@@ -14,7 +14,7 @@ from ...geometry import ParticleFlags
 from ...sim import BodyFlags, JointType, Model
 
 if TYPE_CHECKING:
-    from ...sim import State
+    from ...sim import Control, State
 
 
 def _types_compatible(current, value) -> bool:
@@ -312,6 +312,12 @@ class ModelView:
 
         with self._temporary_state_array_overrides():
             return Model.state(self, requires_grad=requires_grad)
+
+    def control(self, requires_grad: bool | None = None, clone_variables: bool = True) -> Control:
+        """Create control inputs using view-local arrays, including synthesized FREE joint rows."""
+        from ...sim import Model  # noqa: PLC0415
+
+        return Model.control(self, requires_grad=requires_grad, clone_variables=clone_variables)
 
     def get_requested_state_attributes(self) -> list[str]:
         """Return requested state attributes using view-local counts."""

@@ -98,7 +98,8 @@ from typing import TYPE_CHECKING
 import warp as wp
 
 from ...geometry import ParticleFlags
-from ...sim import BodyFlags, StateFlags
+from ...sim import BodyFlags, JointType, StateFlags
+from ...sim.articulation import eval_ik
 from .proxy_utils import (
     filter_proxy_rigid_contacts_kernel,
     harvest_proxy_momentum_forces_kernel,
@@ -108,9 +109,64 @@ from .proxy_utils import (
 )
 
 if TYPE_CHECKING:
-    from ...sim import Contacts, State
+    from ...sim import Contacts, Model, State
 
 __all__ = ["CouplingInterface"]
+
+
+@wp.kernel(enable_backward=False)
+def _copy_joint_positions_near_previous(
+    joint_type: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    positions: wp.array[float],
+    joint_q: wp.array[float],
+):
+    joint = wp.tid()
+    start = joint_q_start[joint]
+    for coord in range(start, joint_q_start[joint + 1]):
+        value = positions[coord]
+        angular = joint_type[joint] == JointType.REVOLUTE or (
+            joint_type[joint] == JointType.D6 and coord >= start + joint_dof_dim[joint, 0]
+        )
+        if angular:
+            period = 2.0 * wp.pi
+            value += period * wp.round((joint_q[coord] - value) / period)
+        joint_q[coord] = value
+
+
+def _sync_joint_state_from_body(
+    model: Model,
+    state: State,
+    flags: StateFlags | int,
+    joint_q_scratch: wp.array[float],
+    joint_qd_scratch: wp.array[float],
+) -> bool:
+    """Translate body-only edits while preserving explicitly supplied joint components."""
+    update_q = bool(flags & StateFlags.BODY_Q) and not bool(flags & StateFlags.JOINT_Q)
+    update_qd = bool(flags & StateFlags.BODY_QD) and not bool(flags & StateFlags.JOINT_QD)
+    if not model.articulation_count or not (update_q or update_qd):
+        return False
+    if update_q:
+        # IK leaves non-articulation rows untouched.
+        wp.copy(joint_q_scratch, state.joint_q)
+    # IK writes both components; discard whichever one was not requested.
+    eval_ik(
+        model,
+        state,
+        joint_q_scratch,
+        state.joint_qd if update_qd else joint_qd_scratch,
+    )
+    if update_q:
+        # A proxy update must not discard the revolution count of an unchanged
+        # physical joint, which would change its limits and drive error.
+        wp.launch(
+            _copy_joint_positions_near_previous,
+            dim=model.joint_count,
+            inputs=[model.joint_type, model.joint_q_start, model.joint_dof_dim, joint_q_scratch, state.joint_q],
+            device=model.device,
+        )
+    return True
 
 
 class CouplingInterface:
@@ -248,6 +304,10 @@ class CouplingInterface:
 
         ``flags`` uses :class:`~newton.StateFlags` bits for both kinematic
         state arrays and public force-input buffers.
+
+        Reduced-coordinate solvers translate body-only edits into joint state.
+        When the corresponding joint component is also flagged, that joint
+        component is authoritative and must retain its supplied value.
 
         A pose update with ``dt=0`` establishes an instantaneous input baseline;
         it does not represent motion over a timestep. This is used when

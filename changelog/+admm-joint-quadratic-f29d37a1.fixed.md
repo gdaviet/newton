@@ -20,3 +20,11 @@ velocities and apply matching target-momentum forces. Evaluate reduced-coordinat
 targets at the initial configuration and cancel the full added inertial bias,
 including for numerical proxies. Cover spinning anisotropic bodies and moving
 articulations with gamma fixed-point regressions.
+
+Give receiving body proxies synthesized FREE roots, including proxies whose
+source is constrained by a world joint. Synchronize body-only input notifications
+into MuJoCo and Featherstone joint state while preserving explicitly supplied
+joint components and native solver history. Honor MuJoCo notifications when
+automatic state uploads are disabled or infrequent.
+Allocate default controls from the compact view's joint layout and retain
+continuous joint angles when synchronizing body poses.

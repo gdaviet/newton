@@ -1220,7 +1220,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
         visible_particles = {int(i) for i in cfg.particles} | {int(i) for i in proxy_particle_keep}
         visible_joints = {int(i) for i in cfg.joints} | {int(i) for i in proxy_joint_keep}
         visible_shapes = self._entry_visible_shapes(cfg, visible_bodies)
-        free_root_cuts = self._entry_free_root_cut_joints(cfg, visible_joints)
+        free_root_cuts = self._entry_free_root_cut_joints(cfg, visible_joints, proxy_body_keep)
 
         body_order = self._ordered_world_subset(
             visible_bodies,
@@ -1280,8 +1280,10 @@ class SolverCoupled(SolverBase, CouplingInterface):
         self._apply_compact_entry_view(view, compact)
         return compact
 
-    def _entry_free_root_cut_joints(self, cfg: SolverCoupled.Entry, visible_joints: set[int]) -> set[int]:
-        """Return hidden incoming tree joints of entry-owned bodies that receive a FREE root joint.
+    def _entry_free_root_cut_joints(
+        self, cfg: SolverCoupled.Entry, visible_joints: set[int], proxy_bodies: set[int]
+    ) -> set[int]:
+        """Return hidden incoming tree joints of owned or proxy bodies needing a FREE root.
 
         A reduced-coordinate solver moves a body only through its incoming
         joint, so each entry-owned body whose enabled articulation joint to a
@@ -1289,12 +1291,14 @@ class SolverCoupled(SolverBase, CouplingInterface):
         holds whether the hidden joint is unowned or owned by another entry.
         A hidden FREE joint to the world is replaced by an identical one. A
         hidden joint of another type to the world stays out of the view, with
-        a warning, since no entry simulates it.
+        a warning, since no entry simulates it. Receiving proxies instead get
+        a FREE root for any hidden incoming joint: their source supplies the
+        constrained motion, while the destination simulates independent copies.
         """
         model = self.model
-        if model.joint_count == 0 or model.articulation_count == 0 or not cfg.bodies:
+        if model.joint_count == 0 or model.articulation_count == 0 or not (cfg.bodies or proxy_bodies):
             return set()
-        owned_bodies = {int(body) for body in cfg.bodies}
+        dynamic_bodies = {int(body) for body in cfg.bodies} | proxy_bodies
         joint_parent = model.joint_parent.numpy()
         joint_child = model.joint_child.numpy()
         joint_type = model.joint_type.numpy()
@@ -1303,7 +1307,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
         incoming: dict[int, list[int]] = {}
         for joint in np.flatnonzero(joint_articulation >= 0).tolist():
             child = int(joint_child[joint])
-            if child in owned_bodies:
+            if child in dynamic_bodies:
                 incoming.setdefault(child, []).append(int(joint))
         cuts = set()
         hidden_world_joints = []
@@ -1312,7 +1316,11 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 continue
             for joint in joints:
                 if bool(joint_enabled[joint]):
-                    if int(joint_parent[joint]) >= 0 or int(joint_type[joint]) == JointType.FREE:
+                    if (
+                        int(joint_child[joint]) in proxy_bodies
+                        or int(joint_parent[joint]) >= 0
+                        or int(joint_type[joint]) == JointType.FREE
+                    ):
                         cuts.add(joint)
                     else:
                         hidden_world_joints.append(joint)
