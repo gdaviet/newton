@@ -5298,6 +5298,17 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._last_nacon_count.zero_()
 
     @override
+    def coupling_uses_reduced_coordinates(self) -> bool:
+        """Represent rigid motion through articulation joint coordinates."""
+        return True
+
+    @override
+    def coupling_validate_numerical_bodies(self) -> None:
+        """Validate the explicit inertial target used by numerical bodies."""
+        if int(self.mj_model.opt.integrator) != 0 or self.model.shape_count:
+            raise ValueError("MuJoCo numerical bodies currently require Euler integration and no shapes")
+
+    @override
     def coupling_eval_gravity_acceleration(
         self,
         out_body_acceleration: wp.array[wp.vec3] | None,

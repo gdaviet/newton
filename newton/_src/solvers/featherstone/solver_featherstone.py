@@ -149,6 +149,16 @@ class SolverFeatherstone(SolverBase, CouplingInterface):
 
     SUPPORTED_OBSERVABLES = frozenset({SolverBase.ObservableKind.BODY_PARENT_F})
 
+    @override
+    def coupling_uses_reduced_coordinates(self) -> bool:
+        """Represent rigid motion through articulation joint coordinates."""
+        return True
+
+    @override
+    def coupling_supports_inertial_property_refresh(self) -> bool:
+        """Refresh spatial inertia and COM transforms entirely on the device."""
+        return True
+
     def __init__(
         self,
         model: Model,
@@ -321,6 +331,26 @@ class SolverFeatherstone(SolverBase, CouplingInterface):
             ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
         ):
             self._update_kinematic_state()
+            self._mass_matrix_dirty = True
+        if flags & ModelFlags.BODY_INERTIAL_PROPERTIES:
+            model = self.model
+            if model.body_count:
+                wp.launch(
+                    compute_spatial_inertia,
+                    model.body_count,
+                    inputs=[model.body_inertia, model.body_mass],
+                    outputs=[self.body_I_m],
+                    device=model.device,
+                )
+                wp.launch(
+                    compute_com_transforms,
+                    model.body_count,
+                    inputs=[model.body_com],
+                    outputs=[self.body_X_com],
+                    device=model.device,
+                )
+            self._mass_matrix_dirty = True
+        if flags & ModelFlags.JOINT_PROPERTIES:
             self._mass_matrix_dirty = True
 
     def _compute_articulation_indices(self, model):

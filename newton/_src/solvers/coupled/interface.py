@@ -47,6 +47,12 @@ Supported hook signatures are:
     def coupling_supports_full_surface_soft_contacts() -> bool: ...
 
 
+    def coupling_uses_reduced_coordinates() -> bool: ...
+
+
+    def coupling_validate_numerical_bodies() -> None: ...
+
+
     def coupling_rewind_proxy_body(
         body_local_to_proxy_global, state, coupling_forces, body_gravity_acceleration, dt
     ) -> None: ...
@@ -242,6 +248,11 @@ class CouplingInterface:
 
         ``flags`` uses :class:`~newton.StateFlags` bits for both kinematic
         state arrays and public force-input buffers.
+
+        A pose update with ``dt=0`` establishes an instantaneous input baseline;
+        it does not represent motion over a timestep. This is used when
+        restoring physical timestep inputs and recentering numerical bodies.
+        It must preserve joint and contact history.
         """
         del state, flags, iteration_restart, dt
 
@@ -266,6 +277,27 @@ class CouplingInterface:
         contacts; rigid-only entries receive no soft contacts and need not support it.
         """
         return False
+
+    def coupling_uses_reduced_coordinates(self) -> bool:
+        """Return whether joint coordinates determine rigid body motion.
+
+        Reduced-coordinate solvers must return ``True``: an attached numerical
+        body belongs to its parent's articulation and cannot be teleported
+        independently. Its inertial target is imposed through applied forces.
+        Maximal-coordinate solvers use the default ``False`` and receive
+        recentered numerical poses through the input state notification.
+        """
+        return False
+
+    def coupling_validate_numerical_bodies(self) -> None:
+        """Validate backend requirements for recentered numerical inertia.
+
+        Called before constructing the augmented model. Override to reject
+        backend configurations that cannot realize the numerical inertial
+        target. Model topology checks belong to the model construction; native
+        integrator and backend restrictions belong here. The default imposes
+        no additional restrictions.
+        """
 
     def coupling_eval_gravity_acceleration(
         self,

@@ -1538,9 +1538,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             return
 
         if dt <= 0.0:
-            # A reset distributes state before its world mask selects histories.
+            # Accept an instantaneous pose edit without converting it to motion.
             if not iteration_restart:
                 wp.copy(dest=self.body_q_prev, src=state.body_q)
+                wp.copy(dest=self._coupling_body_q_prev_snapshot, src=state.body_q)
             return
 
         if iteration_restart:
@@ -1922,10 +1923,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         if not self.model._has_rod_joints:  # pyright: ignore[reportPrivateUsage]
             return
-        joint_type_np = self._to_numpy(self.model.joint_type, dtype=np.int32)
-        if not np.any(joint_type_np == int(JointType.ROD)):
-            return
-
+        # The kernel skips non-rod joints. Keep this refresh on the device:
+        # a temporary host copy captured here would outlive its allocation.
         wp.launch(
             kernel=init_rod_rest_bend_twist,
             dim=self.model.joint_count,

@@ -749,7 +749,6 @@ class TestAdmmSmoke(unittest.TestCase):
             ({"gamma": -1.0}, "gamma"),
             ({"baumgarte": float("inf")}, "baumgarte"),
             ({"joint_stiffness": -1.0}, "joint_stiffness"),
-            ({"joint_proximal_mass_scale": 0.0}, "joint_proximal_mass_scale"),
             ({"contact_matching_normal_dot_threshold": 1.1}, "normal_dot_threshold"),
             ({"contact_max_triangle_pairs": 0}, "contact_max_triangle_pairs"),
             ({"contact_max_triangle_pairs": 1.5}, "contact_max_triangle_pairs"),
@@ -935,12 +934,12 @@ class TestAdmmModelJointInterface(unittest.TestCase):
             entries=[
                 SolverCoupled.Entry(
                     name="parent",
-                    solver=lambda v: SolverSemiImplicit(model=v, enable_tri_contact=False),
+                    solver=lambda v: SolverXPBD(model=v, iterations=20, angular_damping=0.0),
                     bodies=[parent],
                 ),
                 SolverCoupled.Entry(
                     name="child",
-                    solver=lambda v: SolverSemiImplicit(model=v, enable_tri_contact=False),
+                    solver=lambda v: SolverXPBD(model=v, iterations=20, angular_damping=0.0),
                     bodies=[child],
                 ),
             ],
@@ -1058,8 +1057,8 @@ class TestAdmmModelJointInterface(unittest.TestCase):
         self.assertLess(body_q[child, 0], 0.25)
         self.assertGreater(body_q[parent, 0], 0.05)
 
-    def test_split_articulation_proximal_dofs_follow_view_articulations(self):
-        """Map each body to the DOFs of its view articulation, including synthesized FREE roots.
+    def test_split_articulation_proximal_targets_follow_view_articulations(self):
+        """Evaluate proximal targets through each synthesized FREE root articulation.
 
         The chain A-B-C-D alternates entries, so the ``outer`` view holds A's
         FREE root in one articulation and C's synthesized FREE root with the
@@ -1093,17 +1092,19 @@ class TestAdmmModelJointInterface(unittest.TestCase):
 
         entry = solver._entries["outer"]
         buf = solver._admm_buffers["outer"]
-        starts = buf.body_joint_qd_start.numpy()
-        counts = buf.body_joint_qd_count.numpy()
-        indices = buf.body_joint_qd_indices.numpy()
-        body_dofs = {
-            int(body): indices[starts[local] : starts[local] + counts[local]].tolist()
-            for local, body in enumerate(entry.body_local_to_global.numpy())
-        }
         # View DOFs: A's FREE root 0-5, C's synthesized FREE root 6-11, C-D revolute 12.
-        self.assertEqual(body_dofs[a], list(range(6)))
-        self.assertEqual(body_dofs[c], list(range(6, 13)))
-        self.assertEqual(body_dofs[d], list(range(6, 13)))
+        # Exercise the current kinematic target computation, replacing the old
+        # scalar proximal-DOF map that gamma no longer uses.
+        for dof, moving_bodies in ((0, {a}), (6, {c, d})):
+            qd = wp.zeros(entry.view.joint_dof_count, dtype=float, device=model.device)
+            values = qd.numpy()
+            values[dof] = 1.0
+            qd.assign(values)
+            velocity = buf.reduced_gamma.target_velocity(entry.state_0.joint_q, qd).numpy()
+            for local, body in enumerate(entry.body_local_to_global.numpy()):
+                expected = np.zeros(6)
+                expected[0] = float(int(body) in moving_bodies)
+                np.testing.assert_allclose(velocity[local], expected, atol=1.0e-7)
 
         state_0, state_1 = model.state(), model.state()
         for _ in range(4):
@@ -1111,7 +1112,8 @@ class TestAdmmModelJointInterface(unittest.TestCase):
             state_0, state_1 = state_1, state_0
         self.assertTrue(np.all(np.isfinite(state_0.body_q.numpy())))
 
-    def test_joint_proxy_shape_collisions_disabled_after_shape_compaction(self):
+    def test_joint_proximal_keeps_only_owned_shapes_after_compaction(self):
+        """Exclude neighbor bodies and shapes from local joint quadratic solves."""
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         unrelated = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
         builder.add_shape_sphere(body=unrelated, radius=0.05)
@@ -1128,12 +1130,12 @@ class TestAdmmModelJointInterface(unittest.TestCase):
             entries=[
                 SolverCoupled.Entry(
                     name="parent",
-                    solver=lambda v: SolverSemiImplicit(model=v, enable_tri_contact=False),
+                    solver=lambda v: SolverXPBD(model=v, iterations=20, angular_damping=0.0),
                     bodies=[parent],
                 ),
                 SolverCoupled.Entry(
                     name="child",
-                    solver=lambda v: SolverSemiImplicit(model=v, enable_tri_contact=False),
+                    solver=lambda v: SolverXPBD(model=v, iterations=20, angular_damping=0.0),
                     bodies=[child],
                 ),
             ],
@@ -1163,12 +1165,16 @@ class TestAdmmModelJointInterface(unittest.TestCase):
                 ]
                 hidden_shapes = [shape_id for shape_id, body_id in enumerate(shape_body) if int(body_id) < 0]
 
-                self.assertEqual(len(proxy_shapes), 1)
+                self.assertEqual(len(proxy_shapes), 0)
                 self.assertEqual(len(owned_shapes), 1)
-                self.assertEqual(len(hidden_shapes), 1)
-                self.assertEqual(int(shape_flags[proxy_shapes[0]]) & collision_mask, 0)
+                self.assertEqual(len(hidden_shapes), 2)
+                self.assertEqual(view.joint_count, 1)
+                self.assertEqual(int(view.joint_type.numpy()[0]), int(newton.JointType.FREE))
+                self.assertEqual(int(view.joint_parent.numpy()[0]), -1)
+                self.assertEqual(int(view.joint_child.numpy()[0]), 0)
                 self.assertNotEqual(int(shape_flags[owned_shapes[0]]) & collision_mask, 0)
-                self.assertEqual(int(shape_flags[hidden_shapes[0]]) & collision_mask, 0)
+                for shape in hidden_shapes:
+                    self.assertEqual(int(shape_flags[shape]) & collision_mask, 0)
 
     def test_rejects_cross_solver_joint_owned_by_subsolver(self):
         model, parent, child, joint = self._build_two_body_joint_scene("ball")
@@ -1178,13 +1184,13 @@ class TestAdmmModelJointInterface(unittest.TestCase):
                 entries=[
                     SolverCoupled.Entry(
                         name="parent",
-                        solver=lambda v: SolverSemiImplicit(model=v, enable_tri_contact=False),
+                        solver=lambda v: SolverXPBD(model=v, iterations=20, angular_damping=0.0),
                         bodies=[parent],
                         joints=[joint],
                     ),
                     SolverCoupled.Entry(
                         name="child",
-                        solver=lambda v: SolverSemiImplicit(model=v, enable_tri_contact=False),
+                        solver=lambda v: SolverXPBD(model=v, iterations=20, angular_damping=0.0),
                         bodies=[child],
                     ),
                 ],
