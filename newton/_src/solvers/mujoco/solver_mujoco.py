@@ -42,7 +42,7 @@ from ...sim.graph_coloring import color_graph, plot_graph
 from ...utils import topological_sort
 from ...utils.benchmark import event_scope
 from ...utils.import_utils import string_to_warp
-from ..coupled.interface import CouplingEndpointKind, CouplingInterface, _sync_joint_state_from_body
+from ..coupled.interface import CouplingEndpointKind, CouplingInterface
 from ..solver import SolverBase
 from . import kernels, speculative
 from .collision_masks import (
@@ -4382,8 +4382,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 :meth:`observables` and check the bitmask after each step.
         """
         super().__init__(model)
-        self._coupling_joint_q_scratch = wp.empty(model.joint_coord_count, dtype=float, device=model.device)
-        self._coupling_joint_qd_scratch = wp.empty(model.joint_dof_count, dtype=float, device=model.device)
         if use_speculative_contacts and (use_mujoco_contacts or use_mujoco_cpu):
             raise ValueError("use_speculative_contacts=True requires Newton contacts on the MuJoCo Warp backend.")
         self._use_speculative_contacts = use_speculative_contacts
@@ -5309,13 +5307,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self, state: State, flags: StateFlags | int, *, iteration_restart: bool = False, dt: float = 0.0
     ) -> None:
         """Synchronize edited input coordinates without clearing MuJoCo's persistent history."""
-        del iteration_restart, dt
-        body_updated = _sync_joint_state_from_body(
-            self.model, state, flags, self._coupling_joint_q_scratch, self._coupling_joint_qd_scratch
-        )
+        super().coupling_notify_input_state_update(state, flags, iteration_restart=iteration_restart, dt=dt)
         # The usual per-step upload consumes the changed public joint arrays.
         # Sparse or disabled uploads need an immediate update on notification.
-        if self.update_data_interval != 1 and (body_updated or flags & StateFlags.JOINT):
+        if self.update_data_interval != 1 and flags & (StateFlags.BODY | StateFlags.JOINT):
             data = self.mj_data if self.use_mujoco_cpu else self.mjw_data
             self._update_mjc_data(data, self.model, state)
 

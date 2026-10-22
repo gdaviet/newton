@@ -5,9 +5,9 @@ import numpy as np
 import warp as wp
 
 from ...core.types import override
-from ...sim import BodyFlags, Contacts, Control, JointType, Model, ModelFlags, State, StateFlags
+from ...sim import BodyFlags, Contacts, Control, JointType, Model, ModelFlags, State
 from ...sim.joint_mimic import eval_joint_mimic, has_supported_joint_mimics
-from ..coupled.interface import CouplingInterface, _sync_joint_state_from_body
+from ..coupled.interface import CouplingInterface
 from ..semi_implicit import kernels_contact, kernels_muscle, kernels_particle
 from ..semi_implicit.kernels_contact import (
     eval_body_contact,
@@ -159,16 +159,6 @@ class SolverFeatherstone(SolverBase, CouplingInterface):
         """Refresh spatial inertia and COM transforms entirely on the device."""
         return True
 
-    @override
-    def coupling_notify_input_state_update(
-        self, state: State, flags: StateFlags | int, *, iteration_restart: bool = False, dt: float = 0.0
-    ) -> None:
-        """Translate edited body poses and twists into the joint inputs used by the next step."""
-        del iteration_restart, dt
-        _sync_joint_state_from_body(
-            self.model, state, flags, self._coupling_joint_q_scratch, self._coupling_joint_qd_scratch
-        )
-
     def __init__(
         self,
         model: Model,
@@ -202,8 +192,6 @@ class SolverFeatherstone(SolverBase, CouplingInterface):
             raise ValueError("SolverFeatherstone does not support JointType.ROD joints.")
 
         super().__init__(model)
-        self._coupling_joint_q_scratch = wp.empty(model.joint_coord_count, dtype=float, device=model.device)
-        self._coupling_joint_qd_scratch = wp.empty(model.joint_dof_count, dtype=float, device=model.device)
         self._has_joint_mimics = has_supported_joint_mimics(model, "SolverFeatherstone")
         if self._has_joint_mimics:
             mimic_joints = model.joint_mimic_joint.numpy()

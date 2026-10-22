@@ -3496,7 +3496,14 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
                 state.body_q.assign(poses)
                 state.body_qd.assign([[0.25, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]])
                 original_qd = state.joint_qd.numpy().copy()
-                solver.coupling_notify_input_state_update(state, newton.StateFlags.BODY_Q, dt=0.0)
+                # Exercise the default on a real reduced solver, independently
+                # of backend overrides needed to upload persistent native state.
+                if backend == "featherstone":
+                    CouplingInterface.coupling_notify_input_state_update(
+                        solver, state, newton.StateFlags.BODY_Q, dt=0.0
+                    )
+                else:
+                    solver.coupling_notify_input_state_update(state, newton.StateFlags.BODY_Q, dt=0.0)
                 np.testing.assert_allclose(state.joint_q.numpy()[:3], [1, 2, 3])
                 self.assertAlmostEqual(float(state.joint_q.numpy()[-1]), 4 * np.pi + 0.2, places=5)
                 np.testing.assert_array_equal(state.joint_qd.numpy(), original_qd)
@@ -3536,8 +3543,8 @@ class TestSolverCoupledBodyProxyInertia(unittest.TestCase):
                 model = builder.finalize(device="cuda:0")
                 solver = factory(model)
                 state, out = model.state(), model.state()
-                solver.coupling_notify_input_state_update(state, newton.StateFlags.BODY)
                 solver.step(state, out, None, None, 0.01)
+                # The inherited hook also supports its first use inside capture.
                 with wp.ScopedCapture(device=model.device) as capture:
                     solver.coupling_notify_input_state_update(state, newton.StateFlags.BODY)
                     solver.step(state, out, None, None, 0.01)

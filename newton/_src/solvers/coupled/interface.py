@@ -109,7 +109,7 @@ from .proxy_utils import (
 )
 
 if TYPE_CHECKING:
-    from ...sim import Contacts, Model, State
+    from ...sim import Contacts, State
 
 __all__ = ["CouplingInterface"]
 
@@ -133,40 +133,6 @@ def _copy_joint_positions_near_previous(
             period = 2.0 * wp.pi
             value += period * wp.round((joint_q[coord] - value) / period)
         joint_q[coord] = value
-
-
-def _sync_joint_state_from_body(
-    model: Model,
-    state: State,
-    flags: StateFlags | int,
-    joint_q_scratch: wp.array[float],
-    joint_qd_scratch: wp.array[float],
-) -> bool:
-    """Translate body-only edits while preserving explicitly supplied joint components."""
-    update_q = bool(flags & StateFlags.BODY_Q) and not bool(flags & StateFlags.JOINT_Q)
-    update_qd = bool(flags & StateFlags.BODY_QD) and not bool(flags & StateFlags.JOINT_QD)
-    if not model.articulation_count or not (update_q or update_qd):
-        return False
-    if update_q:
-        # IK leaves non-articulation rows untouched.
-        wp.copy(joint_q_scratch, state.joint_q)
-    # IK writes both components; discard whichever one was not requested.
-    eval_ik(
-        model,
-        state,
-        joint_q_scratch,
-        state.joint_qd if update_qd else joint_qd_scratch,
-    )
-    if update_q:
-        # A proxy update must not discard the revolution count of an unchanged
-        # physical joint, which would change its limits and drive error.
-        wp.launch(
-            _copy_joint_positions_near_previous,
-            dim=model.joint_count,
-            inputs=[model.joint_type, model.joint_q_start, model.joint_dof_dim, joint_q_scratch, state.joint_q],
-            device=model.device,
-        )
-    return True
 
 
 class CouplingInterface:
@@ -305,16 +271,50 @@ class CouplingInterface:
         ``flags`` uses :class:`~newton.StateFlags` bits for both kinematic
         state arrays and public force-input buffers.
 
-        Reduced-coordinate solvers translate body-only edits into joint state.
+        The default translates body-only edits into joint state when
+        :meth:`coupling_uses_reduced_coordinates` returns ``True``.
         When the corresponding joint component is also flagged, that joint
         component is authoritative and must retain its supplied value.
+        Solvers with additional native state should call this default before
+        refreshing their native buffers. Scratch arrays are allocated on the
+        first body-only notification and reused thereafter.
 
         A pose update with ``dt=0`` establishes an instantaneous input baseline;
         it does not represent motion over a timestep. This is used when
         restoring physical timestep inputs and recentering numerical bodies.
         It must preserve joint and contact history.
         """
-        del state, flags, iteration_restart, dt
+        del iteration_restart, dt
+        if not self.coupling_uses_reduced_coordinates():
+            return
+        model = self.model
+        update_q = bool(flags & StateFlags.BODY_Q) and not bool(flags & StateFlags.JOINT_Q)
+        update_qd = bool(flags & StateFlags.BODY_QD) and not bool(flags & StateFlags.JOINT_QD)
+        if not model.articulation_count or not (update_q or update_qd):
+            return
+        if not hasattr(self, "_coupling_joint_q_scratch"):
+            self._coupling_joint_q_scratch = wp.empty(model.joint_coord_count, dtype=float, device=model.device)
+            self._coupling_joint_qd_scratch = wp.empty(model.joint_dof_count, dtype=float, device=model.device)
+        joint_q_scratch = self._coupling_joint_q_scratch
+        if update_q:
+            # IK leaves non-articulation rows untouched.
+            wp.copy(joint_q_scratch, state.joint_q)
+        # IK writes both components; discard whichever one was not requested.
+        eval_ik(
+            model,
+            state,
+            joint_q_scratch,
+            state.joint_qd if update_qd else self._coupling_joint_qd_scratch,
+        )
+        if update_q:
+            # Preserve revolution counts so an unchanged physical joint retains
+            # its limits and drive error after a proxy pose update.
+            wp.launch(
+                _copy_joint_positions_near_previous,
+                dim=model.joint_count,
+                inputs=[model.joint_type, model.joint_q_start, model.joint_dof_dim, joint_q_scratch, state.joint_q],
+                device=model.device,
+            )
 
     def coupling_supports_inertial_property_refresh(self) -> bool:
         """Return whether inertial property refresh is safe during graph capture.
