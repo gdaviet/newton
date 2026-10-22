@@ -595,6 +595,9 @@ class SolverCoupledADMM(SolverCoupled):
             joint_proximal_bodies: Add numerical bodies realizing the local
                 rho joint inertia. If ``False``, use linearized local updates
                 without numerical bodies. Gamma remains independently optional.
+                Known limitation: MuJoCo CPU and GPU ``implicitfast`` integration
+                can change the physical fixed point with numerical bodies,
+                including at gamma zero. Integrator compensation is deferred.
             joint_proximal_destination_entries: Entry names receiving numerical
                 bodies. ``None`` selects both endpoints of every coupled joint;
                 an empty sequence selects none. Unselected entries use linearized

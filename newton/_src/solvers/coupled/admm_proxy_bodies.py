@@ -3,10 +3,42 @@
 
 """Recentered numerical rigid bodies for positional ADMM local solves.
 
-An auxiliary welded body realizes each owned body's accumulated spatial
-inertia. Its predictor is reset to the last outer iterate, so its reaction
-vanishes at a fixed point. Physical body inertia and timestep history stay
-unchanged. The augmented model is private; public entry indices stay physical.
+An auxiliary body realizes each owned body's accumulated spatial inertia.
+Its inertial target follows the last outer iterate, so the intended proximal
+reaction vanishes at a fixed point. Physical body inertia and timestep history
+stay unchanged. The augmented model is private; public entry indices stay physical.
+
+Known limitation (correction deferred): canceling the added inertial bias does
+not cancel changes to the native integrator's velocity derivatives. With MuJoCo
+3.15.0 CPU implicitfast, a free rigid subtree includes the numerical descendants
+in its implicit gyroscopic derivative. Let P be numerical inertia, B_p the added
+bias velocity derivative, A the physical integration matrix, h the timestep,
+v_n the physical input velocity, and v_k the current ADMM target. After the
+existing bias compensation, the local equation has the form::
+
+    (A + P + h B_p) (v_next - v_n) = h f_physical + P (v_k - v_n)
+
+At convergence P cancels, but h B_p (v_star - v_n) remains. More ADMM iterations
+cannot remove this error; it also occurs with gamma zero. The installed
+mujoco-warp 3.15.0 instead excludes free roots with massive fixed descendants
+from its standalone-body gyroscopic treatment, changing the physical derivative.
+Both behaviors can change the physical fixed point.
+
+In the off-center spinning-body replay case at h=0.02 s and gamma=0, CPU
+implicitfast linear/angular velocity norm errors were 0.19%/0.08% at rho=20
+and 9.6%/4.0% at rho=1000. Results at 256 and 1024 iterations were identical
+for rho=1000. GPU angular error was about 0.47% at both penalties; Euler replay
+errors were approximately roundoff. These are single-step measurements, not
+bounds for other models or trajectory errors.
+
+Deferred design: a solver-owned coupling hook should evaluate the discrete
+inertial correction using physical and numerical inertia, input state, target
+velocity, and timestep. For the CPU equation above, adding B_p (v_k - v_n) to
+the applied force leaves only B_p (v_next - v_k), which vanishes at convergence.
+The hook must also account for changes to physical integration caused by the
+augmented topology, as on the GPU. Keep backend logic inside the solver and
+retain one native solve per local update; no inner solve is proposed. Validate
+physical replay, parameter invariance, and convergence before enabling a fix.
 """
 
 from dataclasses import replace

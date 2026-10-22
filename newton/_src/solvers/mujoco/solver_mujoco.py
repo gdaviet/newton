@@ -5317,8 +5317,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
     @override
     def coupling_validate_numerical_bodies(self) -> None:
         """Validate the explicit inertial target used by numerical bodies."""
-        if int(self.mj_model.opt.integrator) != 0 or self.model.shape_count:
-            raise ValueError("MuJoCo numerical bodies currently require Euler integration and no shapes")
+        if int(self.mj_model.opt.integrator) not in (0, 3):
+            raise ValueError("MuJoCo numerical bodies require Euler or implicitfast integration")
 
     @override
     def coupling_eval_gravity_acceleration(

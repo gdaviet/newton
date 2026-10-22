@@ -305,6 +305,7 @@ class TestAdmmJointProximal(unittest.TestCase):
             "xpbd": lambda view: SolverXPBD(view, iterations=10, angular_damping=0.0),
             "vbd": lambda view: SolverVBD(view, iterations=10, rigid_compliant_alm=True),
             "mujoco": lambda view: SolverMuJoCo(view, use_mujoco_cpu=True, integrator="euler"),
+            "mujoco_implicitfast": lambda view: SolverMuJoCo(view, use_mujoco_cpu=True, integrator="implicitfast"),
         }
         dt, rho = 0.01, 20.0
         for name, factory in factories.items():
@@ -335,17 +336,28 @@ class TestAdmmJointProximal(unittest.TestCase):
 
     def test_recentered_proxies_preserve_native_fixed_point(self):
         """Remove numerical bodies and replay the converged physical equations."""
-        anchor = np.array([0.3, -0.4, 0.2])
-        initial = np.array([[1.3, 0.2, -0.3, 0.7, -0.4, 0.3], [-0.7, -0.1, 0.2, -0.2, 0.1, 0.3]], dtype=np.float32)
-        forces = np.array([[1, 3, 2, 0.5, -0.2, 0.4], [-2, 1, 4, -0.4, 0.3, 0.2]], dtype=np.float32)
-        jacobians = [np.hstack((np.eye(3), -_cross(anchor))), np.hstack((np.eye(3), np.zeros((3, 3))))]
-        dt, stiffness = 0.02, 100.0
         factories = {
             "featherstone": SolverFeatherstone,
             "xpbd": lambda view: SolverXPBD(view, iterations=30, angular_damping=0.0),
             "vbd": lambda view: SolverVBD(view, iterations=30, rigid_compliant_alm=True, rigid_joint_linear_ke=1e5),
             "mujoco": lambda view: SolverMuJoCo(view, use_mujoco_cpu=True, integrator="euler"),
         }
+        self._check_recentered_proxy_fixed_point(factories)
+
+    @unittest.expectedFailure
+    def test_implicitfast_proxy_fixed_point(self):
+        """Expose the deferred implicit gyroscopic correction for numerical bodies."""
+        self._check_recentered_proxy_fixed_point(
+            {"mujoco_implicitfast": lambda view: SolverMuJoCo(view, use_mujoco_cpu=True, integrator="implicitfast")}
+        )
+
+    def _check_recentered_proxy_fixed_point(self, factories):
+        """Replay converged coupling forces using only the physical model."""
+        anchor = np.array([0.3, -0.4, 0.2])
+        initial = np.array([[1.3, 0.2, -0.3, 0.7, -0.4, 0.3], [-0.7, -0.1, 0.2, -0.2, 0.1, 0.3]], dtype=np.float32)
+        forces = np.array([[1, 3, 2, 0.5, -0.2, 0.4], [-2, 1, 4, -0.4, 0.3, 0.2]], dtype=np.float32)
+        jacobians = [np.hstack((np.eye(3), -_cross(anchor))), np.hstack((np.eye(3), np.zeros((3, 3))))]
+        dt, stiffness = 0.02, 100.0
         for backend, factory in factories.items():
             reference = None
             for rho in (20.0, 1000.0):
@@ -639,7 +651,7 @@ class TestAdmmJointProximal(unittest.TestCase):
     def test_incomplete_proxy_construction_does_not_change_algorithm(self):
         """Reject incomplete constructions instead of switching to an inner solver."""
         with self.assertRaisesRegex(ValueError, "Euler"):
-            self._make_solver(factory=lambda view: SolverMuJoCo(view, use_mujoco_cpu=True, integrator="implicitfast"))
+            self._make_solver(factory=lambda view: SolverMuJoCo(view, use_mujoco_cpu=True, integrator="rk4"))
         with self.assertRaisesRegex(ValueError, "free-axis"):
             self._make_solver(kind="revolute", factory=lambda view: SolverXPBD(view, iterations=10), gamma=0.0)
 
