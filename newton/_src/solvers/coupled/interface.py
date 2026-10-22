@@ -53,6 +53,11 @@ Supported hook signatures are:
     def coupling_validate_numerical_bodies() -> None: ...
 
 
+    def coupling_set_inertial_target(
+        state, body_indices, parent_indices, target_q, target_qd, gravity, *, dt
+    ) -> None: ...
+
+
     def coupling_rewind_proxy_body(
         body_local_to_proxy_global, state, coupling_forces, body_gravity_acceleration, dt
     ) -> None: ...
@@ -112,6 +117,53 @@ if TYPE_CHECKING:
     from ...sim import Contacts, State
 
 __all__ = ["CouplingInterface"]
+
+
+@wp.kernel(enable_backward=False)
+def _set_body_inertial_target(
+    bodies: wp.array[int],
+    parents: wp.array[int],
+    target_qd: wp.array[wp.spatial_vector],
+    gravity: wp.array[wp.vec3],
+    mass: wp.array[float],
+    com: wp.array[wp.vec3],
+    inertia: wp.array[wp.mat33],
+    dt: float,
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_f: wp.array[wp.spatial_vector],
+):
+    row = wp.tid()
+    body = bodies[row]
+    parent = parents[row]
+    q = body_q[parent]
+    R = wp.quat_to_matrix(wp.transform_get_rotation(q))
+    r = R * (com[body] - com[parent])
+    I = R * inertia[body] * wp.transpose(R)
+    v = wp.spatial_top(target_qd[row])
+    w = wp.spatial_bottom(target_qd[row])
+    # Align joint frames so Baumgarte stabilization contributes no target bias.
+    # Zero initial spin also removes the numerical body's gyroscopic bias.
+    body_q[body] = q
+    body_qd[body] = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
+    body_f[body] = wp.spatial_vector(mass[body] * ((v + wp.cross(w, r)) / dt - gravity[row]), I * w / dt)
+
+
+@wp.kernel(enable_backward=False)
+def _set_body_inertial_target_pose(
+    bodies: wp.array[int],
+    target_q: wp.array[wp.transform],
+    gravity: wp.array[wp.vec3],
+    mass: wp.array[float],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_f: wp.array[wp.spatial_vector],
+):
+    row = wp.tid()
+    body = bodies[row]
+    body_q[body] = target_q[row]
+    body_qd[body] = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
+    body_f[body] = wp.spatial_vector(-mass[body] * gravity[row], wp.vec3(0.0))
 
 
 @wp.kernel(enable_backward=False)
@@ -358,6 +410,62 @@ class CouplingInterface:
         integrator and backend restrictions belong here. The default imposes
         no additional restrictions.
         """
+
+    def coupling_set_inertial_target(
+        self,
+        state: State,
+        body_indices: wp.array[int],
+        parent_indices: wp.array[int],
+        target_q: wp.array[wp.transform],
+        target_qd: wp.array[wp.spatial_vector],
+        gravity: wp.array[wp.vec3],
+        *,
+        dt: float,
+    ) -> None:
+        """Set the inertial target for selected bodies in the next local solve.
+
+        The default aligns each selected body with its reference body, zeros
+        its initial velocity, and applies the target momentum through forces.
+        Gravity is canceled and the target twist is transported to the selected
+        body's center of mass. Zero initial spin avoids a gyroscopic bias.
+        Position-based solvers may override this using the supplied target pose
+        to match their discrete inertial objective more accurately.
+
+        This replaces the selected bodies' poses, velocities, and forces;
+        reference bodies and persistent solver history are preserved. The caller
+        must call :meth:`coupling_notify_input_state_update` after setting the
+        target and before stepping. This hook performs no solve or notification.
+
+        Args:
+            state: Input state to update in place.
+            body_indices: Indices of bodies receiving the inertial target.
+            parent_indices: Corresponding reference body indices in this model.
+            target_q: Reference body-frame target poses [m, quaternion], ordered
+                as ``body_indices``. Used by position-based overrides.
+            target_qd: Reference target world twists at their centers of mass
+                [m/s, rad/s], in the same order.
+            gravity: Solver-applied gravity acceleration [m/s^2], in the same order.
+            dt: Local solve duration [s].
+        """
+        del target_q
+        wp.launch(
+            _set_body_inertial_target,
+            dim=body_indices.shape[0],
+            inputs=[
+                body_indices,
+                parent_indices,
+                target_qd,
+                gravity,
+                self.model.body_mass,
+                self.model.body_com,
+                self.model.body_inertia,
+                dt,
+                state.body_q,
+                state.body_qd,
+                state.body_f,
+            ],
+            device=self.model.device,
+        )
 
     def coupling_eval_gravity_acceleration(
         self,

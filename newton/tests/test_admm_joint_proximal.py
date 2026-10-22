@@ -21,6 +21,34 @@ def _cross(v):
 
 
 class TestAdmmJointProximal(unittest.TestCase):
+    @unittest.skipUnless(wp.is_cuda_available(), "Kamino requires CUDA")
+    def test_kamino_mujoco_four_bar_default_layout(self):
+        """Run the unchanged four-world example with proxies and CUDA graph replay."""
+        from newton.examples.multiphysics.example_kamino_mujoco_admm_solver import Example  # noqa: PLC0415
+        from newton.viewer import ViewerNull  # noqa: PLC0415
+
+        args = Example.create_parser().parse_args([])
+        with wp.ScopedDevice("cuda:0"):
+            example = Example(ViewerNull(num_frames=120), args)
+            initial_positions = example.state_0.body_q.numpy()[:, :3].copy()
+            for _ in range(120):
+                example.step()
+                example.test_final()
+        displacement = np.linalg.norm(example.state_0.body_q.numpy()[:, :3] - initial_positions, axis=1)
+        self.assertGreater(float(np.max(displacement)), 0.01, "Numerical bodies must not freeze the linkage")
+        poses = example.state_0.body_q.numpy().reshape(args.world_count, -1, 7)
+        np.testing.assert_allclose(poses, np.broadcast_to(poses[0], poses.shape), atol=2e-5)
+        for proxies in example.solver._admm_proxy_bodies.values():
+            view = proxies.entry.view
+            body_world = view.body_world.numpy()
+            joint_world = view.joint_world.numpy()
+            np.testing.assert_array_equal(joint_world, body_world[view.joint_child.numpy()])
+            np.testing.assert_array_equal(
+                body_world[proxies.proxies.numpy()],
+                body_world[proxies._maps[newton.Model.AttributeFrequency.BODY].numpy()[proxies.bodies.numpy()]],
+            )
+            self.assertEqual(view.fk_actuation_flag.shape[0], view.joint_count)
+
     def _make_solver(
         self,
         *,
@@ -416,6 +444,48 @@ class TestAdmmJointProximal(unittest.TestCase):
                         else:
                             np.testing.assert_allclose(velocity, reference, atol=4e-5, rtol=3e-5)
 
+    @unittest.skipUnless(wp.is_cuda_available(), "Kamino requires CUDA")
+    def test_kamino_proxies_preserve_native_fixed_point(self):
+        """Cancel numerical inertia with weak joint stabilization and off-center spin."""
+        from newton.solvers import SolverKamino  # noqa: PLC0415
+
+        config = SolverKamino.Config()
+        config.use_collision_detector = False
+        config.use_fk_solver = False
+        config.constraints.alpha = 0.01
+        anchor = np.array([0.3, -0.4, 0.2])
+        initial = np.array([[1.3, 0.2, -0.3, 0.7, -0.4, 0.3], [-0.7, -0.1, 0.2, -0.2, 0.1, 0.3]], dtype=np.float32)
+        forces = np.array([[1, 3, 2, 0.5, -0.2, 0.4], [-2, 1, 4, -0.4, 0.3, 0.2]], dtype=np.float32)
+        jacobians = [np.hstack((np.eye(3), -_cross(anchor))), np.hstack((np.eye(3), np.zeros((3, 3))))]
+        model, solver = self._make_solver(
+            factory=lambda view: SolverKamino(view, config=config),
+            device="cuda:0",
+            anchor=anchor,
+            gravity=(0, -9.81, 0),
+            iterations=64,
+            rho=20.0,
+            gamma=0.02,
+            joint_stiffness=100.0,
+        )
+        state, out = model.state(), model.state()
+        state.body_qd.assign(initial)
+        state.joint_qd.assign(initial.ravel())
+        state.body_f.assign(forces)
+        solver.step(state, out, None, None, 0.02)
+        velocity = out.body_qd.numpy()
+        group = solver._admm_rr_groups[0]
+        np.testing.assert_allclose(group.u.numpy(), group.Jv.numpy(), atol=2e-5)
+        jv = jacobians[1] @ velocity[1] - jacobians[0] @ velocity[0]
+        for body in range(2):
+            entry = solver._entries[str(body)]
+            physical, replay = entry.view.state(), entry.view.state()
+            physical.body_qd.assign(initial[body : body + 1])
+            physical.joint_qd.assign(initial[body])
+            physical.body_f.assign([forces[body] + (1 if body == 0 else -1) * 100.0 * jacobians[body].T @ jv])
+            entry.solver.step(physical, replay, None, None, 0.02)
+            np.testing.assert_allclose(velocity[body], replay.body_qd.numpy()[0], atol=4e-5, rtol=3e-5)
+            np.testing.assert_allclose(out.body_q.numpy()[body], replay.body_q.numpy()[0], atol=2e-6)
+
     def test_gamma_preserves_native_fixed_point_without_all_proxies(self):
         """Cancel gamma for spinning anisotropic bodies with optional proxy destinations."""
         anchor = np.array([0.3, -0.4, 0.2])
@@ -787,7 +857,7 @@ class TestAdmmJointProximal(unittest.TestCase):
         for proxies in solver._admm_proxy_bodies.values():
             view = proxies.entry.view
             self.assertEqual(view.max_joints_per_articulation, view.joint_count)
-            self.assertTrue(np.all(view.joint_ancestor.numpy()[proxies.joint_offset :] >= 0))
+            self.assertTrue(np.all(view.joint_ancestor.numpy()[proxies.joints.numpy()] >= 0))
         state, out = model.state(), model.state()
         forces = np.zeros((2, 6), dtype=np.float32)
         forces[child, 1] = 100.0

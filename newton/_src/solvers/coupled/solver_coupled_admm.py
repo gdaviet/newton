@@ -708,23 +708,6 @@ class SolverCoupledADMM(SolverCoupled):
                 continue
             reduced_coordinates = entry.solver.coupling_uses_reduced_coordinates()
             entry.solver.coupling_validate_numerical_bodies()
-            if reduced_coordinates and (
-                entry.view.articulation_count != 1 or np.any(entry.view.joint_articulation.numpy() != 0)
-            ):
-                raise ValueError(
-                    f"ADMM numerical bodies for {name!r} currently require "
-                    "one articulation containing all joints for reduced coordinates"
-                )
-            # Appending a private suffix preserves all physical indices. Mixed
-            # world layouts and custom rigid attributes need explicit remaps.
-            if len(set(entry.view.body_world.numpy())) != 1:
-                raise ValueError(f"ADMM numerical bodies for {name!r} currently require one body world per entry")
-            if any(
-                ":" in attr
-                and spec.frequency in (self.model.AttributeFrequency.BODY, self.model.AttributeFrequency.JOINT)
-                for attr, spec in self.model._iter_attribute_specs()
-            ):
-                raise ValueError(f"ADMM numerical bodies for {name!r} require remapping custom body/joint attributes")
             bodies = set()
             points = {}
             for group in self._admm_rr_groups:

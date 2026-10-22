@@ -46,18 +46,18 @@ from dataclasses import replace
 import numpy as np
 import warp as wp
 
-from ...sim import Model, ModelBuilder, ModelFlags, StateFlags
+from ...sim import Model, ModelFlags, StateFlags
 from ...sim.articulation import eval_fk
 from .admm_inertial import ReducedInertia
-from .model_view import ModelView
-from .solver_coupled import _entry_control
+from .admm_proxy_model import build_proxy_model
+from .solver_coupled import _entry_control, _nested_attribute_value
 
 
 @wp.kernel(enable_backward=False)
 def _update_inertia(
     bodies: wp.array[int],
-    offset: int,
-    joint_offset: int,
+    proxies: wp.array[int],
+    joints: wp.array[int],
     point_proxies: wp.array[int],
     physical_com: wp.array[wp.vec3],
     mass: wp.array[float],
@@ -73,7 +73,7 @@ def _update_inertia(
 ):
     row = wp.tid()
     body = bodies[row]
-    proxy = offset + row
+    proxy = proxies[row]
     m = wp.max(mass[body], 1.0e-8)
     r = moment[body] / m
     I = inertia[body] - m * (wp.dot(r, r) * wp.identity(n=3, dtype=float) - wp.outer(r, r))
@@ -83,8 +83,8 @@ def _update_inertia(
     if point_proxies[row] != 0:
         I = wp.identity(n=3, dtype=float)
         anchor = wp.transform(physical_com[body] + r, wp.quat_identity())
-        joint_X_p[joint_offset + row] = anchor
-        joint_X_c[joint_offset + row] = anchor
+        joint_X_p[joints[row]] = anchor
+        joint_X_c[joints[row]] = anchor
     proxy_mass[proxy] = m
     proxy_inv_mass[proxy] = 1.0 / m
     proxy_com[proxy] = physical_com[body] + r
@@ -93,28 +93,10 @@ def _update_inertia(
 
 
 @wp.kernel(enable_backward=False)
-def _recenter(
-    bodies: wp.array[int],
-    offset: int,
-    target: wp.array[wp.transform],
-    gravity: wp.array[wp.vec3],
-    mass: wp.array[float],
-    body_q: wp.array[wp.transform],
-    body_qd: wp.array[wp.spatial_vector],
-    body_f: wp.array[wp.spatial_vector],
-):
-    row = wp.tid()
-    body = bodies[row]
-    proxy = offset + row
-    body_q[proxy] = target[body]
-    body_qd[proxy] = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
-    body_f[proxy] = wp.spatial_vector(-mass[proxy] * gravity[body], wp.vec3(0.0))
-
-
-@wp.kernel(enable_backward=False)
 def _prepare_reduced_coordinates(
     bodies: wp.array[int],
-    offset: int,
+    augmented_bodies: wp.array[int],
+    proxies: wp.array[int],
     velocity_k: wp.array[wp.spatial_vector],
     bias: wp.array[wp.spatial_vector],
     gravity: wp.array[wp.vec3],
@@ -128,12 +110,13 @@ def _prepare_reduced_coordinates(
 ):
     row = wp.tid()
     body = bodies[row]
-    proxy = offset + row
-    q = body_q[body]
+    proxy = proxies[row]
+    augmented_body = augmented_bodies[body]
+    q = body_q[augmented_body]
     R = wp.quat_to_matrix(wp.transform_get_rotation(q))
-    r = R * (com[proxy] - com[body])
+    r = R * (com[proxy] - com[augmented_body])
     I = R * inertia[proxy] * wp.transpose(R)
-    vn = body_qd[body]
+    vn = body_qd[augmented_body]
     vk = velocity_k[proxy]
     wn = wp.spatial_bottom(vn)
     wk = wp.spatial_bottom(vk)
@@ -150,147 +133,75 @@ def _prepare_reduced_coordinates(
     )
 
 
-def _copy_state_prefix(source, destination):
-    for name, value in vars(source).items():
-        other = getattr(destination, name, None)
-        if isinstance(value, wp.array) and isinstance(other, wp.array):
-            wp.copy(other, value, count=min(value.shape[0], other.shape[0]))
-
-
 class ProxyBodies:
     """Private augmented entry with one numerical body per participating body."""
 
     def __init__(self, entry, factory, bodies, *, reduced_coordinates=False, point_bodies=()):
         physical = entry.view
         device = physical.device
-        self.offset = physical.body_count
         self.bodies = wp.array(sorted(bodies), dtype=int, device=device)
         self.point_proxies = wp.array([int(body in point_bodies) for body in sorted(bodies)], dtype=int, device=device)
-        self.joint_offset = physical.joint_count
         self.reduced_coordinates = reduced_coordinates
-        builder = ModelBuilder()
-        for _ in range(self.offset):
-            builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
-        proxies = {body: builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3))) for body in sorted(bodies)}
-        fixed_joints = []
-        for body in range(self.offset):
-            joints = [builder.add_joint_free(body)]
-            if body in proxies:
-                joint = (
-                    builder.add_joint_ball(body, proxies[body], armature=0.0, damping=0.0)
-                    if body in point_bodies
-                    else builder.add_joint_fixed(body, proxies[body])
-                )
-                joints.append(joint)
-                fixed_joints.append(joint)
-            builder.add_articulation(joints)
-        template = builder.finalize(device=device)
-        view = ModelView(physical, physical.name)
+        view, maps, numerical_bodies, numerical_joints, self._model_copies = build_proxy_model(
+            physical, sorted(bodies), point_bodies
+        )
+        self._maps = {freq: wp.array(mapping, dtype=int, device=device) for freq, mapping in maps.items()}
+        self.proxies = wp.array([numerical_bodies[body] for body in sorted(bodies)], dtype=int, device=device)
+        self.joints = wp.array([numerical_joints[body] for body in sorted(bodies)], dtype=int, device=device)
         frequency = Model.AttributeFrequency
-        counts = {
-            frequency.BODY: self.offset + len(bodies),
-            frequency.JOINT: physical.joint_count + len(bodies),
-            frequency.JOINT_CONSTRAINT: physical.joint_constraint_count + template.joint_constraint_count,
-            frequency.JOINT_COORD: physical.joint_coord_count + 4 * len(point_bodies),
-            frequency.JOINT_DOF: physical.joint_dof_count + 3 * len(point_bodies),
-        }
-        selected = {frequency.JOINT: fixed_joints}
-        for freq, starts in (
-            (frequency.JOINT_COORD, template.joint_q_start),
-            (frequency.JOINT_DOF, template.joint_qd_start),
-        ):
-            offsets = starts.numpy()
-            selected[freq] = [i for j in fixed_joints for i in range(offsets[j], offsets[j + 1])]
-        overrides = {}
-        # Append private rigid rows without renumbering physical entities.
-        # Ball proxies also append unused rotational coordinates and controls.
-        for name, spec in physical._iter_attribute_specs():
-            if spec.frequency not in counts or spec.assignment is not None or ":" in name:
-                continue
-            value = getattr(physical, name, None)
-            extra = getattr(template, name, None)
-            if value is None or extra is None:
-                continue
-            if spec.compaction_policy == "world_start":
-                data = value.numpy().copy()
-                world = int(physical.body_world.numpy()[0])
-                if world == -1:
-                    data[-1] = counts[spec.frequency]
-                else:
-                    data[world + 1 :] = counts[spec.frequency]
-                overrides[name] = wp.array(data, dtype=value.dtype, device=device)
-            elif spec.compaction_policy == "start":
-                widths = np.diff(extra.numpy())[fixed_joints]
-                data = np.concatenate((value.numpy(), np.cumsum(widths) + int(value.numpy()[-1])))
-                overrides[name] = wp.array(data, dtype=value.dtype, device=device)
-            elif spec.compaction_policy == "generic":
-                start = self.offset * spec.row_width if spec.frequency == frequency.BODY else 0
-                if isinstance(value, wp.array):
-                    data = extra.numpy()[start:].copy()
-                    if spec.frequency in selected:
-                        data = extra.numpy()[selected[spec.frequency]].copy()
-                    if name in ("body_world", "joint_world"):
-                        data[:] = int(physical.body_world.numpy()[0])
-                    if spec.references == frequency.JOINT:
-                        data[:] = -1
-                    if name == "joint_articulation":
-                        data[:] = 0 if reduced_coordinates else -1
-                    data = np.concatenate((value.numpy(), data))
-                    overrides[name] = wp.array(data, dtype=value.dtype, device=device)
-                elif isinstance(value, list):
-                    tail = [extra[i] for i in selected[spec.frequency]] if spec.frequency in selected else extra[start:]
-                    overrides[name] = value + tail
-        for name, value in overrides.items():
-            setattr(view, name, value)
-        view.body_count = counts[frequency.BODY]
-        view.joint_count = counts[frequency.JOINT]
-        view.joint_constraint_count = counts[frequency.JOINT_CONSTRAINT]
-        view.joint_coord_count = counts[frequency.JOINT_COORD]
-        view.joint_dof_count = counts[frequency.JOINT_DOF]
-        view.body_shapes = dict(physical.body_shapes)
-        for proxy in range(self.offset, view.body_count):
-            view.body_shapes[proxy] = []
-        view.body_color_groups = [
-            *physical.body_color_groups,
-            wp.array(range(self.offset, view.body_count), dtype=int, device=device),
-        ]
-        if reduced_coordinates:
-            starts = physical.articulation_start.numpy().copy()
-            starts[-1] = view.joint_count
-            view.articulation_start = wp.array(starts, dtype=int, device=device)
-            ends = physical.articulation_end.numpy().copy()
-            ends[0] = view.joint_count
-            view.articulation_end = wp.array(ends, dtype=int, device=device)
-            view.max_joints_per_articulation = view.joint_count
-            view.max_dofs_per_articulation = view.joint_dof_count
-            incoming = {int(body): joint for joint, body in enumerate(physical.joint_child.numpy())}
-            ancestors = view.joint_ancestor.numpy()
-            for row, body in enumerate(sorted(bodies)):
-                ancestors[physical.joint_count + row] = incoming[body]
-            view.joint_ancestor = wp.array(ancestors, dtype=int, device=device)
-            for name in (
-                "_fk_articulation_level_start",
-                "_fk_level_joint_start",
-                "_fk_level_joints",
-                "_fk_level_parent_pos",
-            ):
-                setattr(view, name, None)
-            view._fk_level_capacity = 0
+
+        def compose(local_to_global, freq):
+            source = local_to_global.numpy()
+            result = np.full(Model._attribute_frequency_count(view, freq), -1, dtype=np.int32)
+            result[maps[freq]] = source
+            return wp.array(result, dtype=int, device=device)
+
+        def inverse(global_to_local, freq):
+            result = global_to_local.numpy().copy()
+            valid = result >= 0
+            result[valid] = maps[freq][result[valid]]
+            return wp.array(result, dtype=int, device=device)
+
+        attributes = dict(entry.attribute_local_to_global)
+        for freq in maps:
+            if freq in attributes:
+                attributes[freq] = compose(attributes[freq], freq)
         self.entry = replace(
             entry,
             view=view,
             solver=factory(view),
+            body_local_to_global=compose(entry.body_local_to_global, frequency.BODY),
+            body_global_to_local=inverse(entry.body_global_to_local, frequency.BODY),
+            body_dynamics_disabled_local_indices=wp.array(
+                maps[frequency.BODY][entry.body_dynamics_disabled_local_indices.numpy()], dtype=int, device=device
+            ),
+            proxy_body_local_indices=wp.array(
+                maps[frequency.BODY][entry.proxy_body_local_indices.numpy()], dtype=int, device=device
+            ),
+            joint_dynamics_disabled_local_indices=wp.array(
+                maps[frequency.JOINT][entry.joint_dynamics_disabled_local_indices.numpy()], dtype=int, device=device
+            ),
+            joint_coord_local_to_global=compose(entry.joint_coord_local_to_global, frequency.JOINT_COORD),
+            joint_coord_global_to_local=inverse(entry.joint_coord_global_to_local, frequency.JOINT_COORD),
+            joint_dof_local_to_global=compose(entry.joint_dof_local_to_global, frequency.JOINT_DOF),
+            joint_dof_global_to_local=inverse(entry.joint_dof_global_to_local, frequency.JOINT_DOF),
+            attribute_local_to_global=attributes,
             state_0=view.state(),
             state_1=view.state(),
             state_tmp=view.state() if entry.substeps > 1 and not entry.in_place else None,
             control=_entry_control(view),
         )
-        self._prefix_arrays = [
-            name
-            for name, value in overrides.items()
-            if isinstance(value, wp.array) and physical._attribute_spec(name).compaction_policy == "generic"
-        ]
-        self.target = wp.clone(physical.body_q)
+        self._state_maps = {}
+        for name, spec in view._iter_attribute_specs():
+            if spec.frequency in maps:
+                rows = (maps[spec.frequency][:, None] * spec.row_width + np.arange(spec.row_width)).ravel()
+                self._state_maps[name] = wp.array(rows, dtype=int, device=device)
+        self.parents = wp.array(maps[frequency.BODY][sorted(bodies)], dtype=int, device=device)
+        self.target = wp.empty(len(bodies), dtype=wp.transform, device=device)
+        self.target_velocity = wp.empty(len(bodies), dtype=wp.spatial_vector, device=device)
+        self.gravity = wp.empty(len(bodies), dtype=wp.vec3, device=device)
+        wp.copy(self.target, physical.body_q[self.bodies])
+        wp.copy(self.gravity, entry.body_gravity_acceleration[self.bodies])
         self.reduced_inertia = None
         if reduced_coordinates:
             mass = wp.zeros(view.body_count, dtype=float, device=device)
@@ -306,8 +217,8 @@ class ProxyBodies:
             dim=self.bodies.shape[0],
             inputs=[
                 self.bodies,
-                self.offset,
-                self.joint_offset,
+                self.proxies,
+                self.joints,
                 self.point_proxies,
                 buf.body_com,
                 buf.proxy_mass,
@@ -324,41 +235,61 @@ class ProxyBodies:
             device=view.device,
         )
         self.entry.solver.notify_model_changed(ModelFlags.BODY_INERTIAL_PROPERTIES | ModelFlags.JOINT_PROPERTIES)
-        wp.copy(self.target, buf.body_q_n)
+        wp.copy(self.target, buf.body_q_n[self.bodies])
+        wp.copy(self.gravity, entry.body_gravity_acceleration[self.bodies])
         if self.reduced_inertia is not None:
             numerical = self.reduced_inertia.view
-            count = view.body_count - self.offset
-            wp.copy(numerical.body_mass, view.body_mass, src_offset=self.offset, dest_offset=self.offset, count=count)
-            wp.copy(
-                numerical.body_inertia, view.body_inertia, src_offset=self.offset, dest_offset=self.offset, count=count
-            )
-            _copy_state_prefix(entry.state_0, self.entry.state_0)
+            wp.copy(numerical.body_mass[self.proxies], view.body_mass[self.proxies])
+            wp.copy(numerical.body_inertia[self.proxies], view.body_inertia[self.proxies])
+            self._copy_state(entry.state_0, self.entry.state_0)
             eval_fk(view, self.entry.state_0.joint_q, self.entry.state_0.joint_qd, self.entry.state_0)
             self.reduced_inertia.refresh(self.entry.state_0)
 
     def sync_model(self, entry):
         """Copy changed physical rows while preserving private topology."""
-        for name in self._prefix_arrays:
-            physical = getattr(entry.view, name)
-            wp.copy(getattr(self.entry.view, name), physical, count=physical.shape[0])
+        for name, mapping in self._model_copies:
+            physical = _nested_attribute_value(entry.view, name)
+            wp.copy(_nested_attribute_value(self.entry.view, name)[mapping], physical)
+
+    def _copy_state(self, source, destination, *, gather=False):
+        names = dict.fromkeys(vars(source))
+        names.update(dict.fromkeys(name for name, _ in self.entry.view._iter_attribute_specs() if ":" in name))
+        for name in names:
+            value = _nested_attribute_value(source, name)
+            other = _nested_attribute_value(destination, name)
+            if not isinstance(value, wp.array) or not isinstance(other, wp.array):
+                continue
+            mapping = self._state_maps.get(name)
+            if mapping is None:
+                wp.copy(other, value)
+            elif gather:
+                wp.copy(other, value[mapping])
+            else:
+                wp.copy(other[mapping], value)
 
     def reset(self, entry, world_mask):
         """Reset native caches without changing the caller's physical state."""
-        _copy_state_prefix(entry.state_0, self.entry.state_0)
+        self._copy_state(entry.state_0, self.entry.state_0)
         self.entry.solver.reset(self.entry.state_0, world_mask=world_mask, flags=0)
 
     def prepare(self, entry, buf, *, dt):
         """Teleport the numerical bodies without changing physical input state."""
         local = self.entry
-        _copy_state_prefix(entry.state_0, local.state_0)
+        self._copy_state(entry.state_0, local.state_0)
         if self.reduced_coordinates:
-            velocity_k = self.reduced_inertia.target_velocity(local.state_0.joint_q, buf.joint_qd_k)
+            wp.copy(
+                self.reduced_inertia.target.joint_qd[self._maps[Model.AttributeFrequency.JOINT_DOF]], buf.joint_qd_k
+            )
+            velocity_k = self.reduced_inertia.target_velocity(
+                local.state_0.joint_q, self.reduced_inertia.target.joint_qd
+            )
             wp.launch(
                 _prepare_reduced_coordinates,
                 dim=self.bodies.shape[0],
                 inputs=[
                     self.bodies,
-                    self.offset,
+                    self._maps[Model.AttributeFrequency.BODY],
+                    self.proxies,
                     velocity_k,
                     self.reduced_inertia.bias,
                     entry.body_gravity_acceleration,
@@ -373,20 +304,15 @@ class ProxyBodies:
                 device=local.view.device,
             )
         else:
-            wp.launch(
-                _recenter,
-                dim=self.bodies.shape[0],
-                inputs=[
-                    self.bodies,
-                    self.offset,
-                    self.target,
-                    entry.body_gravity_acceleration,
-                    local.view.body_mass,
-                    local.state_0.body_q,
-                    local.state_0.body_qd,
-                    local.state_0.body_f,
-                ],
-                device=local.view.device,
+            wp.copy(self.target_velocity, buf.body_qd_k[self.bodies])
+            local.solver.coupling_set_inertial_target(
+                local.state_0,
+                self.proxies,
+                self.parents,
+                self.target,
+                self.target_velocity,
+                self.gravity,
+                dt=dt,
             )
         local.solver.coupling_notify_input_state_update(
             local.state_0,
@@ -398,5 +324,5 @@ class ProxyBodies:
 
     def finish(self, entry):
         output = self.entry.state_0 if self.entry.in_place else self.entry.state_1
-        _copy_state_prefix(output, entry.state_1)
-        wp.copy(self.target, entry.state_1.body_q)
+        self._copy_state(output, entry.state_1, gather=True)
+        wp.copy(self.target, entry.state_1.body_q[self.bodies])

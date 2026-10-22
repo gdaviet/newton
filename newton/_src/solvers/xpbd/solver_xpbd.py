@@ -11,7 +11,7 @@ from ...core.types import override
 from ...exceptions import NewtonDeprecationWarning
 from ...sim import Contacts, Control, JointType, Model, ModelFlags, State, StateFlags
 from ...sim.joint_mimic import has_supported_joint_mimics
-from ..coupled.interface import CouplingInterface
+from ..coupled.interface import CouplingInterface, _set_body_inertial_target_pose
 from ..solver import SolverBase
 from ..tendon_kernels import solve_tendon_material, update_tendon_attachments
 from ..tendon_state import TendonStateMixin
@@ -313,6 +313,33 @@ class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
             # Registration may advance the shared revision while this solver's
             # core module options are stale, so force a complete reapplication.
             self._applied_module_options_revision = -1
+
+    @override
+    def coupling_set_inertial_target(
+        self,
+        state: State,
+        body_indices: wp.array[int],
+        parent_indices: wp.array[int],
+        target_q: wp.array[wp.transform],
+        target_qd: wp.array[wp.spatial_vector],
+        gravity: wp.array[wp.vec3],
+        *,
+        dt: float,
+    ) -> None:
+        """Set the native inertial pose directly to the supplied target pose.
+
+        Integrating a target twist does not invert the discrete pose-to-twist
+        map exactly. Using the previous output pose avoids that residual in
+        the position-based inertial objective at a coupling fixed point.
+        The caller updates solver history through the state notification hook.
+        """
+        del parent_indices, target_qd, dt
+        wp.launch(
+            _set_body_inertial_target_pose,
+            dim=body_indices.shape[0],
+            inputs=[body_indices, target_q, gravity, self.model.body_mass, state.body_q, state.body_qd, state.body_f],
+            device=self.model.device,
+        )
 
     @override
     def coupling_supports_inertial_property_refresh(self) -> bool:

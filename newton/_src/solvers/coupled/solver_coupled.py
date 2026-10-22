@@ -1025,7 +1025,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
         cfg: SolverCoupled.Entry,
         proxy_body_keep: set[int],
     ) -> None:
-        """Restrict shape collisions to entry-owned and proxy-visible shapes."""
+        """Clear all flags on shapes excluded from the entry's view."""
         model = self.model
         if model.shape_count == 0 or model.shape_flags is None:
             return
@@ -3861,8 +3861,7 @@ def _copy_control_to_entry(src: Control | None, entry: SolverEntry) -> Control |
         mapping = entry.attribute_local_to_global.get(spec.frequency)
         if mapping is None:
             continue
-        has_unmapped_rows = has_free_root_joints and spec.frequency in _FREE_ROOT_JOINT_FREQUENCIES
-        _copy_mapped_control_attribute(src, dst, full_name, mapping, has_unmapped_rows=has_unmapped_rows)
+        _copy_mapped_control_attribute(src, dst, full_name, mapping)
     return dst
 
 
@@ -3879,8 +3878,6 @@ def _copy_mapped_control_attribute(
     dst_control: Control,
     full_name: str,
     local_to_global: wp.array,
-    *,
-    has_unmapped_rows: bool = False,
 ) -> None:
     src = _nested_attribute_value(src_control, full_name)
     dst = _nested_attribute_value(dst_control, full_name)
@@ -3891,16 +3888,13 @@ def _copy_mapped_control_attribute(
         return
     if dst.shape[0] == 0:
         return
-    if has_unmapped_rows:
-        # Unmapped rows keep their entry-local values.
-        wp.launch(
-            _copy_mapped_rows_kernel,
-            dim=dst.shape[0],
-            inputs=[local_to_global, src, dst],
-            device=dst.device,
-        )
-        return
-    wp.copy(dst, src[local_to_global])
+    # FREE roots and numerical bodies have no source row. Keep their defaults.
+    wp.launch(
+        _copy_mapped_rows_kernel,
+        dim=dst.shape[0],
+        inputs=[local_to_global, src, dst],
+        device=dst.device,
+    )
 
 
 def _copy_control_float_array(

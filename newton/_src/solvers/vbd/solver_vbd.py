@@ -36,7 +36,7 @@ from ...sim.collide import _count_soft_particle_rigid_contact_pairs
 from ...sim.joint_mimic import has_supported_joint_mimics
 from ...utils import is_graph_capture_allocation_enabled
 from ...utils.mesh import build_vertex_adjacency_with_warp
-from ..coupled.interface import CouplingInterface
+from ..coupled.interface import CouplingInterface, _set_body_inertial_target_pose
 from ..solver import SolverBase
 from ..tendon_kernels import solve_tendon_material, update_tendon_attachments
 from ..tendon_state import TendonStateMixin
@@ -1508,6 +1508,33 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             ModelFlags.JOINT_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES
         ):
             self._refresh_rod_rest_bend_twist_cache()
+
+    @override
+    def coupling_set_inertial_target(
+        self,
+        state: State,
+        body_indices: wp.array[int],
+        parent_indices: wp.array[int],
+        target_q: wp.array[wp.transform],
+        target_qd: wp.array[wp.spatial_vector],
+        gravity: wp.array[wp.vec3],
+        *,
+        dt: float,
+    ) -> None:
+        """Set the native inertial pose directly to the supplied target pose.
+
+        Integrating a target twist does not invert the discrete pose-to-twist
+        map exactly. Using the previous output pose avoids that residual in
+        the position-based inertial objective at a coupling fixed point.
+        The caller updates solver history through the state notification hook.
+        """
+        del parent_indices, target_qd, dt
+        wp.launch(
+            _set_body_inertial_target_pose,
+            dim=body_indices.shape[0],
+            inputs=[body_indices, target_q, gravity, self.model.body_mass, state.body_q, state.body_qd, state.body_f],
+            device=self.model.device,
+        )
 
     @override
     def coupling_supports_inertial_property_refresh(self) -> bool:
