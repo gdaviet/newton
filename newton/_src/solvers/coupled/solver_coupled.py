@@ -46,13 +46,12 @@ def _remap_reference_kernel(src: wp.array[int], global_to_local: wp.array[int], 
 
 
 @wp.kernel(enable_backward=False)
-def _clear_shape_collision_flags_kernel(
+def _clear_shape_flags_kernel(
     hidden_shape_indices: wp.array[int],
-    collision_mask: int,
     shape_flags: wp.array[int],
 ):
     shape = hidden_shape_indices[wp.tid()]
-    shape_flags[shape] = shape_flags[shape] & ~collision_mask
+    shape_flags[shape] = 0
 
 
 @wp.kernel(enable_backward=False)
@@ -1040,17 +1039,13 @@ class SolverCoupled(SolverBase, CouplingInterface):
         if not cfg.shapes:
             visible_bodies.update(int(i) for i in cfg.bodies)
         visible.update(self._entry_visible_shapes(cfg, visible_bodies))
-        if not visible:
-            return
-
-        collision_mask = int(ShapeFlags.COLLIDE_SHAPES | ShapeFlags.COLLIDE_PARTICLES | ShapeFlags.HYDROELASTIC)
         hidden = [shape for shape in range(model.shape_count) if shape not in visible]
         shape_flags = view._cow_array("shape_flags")
         if hidden:
             wp.launch(
-                _clear_shape_collision_flags_kernel,
+                _clear_shape_flags_kernel,
                 dim=len(hidden),
-                inputs=[wp.array(hidden, dtype=int, device=model.device), collision_mask],
+                inputs=[wp.array(hidden, dtype=int, device=model.device)],
                 outputs=[shape_flags],
                 device=model.device,
             )
