@@ -1300,17 +1300,24 @@ class LOXSolverConfig:
     """Whether to detect the vertex-triangle and edge-edge self-contacts of the deformable surfaces."""
 
     deformable_enable_normal_cone_filtering: bool = True
-    """Whether to keep only the self-contacts whose direction lies in the normal cone of their surface features."""
+    """Whether to keep only the self-contacts whose direction lies in the normal cones of the surface features of
+    both primitives.
+
+    A contact on a concave feature, such as a crease edge or a pit vertex, keeps the face normal of that feature.
+    """
 
     deformable_enable_rigid_contact_normal_cone_filtering: bool = False
-    """Whether to keep only the full-surface rigid-soft contacts whose direction lies in the normal cone of their
-    surface feature."""
+    """Whether to keep only the full-surface rigid-soft contacts whose direction lies in the normal cones of the
+    particle feature and of the collider mesh feature.
+
+    A contact on a concave feature keeps the face normal of that feature; analytic colliders admit every direction.
+    """
 
     deformable_normal_cone_filtering_min_distance: float = 1.0e-4
     """Separation below which the contacts bypass the normal-cone filters [m]."""
 
     deformable_self_contact_margin: float = 0.2
-    """Detection margin of the self-contacts [m]."""
+    """Detection margin and target separation of the self-contacts [m]."""
 
     deformable_self_contact_gap: float = 0.001
     """Speculative self-contact distance [m]."""
@@ -1324,9 +1331,6 @@ class LOXSolverConfig:
     deformable_self_contact_topological_filter_threshold: int = 1
     """Mesh-ring distance within which the self-contact candidates are excluded."""
 
-    deformable_self_contact_rest_exclusion_radius: float = 0.0
-    """Rest-pose distance within which the self-contact candidates are excluded [m]."""
-
     deformable_self_contact_edge_parallel_epsilon: float = 1.0e-5
     """Tolerance that classifies nearly parallel surface edges in the self-contact detection."""
 
@@ -1338,6 +1342,12 @@ class LOXSolverConfig:
 
     deformable_penetration_free_contact_relaxation: float = 0.85
     """Safety relaxation of the deformable directional step bounds."""
+
+    deformable_self_contact_stabilization: float = 0.02
+    """Fraction of the self-contact separation deficit recovered in one step."""
+
+    deformable_self_contact_max_separation_velocity: float = 1.0
+    """Largest normal velocity that recovers the self-contact separation [m/s]."""
 
     position_tolerance: float = 1.0e-5
     """Translational end-of-step convergence tolerance [m].
@@ -1674,7 +1684,6 @@ class LOXSolverConfig:
             "deformable_normal_cone_filtering_min_distance",
             "deformable_self_contact_margin",
             "deformable_self_contact_gap",
-            "deformable_self_contact_rest_exclusion_radius",
         ):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) < 0.0:
                 raise ValueError(f"Invalid {name}: {getattr(self, name)}. Must be finite and nonnegative.")
@@ -1702,6 +1711,22 @@ class LOXSolverConfig:
             raise ValueError(
                 f"Invalid deformable_hessian_regularization: {self.deformable_hessian_regularization}. "
                 "Must be greater than zero."
+            )
+        if (
+            not np.isfinite(self.deformable_self_contact_stabilization)
+            or self.deformable_self_contact_stabilization < 0.0
+            or self.deformable_self_contact_stabilization > 1.0
+        ):
+            raise ValueError(
+                "Invalid deformable_self_contact_stabilization: "
+                f"{self.deformable_self_contact_stabilization}. Must be in range [0, 1]."
+            )
+        if np.isnan(self.deformable_self_contact_max_separation_velocity) or not (
+            self.deformable_self_contact_max_separation_velocity > 0.0
+        ):
+            raise ValueError(
+                "Invalid deformable_self_contact_max_separation_velocity: "
+                f"{self.deformable_self_contact_max_separation_velocity}. Must be greater than zero."
             )
         if (
             not np.isfinite(self.deformable_penetration_free_contact_relaxation)

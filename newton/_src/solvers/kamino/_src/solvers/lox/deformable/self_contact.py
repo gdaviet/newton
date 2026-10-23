@@ -6,7 +6,8 @@
 :class:`DeformableSelfContacts` detects the vertex-triangle and edge-edge proximity
 candidates of the deformable surfaces with VBD's triangle-mesh collision detector at the
 beginning of each time step, keeps those whose direction lies in the normal cones of
-their surface features, and writes them as particle contact rows after the rigid-soft
+the surface features on both sides (with the face normal of a concave feature), and
+writes them as particle contact rows after the rigid-soft
 rows. A vertex-triangle row couples the vertex with coefficient one and the triangle
 vertices with their negated barycentric coordinates; an edge-edge row couples the two
 edges with their opposite interpolation coefficients.
@@ -31,11 +32,12 @@ from ....geometry.contacts import make_contact_frame_znorm
 from ..contact import compute_contact_velocity_target
 from ..types import ParticleContactStatus
 from .contact_filter import (
+    CONTACT_CONE_INSIDE,
+    CONTACT_CONE_OUTSIDE,
+    CONTACT_CONE_PENETRATING,
     SOFT_CONTACT_GEOMETRY_EPSILON,
-    _compute_edge_normal_cones,
-    edge_feature_normal_cone_contains,
-    triangle_feature_normal_cone_contains,
-    vertex_normal_cone_contains,
+    classify_surface_contact,
+    surface_point_is_behind,
 )
 
 if TYPE_CHECKING:
@@ -79,6 +81,33 @@ class _SurfaceCollisionModel:
 
 
 @wp.func
+def _pair_normal(
+    first_verdict: int,
+    first_face_normal: wp.vec3,
+    second_verdict: int,
+    second_face_normal: wp.vec3,
+    normal: wp.vec3,
+):
+    """Select whether a self-contact keeps its row and the normal from the second towards the first primitive.
+
+    A penetrated feature keeps the contact along its outward normal whatever the other feature;
+    otherwise a feature outside its cone drops the contact, and a concave feature presses along
+    its face normal.
+    """
+    if first_verdict == CONTACT_CONE_PENETRATING:
+        return True, -first_face_normal
+    if second_verdict == CONTACT_CONE_PENETRATING:
+        return True, second_face_normal
+    if first_verdict == CONTACT_CONE_OUTSIDE or second_verdict == CONTACT_CONE_OUTSIDE:
+        return False, normal
+    if first_verdict != CONTACT_CONE_INSIDE:
+        return True, -first_face_normal
+    if second_verdict != CONTACT_CONE_INSIDE:
+        return True, second_face_normal
+    return True, normal
+
+
+@wp.func
 def _write_self_contact(
     row: int,
     source_particles: wp.vec4i,
@@ -92,6 +121,7 @@ def _write_self_contact(
     particle_inverse_weight: wp.array[wp.float32],
     model_time_dt: wp.array[wp.float32],
     stabilization_fraction: wp.float32,
+    max_separation_velocity: wp.float32,
     dead_zone: wp.float32,
     friction: wp.float32,
     restitution: wp.float32,
@@ -104,7 +134,10 @@ def _write_self_contact(
     row_bias: wp.array[wp.vec3f],
     row_friction: wp.array[wp.float32],
 ):
-    """Write one self-contact row; the prescribed particles enter its bias."""
+    """Write one self-contact row; the prescribed particles enter its bias.
+
+    The separation recovery of a row closer than its target stays within the largest separation velocity.
+    """
     wid = int(-1)
     relative_velocity = wp.vec3f(0.0)
     prescribed_velocity = wp.vec3f(0.0)
@@ -123,8 +156,12 @@ def _write_self_contact(
             relative_velocity += coefficient * particle_qd[source_particle]
             if particle_inverse_weight[pid] <= 0.0:
                 prescribed_velocity += coefficient * particle_qd[source_particle]
+    time_step = model_time_dt[wid]
+    recovery_gap = gap
+    if stabilization_fraction > 0.0:
+        recovery_gap = wp.max(gap, -(max_separation_velocity * time_step / stabilization_fraction + dead_zone))
     velocity_target = compute_contact_velocity_target(
-        gap, wp.dot(normal, relative_velocity), restitution, model_time_dt[wid], stabilization_fraction, dead_zone
+        recovery_gap, wp.dot(normal, relative_velocity), restitution, time_step, stabilization_fraction, dead_zone
     )
     frame = make_contact_frame_znorm(normal)
     row_world[row] = wid
@@ -180,19 +217,18 @@ def _load_self_contacts(
     tri_indices: wp.array2d[wp.int32],
     edge_indices: wp.array2d[wp.int32],
     adjacency: MeshAdjacencyData,
-    edge_cone_axis: wp.array[wp.vec3f],
-    edge_cone_cosine: wp.array[wp.float32],
+    face_side: wp.array[wp.float32],
     normal_cone_filtering: wp.bool,
     normal_cone_filtering_min_distance: wp.float32,
     newton_to_packed: wp.array[wp.int32],
     particle_world: wp.array[wp.int32],
     particle_inverse_weight: wp.array[wp.float32],
-    rest_exclusion_radius: wp.float32,
     margin: wp.float32,
     gap: wp.float32,
     edge_parallel_epsilon: wp.float32,
     model_time_dt: wp.array[wp.float32],
     stabilization_fraction: wp.float32,
+    max_separation_velocity: wp.float32,
     dead_zone: wp.float32,
     friction: wp.float32,
     restitution: wp.float32,
@@ -212,8 +248,8 @@ def _load_self_contacts(
 ):
     """Load the filtered vertex-triangle and edge-edge candidates of the time step into self-contact rows.
 
-    The candidates within the rest exclusion radius, beyond the detection distance, or outside the
-    normal cones of their surface features leave their rows unused.
+    Each row targets the margin. The candidates beyond the detection distance or outside the normal
+    cones of their surface features leave their rows unused.
     """
     candidate = wp.tid()
     row = row_offset + candidate
@@ -242,44 +278,74 @@ def _load_self_contacts(
         closest, barycentric, _feature = triangle_closest_point(
             particle_q[triangle_0], particle_q[triangle_1], particle_q[triangle_2], particle_q[vertex]
         )
-        if rest_exclusion_radius > 0.0:
-            rest_closest, _rest_barycentric, _rest_feature = triangle_closest_point(
-                particle_q_rest[triangle_0],
-                particle_q_rest[triangle_1],
-                particle_q_rest[triangle_2],
-                particle_q_rest[vertex],
-            )
-            if wp.length(particle_q_rest[vertex] - rest_closest) < rest_exclusion_radius:
-                return
         difference = particle_q[vertex] - closest
         distance = wp.length(difference)
         if distance <= SOFT_CONTACT_GEOMETRY_EPSILON or distance >= margin + gap:
             return
         normal = difference / distance
         if normal_cone_filtering and distance > normal_cone_filtering_min_distance:
-            # Each cone is tested from its feature toward the opposing point; the normal
-            # points from the triangle towards the vertex.
-            if not vertex_normal_cone_contains(vertex, -normal, particle_q, edge_indices, adjacency):
+            # A pair facing across the interior of a soft body in the rest pose is no contact
+            rest_closest, rest_barycentric, _rest_feature = triangle_closest_point(
+                particle_q_rest[triangle_0],
+                particle_q_rest[triangle_1],
+                particle_q_rest[triangle_2],
+                particle_q_rest[vertex],
+            )
+            if surface_point_is_behind(
+                wp.vec3i(triangle_0, triangle_1, triangle_2),
+                rest_barycentric,
+                rest_closest,
+                particle_q_rest[vertex],
+                particle_q_rest,
+                tri_indices,
+                edge_indices,
+                adjacency,
+                face_side,
+            ) or surface_point_is_behind(
+                wp.vec3i(vertex, -1, -1),
+                wp.vec3(1.0, 0.0, 0.0),
+                particle_q_rest[vertex],
+                rest_closest,
+                particle_q_rest,
+                tri_indices,
+                edge_indices,
+                adjacency,
+                face_side,
+            ):
                 return
-            if not triangle_feature_normal_cone_contains(
-                triangle_0,
-                triangle_1,
-                triangle_2,
+            # Each feature is tested with the direction towards the other primitive; the normal
+            # points from the triangle towards the vertex.
+            vertex_verdict, vertex_face_normal = classify_surface_contact(
+                wp.vec3i(vertex, -1, -1),
+                wp.vec3(1.0, 0.0, 0.0),
+                -normal,
+                particle_q,
+                tri_indices,
+                edge_indices,
+                adjacency,
+                face_side,
+            )
+            triangle_verdict, triangle_face_normal = classify_surface_contact(
+                wp.vec3i(triangle_0, triangle_1, triangle_2),
                 barycentric,
                 normal,
                 particle_q,
+                tri_indices,
                 edge_indices,
                 adjacency,
-                edge_cone_axis,
-                edge_cone_cosine,
-            ):
+                face_side,
+            )
+            keep, normal = _pair_normal(
+                vertex_verdict, vertex_face_normal, triangle_verdict, triangle_face_normal, normal
+            )
+            if not keep:
                 return
         _write_self_contact(
             row,
             wp.vec4i(triangle_0, triangle_1, triangle_2, vertex),
             wp.vec4f(-barycentric[0], -barycentric[1], -barycentric[2], 1.0),
             normal,
-            distance - margin,
+            wp.dot(normal, difference) - margin,
             particle_qd,
             particle_flags,
             newton_to_packed,
@@ -287,6 +353,7 @@ def _load_self_contacts(
             particle_inverse_weight,
             model_time_dt,
             stabilization_fraction,
+            max_separation_velocity,
             dead_zone,
             friction,
             restitution,
@@ -311,16 +378,6 @@ def _load_self_contacts(
     edge_0_vertex_1 = edge_indices[edge_0, 3]
     edge_1_vertex_0 = edge_indices[edge_1, 2]
     edge_1_vertex_1 = edge_indices[edge_1, 3]
-    if rest_exclusion_radius > 0.0:
-        rest_closest = wp.closest_point_edge_edge(
-            particle_q_rest[edge_0_vertex_0],
-            particle_q_rest[edge_0_vertex_1],
-            particle_q_rest[edge_1_vertex_0],
-            particle_q_rest[edge_1_vertex_1],
-            edge_parallel_epsilon,
-        )
-        if rest_closest[2] < rest_exclusion_radius:
-            return
     closest = wp.closest_point_edge_edge(
         particle_q[edge_0_vertex_0],
         particle_q[edge_0_vertex_1],
@@ -337,21 +394,74 @@ def _load_self_contacts(
     point_1 = (1.0 - parameter_1) * particle_q[edge_1_vertex_0] + parameter_1 * particle_q[edge_1_vertex_1]
     normal = (point_0 - point_1) / distance
     if normal_cone_filtering and distance > normal_cone_filtering_min_distance:
-        # The normal points from edge 1 towards edge 0, opposite the feature-to-query direction of edge 0
-        if not edge_feature_normal_cone_contains(
-            edge_0, parameter_0, -normal, particle_q, edge_indices, adjacency, edge_cone_axis, edge_cone_cosine
+        # A pair facing across the interior of a soft body in the rest pose is no contact
+        rest_closest = wp.closest_point_edge_edge(
+            particle_q_rest[edge_0_vertex_0],
+            particle_q_rest[edge_0_vertex_1],
+            particle_q_rest[edge_1_vertex_0],
+            particle_q_rest[edge_1_vertex_1],
+            edge_parallel_epsilon,
+        )
+        rest_parameter_0 = rest_closest[0]
+        rest_parameter_1 = rest_closest[1]
+        rest_point_0 = (1.0 - rest_parameter_0) * particle_q_rest[edge_0_vertex_0] + rest_parameter_0 * particle_q_rest[
+            edge_0_vertex_1
+        ]
+        rest_point_1 = (1.0 - rest_parameter_1) * particle_q_rest[edge_1_vertex_0] + rest_parameter_1 * particle_q_rest[
+            edge_1_vertex_1
+        ]
+        if surface_point_is_behind(
+            wp.vec3i(edge_0_vertex_0, edge_0_vertex_1, -1),
+            wp.vec3(1.0 - rest_parameter_0, rest_parameter_0, 0.0),
+            rest_point_0,
+            rest_point_1,
+            particle_q_rest,
+            tri_indices,
+            edge_indices,
+            adjacency,
+            face_side,
+        ) or surface_point_is_behind(
+            wp.vec3i(edge_1_vertex_0, edge_1_vertex_1, -1),
+            wp.vec3(1.0 - rest_parameter_1, rest_parameter_1, 0.0),
+            rest_point_1,
+            rest_point_0,
+            particle_q_rest,
+            tri_indices,
+            edge_indices,
+            adjacency,
+            face_side,
         ):
             return
-        if not edge_feature_normal_cone_contains(
-            edge_1, parameter_1, normal, particle_q, edge_indices, adjacency, edge_cone_axis, edge_cone_cosine
-        ):
+        # The normal points from edge 1 towards edge 0, so edge 0 sees the other edge along its opposite
+        verdict_0, face_normal_0 = classify_surface_contact(
+            wp.vec3i(edge_0_vertex_0, edge_0_vertex_1, -1),
+            wp.vec3(1.0 - parameter_0, parameter_0, 0.0),
+            -normal,
+            particle_q,
+            tri_indices,
+            edge_indices,
+            adjacency,
+            face_side,
+        )
+        verdict_1, face_normal_1 = classify_surface_contact(
+            wp.vec3i(edge_1_vertex_0, edge_1_vertex_1, -1),
+            wp.vec3(1.0 - parameter_1, parameter_1, 0.0),
+            normal,
+            particle_q,
+            tri_indices,
+            edge_indices,
+            adjacency,
+            face_side,
+        )
+        keep, normal = _pair_normal(verdict_0, face_normal_0, verdict_1, face_normal_1, normal)
+        if not keep:
             return
     _write_self_contact(
         row,
         wp.vec4i(edge_0_vertex_0, edge_0_vertex_1, edge_1_vertex_0, edge_1_vertex_1),
         wp.vec4f(1.0 - parameter_0, parameter_0, -1.0 + parameter_1, -parameter_1),
         normal,
-        distance - margin,
+        wp.dot(normal, point_0 - point_1) - margin,
         particle_qd,
         particle_flags,
         newton_to_packed,
@@ -359,6 +469,7 @@ def _load_self_contacts(
         particle_inverse_weight,
         model_time_dt,
         stabilization_fraction,
+        max_separation_velocity,
         dead_zone,
         friction,
         restitution,
@@ -383,16 +494,20 @@ class DeformableSelfContacts:
 
     Args:
         model: Newton model of the deformable bodies.
-        margin: Detection margin of the self-contacts [m].
+        margin: Detection margin and target separation of the self-contacts [m].
         gap: Speculative self-contact distance [m].
         vertex_buffer_size: Largest number of candidate triangles of each surface vertex.
         edge_buffer_size: Largest number of candidate edges of each surface edge.
         topological_filter_threshold: Mesh-ring distance within which the candidates are excluded.
-        rest_exclusion_radius: Rest-pose distance within which the candidates are excluded [m].
         edge_parallel_epsilon: Tolerance that classifies nearly parallel edges.
+        stabilization_fraction: Fraction of the separation deficit recovered in one step.
+        max_separation_velocity: Largest normal velocity that recovers the separation [m/s].
         normal_cone_filtering: Whether to keep only the candidates in the normal cones of their surface features.
         normal_cone_filtering_min_distance: Separation below which the candidates bypass the normal-cone
             filter [m].
+        record_triangle_distances: Whether the detector reduces the smallest vertex distance of each triangle.
+        face_side: Side of each surface triangle (zero for cloth, outward sign for a soft body boundary),
+            or ``None`` for two-sided triangles.
     """
 
     def __init__(
@@ -404,19 +519,27 @@ class DeformableSelfContacts:
         vertex_buffer_size: int,
         edge_buffer_size: int,
         topological_filter_threshold: int,
-        rest_exclusion_radius: float,
         edge_parallel_epsilon: float,
+        stabilization_fraction: float,
+        max_separation_velocity: float,
         normal_cone_filtering: bool = True,
         normal_cone_filtering_min_distance: float = 1.0e-4,
+        record_triangle_distances: bool = False,
+        face_side: wp.array[wp.float32] | None = None,
     ):
         if model.tri_count < 1:
             raise ValueError("LOX deformable self-contacts require a triangulated surface.")
         self.model = model
         self.device = wp.get_device(model.device)
+        if face_side is None:
+            face_side = wp.zeros(model.tri_count, dtype=wp.float32, device=self.device)
+        self.face_side = face_side
+        """Side of each surface triangle; zero for a two-sided triangle."""
         self.margin = float(margin)
         self.gap = float(gap)
-        self.rest_exclusion_radius = float(rest_exclusion_radius)
         self.edge_parallel_epsilon = float(edge_parallel_epsilon)
+        self.stabilization_fraction = float(stabilization_fraction)
+        self.max_separation_velocity = float(max_separation_velocity)
         self.normal_cone_filtering = normal_cone_filtering
         self.normal_cone_filtering_min_distance = float(normal_cone_filtering_min_distance)
         self.vertex_buffer_size = vertex_buffer_size
@@ -427,14 +550,10 @@ class DeformableSelfContacts:
         self.edge_indices = wp.array(surface_adjacency.edge_indices, dtype=wp.int32, device=self.device)
         """Surface edges as ``(opposite_0, opposite_1, vertex_0, vertex_1)``."""
         self.adjacency = surface_adjacency.to(self.device)
-        """Vertex adjacency of the surface edges."""
-        edge_count = self.edge_indices.shape[0]
-        self.edge_cone_axis = wp.zeros(edge_count, dtype=wp.vec3f, device=self.device)
-        """Normal-cone axis of each surface edge."""
-        self.edge_cone_cosine = wp.full(edge_count, -1.0, dtype=wp.float32, device=self.device)
-        """Cosine of the normal-cone half angle of each surface edge, or ``-1`` for an unavailable cone."""
+        """Vertex, edge, and triangle adjacency of the surface."""
         self.detector = TriMeshCollisionDetector(
             _SurfaceCollisionModel(model, self.edge_indices, surface_adjacency),
+            record_triangle_contacting_vertices=record_triangle_distances,
             init_collision_info=True,
             vertex_collision_buffer_pre_alloc=vertex_buffer_size,
             edge_collision_buffer_pre_alloc=edge_buffer_size,
@@ -458,26 +577,10 @@ class DeformableSelfContacts:
         """Refit the proximity structures and freeze the candidates of the time step."""
         detector = self.detector
         detector.resize_flags.zero_()
-        if self.normal_cone_filtering:
-            wp.launch(
-                _compute_edge_normal_cones,
-                dim=self.edge_indices.shape[0],
-                inputs=[particle_q, self.edge_indices],
-                outputs=[self.edge_cone_axis, self.edge_cone_cosine],
-                device=self.device,
-            )
         query_radius = self.margin + self.gap
         detector.refit(particle_q)
-        detector.vertex_triangle_collision_detection(
-            query_radius,
-            min_query_radius=self.rest_exclusion_radius,
-            min_distance_filtering_ref_pos=self.model.particle_q,
-        )
-        detector.edge_edge_collision_detection(
-            query_radius,
-            min_query_radius=self.rest_exclusion_radius,
-            min_distance_filtering_ref_pos=self.model.particle_q,
-        )
+        detector.vertex_triangle_collision_detection(query_radius)
+        detector.edge_edge_collision_detection(query_radius)
         wp.launch(
             _warn_candidate_buffer_overflow,
             dim=1,
@@ -495,7 +598,6 @@ class DeformableSelfContacts:
         particle_world: wp.array[wp.int32],
         particle_inverse_weight: wp.array[wp.float32],
         time_step: wp.array[wp.float32],
-        stabilization_fraction: float,
         dead_zone: float,
     ) -> None:
         """Load the detected candidates into the self-contact rows, after the rigid-soft rows.
@@ -508,7 +610,6 @@ class DeformableSelfContacts:
             particle_world: World of each packed particle.
             particle_inverse_weight: Inverse weight of each packed particle; zero for prescribed particles.
             time_step: Time step of each world [s].
-            stabilization_fraction: Fraction of the contact penetration corrected in one step.
             dead_zone: Symmetric contact distance dead zone of the stabilization [m].
         """
         if self.capacity == 0:
@@ -529,19 +630,18 @@ class DeformableSelfContacts:
                 model.tri_indices,
                 self.edge_indices,
                 self.adjacency,
-                self.edge_cone_axis,
-                self.edge_cone_cosine,
+                self.face_side,
                 self.normal_cone_filtering,
                 self.normal_cone_filtering_min_distance,
                 newton_to_packed,
                 particle_world,
                 particle_inverse_weight,
-                self.rest_exclusion_radius,
                 self.margin,
                 self.gap,
                 self.edge_parallel_epsilon,
                 time_step,
-                stabilization_fraction,
+                self.stabilization_fraction,
+                self.max_separation_velocity,
                 dead_zone,
                 float(model.soft_contact_mu),
                 float(model.soft_contact_restitution),

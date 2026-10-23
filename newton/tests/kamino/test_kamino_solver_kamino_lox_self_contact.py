@@ -205,7 +205,10 @@ def _truncate_velocity(solver: SolverKamino, velocity: np.ndarray, time_step: wp
     topology = deformables.topology
     projected_velocity = lox.data.particles.projected_velocity
     projected_velocity.assign(velocity[topology.packed_to_newton.numpy()])
-    deformables.penetration_limiter.truncate(projected_velocity, lox.data.state.world_active, time_step)
+    state = lox.data.state
+    deformables.penetration_limiter.truncate(
+        projected_velocity, state.world_active, time_step, state.projected_twist, state.global_twist, 0.0
+    )
     return projected_velocity.numpy()[topology.newton_to_packed.numpy()]
 
 

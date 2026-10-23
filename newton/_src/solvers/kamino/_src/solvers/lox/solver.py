@@ -1036,8 +1036,14 @@ class LOXSolver:
             particles.projected_velocity if particles is not None else None,
         )
         if particles is not None:
+            state = self._data.state
             self._deformables.limit_penetration(
-                particles.projected_velocity, self._data.state.world_active, self._model.time.dt
+                particles.projected_velocity,
+                state.world_active,
+                self._model.time.dt,
+                state.projected_twist,
+                state.global_twist,
+                self._config.projected_twist_fraction,
             )
 
     def _update_multipliers(self) -> None:

@@ -17,9 +17,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import warp as wp
 
+from .......geometry.flags import ShapeFlags
+from .......geometry.types import GeoType
+from .......utils.mesh import MeshAdjacency
 from ....core.materials import MaterialMixMode
 from ....core.types import vec6f
-from .contact_filter import _compute_edge_normal_cones
 from .contact_kernels import _finish_particle_contacts, _load_particle_contacts
 
 if TYPE_CHECKING:
@@ -32,7 +34,7 @@ if TYPE_CHECKING:
 # Module interface
 ###
 
-__all__ = ["DeformableContacts"]
+__all__ = ["ColliderMeshTopology", "DeformableContacts"]
 
 ###
 # Module configs
@@ -44,6 +46,69 @@ wp.set_module_options({"enable_backward": False})
 ###
 # Interfaces
 ###
+
+
+class ColliderMeshTopology:
+    """Scaled triangles and adjacency of the collider meshes, which classify the rigid side of the contacts.
+
+    The meshes of the particle-colliding mesh shapes are concatenated in their shape frames, with the
+    shape scale applied; each shape addresses its triangles from an offset, and the other shapes have
+    the offset ``-1``.
+
+    Args:
+        model: Newton model whose mesh shapes collide with the particles.
+        include_shapes: Whether to gather the mesh shapes, which reads the shape arrays on the host;
+            otherwise only the placeholder of the kernel arguments is built.
+    """
+
+    def __init__(self, model: Model, include_shapes: bool = True):
+        device = wp.get_device(model.device)
+        shape_count = int(model.shape_count)
+        tri_offset = np.full(max(shape_count, 1), -1, dtype=np.int32)
+        positions = []
+        triangles = []
+        vertex_count = 0
+        triangle_count = 0
+        if include_shapes and shape_count > 0:
+            meshes = {int(mesh.id): mesh for mesh in getattr(model, "_mesh_keep_alive", [])}
+            shape_type = model.shape_type.numpy()
+            shape_flags = model.shape_flags.numpy()
+            shape_source = model.shape_source_ptr.numpy()
+            shape_scale = model.shape_scale.numpy()
+            for shape in range(shape_count):
+                if shape_type[shape] not in (int(GeoType.MESH), int(GeoType.CONVEX_MESH)):
+                    continue
+                if (int(shape_flags[shape]) & int(ShapeFlags.COLLIDE_PARTICLES)) == 0:
+                    continue
+                mesh = meshes.get(int(shape_source[shape]))
+                if mesh is None:
+                    continue
+                points = mesh.points.numpy().astype(np.float32) * shape_scale[shape].astype(np.float32)
+                indices = mesh.indices.numpy().astype(np.int32).reshape(-1, 3)
+                tri_offset[shape] = triangle_count
+                positions.append(points)
+                triangles.append(indices + vertex_count)
+                vertex_count += len(points)
+                triangle_count += len(indices)
+        if not triangles:
+            # A placeholder triangle keeps the arrays valid; no shape addresses it
+            positions.append(np.eye(3, dtype=np.float32))
+            triangles.append(np.array([[0, 1, 2]], dtype=np.int32))
+        positions = np.concatenate(positions)
+        triangles = np.concatenate(triangles)
+        adjacency = MeshAdjacency(tri_indices=triangles).init_vertex_adjacency(len(positions))
+        self.position = wp.array(positions, dtype=wp.vec3f, device=device)
+        """Vertex positions of the concatenated collider meshes in their scaled shape frames."""
+        self.tri_indices = wp.array(triangles, dtype=wp.int32, device=device)
+        """Triangles of the concatenated collider meshes."""
+        self.edge_indices = wp.array(adjacency.edge_indices, dtype=wp.int32, device=device)
+        """Edges of the concatenated collider meshes as ``(opposite_0, opposite_1, vertex_0, vertex_1)``."""
+        self.adjacency = adjacency.to(device)
+        """Vertex, edge, and triangle adjacency of the concatenated collider meshes."""
+        self.shape_tri_offset = wp.array(tri_offset, dtype=wp.int32, device=device)
+        """First triangle of each collider mesh shape, or ``-1`` for the other shapes."""
+        self.face_side = wp.ones(len(triangles), dtype=wp.float32, device=device)
+        """Side of each collider triangle; the collider meshes are wound outwards."""
 
 
 class DeformableContacts:
@@ -60,9 +125,14 @@ class DeformableContacts:
         friction_mix_mode: Mixing of the soft contact and shape friction coefficients.
         restitution_mix_mode: Mixing of the soft contact and shape restitution coefficients.
         rigid_normal_cone_filtering: Whether to keep only the full-surface rigid-soft contacts whose
-            direction lies in the normal cone of their surface feature.
+            direction lies in the normal cones of the features of both primitives, with the face
+            normal of a concave feature.
         normal_cone_filtering_min_distance: Separation below which the contacts bypass the normal-cone
             filter [m].
+        collider_topology: Collider mesh topology of the rigid side of the filter, or ``None`` to classify
+            the particle side only.
+        face_side: Side of each particle surface triangle (zero for cloth, outward sign for a soft body
+            boundary), or ``None`` for two-sided triangles.
     """
 
     def __init__(
@@ -77,6 +147,8 @@ class DeformableContacts:
         restitution_mix_mode: MaterialMixMode = MaterialMixMode.MIN,
         rigid_normal_cone_filtering: bool = False,
         normal_cone_filtering_min_distance: float = 1.0e-4,
+        collider_topology: ColliderMeshTopology | None = None,
+        face_side: wp.array[wp.float32] | None = None,
     ):
         self.model = model
         self.kamino_model = kamino_model
@@ -95,12 +167,14 @@ class DeformableContacts:
             raise ValueError("The soft contact friction of the model must be finite and nonnegative.")
         if not np.isfinite(self.soft_restitution) or self.soft_restitution < 0.0:
             raise ValueError("The soft contact restitution of the model must be finite and nonnegative.")
-        edge_count = model.edge_count
-        self.edge_cone_axis = wp.zeros(edge_count, dtype=wp.vec3f, device=self.device)
-        """Normal-cone axis of each surface edge."""
-        self.edge_cone_cosine = wp.full(edge_count, -1.0, dtype=wp.float32, device=self.device)
-        """Cosine of the normal-cone half angle of each surface edge, or ``-1`` for an unavailable cone."""
+        if collider_topology is None:
+            collider_topology = ColliderMeshTopology(model, include_shapes=rigid_normal_cone_filtering)
+        self.collider_topology = collider_topology
+        if face_side is None:
+            face_side = wp.zeros(max(int(model.tri_count), 1), dtype=wp.float32, device=self.device)
+        self.face_side = face_side
         self._empty_edge_indices = wp.empty((0, 4), dtype=wp.int32, device=self.device)
+        self._empty_tri_indices = wp.empty((0, 3), dtype=wp.int32, device=self.device)
         self._empty_body_com = wp.empty(0, dtype=wp.vec3f, device=self.device)
 
     ###
@@ -145,20 +219,14 @@ class DeformableContacts:
             rows.status[: rows.rigid_capacity].zero_()
             return
         model = self.model
+        # The cone filter needs every feature record of the surfaces, which full-surface contacts provide
         filter_surface_contacts = bool(
             self.rigid_normal_cone_filtering
             and contacts._enable_rigid_soft_full_surface_contact
             and model.tri_count > 0
             and model.edge_count > 0
         )
-        if filter_surface_contacts:
-            wp.launch(
-                _compute_edge_normal_cones,
-                dim=model.edge_count,
-                inputs=[particle_q, model.edge_indices],
-                outputs=[self.edge_cone_axis, self.edge_cone_cosine],
-                device=self.device,
-            )
+        topology = self.collider_topology
         capacity = min(rows.rigid_capacity, contacts.soft_contact_max)
         if capacity < rows.rigid_capacity:
             rows.status[capacity : rows.rigid_capacity].zero_()
@@ -173,10 +241,19 @@ class DeformableContacts:
                 contacts.soft_contact_body_pos,
                 contacts.soft_contact_body_vel,
                 contacts.soft_contact_normal,
+                model.tri_indices if model.tri_indices is not None else self._empty_tri_indices,
                 model.edge_indices if model.edge_indices is not None else self._empty_edge_indices,
                 model.soft_mesh_adjacency_device,
-                self.edge_cone_axis,
-                self.edge_cone_cosine,
+                self.face_side,
+                topology.position,
+                topology.tri_indices,
+                topology.edge_indices,
+                topology.adjacency,
+                topology.face_side,
+                topology.shape_tri_offset,
+                model.shape_source_ptr,
+                model.shape_transform,
+                model.shape_scale,
                 filter_surface_contacts,
                 self.normal_cone_filtering_min_distance,
                 particle_q,

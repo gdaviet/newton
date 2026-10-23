@@ -240,7 +240,10 @@ rigid contacts and transfer their reactions to dynamic bodies. Set
 vertex-triangle and edge-edge self-contacts of the deformable surfaces, and
 ``config.lox.deformable_enable_penetration_free_contact=True`` to truncate the
 particle steps against the self-contact candidates so that the surfaces keep
-their sides.
+their sides. The self-contact rows target the separation
+``config.lox.deformable_self_contact_margin`` and recover a deficit by the fraction
+``config.lox.deformable_self_contact_stabilization`` per step, at most at
+``config.lox.deformable_self_contact_max_separation_velocity``.
 
 LOX deformables support particles, triangles, bending edges, and tetrahedra;
 models with springs or muscles are rejected. Global particles require a single

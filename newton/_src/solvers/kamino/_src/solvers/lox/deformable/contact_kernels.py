@@ -21,7 +21,12 @@ from ....geometry.contacts import make_contact_frame_znorm
 from ..contact import compute_contact_velocity_target
 from ..projection_kernels import PARTICLE_COEFFICIENT_TOLERANCE
 from ..types import ParticleContactStatus
-from .contact_filter import soft_surface_contact_normal_cone_contains
+from .contact_filter import (
+    CONTACT_CONE_INSIDE,
+    CONTACT_CONE_OUTSIDE,
+    CONTACT_CONE_PENETRATING,
+    classify_surface_contact,
+)
 
 ###
 # Module interface
@@ -236,6 +241,56 @@ def _prepare_soft_contact_collider(
     return result
 
 
+@wp.func
+def _classify_collider_contact(
+    shape: wp.int32,
+    body: wp.int32,
+    body_point: wp.vec3f,
+    normal: wp.vec3f,
+    data_bodies_q_i: wp.array[wp.transformf],
+    shape_transform: wp.array[wp.transformf],
+    shape_scale: wp.array[wp.vec3f],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_tri_offset: wp.array[wp.int32],
+    collider_position: wp.array[wp.vec3f],
+    collider_tri_indices: wp.array2d[wp.int32],
+    collider_edge_indices: wp.array2d[wp.int32],
+    collider_adjacency: MeshAdjacencyData,
+    collider_face_side: wp.array[wp.float32],
+):
+    """Classify the contact normal against the collider mesh feature of a rigid-soft contact point.
+
+    The collider point is located on its mesh in the scaled shape frame. Shapes without a collider
+    mesh admit every direction.
+
+    Returns:
+        The cone verdict, and for a concave or penetrated feature its outward face normal in world frame.
+    """
+    tri_offset = shape_tri_offset[shape]
+    if tri_offset < 0:
+        return CONTACT_CONE_INSIDE, wp.vec3f(0.0)
+    X_bs = shape_transform[shape]
+    rotation = wp.transform_get_rotation(X_bs)
+    if body >= 0:
+        rotation = wp.transform_get_rotation(data_bodies_q_i[body]) * rotation
+    local_point = wp.transform_point(wp.transform_inverse(X_bs), body_point)
+    query = wp.mesh_query_point_no_sign(shape_source_ptr[shape], wp.cw_div(local_point, shape_scale[shape]), 1.0e6)
+    if not query.result:
+        return CONTACT_CONE_INSIDE, wp.vec3f(0.0)
+    face = tri_offset + query.face
+    verdict, face_normal = classify_surface_contact(
+        wp.vec3i(collider_tri_indices[face, 0], collider_tri_indices[face, 1], collider_tri_indices[face, 2]),
+        wp.vec3(query.u, query.v, 1.0 - query.u - query.v),
+        wp.quat_rotate_inv(rotation, normal),
+        collider_position,
+        collider_tri_indices,
+        collider_edge_indices,
+        collider_adjacency,
+        collider_face_side,
+    )
+    return verdict, wp.quat_rotate(rotation, face_normal)
+
+
 ###
 # Kernels
 ###
@@ -251,10 +306,19 @@ def _load_particle_contacts(
     contacts_soft_contact_body_pos: wp.array[wp.vec3f],
     contacts_soft_contact_body_vel: wp.array[wp.vec3f],
     contacts_soft_contact_normal: wp.array[wp.vec3f],
+    tri_indices: wp.array2d[wp.int32],
     edge_indices: wp.array2d[wp.int32],
     adjacency: MeshAdjacencyData,
-    edge_cone_axis: wp.array[wp.vec3f],
-    edge_cone_cosine: wp.array[wp.float32],
+    face_side: wp.array[wp.float32],
+    collider_position: wp.array[wp.vec3f],
+    collider_tri_indices: wp.array2d[wp.int32],
+    collider_edge_indices: wp.array2d[wp.int32],
+    collider_adjacency: MeshAdjacencyData,
+    collider_face_side: wp.array[wp.float32],
+    shape_tri_offset: wp.array[wp.int32],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_transform: wp.array[wp.transformf],
+    shape_scale: wp.array[wp.vec3f],
     filter_surface_contacts: wp.bool,
     normal_cone_filtering_min_distance: wp.float32,
     particle_q: wp.array[wp.vec3f],
@@ -297,8 +361,9 @@ def _load_particle_contacts(
     """Load each soft contact detected by Newton into its particle contact row.
 
     Malformed records leave their row unused; a contact between worlds fails its world
-    when the projection blocks are prepared. Contacts whose direction leaves the normal
-    cone of their surface feature are filtered out with ``filter_surface_contacts``.
+    when the projection blocks are prepared. With ``filter_surface_contacts``, a contact whose
+    direction leaves the normal cone of the particle feature or of the collider mesh feature is
+    filtered out, and a contact on a concave feature takes the face normal of that feature.
     """
     cid = wp.tid()
     for slot in range(4):
@@ -391,23 +456,45 @@ def _load_particle_contacts(
         return
 
     # At nearly coincident closest points, small positional errors can rotate the derived
-    # normal arbitrarily, so the filter keeps those contacts.
+    # normal arbitrarily, and a feature inside the collider recovers along its contact
+    # normal, so the filter keeps those contacts.
+    separation = feature.position - collider.position
     if (
         filter_surface_contacts
-        and wp.length(feature.position - collider.position) > normal_cone_filtering_min_distance
-        and not soft_surface_contact_normal_cone_contains(
-            source_particles,
-            source_coefficients,
-            -normal,
-            particle_q,
-            edge_indices,
-            adjacency,
-            edge_cone_axis,
-            edge_cone_cosine,
-        )
+        and wp.length(separation) > normal_cone_filtering_min_distance
+        and wp.dot(normal, separation) > 0.0
     ):
-        row_status[cid] = ParticleContactStatus.UNUSED
-        return
+        particle_verdict, particle_face_normal = classify_surface_contact(
+            source_particles, source_coefficients, -normal, particle_q, tri_indices, edge_indices, adjacency, face_side
+        )
+        if particle_verdict == CONTACT_CONE_OUTSIDE:
+            row_status[cid] = ParticleContactStatus.UNUSED
+            return
+        collider_verdict, collider_face_normal = _classify_collider_contact(
+            shape,
+            collider.body,
+            contacts_soft_contact_body_pos[cid],
+            normal,
+            data_bodies_q_i,
+            shape_transform,
+            shape_scale,
+            shape_source_ptr,
+            shape_tri_offset,
+            collider_position,
+            collider_tri_indices,
+            collider_edge_indices,
+            collider_adjacency,
+            collider_face_side,
+        )
+        # A collider point behind the particle surface recovers along its outward normal
+        if collider_verdict == CONTACT_CONE_OUTSIDE and particle_verdict != CONTACT_CONE_PENETRATING:
+            row_status[cid] = ParticleContactStatus.UNUSED
+            return
+        # A concave or penetrated feature presses along its face normal
+        if particle_verdict != CONTACT_CONE_INSIDE:
+            normal = -particle_face_normal
+        elif collider_verdict != CONTACT_CONE_INSIDE:
+            normal = collider_face_normal
 
     dt = model_time_dt[feature.world]
     gap = wp.dot(normal, feature.position - collider.position) - feature.radius - margin
