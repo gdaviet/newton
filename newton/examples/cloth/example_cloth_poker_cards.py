@@ -242,6 +242,7 @@ class Example:
             self.model,
             broad_phase="nxn",
             soft_contact_gap=0.005,  # m (0.5 cm)
+            enable_rigid_soft_full_surface_contact=self.solver_type == "lox",
         )
         self.contacts = self.collision_pipeline.contacts()
 

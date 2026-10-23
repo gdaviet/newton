@@ -268,6 +268,7 @@ class Example:
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             soft_contact_gap=self.cloth_body_contact_margin,
+            enable_rigid_soft_full_surface_contact=self.solver_type == "lox",
         )
         self.contacts = self.collision_pipeline.contacts()
 

@@ -87,6 +87,7 @@ class Example:
             self.model,
             broad_phase="nxn",
             soft_contact_gap=0.1,
+            enable_rigid_soft_full_surface_contact=self.solver_type == "lox",
         )
         self.contacts = None
 
