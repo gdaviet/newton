@@ -366,10 +366,15 @@ def _load_particle_contacts(
     filtered out, and a contact on a concave feature takes the face normal of that feature.
     """
     cid = wp.tid()
+    row_world[cid] = -1
+    row_status[cid] = ParticleContactStatus.UNUSED
+    # The consumers read the rows with an active status only, so the slots past the records keep
+    # their other fields
+    if cid >= wp.min(contacts_soft_contact_count[0], contacts_soft_contact_indices.shape[0]):
+        return
     for slot in range(4):
         row_particle[cid, slot] = -1
         row_coefficient[cid, slot] = 0.0
-    row_world[cid] = -1
     row_shape[cid] = -1
     row_body[cid] = -1
     row_frame[cid] = wp.mat33f(0.0)
@@ -378,9 +383,6 @@ def _load_particle_contacts(
     row_bias[cid] = wp.vec3f(0.0)
     row_friction[cid] = 0.0
     row_reaction[cid] = wp.vec3f(0.0)
-    row_status[cid] = ParticleContactStatus.UNUSED
-    if cid >= wp.min(contacts_soft_contact_count[0], contacts_soft_contact_indices.shape[0]):
-        return
 
     shape = contacts_soft_contact_shape[cid]
     if (
