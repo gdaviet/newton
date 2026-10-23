@@ -133,6 +133,10 @@ def _write_self_contact(
     row_gap: wp.array[wp.float32],
     row_bias: wp.array[wp.vec3f],
     row_friction: wp.array[wp.float32],
+    row_body: wp.array[wp.int32],
+    row_shape: wp.array[wp.int32],
+    row_body_jacobian: wp.array[mat36f],
+    row_reaction: wp.array[wp.vec3f],
 ):
     """Write one self-contact row; the prescribed particles enter its bias.
 
@@ -169,6 +173,10 @@ def _write_self_contact(
     row_gap[row] = gap
     row_bias[row] = wp.transpose(frame) @ (prescribed_velocity - velocity_target * normal)
     row_friction[row] = friction
+    row_body[row] = -1
+    row_shape[row] = -1
+    row_body_jacobian[row] = mat36f(0.0)
+    row_reaction[row] = wp.vec3f(0.0)
     row_status[row] = ParticleContactStatus.ACTIVE
 
 
@@ -253,18 +261,9 @@ def _load_self_contacts(
     """
     candidate = wp.tid()
     row = row_offset + candidate
-    for slot in range(4):
-        row_particle[row, slot] = -1
-        row_coefficient[row, slot] = 0.0
+    # The consumers read the rows with an active status only; the row writer fills every field of
+    # the kept candidates
     row_world[row] = -1
-    row_shape[row] = -1
-    row_body[row] = -1
-    row_frame[row] = wp.mat33f(0.0)
-    row_body_jacobian[row] = mat36f(0.0)
-    row_gap[row] = 0.0
-    row_bias[row] = wp.vec3f(0.0)
-    row_friction[row] = 0.0
-    row_reaction[row] = wp.vec3f(0.0)
     row_status[row] = ParticleContactStatus.UNUSED
 
     if candidate < vertex_capacity:
@@ -365,6 +364,10 @@ def _load_self_contacts(
             row_gap,
             row_bias,
             row_friction,
+            row_body,
+            row_shape,
+            row_body_jacobian,
+            row_reaction,
         )
         return
 
@@ -481,6 +484,10 @@ def _load_self_contacts(
         row_gap,
         row_bias,
         row_friction,
+        row_body,
+        row_shape,
+        row_body_jacobian,
+        row_reaction,
     )
 
 
