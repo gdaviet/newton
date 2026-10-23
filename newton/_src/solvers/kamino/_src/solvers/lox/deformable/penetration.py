@@ -5,14 +5,15 @@
 
 :class:`DeformablePenetrationLimiter` keeps the straight displacement of each self-contact
 candidate from the begin-step surface on its side of a certified division plane, with the
-divide-and-truncate planes of VBD. Each rigid-soft record of the collision pipeline adds a
-plane through its rigid surface point, placed beyond the predicted advance of that point
-under the accepted body twist, so that only the particles are limited. A few averaged
-projection sweeps first remove the normal displacement that crosses each plane, which keeps
-the tangential motion; a truncation of the remaining step along its direction then
-certifies every plane. The displacement of each particle stays within half the self-contact
-detection distance, and within the conservative bound of the smallest detected distances
-when a candidate buffer overflows.
+divide-and-truncate planes of VBD. The self-contact planes are placed once per time step, from
+the displacements predicted by the begin-step velocities, into a dense list. Each rigid-soft record of the
+collision pipeline adds a plane through its rigid surface point, placed at every iteration
+beyond the predicted advance of that point under the accepted body twist, so that only the
+particles are limited. An averaged projection sweep first removes the normal displacement
+that crosses each plane, which keeps the tangential motion; a truncation of the remaining
+step along its direction then certifies every plane. The displacement of each particle stays
+within half the self-contact detection distance, and within the conservative bound of the
+smallest detected distances when a candidate buffer overflows.
 """
 
 from __future__ import annotations
@@ -56,14 +57,6 @@ wp.set_module_options({"enable_backward": False})
 
 
 ###
-# Constants
-###
-
-_PLANE_PROJECTION_SWEEPS = 2
-"""Number of averaged projection sweeps onto the division planes before the truncation."""
-
-
-###
 # Functions
 ###
 
@@ -103,47 +96,27 @@ def _candidate_particles(
 
 
 @wp.func
-def _accumulate_particle_projection(
-    particle: int,
-    side_normal: wp.vec3,
-    point: wp.vec3,
-    epsilon: float,
-    reference_position: wp.array[wp.vec3],
-    displacement: wp.array[wp.vec3],
-    relaxation: float,
-    correction: wp.array[wp.vec3],
-    correction_count: wp.array[wp.float32],
-):
-    """Accumulate the normal correction that keeps one particle within the relaxed side of one plane.
+def _plane_index(
+    tid: int,
+    self_capacity: int,
+    self_count: wp.array[wp.int32],
+    rigid_count: wp.array[wp.int32],
+    plane_normal: wp.array[wp.vec3],
+) -> int:
+    """Return the plane of a thread, or ``-1`` past the self-contact and rigid-soft plane counts.
 
-    A particle may approach the plane by the relaxed fraction of its begin-step distance, and a
-    particle on the wrong side may only move towards its side.
+    The self-contact planes fill the front of the plane arrays densely; the rigid-soft planes
+    follow at the offset of the self-contact capacity, one slot per collision record.
     """
-    distance = wp.dot(side_normal, reference_position[particle] - point) - epsilon
-    allowed = -relaxation * wp.max(distance, 0.0)
-    violation = allowed - wp.dot(side_normal, displacement[particle])
-    if violation > 0.0:
-        wp.atomic_add(correction, particle, violation * side_normal)
-        wp.atomic_add(correction_count, particle, 1.0)
-
-
-@wp.func
-def _accumulate_particle_bound(
-    particle: int,
-    side_normal: wp.vec3,
-    point: wp.vec3,
-    epsilon: float,
-    reference_position: wp.array[wp.vec3],
-    displacement: wp.array[wp.vec3],
-    relaxation: float,
-    truncation: wp.array[wp.float32],
-):
-    """Reduce the step fraction that keeps one particle on its side of one plane."""
-    bound = planar_truncation_t(
-        reference_position[particle], displacement[particle], side_normal, point, relaxation, epsilon
-    )
-    if bound < 1.0:
-        wp.atomic_min(truncation, particle, bound)
+    if tid < self_capacity:
+        if tid >= self_count[0]:
+            return -1
+        return tid
+    if tid - self_capacity >= rigid_count[0]:
+        return -1
+    if wp.length_sq(plane_normal[tid]) == 0.0:
+        return -1
+    return tid
 
 
 @wp.func
@@ -231,6 +204,21 @@ def _compute_particle_displacements(
 
 
 @wp.kernel
+def _predict_particle_displacements(
+    # Inputs:
+    model_time_dt: wp.array[wp.float32],
+    newton_to_packed: wp.array[wp.int32],
+    particle_world: wp.array[wp.int32],
+    particle_qd: wp.array[wp.vec3],
+    # Outputs:
+    displacement: wp.array[wp.vec3],
+):
+    """Predict the displacement ``dt v`` of each particle from its begin-step velocity, in Newton order."""
+    particle = wp.tid()
+    displacement[particle] = model_time_dt[particle_world[newton_to_packed[particle]]] * particle_qd[particle]
+
+
+@wp.kernel
 def _build_division_planes(
     # Inputs:
     vertex_capacity: wp.int32,
@@ -242,11 +230,17 @@ def _build_division_planes(
     edge_indices: wp.array2d[wp.int32],
     adjacency: MeshAdjacencyData,
     # Outputs:
+    plane_count: wp.array[wp.int32],
+    plane_particles: wp.array[wp.vec4i],
+    plane_sides: wp.array[wp.vec4],
     plane_normal: wp.array[wp.vec3],
     plane_point: wp.array[wp.vec3],
     plane_epsilon: wp.array[wp.float32],
 ):
-    """Place the division plane of each self-contact candidate from the begin-step surface."""
+    """Place the division plane of each self-contact candidate from the begin-step surface, once per time step.
+
+    The certified planes are appended densely; a candidate without a separator leaves no plane.
+    """
     candidate = wp.tid()
     normal = wp.vec3(0.0)
     point = wp.vec3(0.0)
@@ -269,113 +263,23 @@ def _build_division_planes(
             displacement,
             edge_indices,
         )
-    plane_normal[candidate] = normal
-    plane_point[candidate] = point
-    plane_epsilon[candidate] = epsilon
-
-
-@wp.kernel
-def _accumulate_plane_projections(
-    # Inputs:
-    vertex_capacity: wp.int32,
-    vertex_records: wp.array[wp.int32],
-    edge_records: wp.array[wp.int32],
-    tri_indices: wp.array2d[wp.int32],
-    edge_indices: wp.array2d[wp.int32],
-    plane_normal: wp.array[wp.vec3],
-    plane_point: wp.array[wp.vec3],
-    plane_epsilon: wp.array[wp.float32],
-    reference_position: wp.array[wp.vec3],
-    displacement: wp.array[wp.vec3],
-    relaxation: wp.float32,
-    # Outputs:
-    correction: wp.array[wp.vec3],
-    correction_count: wp.array[wp.float32],
-):
-    """Accumulate the normal correction that keeps each particle within the relaxed side of its self-contact
-    planes."""
-    candidate = wp.tid()
-    normal = plane_normal[candidate]
     if wp.length_sq(normal) == 0.0:
         return
     particles, sides = _candidate_particles(
         candidate, vertex_capacity, vertex_records, edge_records, tri_indices, edge_indices
     )
-    point = plane_point[candidate]
-    epsilon = plane_epsilon[candidate]
-    for slot in range(4):
-        _accumulate_particle_projection(
-            particles[slot],
-            sides[slot] * normal,
-            point,
-            epsilon,
-            reference_position,
-            displacement,
-            relaxation,
-            correction,
-            correction_count,
-        )
-
-
-@wp.kernel
-def _apply_plane_projections(
-    # Outputs:
-    correction: wp.array[wp.vec3],
-    correction_count: wp.array[wp.float32],
-    displacement: wp.array[wp.vec3],
-):
-    """Move each particle by the average of its plane corrections and clear the accumulators."""
-    particle = wp.tid()
-    count = correction_count[particle]
-    if count > 0.0:
-        displacement[particle] = displacement[particle] + correction[particle] / count
-        correction[particle] = wp.vec3(0.0)
-        correction_count[particle] = 0.0
-
-
-@wp.kernel
-def _accumulate_directional_bounds(
-    # Inputs:
-    vertex_capacity: wp.int32,
-    vertex_records: wp.array[wp.int32],
-    edge_records: wp.array[wp.int32],
-    tri_indices: wp.array2d[wp.int32],
-    edge_indices: wp.array2d[wp.int32],
-    plane_normal: wp.array[wp.vec3],
-    plane_point: wp.array[wp.vec3],
-    plane_epsilon: wp.array[wp.float32],
-    reference_position: wp.array[wp.vec3],
-    displacement: wp.array[wp.vec3],
-    relaxation: wp.float32,
-    # Outputs:
-    truncation: wp.array[wp.float32],
-):
-    """Reduce the smallest step fraction of each particle over its self-contact planes."""
-    candidate = wp.tid()
-    normal = plane_normal[candidate]
-    if wp.length_sq(normal) == 0.0:
-        return
-    particles, sides = _candidate_particles(
-        candidate, vertex_capacity, vertex_records, edge_records, tri_indices, edge_indices
-    )
-    point = plane_point[candidate]
-    epsilon = plane_epsilon[candidate]
-    for slot in range(4):
-        _accumulate_particle_bound(
-            particles[slot],
-            sides[slot] * normal,
-            point,
-            epsilon,
-            reference_position,
-            displacement,
-            relaxation,
-            truncation,
-        )
+    slot = wp.atomic_add(plane_count, 0, 1)
+    plane_particles[slot] = particles
+    plane_sides[slot] = sides
+    plane_normal[slot] = normal
+    plane_point[slot] = point
+    plane_epsilon[slot] = epsilon
 
 
 @wp.kernel
 def _build_rigid_soft_planes(
     # Inputs:
+    plane_offset: wp.int32,
     contact_count: wp.array[wp.int32],
     contact_particles: wp.array[wp.vec3i],
     contact_coefficients: wp.array[wp.vec3f],
@@ -394,7 +298,8 @@ def _build_rigid_soft_planes(
     reference_position: wp.array[wp.vec3],
     displacement: wp.array[wp.vec3],
     # Outputs:
-    plane_particles: wp.array[wp.vec3i],
+    plane_particles: wp.array[wp.vec4i],
+    plane_sides: wp.array[wp.vec4],
     plane_normal: wp.array[wp.vec3],
     plane_point: wp.array[wp.vec3],
     plane_epsilon: wp.array[wp.float32],
@@ -408,10 +313,10 @@ def _build_rigid_soft_planes(
     starts inside the collider holds its particles from moving deeper.
     """
     cid = wp.tid()
-    plane_particles[cid] = wp.vec3i(-1)
-    plane_normal[cid] = wp.vec3(0.0)
     if cid >= contact_count[0]:
         return
+    slot = plane_offset + cid
+    plane_normal[slot] = wp.vec3(0.0)
     particles = contact_particles[cid]
     normal_length = wp.length(contact_normal[cid])
     if particles[0] < 0 or normal_length == 0.0:
@@ -421,11 +326,11 @@ def _build_rigid_soft_planes(
     feature_position = wp.vec3(0.0)
     soft_approach = float(0.0)
     coordinate_scale = float(1.0)
-    for slot in range(3):
-        particle = particles[slot]
+    for corner in range(3):
+        particle = particles[corner]
         if particle >= 0:
             position = reference_position[particle]
-            feature_position += contact_coefficients[cid][slot] * position
+            feature_position += contact_coefficients[cid][corner] * position
             soft_approach = wp.max(soft_approach, -wp.dot(normal, displacement[particle]))
             coordinate_scale = wp.max(coordinate_scale, wp.max(wp.abs(position)))
 
@@ -449,16 +354,21 @@ def _build_rigid_soft_planes(
     point, _fraction = place_dat_division_plane(normal, anchor, gap, soft_approach, rigid_approach, epsilon)
     # The rigid side keeps its predicted advance and the separation band below the plane
     offset = wp.max(wp.dot(normal, point - anchor), rigid_approach + epsilon)
-    plane_particles[cid] = particles
-    plane_normal[cid] = normal
-    plane_point[cid] = anchor + offset * normal
-    plane_epsilon[cid] = epsilon
+    plane_particles[slot] = wp.vec4i(particles[0], particles[1], particles[2], -1)
+    plane_sides[slot] = wp.vec4(1.0, 1.0, 1.0, 0.0)
+    plane_normal[slot] = normal
+    plane_point[slot] = anchor + offset * normal
+    plane_epsilon[slot] = epsilon
 
 
 @wp.kernel
-def _accumulate_rigid_soft_projections(
+def _accumulate_plane_projections(
     # Inputs:
-    plane_particles: wp.array[wp.vec3i],
+    self_capacity: wp.int32,
+    self_count: wp.array[wp.int32],
+    rigid_count: wp.array[wp.int32],
+    plane_particles: wp.array[wp.vec4i],
+    plane_sides: wp.array[wp.vec4],
     plane_normal: wp.array[wp.vec3],
     plane_point: wp.array[wp.vec3],
     plane_epsilon: wp.array[wp.float32],
@@ -469,32 +379,58 @@ def _accumulate_rigid_soft_projections(
     correction: wp.array[wp.vec3],
     correction_count: wp.array[wp.float32],
 ):
-    """Accumulate the normal correction that keeps each particle within the relaxed side of its rigid-soft
-    planes."""
-    cid = wp.tid()
-    normal = plane_normal[cid]
-    if wp.length_sq(normal) == 0.0:
+    """Accumulate the normal correction that keeps each particle within the relaxed side of its planes.
+
+    A particle may approach a plane by the relaxed fraction of its begin-step distance, and a
+    particle on the wrong side may only move towards its side.
+    """
+    plane = _plane_index(wp.tid(), self_capacity, self_count, rigid_count, plane_normal)
+    if plane < 0:
         return
-    particles = plane_particles[cid]
-    for slot in range(3):
-        if particles[slot] >= 0:
-            _accumulate_particle_projection(
-                particles[slot],
-                normal,
-                plane_point[cid],
-                plane_epsilon[cid],
-                reference_position,
-                displacement,
-                relaxation,
-                correction,
-                correction_count,
-            )
+    particles = plane_particles[plane]
+    sides = plane_sides[plane]
+    normal = plane_normal[plane]
+    point = plane_point[plane]
+    epsilon = plane_epsilon[plane]
+    for slot in range(4):
+        particle = particles[slot]
+        if particle >= 0:
+            side_normal = sides[slot] * normal
+            distance = wp.dot(side_normal, reference_position[particle] - point) - epsilon
+            allowed = -relaxation * wp.max(distance, 0.0)
+            violation = allowed - wp.dot(side_normal, displacement[particle])
+            if violation > 0.0:
+                wp.atomic_add(correction, particle, violation * side_normal)
+                wp.atomic_add(correction_count, particle, 1.0)
 
 
 @wp.kernel
-def _accumulate_rigid_soft_bounds(
+def _apply_plane_projections(
+    # Outputs:
+    correction: wp.array[wp.vec3],
+    correction_count: wp.array[wp.float32],
+    displacement: wp.array[wp.vec3],
+    truncation: wp.array[wp.float32],
+):
+    """Move each particle by the average of its plane corrections, clear the accumulators, and reset its step
+    fraction."""
+    particle = wp.tid()
+    count = correction_count[particle]
+    if count > 0.0:
+        displacement[particle] = displacement[particle] + correction[particle] / count
+        correction[particle] = wp.vec3(0.0)
+        correction_count[particle] = 0.0
+    truncation[particle] = 1.0
+
+
+@wp.kernel
+def _accumulate_directional_bounds(
     # Inputs:
-    plane_particles: wp.array[wp.vec3i],
+    self_capacity: wp.int32,
+    self_count: wp.array[wp.int32],
+    rigid_count: wp.array[wp.int32],
+    plane_particles: wp.array[wp.vec4i],
+    plane_sides: wp.array[wp.vec4],
     plane_normal: wp.array[wp.vec3],
     plane_point: wp.array[wp.vec3],
     plane_epsilon: wp.array[wp.float32],
@@ -504,24 +440,23 @@ def _accumulate_rigid_soft_bounds(
     # Outputs:
     truncation: wp.array[wp.float32],
 ):
-    """Reduce the smallest step fraction of each particle over its rigid-soft planes."""
-    cid = wp.tid()
-    normal = plane_normal[cid]
-    if wp.length_sq(normal) == 0.0:
+    """Reduce the smallest step fraction of each particle over its planes."""
+    plane = _plane_index(wp.tid(), self_capacity, self_count, rigid_count, plane_normal)
+    if plane < 0:
         return
-    particles = plane_particles[cid]
-    for slot in range(3):
-        if particles[slot] >= 0:
-            _accumulate_particle_bound(
-                particles[slot],
-                normal,
-                plane_point[cid],
-                plane_epsilon[cid],
-                reference_position,
-                displacement,
-                relaxation,
-                truncation,
+    particles = plane_particles[plane]
+    sides = plane_sides[plane]
+    normal = plane_normal[plane]
+    point = plane_point[plane]
+    epsilon = plane_epsilon[plane]
+    for slot in range(4):
+        particle = particles[slot]
+        if particle >= 0:
+            bound = planar_truncation_t(
+                reference_position[particle], displacement[particle], sides[slot] * normal, point, relaxation, epsilon
             )
+            if bound < 1.0:
+                wp.atomic_min(truncation, particle, bound)
 
 
 @wp.kernel
@@ -614,9 +549,7 @@ class DeformablePenetrationLimiter:
         self.body_com = model.body_com if model.body_count > 0 else wp.empty(0, dtype=wp.vec3f, device=self.device)
         self.rigid_contacts: Contacts | None = None
         """Newton contacts whose rigid-soft records bound the steps, or ``None``."""
-        self.set_rigid_capacity(0)
-        particle_count = int(self_contacts.model.particle_count)
-        capacity = self_contacts.capacity
+        particle_count = int(model.particle_count)
         self.reference_position = wp.zeros(particle_count, dtype=wp.vec3, device=self.device)
         """Begin-step particle positions, in Newton order."""
         self.displacement = wp.zeros(particle_count, dtype=wp.vec3, device=self.device)
@@ -627,36 +560,82 @@ class DeformablePenetrationLimiter:
         """Accumulated plane correction of each particle, in Newton order."""
         self.correction_count = wp.zeros(particle_count, dtype=wp.float32, device=self.device)
         """Number of plane corrections of each particle, in Newton order."""
-        self.plane_normal = wp.zeros(capacity, dtype=wp.vec3, device=self.device)
-        """Division-plane normal of each candidate, or zero for an unconstrained candidate."""
-        self.plane_point = wp.zeros(capacity, dtype=wp.vec3, device=self.device)
-        """Point on the division plane of each candidate [m]."""
-        self.plane_epsilon = wp.zeros(capacity, dtype=wp.float32, device=self.device)
-        """Separation clearance of the division plane of each candidate [m]."""
+        self.self_plane_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+        """Number of self-contact planes of the time step."""
+        self._no_rigid_planes = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self.set_rigid_capacity(0)
 
     ###
     # Public API
     ###
 
     def set_rigid_capacity(self, capacity: int) -> None:
-        """Size the rigid-soft planes for the soft contact capacity of the Newton contacts."""
+        """Size the planes for the self-contact candidates and the soft contact capacity of the Newton contacts."""
         self.rigid_capacity = int(capacity)
-        self.rigid_plane_particles = wp.full(self.rigid_capacity, wp.vec3i(-1), dtype=wp.vec3i, device=self.device)
-        """Particles of the feature of each rigid-soft record, in Newton order, or ``-1``."""
-        self.rigid_plane_normal = wp.zeros(self.rigid_capacity, dtype=wp.vec3, device=self.device)
-        """Division-plane normal of each rigid-soft record, or zero for an unused record."""
-        self.rigid_plane_point = wp.zeros(self.rigid_capacity, dtype=wp.vec3, device=self.device)
-        """Point on the division plane of each rigid-soft record [m]."""
-        self.rigid_plane_epsilon = wp.zeros(self.rigid_capacity, dtype=wp.float32, device=self.device)
-        """Separation clearance of the division plane of each rigid-soft record [m]."""
+        size = self.self_contacts.capacity + self.rigid_capacity
+        self.plane_particles = wp.full(size, wp.vec4i(-1), dtype=wp.vec4i, device=self.device)
+        """Particles of each plane, in Newton order, padded with ``-1``."""
+        self.plane_sides = wp.zeros(size, dtype=wp.vec4, device=self.device)
+        """Side of the plane of each particle of each plane."""
+        self.plane_normal = wp.zeros(size, dtype=wp.vec3, device=self.device)
+        """Division-plane normal of each plane, or zero for an unused rigid-soft slot."""
+        self.plane_point = wp.zeros(size, dtype=wp.vec3, device=self.device)
+        """Point on each division plane [m]."""
+        self.plane_epsilon = wp.zeros(size, dtype=wp.float32, device=self.device)
+        """Separation clearance of each division plane [m]."""
 
     def bind_rigid_contacts(self, contacts: Contacts | None) -> None:
         """Bound the steps of the time step with the rigid-soft records of the Newton contacts."""
         self.rigid_contacts = contacts if contacts is not None and self.rigid_capacity > 0 else None
 
-    def begin_time_step(self, particle_q: wp.array[wp.vec3]) -> None:
-        """Freeze the begin-step surface of the step bounds."""
+    def begin_time_step(
+        self, particle_q: wp.array[wp.vec3], particle_qd: wp.array[wp.vec3], time_step: wp.array[wp.float32]
+    ) -> None:
+        """Freeze the begin-step surface of the step bounds and place the self-contact planes.
+
+        The planes split the gap of each candidate according to the displacements predicted from
+        the begin-step velocities; any placement within the gap separates the pair.
+
+        Args:
+            particle_q: Begin-step particle positions [m], in Newton order.
+            particle_qd: Begin-step particle velocities [m/s], in Newton order.
+            time_step: Time step of each world [s].
+        """
+        self_contacts = self.self_contacts
+        detector = self_contacts.detector
+        model = self_contacts.model
         wp.copy(self.reference_position, particle_q)
+        wp.launch(
+            _predict_particle_displacements,
+            dim=model.particle_count,
+            inputs=[time_step, self.topology.newton_to_packed, self.topology.packed_solve_world, particle_qd],
+            outputs=[self.displacement],
+            device=self.device,
+        )
+        self.self_plane_count.zero_()
+        wp.launch(
+            _build_division_planes,
+            dim=self_contacts.capacity,
+            inputs=[
+                self_contacts.vertex_capacity,
+                detector.vertex_colliding_triangles,
+                detector.edge_colliding_edges,
+                self.reference_position,
+                self.displacement,
+                model.tri_indices,
+                self_contacts.edge_indices,
+                self_contacts.adjacency,
+            ],
+            outputs=[
+                self.self_plane_count,
+                self.plane_particles,
+                self.plane_sides,
+                self.plane_normal,
+                self.plane_point,
+                self.plane_epsilon,
+            ],
+            device=self.device,
+        )
 
     def truncate(
         self,
@@ -681,6 +660,7 @@ class DeformablePenetrationLimiter:
         detector = self_contacts.detector
         model = self_contacts.model
         particle_count = model.particle_count
+        self_capacity = self_contacts.capacity
         wp.launch(
             _compute_particle_displacements,
             dim=projected_velocity.shape[0],
@@ -688,42 +668,15 @@ class DeformablePenetrationLimiter:
             outputs=[self.displacement],
             device=self.device,
         )
-        candidate_inputs = [
-            self_contacts.vertex_capacity,
-            detector.vertex_colliding_triangles,
-            detector.edge_colliding_edges,
-        ]
-        wp.launch(
-            _build_division_planes,
-            dim=self_contacts.capacity,
-            inputs=[
-                *candidate_inputs,
-                self.reference_position,
-                self.displacement,
-                model.tri_indices,
-                self_contacts.edge_indices,
-                self_contacts.adjacency,
-            ],
-            outputs=[self.plane_normal, self.plane_point, self.plane_epsilon],
-            device=self.device,
-        )
-        plane_inputs = [
-            *candidate_inputs,
-            model.tri_indices,
-            self_contacts.edge_indices,
-            self.plane_normal,
-            self.plane_point,
-            self.plane_epsilon,
-            self.reference_position,
-            self.displacement,
-            self.relaxation,
-        ]
         contacts = self.rigid_contacts
+        rigid_count = self._no_rigid_planes
         if contacts is not None:
+            rigid_count = contacts.soft_contact_count
             wp.launch(
                 _build_rigid_soft_planes,
                 dim=self.rigid_capacity,
                 inputs=[
+                    self_capacity,
                     contacts.soft_contact_count,
                     contacts.soft_contact_indices,
                     contacts.soft_contact_barycentric,
@@ -743,60 +696,48 @@ class DeformablePenetrationLimiter:
                     self.displacement,
                 ],
                 outputs=[
-                    self.rigid_plane_particles,
-                    self.rigid_plane_normal,
-                    self.rigid_plane_point,
-                    self.rigid_plane_epsilon,
+                    self.plane_particles,
+                    self.plane_sides,
+                    self.plane_normal,
+                    self.plane_point,
+                    self.plane_epsilon,
                 ],
                 device=self.device,
             )
-        rigid_plane_inputs = [
-            self.rigid_plane_particles,
-            self.rigid_plane_normal,
-            self.rigid_plane_point,
-            self.rigid_plane_epsilon,
+        plane_inputs = [
+            self_capacity,
+            self.self_plane_count,
+            rigid_count,
+            self.plane_particles,
+            self.plane_sides,
+            self.plane_normal,
+            self.plane_point,
+            self.plane_epsilon,
             self.reference_position,
             self.displacement,
             self.relaxation,
         ]
-        for _sweep in range(_PLANE_PROJECTION_SWEEPS):
-            wp.launch(
-                _accumulate_plane_projections,
-                dim=self_contacts.capacity,
-                inputs=plane_inputs,
-                outputs=[self.correction, self.correction_count],
-                device=self.device,
-            )
-            if contacts is not None:
-                wp.launch(
-                    _accumulate_rigid_soft_projections,
-                    dim=self.rigid_capacity,
-                    inputs=rigid_plane_inputs,
-                    outputs=[self.correction, self.correction_count],
-                    device=self.device,
-                )
-            wp.launch(
-                _apply_plane_projections,
-                dim=particle_count,
-                outputs=[self.correction, self.correction_count, self.displacement],
-                device=self.device,
-            )
-        self.truncation.fill_(1.0)
+        plane_slots = self_capacity + (self.rigid_capacity if contacts is not None else 0)
+        wp.launch(
+            _accumulate_plane_projections,
+            dim=plane_slots,
+            inputs=plane_inputs,
+            outputs=[self.correction, self.correction_count],
+            device=self.device,
+        )
+        wp.launch(
+            _apply_plane_projections,
+            dim=particle_count,
+            outputs=[self.correction, self.correction_count, self.displacement, self.truncation],
+            device=self.device,
+        )
         wp.launch(
             _accumulate_directional_bounds,
-            dim=self_contacts.capacity,
+            dim=plane_slots,
             inputs=plane_inputs,
             outputs=[self.truncation],
             device=self.device,
         )
-        if contacts is not None:
-            wp.launch(
-                _accumulate_rigid_soft_bounds,
-                dim=self.rigid_capacity,
-                inputs=rigid_plane_inputs,
-                outputs=[self.truncation],
-                device=self.device,
-            )
         wp.launch(
             _apply_directional_bounds,
             dim=particle_count,

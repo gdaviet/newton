@@ -219,7 +219,7 @@ class DeformableProblem:
         if self.self_contacts is not None:
             self.self_contacts.detect(state.particle_q)
         if self.penetration_limiter is not None:
-            self.penetration_limiter.begin_time_step(state.particle_q)
+            self.penetration_limiter.begin_time_step(state.particle_q, state.particle_qd, time_step)
 
     def load_contacts(
         self,
