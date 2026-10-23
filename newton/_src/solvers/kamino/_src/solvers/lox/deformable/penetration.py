@@ -5,8 +5,10 @@
 
 :class:`DeformablePenetrationLimiter` keeps the straight displacement of each self-contact
 candidate from the begin-step surface on its side of a certified division plane, with the
-divide-and-truncate planes of VBD. The self-contact planes are placed once per time step, from
-the displacements predicted by the begin-step velocities, into a dense list. Each rigid-soft record of the
+divide-and-truncate planes of VBD. The certified separators of the self-contact candidates are
+found once per time step into a dense list, and each iteration places their planes within the
+gaps from the current displacements, as the separators depend on the begin-step positions only.
+Each rigid-soft record of the
 collision pipeline adds a plane through its rigid surface point, placed at every iteration
 beyond the predicted advance of that point under the accepted body twist, so that only the
 particles are limited. An averaged projection sweep first removes the normal displacement
@@ -30,12 +32,13 @@ from .......utils.mesh import (
     get_vertex_num_adjacent_edges,
     get_vertex_num_adjacent_faces,
 )
-from ......vbd.particle_vbd_kernels import (
-    create_edge_edge_division_plane_closest_pt,
-    create_vertex_triangle_division_plane_closest_pt,
+from ......vbd.rigid_vbd_kernels import (
+    dat_separation_epsilon,
+    find_edge_edge_separator,
+    find_vertex_triangle_separator,
+    place_dat_division_plane,
     planar_truncation_t,
 )
-from ......vbd.rigid_vbd_kernels import dat_separation_epsilon, place_dat_division_plane
 from ....core.types import vec6f
 
 if TYPE_CHECKING:
@@ -120,67 +123,66 @@ def _plane_index(
 
 
 @wp.func
-def _vertex_triangle_plane(
+def _vertex_triangle_separator(
     vertex: int,
     triangle: int,
     reference_position: wp.array[wp.vec3],
-    displacement: wp.array[wp.vec3],
     tri_indices: wp.array2d[wp.int32],
     adjacency: MeshAdjacencyData,
 ):
-    """Build the division plane of a vertex and a triangle, with a zero normal for an unconstrained pair.
+    """Find the certified separator of a vertex and a triangle at the begin-step surface.
 
-    A pair without a strict separator at the begin-step surface stays unconstrained; its
-    contact row separates it, and a later detection certifies a separator.
+    Returns the normal towards the vertex (zero for an unconstrained pair), the triangle support
+    point, the gap between the supports, and the separation clearance. A pair without a strict
+    separator stays unconstrained; its contact row separates it, and a later detection certifies
+    a separator.
     """
     if vertex < 0 or triangle < 0 or get_vertex_num_adjacent_edges(adjacency, vertex) == 0:
-        return wp.vec3(0.0), wp.vec3(0.0), 0.0
-    triangle_0 = tri_indices[triangle, 0]
-    triangle_1 = tri_indices[triangle, 1]
-    triangle_2 = tri_indices[triangle, 2]
-    valid, normal, plane_point, separation_epsilon = create_vertex_triangle_division_plane_closest_pt(
-        reference_position[vertex],
-        displacement[vertex],
-        reference_position[triangle_0],
-        displacement[triangle_0],
-        reference_position[triangle_1],
-        displacement[triangle_1],
-        reference_position[triangle_2],
-        displacement[triangle_2],
+        return wp.vec3(0.0), wp.vec3(0.0), 0.0, 0.0
+    v = reference_position[vertex]
+    a = reference_position[tri_indices[triangle, 0]]
+    b = reference_position[tri_indices[triangle, 1]]
+    c = reference_position[tri_indices[triangle, 2]]
+    coordinate_scale = wp.max(
+        1.0, wp.max(wp.max(wp.max(wp.abs(v)), wp.max(wp.abs(a))), wp.max(wp.max(wp.abs(b)), wp.max(wp.abs(c))))
+    )
+    epsilon = dat_separation_epsilon(coordinate_scale)
+    valid, normal, _vertex_support, triangle_support, gap, _candidate = find_vertex_triangle_separator(
+        v, a, b, c, wp.vec3(0.0), epsilon
     )
     if not valid:
-        return wp.vec3(0.0), wp.vec3(0.0), 0.0
-    return normal, plane_point, separation_epsilon
+        return wp.vec3(0.0), wp.vec3(0.0), 0.0, 0.0
+    return normal, triangle_support, gap, epsilon
 
 
 @wp.func
-def _edge_edge_plane(
+def _edge_edge_separator(
     edge_0: int,
     edge_1: int,
     reference_position: wp.array[wp.vec3],
-    displacement: wp.array[wp.vec3],
     edge_indices: wp.array2d[wp.int32],
 ):
-    """Build the division plane of two edges, with a zero normal for an unconstrained pair."""
+    """Find the certified separator of two edges at the begin-step surface.
+
+    Returns the normal towards the first edge (zero for an unconstrained pair), the support point
+    of the second edge, the gap between the supports, and the separation clearance.
+    """
     if edge_0 < 0 or edge_1 < 0 or edge_0 == edge_1:
-        return wp.vec3(0.0), wp.vec3(0.0), 0.0
-    edge_0_vertex_0 = edge_indices[edge_0, 2]
-    edge_0_vertex_1 = edge_indices[edge_0, 3]
-    edge_1_vertex_0 = edge_indices[edge_1, 2]
-    edge_1_vertex_1 = edge_indices[edge_1, 3]
-    valid, normal, plane_point, separation_epsilon = create_edge_edge_division_plane_closest_pt(
-        reference_position[edge_0_vertex_0],
-        displacement[edge_0_vertex_0],
-        reference_position[edge_0_vertex_1],
-        displacement[edge_0_vertex_1],
-        reference_position[edge_1_vertex_0],
-        displacement[edge_1_vertex_0],
-        reference_position[edge_1_vertex_1],
-        displacement[edge_1_vertex_1],
+        return wp.vec3(0.0), wp.vec3(0.0), 0.0, 0.0
+    a0 = reference_position[edge_indices[edge_0, 2]]
+    b0 = reference_position[edge_indices[edge_0, 3]]
+    a1 = reference_position[edge_indices[edge_1, 2]]
+    b1 = reference_position[edge_indices[edge_1, 3]]
+    coordinate_scale = wp.max(
+        1.0, wp.max(wp.max(wp.max(wp.abs(a0)), wp.max(wp.abs(b0))), wp.max(wp.max(wp.abs(a1)), wp.max(wp.abs(b1))))
+    )
+    epsilon = dat_separation_epsilon(coordinate_scale)
+    valid, normal, _edge_0_support, edge_1_support, gap, _candidate = find_edge_edge_separator(
+        a0, b0, a1, b1, wp.vec3(0.0), epsilon
     )
     if not valid:
-        return wp.vec3(0.0), wp.vec3(0.0), 0.0
-    return normal, plane_point, separation_epsilon
+        return wp.vec3(0.0), wp.vec3(0.0), 0.0, 0.0
+    return normal, edge_1_support, gap, epsilon
 
 
 ###
@@ -204,28 +206,12 @@ def _compute_particle_displacements(
 
 
 @wp.kernel
-def _predict_particle_displacements(
-    # Inputs:
-    model_time_dt: wp.array[wp.float32],
-    newton_to_packed: wp.array[wp.int32],
-    particle_world: wp.array[wp.int32],
-    particle_qd: wp.array[wp.vec3],
-    # Outputs:
-    displacement: wp.array[wp.vec3],
-):
-    """Predict the displacement ``dt v`` of each particle from its begin-step velocity, in Newton order."""
-    particle = wp.tid()
-    displacement[particle] = model_time_dt[particle_world[newton_to_packed[particle]]] * particle_qd[particle]
-
-
-@wp.kernel
-def _build_division_planes(
+def _build_division_separators(
     # Inputs:
     vertex_capacity: wp.int32,
     vertex_records: wp.array[wp.int32],
     edge_records: wp.array[wp.int32],
     reference_position: wp.array[wp.vec3],
-    displacement: wp.array[wp.vec3],
     tri_indices: wp.array2d[wp.int32],
     edge_indices: wp.array2d[wp.int32],
     adjacency: MeshAdjacencyData,
@@ -234,33 +220,34 @@ def _build_division_planes(
     plane_particles: wp.array[wp.vec4i],
     plane_sides: wp.array[wp.vec4],
     plane_normal: wp.array[wp.vec3],
-    plane_point: wp.array[wp.vec3],
+    plane_support: wp.array[wp.vec3],
+    plane_gap: wp.array[wp.float32],
     plane_epsilon: wp.array[wp.float32],
 ):
-    """Place the division plane of each self-contact candidate from the begin-step surface, once per time step.
+    """Find the certified separator of each self-contact candidate at the begin-step surface, once per time step.
 
-    The certified planes are appended densely; a candidate without a separator leaves no plane.
+    The separators depend on the begin-step positions only and are appended densely; a candidate
+    without a separator leaves no plane. Each iteration places its plane within the gap.
     """
     candidate = wp.tid()
     normal = wp.vec3(0.0)
-    point = wp.vec3(0.0)
+    support = wp.vec3(0.0)
+    gap = float(0.0)
     epsilon = float(0.0)
     if candidate < vertex_capacity:
-        normal, point, epsilon = _vertex_triangle_plane(
+        normal, support, gap, epsilon = _vertex_triangle_separator(
             vertex_records[2 * candidate],
             vertex_records[2 * candidate + 1],
             reference_position,
-            displacement,
             tri_indices,
             adjacency,
         )
     else:
         edge_candidate = candidate - vertex_capacity
-        normal, point, epsilon = _edge_edge_plane(
+        normal, support, gap, epsilon = _edge_edge_separator(
             edge_records[2 * edge_candidate],
             edge_records[2 * edge_candidate + 1],
             reference_position,
-            displacement,
             edge_indices,
         )
     if wp.length_sq(normal) == 0.0:
@@ -272,7 +259,8 @@ def _build_division_planes(
     plane_particles[slot] = particles
     plane_sides[slot] = sides
     plane_normal[slot] = normal
-    plane_point[slot] = point
+    plane_support[slot] = support
+    plane_gap[slot] = gap
     plane_epsilon[slot] = epsilon
 
 
@@ -370,19 +358,23 @@ def _accumulate_plane_projections(
     plane_particles: wp.array[wp.vec4i],
     plane_sides: wp.array[wp.vec4],
     plane_normal: wp.array[wp.vec3],
-    plane_point: wp.array[wp.vec3],
+    plane_support: wp.array[wp.vec3],
+    plane_gap: wp.array[wp.float32],
     plane_epsilon: wp.array[wp.float32],
     reference_position: wp.array[wp.vec3],
     displacement: wp.array[wp.vec3],
     relaxation: wp.float32,
     # Outputs:
+    plane_point: wp.array[wp.vec3],
     correction: wp.array[wp.vec3],
     correction_count: wp.array[wp.float32],
 ):
-    """Accumulate the normal correction that keeps each particle within the relaxed side of its planes.
+    """Place each self-contact plane for the current displacements and accumulate the normal correction that
+    keeps each particle within the relaxed side of its planes.
 
-    A particle may approach a plane by the relaxed fraction of its begin-step distance, and a
-    particle on the wrong side may only move towards its side.
+    A self-contact plane splits the gap of its separator in proportion to the approach of each
+    side along the normal. A particle may approach a plane by the relaxed fraction of its
+    begin-step distance, and a particle on the wrong side may only move towards its side.
     """
     plane = _plane_index(wp.tid(), self_capacity, self_count, rigid_count, plane_normal)
     if plane < 0:
@@ -390,8 +382,23 @@ def _accumulate_plane_projections(
     particles = plane_particles[plane]
     sides = plane_sides[plane]
     normal = plane_normal[plane]
-    point = plane_point[plane]
     epsilon = plane_epsilon[plane]
+    if plane < self_capacity:
+        positive_approach = float(0.0)
+        negative_approach = float(0.0)
+        for slot in range(4):
+            particle = particles[slot]
+            if particle >= 0:
+                approach = wp.dot(normal, displacement[particle])
+                if sides[slot] > 0.0:
+                    positive_approach = wp.max(positive_approach, -approach)
+                else:
+                    negative_approach = wp.max(negative_approach, approach)
+        placed, _fraction = place_dat_division_plane(
+            normal, plane_support[plane], plane_gap[plane], positive_approach, negative_approach, epsilon
+        )
+        plane_point[plane] = placed
+    point = plane_point[plane]
     for slot in range(4):
         particle = particles[slot]
         if particle >= 0:
@@ -581,6 +588,10 @@ class DeformablePenetrationLimiter:
         """Division-plane normal of each plane, or zero for an unused rigid-soft slot."""
         self.plane_point = wp.zeros(size, dtype=wp.vec3, device=self.device)
         """Point on each division plane [m]."""
+        self.plane_support = wp.zeros(size, dtype=wp.vec3, device=self.device)
+        """Support point of the negative side of each self-contact separator [m]."""
+        self.plane_gap = wp.zeros(size, dtype=wp.float32, device=self.device)
+        """Gap between the supports of each self-contact separator [m]."""
         self.plane_epsilon = wp.zeros(size, dtype=wp.float32, device=self.device)
         """Separation clearance of each division plane [m]."""
 
@@ -591,10 +602,9 @@ class DeformablePenetrationLimiter:
     def begin_time_step(
         self, particle_q: wp.array[wp.vec3], particle_qd: wp.array[wp.vec3], time_step: wp.array[wp.float32]
     ) -> None:
-        """Freeze the begin-step surface of the step bounds and place the self-contact planes.
+        """Freeze the begin-step surface of the step bounds and find the self-contact separators.
 
-        The planes split the gap of each candidate according to the displacements predicted from
-        the begin-step velocities; any placement within the gap separates the pair.
+        Each iteration places the plane of a separator within its gap from the current displacements.
 
         Args:
             particle_q: Begin-step particle positions [m], in Newton order.
@@ -605,23 +615,15 @@ class DeformablePenetrationLimiter:
         detector = self_contacts.detector
         model = self_contacts.model
         wp.copy(self.reference_position, particle_q)
-        wp.launch(
-            _predict_particle_displacements,
-            dim=model.particle_count,
-            inputs=[time_step, self.topology.newton_to_packed, self.topology.packed_solve_world, particle_qd],
-            outputs=[self.displacement],
-            device=self.device,
-        )
         self.self_plane_count.zero_()
         wp.launch(
-            _build_division_planes,
+            _build_division_separators,
             dim=self_contacts.capacity,
             inputs=[
                 self_contacts.vertex_capacity,
                 detector.vertex_colliding_triangles,
                 detector.edge_colliding_edges,
                 self.reference_position,
-                self.displacement,
                 model.tri_indices,
                 self_contacts.edge_indices,
                 self_contacts.adjacency,
@@ -631,7 +633,8 @@ class DeformablePenetrationLimiter:
                 self.plane_particles,
                 self.plane_sides,
                 self.plane_normal,
-                self.plane_point,
+                self.plane_support,
+                self.plane_gap,
                 self.plane_epsilon,
             ],
             device=self.device,
@@ -704,6 +707,27 @@ class DeformablePenetrationLimiter:
                 ],
                 device=self.device,
             )
+        plane_slots = self_capacity + (self.rigid_capacity if contacts is not None else 0)
+        wp.launch(
+            _accumulate_plane_projections,
+            dim=plane_slots,
+            inputs=[
+                self_capacity,
+                self.self_plane_count,
+                rigid_count,
+                self.plane_particles,
+                self.plane_sides,
+                self.plane_normal,
+                self.plane_support,
+                self.plane_gap,
+                self.plane_epsilon,
+                self.reference_position,
+                self.displacement,
+                self.relaxation,
+            ],
+            outputs=[self.plane_point, self.correction, self.correction_count],
+            device=self.device,
+        )
         plane_inputs = [
             self_capacity,
             self.self_plane_count,
@@ -717,14 +741,6 @@ class DeformablePenetrationLimiter:
             self.displacement,
             self.relaxation,
         ]
-        plane_slots = self_capacity + (self.rigid_capacity if contacts is not None else 0)
-        wp.launch(
-            _accumulate_plane_projections,
-            dim=plane_slots,
-            inputs=plane_inputs,
-            outputs=[self.correction, self.correction_count],
-            device=self.device,
-        )
         wp.launch(
             _apply_plane_projections,
             dim=particle_count,
