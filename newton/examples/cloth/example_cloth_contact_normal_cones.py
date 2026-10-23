@@ -323,7 +323,6 @@ def _make_lox_config(model: newton.Model, *, enable_normal_cone_filtering: bool)
     config.lox.deformable_self_contact_margin = 0.035
     config.lox.deformable_self_contact_gap = 0.04
     config.lox.deformable_self_contact_topological_filter_threshold = 0
-    config.lox.deformable_self_contact_rest_exclusion_radius = 0.0
     return config
 
 
@@ -464,7 +463,9 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.collision_pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.015)
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model, soft_contact_gap=0.015, enable_rigid_soft_full_surface_contact=True
+        )
         self.contacts = self.collision_pipeline.contacts()
 
         # These implementation-owned arrays are intentionally used only by this

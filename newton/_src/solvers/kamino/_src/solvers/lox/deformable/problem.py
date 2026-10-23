@@ -19,7 +19,8 @@ import warp as wp
 
 from ....core.materials import MaterialMixMode
 from ..types import ParticleContactRows
-from .contact import DeformableContacts
+from .contact import ColliderMeshTopology, DeformableContacts
+from .contact_filter import surface_face_sides
 from .penetration import DeformablePenetrationLimiter
 from .self_contact import DeformableSelfContacts
 from .system import DeformableSystem
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
     from .....config import LOXSolverConfig, MaterialManagerConfig
     from ....core.data import DataKamino
     from ....core.model import ModelKamino
+    from ....core.types import vec6f
     from ..types import LOXProblemData
     from .types import DeformableSystemData, DeformableTopology
 
@@ -102,7 +104,18 @@ class DeformableProblem:
             self._friction_mix_mode = MaterialMixMode.from_string(materials.friction_mix_mode)
             self._restitution_mix_mode = MaterialMixMode.from_string(materials.restitution_mix_mode)
         self._rigid_normal_cone_filtering = config.deformable_enable_rigid_contact_normal_cone_filtering
+        # The collider meshes are gathered once on the host, outside any graph capture of the contact rows
+        self._collider_topology = ColliderMeshTopology(model, include_shapes=self._rigid_normal_cone_filtering)
         self._normal_cone_filtering_min_distance = config.deformable_normal_cone_filtering_min_distance
+        # Cloth triangles are two-sided; the boundary triangles of the soft bodies face outwards
+        self._face_side: wp.array[wp.float32] | None = None
+        if model.tri_count > 0:
+            sides = surface_face_sides(
+                model.tri_indices.numpy(),
+                model.tet_indices.numpy() if model.tet_count > 0 else None,
+                model.particle_q.numpy(),
+            )
+            self._face_side = wp.array(sides, dtype=wp.float32, device=self.device)
         self.particle_unilateral_count = wp.zeros(self.num_particles, dtype=wp.int32, device=self.device)
         """Number of rows that couple each dynamic particle with a significant coefficient."""
         self.self_contacts: DeformableSelfContacts | None = None
@@ -121,10 +134,14 @@ class DeformableProblem:
                 vertex_buffer_size=config.deformable_self_contact_vertex_buffer_size,
                 edge_buffer_size=config.deformable_self_contact_edge_buffer_size,
                 topological_filter_threshold=config.deformable_self_contact_topological_filter_threshold,
-                rest_exclusion_radius=config.deformable_self_contact_rest_exclusion_radius,
                 edge_parallel_epsilon=config.deformable_self_contact_edge_parallel_epsilon,
+                stabilization_fraction=config.deformable_self_contact_stabilization,
+                max_separation_velocity=config.deformable_self_contact_max_separation_velocity,
                 normal_cone_filtering=config.deformable_enable_normal_cone_filtering,
                 normal_cone_filtering_min_distance=config.deformable_normal_cone_filtering_min_distance,
+                # The penetration-free fallback bound reads the smallest vertex distance of each triangle
+                record_triangle_distances=config.deformable_enable_penetration_free_contact,
+                face_side=self._face_side,
             )
         self.penetration_limiter: DeformablePenetrationLimiter | None = None
         """Step limiter of the penetration-free contacts, or ``None``."""
@@ -136,6 +153,7 @@ class DeformableProblem:
                 self.system.topology,
                 self.system.data.inverse_weight,
                 config.deformable_penetration_free_contact_relaxation,
+                kamino_data.bodies.q_i,
             )
         self.contacts: DeformableContacts | None = None
         """Loader of the particle contact rows."""
@@ -190,6 +208,8 @@ class DeformableProblem:
                 "memory pool. Enable the Warp memory pool or run one step before the capture."
             )
         self._allocate_contacts(rigid_capacity)
+        if self.penetration_limiter is not None:
+            self.penetration_limiter.set_rigid_capacity(rigid_capacity)
         return True
 
     def begin_time_step(self, state: State, time_step: wp.array[wp.float32]) -> None:
@@ -217,12 +237,14 @@ class DeformableProblem:
             contacts: Newton contacts of the time step, or ``None``.
             state: Begin-step Newton state.
             time_step: Time step of each world [s].
-            stabilization_fraction: Fraction of the contact penetration corrected in one step.
+            stabilization_fraction: Fraction of the rigid-soft contact penetration corrected in one step.
             dead_zone: Symmetric contact distance dead zone of the stabilization [m].
             problem_data: Rows and body data of the LOX problem, whose body incidence the rows extend.
             body_vector_index: First entry of each body in the packed body system vectors, or ``-1``.
         """
         full_inverse_weight = self.system.data.full_inverse_weight
+        if self.penetration_limiter is not None:
+            self.penetration_limiter.bind_rigid_contacts(contacts)
         self.contacts.load(
             contacts,
             state.particle_q,
@@ -242,7 +264,6 @@ class DeformableProblem:
                 topology.packed_solve_world,
                 full_inverse_weight,
                 time_step,
-                stabilization_fraction,
                 dead_zone,
             )
         self.contacts.finish(problem_data, body_vector_index, full_inverse_weight, self.particle_unilateral_count)
@@ -270,10 +291,19 @@ class DeformableProblem:
         projected_velocity: wp.array[wp.vec3f],
         world_active: wp.array[wp.bool],
         time_step: wp.array[wp.float32],
+        projected_twist: wp.array[vec6f],
+        global_twist: wp.array[vec6f],
+        projected_twist_fraction: float,
     ) -> None:
-        """Truncate the projected particle velocities within the penetration-free step bounds, if enabled."""
+        """Truncate the projected particle velocities within the penetration-free step bounds, if enabled.
+
+        The accepted body twist, which blends the projected and smooth twists with the projected
+        twist fraction, moves the rigid side of the rigid-soft bounds.
+        """
         if self.penetration_limiter is not None:
-            self.penetration_limiter.truncate(projected_velocity, world_active, time_step)
+            self.penetration_limiter.truncate(
+                projected_velocity, world_active, time_step, projected_twist, global_twist, projected_twist_fraction
+            )
 
     ###
     # Internals
@@ -293,4 +323,6 @@ class DeformableProblem:
             restitution_mix_mode=self._restitution_mix_mode,
             rigid_normal_cone_filtering=self._rigid_normal_cone_filtering,
             normal_cone_filtering_min_distance=self._normal_cone_filtering_min_distance,
+            collider_topology=self._collider_topology,
+            face_side=self._face_side,
         )
