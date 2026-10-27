@@ -22,9 +22,11 @@
 #
 # Run interactively:
 #   uv run --extra examples python -m newton.examples.vbd.example_cable_michell_threshold
+#   uv run --extra examples python -m newton.examples.vbd.example_cable_michell_threshold --solver lox
 #
 # Run as a test:
 #   uv run --extra examples python -m newton.examples.vbd.example_cable_michell_threshold --test --viewer null
+#   uv run --extra examples python -m newton.examples.vbd.example_cable_michell_threshold --solver lox --test --viewer null
 #
 ###########################################################################
 
@@ -78,6 +80,7 @@ class Example:
     def __init__(self, viewer, args=None):
         self.viewer = viewer
         self.args = args
+        self.solver_type = str(getattr(args, "solver", "vbd")).lower()
 
         self.fps = self.FPS
         self.frame_dt = 1.0 / self.fps
@@ -89,6 +92,8 @@ class Example:
         self.critical_twist = self.TOTAL_TWIST
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        if self.solver_type == "lox":
+            newton.solvers.SolverKamino.register_custom_attributes(builder)
         self.cases = []
         x_offsets = self._case_offsets(len(self.TWIST_TO_BEND_RATIOS))
         for twist_to_bend, x_offset in zip(self.TWIST_TO_BEND_RATIOS, x_offsets, strict=True):
@@ -116,7 +121,7 @@ class Example:
             )
             is_dynamic = factor > 1.0
             if not is_dynamic:
-                self._make_bodies_kinematic(builder, bodies)
+                self._make_bodies_kinematic(builder, bodies, flag_kinematic=self.solver_type == "lox")
             self.cases.append(
                 {
                     "label": label,
@@ -133,7 +138,12 @@ class Example:
 
         builder.color()
         self.model = builder.finalize()
-        self.solver = newton.solvers.SolverVBD(self.model, iterations=self.sim_iterations)
+        if self.solver_type == "vbd":
+            self.solver = newton.solvers.SolverVBD(self.model, iterations=self.sim_iterations)
+        else:
+            config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
+            config.lox.max_iterations = self.sim_iterations
+            self.solver = newton.solvers.SolverKamino(self.model, config=config)
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
@@ -192,9 +202,11 @@ class Example:
         return (1.0, 0.25, 0.15)
 
     @staticmethod
-    def _make_bodies_kinematic(builder: newton.ModelBuilder, bodies) -> None:
+    def _make_bodies_kinematic(builder: newton.ModelBuilder, bodies, flag_kinematic: bool = False) -> None:
         for body_id in bodies:
             body = int(body_id)
+            if flag_kinematic:
+                builder.body_flags[body] = int(newton.BodyFlags.KINEMATIC)
             builder.body_mass[body] = 0.0
             builder.body_inv_mass[body] = 0.0
             builder.body_inertia[body] = wp.mat33(0.0)
@@ -410,6 +422,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=("vbd", "lox"), default="vbd", help="Cable dynamics solver.")
     parser.set_defaults(num_frames=int(Example.FPS * Example.RUN_TIME))
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)
