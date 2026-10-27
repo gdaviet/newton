@@ -666,8 +666,8 @@ def _assemble_bending_system(
     position_linearized: wp.array[wp.vec3],
     bending_indices: wp.array2d[wp.int32],
     source_edge_indices: wp.array[wp.int32],
+    bending_rest_scale: wp.array[float],
     model_edge_rest_angle: wp.array[float],
-    model_edge_rest_length: wp.array[float],
     model_edge_bending_properties: wp.array2d[float],
     packed_to_newton: wp.array[wp.int32],
     packed_world: wp.array[wp.int32],
@@ -767,10 +767,10 @@ def _assemble_bending_system(
         cos_angle,
     )
 
-    rest_length = model_edge_rest_length[source_edge]
+    rest_scale = bending_rest_scale[bending]
     stiffness = model_edge_bending_properties[source_edge, 0]
     damping = model_edge_bending_properties[source_edge, 1]
-    elastic_scale = stiffness * rest_length
+    elastic_scale = stiffness * rest_scale
     force_scale = elastic_scale * (angle - model_edge_rest_angle[source_edge])
     tangent_scale = elastic_scale
 
@@ -802,8 +802,8 @@ def _assemble_bending_system(
                 angle_delta -= 2.0 * wp.pi
             elif angle_delta < -wp.pi:
                 angle_delta += 2.0 * wp.pi
-            force_scale += damping * rest_length * angle_delta / dt
-            tangent_scale += damping * rest_length / dt
+            force_scale += damping * rest_scale * angle_delta / dt
+            tangent_scale += damping * rest_scale / dt
 
     for row in range(4):
         row_vertex = bending_indices[bending, row]

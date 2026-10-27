@@ -690,6 +690,20 @@ class DeformableSystem:
         packed_tetrahedron_indices_np = newton_to_packed_np[tetrahedron_indices_np]
         self.bending_count = int(source_edge_indices_np.shape[0])
         """Number of valid bending edges."""
+        # Discrete-shell scale of each bending edge (Grinspun et al. 2003): the hinge energy
+        # 1/2 k |e| / h_e theta^2 with h_e = (A_0 + A_1) / (3 |e|) converges as the mesh is refined.
+        bending_rest_scale_np = np.empty(0, dtype=np.float64)
+        if self.bending_count > 0:
+            rest_positions = model.particle_q.numpy().astype(np.float64)
+            rest_length = model.edge_rest_length.numpy().astype(np.float64)[source_edge_indices_np]
+            opposite_0 = rest_positions[bending_indices_np[:, 0]]
+            opposite_1 = rest_positions[bending_indices_np[:, 1]]
+            edge_start = rest_positions[bending_indices_np[:, 2]]
+            edge_end = rest_positions[bending_indices_np[:, 3]]
+            edge_vector = edge_end - edge_start
+            area_0 = 0.5 * np.linalg.norm(np.cross(edge_vector, opposite_0 - edge_start), axis=1)
+            area_1 = 0.5 * np.linalg.norm(np.cross(edge_vector, opposite_1 - edge_start), axis=1)
+            bending_rest_scale_np = 3.0 * rest_length * rest_length / np.maximum(area_0 + area_1, 1.0e-20)
 
         self._topology = DeformableTopology(
             newton_to_packed=newton_to_packed_np,
@@ -701,6 +715,7 @@ class DeformableSystem:
             triangle_indices=packed_triangle_indices_np,
             bending_indices=packed_bending_indices_np,
             source_edge_indices=source_edge_indices_np,
+            bending_rest_scale=bending_rest_scale_np,
             tetrahedron_indices=packed_tetrahedron_indices_np,
             device=self.device,
         )
@@ -1260,8 +1275,8 @@ class DeformableSystem:
                     data.position_linearized,
                     topology.bending_indices,
                     topology.source_edge_indices,
+                    topology.bending_rest_scale,
                     model.edge_rest_angle,
-                    model.edge_rest_length,
                     model.edge_bending_properties,
                     topology.packed_to_newton,
                     topology.packed_solve_world,
