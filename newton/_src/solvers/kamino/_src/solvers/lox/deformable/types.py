@@ -129,7 +129,7 @@ class DeformableTopology:
         triangle_indices: Packed particles of each triangle.
         bending_indices: Packed particles of each valid bending edge.
         source_edge_indices: Newton edge of each valid bending edge.
-        bending_rest_scale: Discrete-shell scale ``3 |e|^2 / (A_0 + A_1)`` of each valid bending edge.
+        bending_rest_scale: Discrete-shell scale ``|e|^2 / (A_0 + A_1)`` of each valid bending edge.
         tetrahedron_indices: Packed particles of each tetrahedron.
         device: Device of the arrays.
     """
@@ -171,7 +171,7 @@ class DeformableTopology:
         self.source_edge_indices = to_warp_int32_array(source_edge_indices, device)
         """Newton edge of each valid bending edge."""
         self.bending_rest_scale = wp.array(np.asarray(bending_rest_scale, dtype=np.float32), dtype=float, device=device)
-        """Discrete-shell scale ``3 |e|^2 / (A_0 + A_1)`` of each valid bending edge, from its rest length and the
+        """Discrete-shell scale ``|e|^2 / (A_0 + A_1)`` of each valid bending edge, from its rest length and the
         rest areas of its two triangles [dimensionless]."""
         self.tetrahedron_indices = to_warp_int32_array(tetrahedron_indices, device)
         """Packed particles of each tetrahedron, shape ``[tetrahedron_count, 4]``."""

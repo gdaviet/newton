@@ -691,7 +691,8 @@ class DeformableSystem:
         self.bending_count = int(source_edge_indices_np.shape[0])
         """Number of valid bending edges."""
         # Discrete-shell scale of each bending edge (Grinspun et al. 2003): the hinge energy
-        # 1/2 k |e| / h_e theta^2 with h_e = (A_0 + A_1) / (3 |e|) converges as the mesh is refined.
+        # 1/2 k |e|^2 / (A_0 + A_1) theta^2 converges as the mesh is refined, and on near-equilateral
+        # meshes bends a cylinder with the plate bending stiffness k [N m].
         bending_rest_scale_np = np.empty(0, dtype=np.float64)
         if self.bending_count > 0:
             rest_positions = model.particle_q.numpy().astype(np.float64)
@@ -703,7 +704,7 @@ class DeformableSystem:
             edge_vector = edge_end - edge_start
             area_0 = 0.5 * np.linalg.norm(np.cross(edge_vector, opposite_0 - edge_start), axis=1)
             area_1 = 0.5 * np.linalg.norm(np.cross(edge_vector, opposite_1 - edge_start), axis=1)
-            bending_rest_scale_np = 3.0 * rest_length * rest_length / np.maximum(area_0 + area_1, 1.0e-20)
+            bending_rest_scale_np = rest_length * rest_length / np.maximum(area_0 + area_1, 1.0e-20)
 
         self._topology = DeformableTopology(
             newton_to_packed=newton_to_packed_np,
