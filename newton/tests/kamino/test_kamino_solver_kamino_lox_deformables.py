@@ -1129,6 +1129,54 @@ class TestSolverKaminoLOXDeformables(unittest.TestCase):
         self.assertGreater(float(np.linalg.norm(state_out.particle_qd.numpy())), 0.0)
         self.assertGreater(float(np.linalg.norm(state_out.body_qd.numpy()[body])), 0.0)
 
+    def test_step_full_surface_mesh_contact_skips_inactive_cloth(self):
+        """Leave the rows of full-surface mesh contacts without an active particle unused."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        body = builder.add_body(xform=wp.transform_identity())
+        builder.add_shape_mesh(body, mesh=newton.Mesh.create_box(0.5, 0.5, 0.5))
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.5, -0.5, 0.53),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=2,
+            dim_y=2,
+            cell_x=0.5,
+            cell_y=0.5,
+            mass=0.0,
+            tri_ke=100.0,
+            tri_ka=80.0,
+            tri_kd=0.0,
+            tri_drag=0.0,
+            tri_lift=0.0,
+            edge_ke=2.0,
+            edge_kd=0.0,
+            particle_radius=0.01,
+        )
+        for particle in range(builder.particle_count):
+            builder.particle_flags[particle] &= ~int(newton.ParticleFlags.ACTIVE)
+        model = builder.finalize(device=self.default_device)
+        state_in = model.state()
+        state_out = model.state()
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            soft_contact_gap=0.1,
+            enable_rigid_soft_full_surface_contact=True,
+        )
+        contacts = pipeline.contacts()
+        pipeline.collide(state_in, contacts)
+        contact_count = int(contacts.soft_contact_count.numpy()[0])
+        self.assertGreater(contact_count, 0)
+        self.assertTrue(np.all(contacts._soft_contact_mesh_features.numpy()[:contact_count, 0] >= 0))
+
+        solver = SolverKamino(model, config=_make_lox_config(max_iterations=50))
+        solver.step(state_in, state_out, None, contacts, 0.01)
+
+        rows = _lox(solver).deformables.contact_rows
+        np.testing.assert_array_equal(solver.status.numpy()["failed"], [0])
+        np.testing.assert_array_equal(rows.status.numpy()[:contact_count], ParticleContactStatus.UNUSED)
+        np.testing.assert_array_equal(state_out.body_qd.numpy()[body], 0.0)
+
     def test_reset_pure_cloth_state_and_warm_start(self):
         """Reset Newton-owned particle state and clear the pure-cloth LOX warm start."""
         model, _, _ = _build_contact_model(device=self.default_device)
