@@ -176,6 +176,7 @@ class DeformableContacts:
         self._empty_edge_indices = wp.empty((0, 4), dtype=wp.int32, device=self.device)
         self._empty_tri_indices = wp.empty((0, 3), dtype=wp.int32, device=self.device)
         self._empty_body_com = wp.empty(0, dtype=wp.vec3f, device=self.device)
+        self._empty_mesh_features = wp.empty(0, dtype=wp.vec3i, device=self.device)
 
     ###
     # Properties
@@ -226,6 +227,9 @@ class DeformableContacts:
             and model.tri_count > 0
             and model.edge_count > 0
         )
+        mesh_features = contacts._soft_contact_mesh_features
+        if mesh_features is None:
+            mesh_features = self._empty_mesh_features
         topology = self.collider_topology
         capacity = min(rows.rigid_capacity, contacts.soft_contact_max)
         if capacity < rows.rigid_capacity:
@@ -241,6 +245,7 @@ class DeformableContacts:
                 contacts.soft_contact_body_pos,
                 contacts.soft_contact_body_vel,
                 contacts.soft_contact_normal,
+                mesh_features,
                 model.tri_indices if model.tri_indices is not None else self._empty_tri_indices,
                 model.edge_indices if model.edge_indices is not None else self._empty_edge_indices,
                 model.soft_mesh_adjacency_device,

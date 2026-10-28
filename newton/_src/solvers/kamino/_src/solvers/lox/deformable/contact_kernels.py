@@ -14,6 +14,7 @@ Jacobi sweep and select the bodies and particles that receive splitting weights.
 
 import warp as wp
 
+from .......geometry.soft_contacts_mesh import _MESH_FEATURE_SIGN_UNKNOWN
 from .......utils.mesh import MeshAdjacencyData
 from ....core.materials import MaterialMixMode
 from ....core.types import mat36f, vec6f
@@ -306,6 +307,7 @@ def _load_particle_contacts(
     contacts_soft_contact_body_pos: wp.array[wp.vec3f],
     contacts_soft_contact_body_vel: wp.array[wp.vec3f],
     contacts_soft_contact_normal: wp.array[wp.vec3f],
+    contacts_soft_contact_mesh_feature: wp.array[wp.vec3i],
     tri_indices: wp.array2d[wp.int32],
     edge_indices: wp.array2d[wp.int32],
     adjacency: MeshAdjacencyData,
@@ -383,6 +385,21 @@ def _load_particle_contacts(
     row_bias[cid] = wp.vec3f(0.0)
     row_friction[cid] = 0.0
     row_reaction[cid] = wp.vec3f(0.0)
+
+    # Full-surface mesh records with an unresolved inside/outside sign or without an active
+    # particle serve penetration prevention only, so their rows stay unused
+    if cid < contacts_soft_contact_mesh_feature.shape[0]:
+        mesh_feature = contacts_soft_contact_mesh_feature[cid][0]
+        if mesh_feature >= 0:
+            if (mesh_feature & _MESH_FEATURE_SIGN_UNKNOWN) != 0:
+                return
+            active = int(0)
+            for slot in range(3):
+                source_particle = contacts_soft_contact_indices[cid][slot]
+                if source_particle >= 0 and source_particle < particle_flags.shape[0]:
+                    active |= particle_flags[source_particle] & _PARTICLE_FLAG_ACTIVE
+            if active == 0:
+                return
 
     shape = contacts_soft_contact_shape[cid]
     if (
