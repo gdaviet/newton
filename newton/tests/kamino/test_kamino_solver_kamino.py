@@ -441,6 +441,7 @@ class TestSolverKaminoConfig(unittest.TestCase):
         SolverKaminoImpl.Config(dynamics_solver="lox", sparse_jacobian=True, sparse_dynamics=True)
         self.assertEqual(SolverKaminoImpl.Config(dynamics_solver="lox", integrator="moreau").integrator, "moreau")
         kamino_config.LOXSolverConfig(gauss_seidel_max_colors=4, projection_acceleration="anderson")
+        kamino_config.LOXSolverConfig(gauss_seidel_max_colors=4, projection_acceleration="apgd")
         kamino_config.LOXSolverConfig(
             contact_compliance=True, contact_implicit_restitution=True, contact_spatial_friction=True
         )
@@ -448,7 +449,6 @@ class TestSolverKaminoConfig(unittest.TestCase):
         invalid_values = (
             ({"contact_warmstart_method": "geom_pair_net_wrench"}, "contact warmstart method is not implemented"),
             ({"projection_acceleration": "invalid"}, "projection_acceleration"),
-            ({"gauss_seidel_max_colors": 4, "projection_acceleration": "apgd"}, "requires gauss_seidel_max_colors=1"),
             ({"gauss_seidel_max_colors": True}, "gauss_seidel_max_colors"),
             ({"max_iterations": 0}, "max_iterations"),
             ({"use_graph_conditionals": 1}, "use_graph_conditionals"),
