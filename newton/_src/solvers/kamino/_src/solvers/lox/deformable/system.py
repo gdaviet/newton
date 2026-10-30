@@ -1431,6 +1431,8 @@ class DeformableSystem:
                 topology.packed_to_newton,
                 topology.packed_component,
                 model.particle_mass,
+                data.smooth_matrix.values,
+                data.diagonal_slots,
                 incidence.component_mass,
                 incidence.component_fixed_count,
                 incidence.patch_count,
