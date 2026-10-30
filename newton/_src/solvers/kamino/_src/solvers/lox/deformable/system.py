@@ -60,6 +60,7 @@ from .system_kernels import (
     _retain_direct_candidate_rhs,
     _rollback_unsafe_recycled_cr_projection,
     _select_consensus_weight,
+    _shift_velocity,
     _validate_and_restart_recycled_cr_projection,
 )
 from .tetrahedron_proximal import DeformableTetrahedronProximal
@@ -1125,7 +1126,13 @@ class DeformableSystem:
                     f"LOX deformable expected world active mask on {self.device}, found {world_active.device}."
                 )
             wp.copy(dest=data.world_active, src=world_active, count=data.world_active.shape[0])
+        if use_cudss is None:
+            use_cudss = self.linear_solver == "cudss"
+        if use_cudss and self.cudss_solver is None:
+            raise RuntimeError("LOX deformable cuDSS candidate solve was not initialized.")
 
+        # The candidate solves resolve the correction to the linearization velocity in place
+        self._shift_smooth_velocity(-1.0)
         wp.launch(
             _prepare_candidate_rhs,
             dim=self.particle_count,
@@ -1134,6 +1141,8 @@ class DeformableSystem:
                 data.nonlinear_rhs,
                 consensus_center,
                 data.weight,
+                self.consensus_fraction,
+                data.velocity_linearized,
                 data.smooth_velocity,
                 self._topology.packed_solve_world,
                 data.world_active,
@@ -1141,11 +1150,24 @@ class DeformableSystem:
             outputs=[data.candidate_rhs],
             device=self.device,
         )
-        if use_cudss is None:
-            use_cudss = self.linear_solver == "cudss"
+        self._solve_candidate_correction(use_cudss)
+        self._shift_smooth_velocity(1.0)
+
+    def _shift_smooth_velocity(self, sign: float) -> None:
+        """Add ``sign`` times the linearization velocity to the candidate velocity."""
+        data = self._data
+        wp.launch(
+            _shift_velocity,
+            dim=self.particle_count,
+            inputs=[data.velocity_linearized, sign],
+            outputs=[data.smooth_velocity],
+            device=self.device,
+        )
+
+    def _solve_candidate_correction(self, use_cudss: bool) -> None:
+        """Solve for the correction to the linearization velocity held in the candidate velocity."""
+        data = self._data
         if use_cudss:
-            if self.cudss_solver is None:
-                raise RuntimeError("LOX deformable cuDSS candidate solve was not initialized.")
             self.cudss_solver.solve(data.candidate_rhs, data.smooth_velocity)
             data.candidate_linear_residual.zero_()
             return
@@ -1319,18 +1341,10 @@ class DeformableSystem:
             prune_numerical_zeros=False,
             topology="masked",
         )
-        wps.bsr_mv(
-            data.smooth_matrix,
-            x=data.velocity_linearized,
-            y=data.matrix_velocity,
-            alpha=1.0,
-            beta=0.0,
-        )
         wp.launch(
             _finalize_smooth_rhs,
             dim=self.particle_count,
             inputs=[
-                data.matrix_velocity,
                 data.smooth_force,
                 data.velocity_start,
                 data.velocity_linearized,
