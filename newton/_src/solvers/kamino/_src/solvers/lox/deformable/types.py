@@ -91,7 +91,8 @@ class DeformableWeightStatus(IntEnum):
     """The weight was finite and required no regularization, or the particle is prescribed."""
 
     REGULARIZED = 2
-    """A patch matrix was not positive definite, and the weight was floored at the particle mass."""
+    """A patch matrix was not positive definite, and its bound took the particle mass for the free patch, or the
+    mean diagonal of the particle for the pinned patch."""
 
 
 class DeformablePreconditionerStatus(IntEnum):

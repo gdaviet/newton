@@ -526,6 +526,8 @@ def _finish_consensus_weight(
     packed_to_newton: wp.array[wp.int32],
     packed_component: wp.array[wp.int32],
     model_particle_mass: wp.array[float],
+    smooth_values: wp.array[wp.mat33],
+    diagonal_slots: wp.array[wp.int32],
     component_mass: wp.array[wp.float32],
     component_fixed_count: wp.array[wp.int32],
     patch_count: wp.array[wp.int32],
@@ -543,8 +545,8 @@ def _finish_consensus_weight(
     A positive ``beta`` caps the weight at ``beta`` times the free bound, and ``sigma`` keeps at least that
     fraction of the mean. The weight of a particle whose structural component has only dynamic particles
     is at most the mass of the component, the largest effective mass that one point of the component
-    shows, and at least the free bound. A patch matrix that is not positive definite regularizes the
-    weight to the particle mass.
+    shows, and at least the free bound. A free patch matrix that is not positive definite takes the
+    particle mass as its bound, and a pinned one the mean diagonal ``tr(A_ii) / 3`` of the particle.
     """
     pid = wp.tid()
     if patch_count[pid] == 0:
@@ -552,18 +554,21 @@ def _finish_consensus_weight(
     free_smallest = patch_smallest[pid]
     pinned_smallest = patch_smallest[patch_count.shape[0] + pid]
     mass = model_particle_mass[packed_to_newton[pid]]
-    particle_weight = mass
-    status = wp.int32(DeformableWeightStatus.REGULARIZED)
-    if free_smallest > 0.0 and pinned_smallest > 0.0:
-        # Round-off can only move the bounds out of their order m <= free <= pinned
-        free_bound = wp.max(free_smallest, mass)
-        particle_weight = wp.sqrt(free_bound * wp.max(pinned_smallest, free_bound))
-        if beta > 0.0:
-            particle_weight = wp.max(sigma * particle_weight, wp.min(particle_weight, beta * free_bound))
-        component = packed_component[pid]
-        if component_fixed_count[component] == 0:
-            particle_weight = wp.min(particle_weight, wp.max(component_mass[component], free_bound))
-        status = wp.int32(DeformableWeightStatus.VALID)
+    status = wp.int32(DeformableWeightStatus.VALID)
+    if not (free_smallest > 0.0):
+        free_smallest = mass
+        status = wp.int32(DeformableWeightStatus.REGULARIZED)
+    if not (pinned_smallest > 0.0):
+        pinned_smallest = wp.trace(smooth_values[diagonal_slots[pid]]) / 3.0
+        status = wp.int32(DeformableWeightStatus.REGULARIZED)
+    # Round-off can only move the bounds out of their order m <= free <= pinned
+    free_bound = wp.max(free_smallest, mass)
+    particle_weight = wp.sqrt(free_bound * wp.max(pinned_smallest, free_bound))
+    if beta > 0.0:
+        particle_weight = wp.max(sigma * particle_weight, wp.min(particle_weight, beta * free_bound))
+    component = packed_component[pid]
+    if component_fixed_count[component] == 0:
+        particle_weight = wp.min(particle_weight, wp.max(component_mass[component], free_bound))
     weight[pid] = particle_weight
     inverse_weight[pid] = 1.0 / particle_weight
     weight_status[pid] = status
