@@ -462,10 +462,8 @@ class DeformableSystemData:
         """Linearization velocity of each particle [m/s]."""
         self.smooth_force = wp.zeros(particle_count, dtype=wp.vec3, device=device)
         """External, elastic, damping, and aerodynamic force of each particle at the linearization [N]."""
-        self.matrix_velocity = wp.zeros(particle_count, dtype=wp.vec3, device=device)
-        """Product of the smooth matrix with the linearization velocity [N s]."""
         self.smooth_rhs = wp.zeros(particle_count, dtype=wp.vec3, device=device)
-        """Frozen smooth right-hand side ``f`` [N s]."""
+        """Frozen smooth right-hand side ``f`` of the correction to the linearization velocity [N s]."""
 
         self.full_weight = wp.zeros(particle_count, dtype=wp.float32, device=device)
         """Consensus weight of each dynamic particle [kg]."""

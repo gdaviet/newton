@@ -52,6 +52,7 @@ __all__ = [
     "_retain_direct_candidate_rhs",
     "_rollback_unsafe_recycled_cr_projection",
     "_select_consensus_weight",
+    "_shift_velocity",
     "_validate_and_restart_recycled_cr_projection",
     "is_dynamic_particle",
     "triangle_vertex_coefficients",
@@ -825,7 +826,6 @@ def _assemble_bending_system(
 @wp.kernel
 def _finalize_smooth_rhs(
     # Inputs:
-    matrix_velocity: wp.array[wp.vec3],
     smooth_force: wp.array[wp.vec3],
     velocity_start: wp.array[wp.vec3],
     velocity_linearized: wp.array[wp.vec3],
@@ -837,7 +837,12 @@ def _finalize_smooth_rhs(
     # Outputs:
     smooth_rhs: wp.array[wp.vec3],
 ):
-    """Finish the affine frozen-dynamics right-hand side."""
+    """Finish the affine frozen-dynamics right-hand side of the correction to the linearization velocity.
+
+    The unknown of the candidate solves is ``v - v_lin``, so the right-hand side holds the forces at the
+    linearization and leaves the matrix product ``A v_lin`` out, whose single-precision round-off grows with
+    the stiffness of the elements. Fixed particles have identity rows and keep the velocity zero.
+    """
     packed_particle = wp.tid()
     dt = model_time_dt[packed_world[packed_particle]]
     if is_dynamic_particle(packed_particle, packed_to_newton, model_particle_mass, model_particle_flags):
@@ -845,11 +850,9 @@ def _finalize_smooth_rhs(
         inertial_correction = model_particle_mass[particle] * (
             velocity_start[packed_particle] - velocity_linearized[packed_particle]
         )
-        smooth_rhs[packed_particle] = (
-            matrix_velocity[packed_particle] + inertial_correction + dt * smooth_force[packed_particle]
-        )
+        smooth_rhs[packed_particle] = inertial_correction + dt * smooth_force[packed_particle]
     else:
-        smooth_rhs[packed_particle] = wp.vec3(0.0)
+        smooth_rhs[packed_particle] = -velocity_linearized[packed_particle]
 
 
 @wp.kernel
@@ -894,20 +897,38 @@ def _prepare_candidate_rhs(
     nonlinear_rhs: wp.array[wp.vec3],
     consensus_center: wp.array[wp.vec3],
     weight: wp.array[float],
-    current_velocity: wp.array[wp.vec3],
+    consensus_fraction: float,
+    velocity_linearized: wp.array[wp.vec3],
+    current_correction: wp.array[wp.vec3],
     packed_world: wp.array[wp.int32],
     world_active: wp.array[wp.bool],
     # Outputs:
     candidate_rhs: wp.array[wp.vec3],
 ):
-    """Form the LOX global candidate RHS with inactive-world retention."""
+    """Form the LOX global candidate RHS of the correction to the linearization velocity, with inactive-world
+    retention."""
     particle = wp.tid()
     if world_active[packed_world[particle]]:
         candidate_rhs[particle] = (
-            smooth_rhs[particle] + nonlinear_rhs[particle] + weight[particle] * consensus_center[particle]
+            smooth_rhs[particle]
+            + nonlinear_rhs[particle]
+            + weight[particle] * (consensus_center[particle] - consensus_fraction * velocity_linearized[particle])
         )
     else:
-        candidate_rhs[particle] = current_velocity[particle]
+        candidate_rhs[particle] = current_correction[particle]
+
+
+@wp.kernel
+def _shift_velocity(
+    # Inputs:
+    reference: wp.array[wp.vec3],
+    sign: float,
+    # Outputs:
+    velocity: wp.array[wp.vec3],
+):
+    """Add ``sign`` times the reference velocity to each particle velocity."""
+    particle = wp.tid()
+    velocity[particle] += sign * reference[particle]
 
 
 @wp.kernel
