@@ -1404,7 +1404,7 @@ def compute_tri_aabb(
     return lower, upper
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False, module="unique")
 def compute_tri_aabbs(
     pos: wp.array[wp.vec3],
     tri_indices: wp.array2d[wp.int32],
@@ -1423,7 +1423,7 @@ def compute_tri_aabbs(
     upper_bounds[t_id] = upper
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False, module="unique")
 def compute_edge_aabbs(
     pos: wp.array[wp.vec3],
     edge_indices: wp.array2d[wp.int32],
@@ -1439,7 +1439,7 @@ def compute_edge_aabbs(
     upper_bounds[e_id] = wp.max(v1, v2)
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False, module="unique")
 def compute_tri_groups(
     tri_indices: wp.array2d[wp.int32],
     particle_world: wp.array[wp.int32],
@@ -1458,7 +1458,7 @@ def compute_tri_groups(
     groups[t_id] = world_index
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False, module="unique")
 def compute_edge_groups(
     edge_indices: wp.array2d[wp.int32],
     particle_world: wp.array[wp.int32],
@@ -1496,7 +1496,7 @@ def vertex_adjacent_to_triangle(v: wp.int32, a: wp.int32, b: wp.int32, c: wp.int
     return v == a or v == b or v == c
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False, module="unique")
 def init_triangle_collision_data_kernel(
     query_radius: float,
     # outputs
@@ -1514,7 +1514,7 @@ def init_triangle_collision_data_kernel(
             resize_flags[i] = 0
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False, module="unique")
 def vertex_triangle_collision_detection_kernel(
     max_query_radius: float,
     min_query_radius: float,
@@ -1685,7 +1685,7 @@ def vertex_triangle_collision_detection_kernel(
     vertex_colliding_triangles_min_dist[v_index] = min_dis_to_tris
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False, module="unique")
 def edge_colliding_edges_detection_kernel(
     max_query_radius: float,
     min_query_radius: float,
@@ -1828,7 +1828,7 @@ def edge_colliding_edges_detection_kernel(
     edge_colliding_edges_min_dist[e_index] = min_dis_to_edges
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False, module="unique")
 def triangle_triangle_collision_detection_kernel(
     bvh_id: wp.uint64,
     pos: wp.array[wp.vec3],
