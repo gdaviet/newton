@@ -210,6 +210,8 @@ class Example:
             config = newton.solvers.SolverKamino.Config.from_model(self.model, dynamics_solver="lox")
             config.use_collision_detector = False
             config.lox.max_iterations = self.iterations
+            # The Jacobi projection lets the dropped cards come to rest, where colored Gauss-Seidel keeps them moving
+            config.lox.gauss_seidel_max_colors = 1
             config.lox.deformable_enable_self_contact = True
             config.lox.deformable_self_contact_margin = 0.001
             config.lox.deformable_self_contact_gap = 0.0015
