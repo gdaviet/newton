@@ -535,11 +535,11 @@ def _emit_soft_ef_contact(
         soft_contact_normal[idx] = normal
 
 
-def _create_soft_face_contact_kernel(compact_sdf: bool):
-    module_name = f"soft_face_contacts_{compact_sdf}"
+def _create_soft_face_contact_kernel(compact_sdf: bool, differentiable: bool = False):
+    module_name = f"soft_face_contacts_{compact_sdf}_{differentiable}"
 
-    # Compaction is disabled under requires_grad, so its kernels never need an adjoint.
-    @wp.kernel(module=module_name, enable_backward=False if compact_sdf else None)
+    # The adjoint of this kernel dominates its compile time; only requires_grad launches build it.
+    @wp.kernel(module=module_name, enable_backward=None if differentiable else False)
     def soft_face_contact_kernel(
         face_pairs: wp.array[wp.vec2i],
         particle_q: wp.array[wp.vec3],
@@ -698,6 +698,7 @@ def _create_soft_face_contact_kernel(compact_sdf: bool):
 
 
 create_soft_face_contacts = _create_soft_face_contact_kernel(False)
+create_soft_face_contacts_differentiable = _create_soft_face_contact_kernel(False, differentiable=True)
 classify_soft_face_contacts = _create_soft_face_contact_kernel(True)
 
 
@@ -815,11 +816,11 @@ _SDF_SPECIALIZED_GEO_TYPES = (
 _SDF_FACE_KERNEL_BY_GEO = {geo: _create_soft_sdf_contact_kernel(int(geo)) for geo in _SDF_SPECIALIZED_GEO_TYPES}
 
 
-def _create_soft_edge_contact_kernel(compact_sdf: bool):
-    module_name = f"soft_edge_contacts_{compact_sdf}"
+def _create_soft_edge_contact_kernel(compact_sdf: bool, differentiable: bool = False):
+    module_name = f"soft_edge_contacts_{compact_sdf}_{differentiable}"
 
-    # Compaction is disabled under requires_grad, so its kernels never need an adjoint.
-    @wp.kernel(module=module_name, enable_backward=False if compact_sdf else None)
+    # The adjoint of this kernel dominates its compile time; only requires_grad launches build it.
+    @wp.kernel(module=module_name, enable_backward=None if differentiable else False)
     def soft_edge_contact_kernel(
         edge_pairs: wp.array[wp.vec2i],
         particle_q: wp.array[wp.vec3],
@@ -960,6 +961,7 @@ def _create_soft_edge_contact_kernel(compact_sdf: bool):
 
 
 create_soft_edge_contacts = _create_soft_edge_contact_kernel(False)
+create_soft_edge_contacts_differentiable = _create_soft_edge_contact_kernel(False, differentiable=True)
 classify_soft_edge_contacts = _create_soft_edge_contact_kernel(True)
 
 
@@ -1057,11 +1059,12 @@ def launch_soft_ef_contacts(
         )
         if compact:
             sdf_fallback_count.zero_()
-        kernel = (
-            (classify_soft_edge_contacts if compact else create_soft_edge_contacts)
-            if edge
-            else (classify_soft_face_contacts if compact else create_soft_face_contacts)
-        )
+        if compact:
+            kernel = classify_soft_edge_contacts if edge else classify_soft_face_contacts
+        elif contacts.requires_grad:
+            kernel = create_soft_edge_contacts_differentiable if edge else create_soft_face_contacts_differentiable
+        else:
+            kernel = create_soft_edge_contacts if edge else create_soft_face_contacts
         wp.launch(
             kernel,
             dim=n_pairs,
