@@ -102,6 +102,16 @@ class ProjectionWeights:
     """Transposed twist response ``J W^-1`` of each contact on its bodies A and B."""
     particle_contact_response: wp.array[mat36f]
     """Transposed twist response ``J W^-1`` of each particle contact row on its body."""
+    contact_world: wp.array[wp.int32]
+    """World of each contact row, with a proximal target."""
+    contact_proximal_target: wp.array[wp.vec3f]
+    """Proximal target of each contact for the first splitting iterations, or ``None``."""
+    iteration_count: wp.array[wp.int32]
+    """Splitting iterations performed so far by each world, with a proximal target."""
+    proximal_iterations: wp.int32
+    """Number of first splitting iterations whose local contact solves pull toward the proximal target."""
+    proximal_weight: wp.float32
+    """Fraction ``r / (1 + r)`` of the regularized local diagonal that forms the proximal weight ``R``."""
 
 
 @wp.func

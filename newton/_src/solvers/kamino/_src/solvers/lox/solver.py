@@ -670,6 +670,13 @@ class LOXSolver:
             self._config.gauss_seidel_max_colors,
             ProjectionAcceleration.from_string(self._config.projection_acceleration),
         )
+        self._projection.contact_proximal_regularization = self._config.contact_proximal_regularization
+        # The first eighth of the splitting iterations pull toward the scaled warm start
+        self._projection.configure_proximal_target(
+            self._config.contact_proximal_warmstart_scale,
+            max(1, self._config.max_iterations // 8),
+            self._data.state.iteration_count,
+        )
 
     def _initialize_splitting(
         self,
@@ -802,6 +809,7 @@ class LOXSolver:
             particle_state=self._particle_state_in if load_particles else None,
             particle_contacts=self._particle_contacts if load_particles else None,
         )
+        self._projection.set_proximal_target()
 
     def _estimate_joint_penalty_scale(self, time_step: float, warn_failures: bool) -> None:
         """Seed the joint penalty scale from the current rigid state at the uniform ``time_step``.
