@@ -1559,7 +1559,7 @@ class LOXSolverConfig:
     contact_proximal_regularization: float = 0.01
     """Relative proximal regularization of the local contact solves [dimensionless].
 
-    The local solve of each rigid and spatial contact uses its Delassus block with the
+    The local solve of each rigid, spatial, and particle contact uses its Delassus block with the
     diagonal scaled by ``1 + contact_proximal_regularization``, so each local update moves by the
     least weighted change. The contact law keeps the mechanical response, so converged solutions
     satisfy the hard contact law. Zero disables the proximal terms, including the proximal warm start.
@@ -1892,6 +1892,15 @@ class LOXSolverConfig:
             raise ValueError(
                 f"Invalid projected_twist_fraction: {self.projected_twist_fraction}. Must be in range [0, 1]."
             )
+        if (
+            not np.isfinite(self.deformable_projected_velocity_fraction)
+            or self.deformable_projected_velocity_fraction < 0.0
+            or self.deformable_projected_velocity_fraction > 1.0
+        ):
+            raise ValueError(
+                "Invalid deformable_projected_velocity_fraction: "
+                f"{self.deformable_projected_velocity_fraction}. Must be in range [0, 1]."
+            )
         if not np.isfinite(self.contact_proximal_regularization) or self.contact_proximal_regularization < 0.0:
             raise ValueError(
                 f"Invalid contact_proximal_regularization: {self.contact_proximal_regularization}. Must be non-negative."
@@ -1904,15 +1913,6 @@ class LOXSolverConfig:
             raise ValueError(
                 f"Invalid contact_proximal_warmstart_scale: {self.contact_proximal_warmstart_scale}. "
                 "Must be in range [0, 1]."
-            )
-        if (
-            not np.isfinite(self.deformable_projected_velocity_fraction)
-            or self.deformable_projected_velocity_fraction < 0.0
-            or self.deformable_projected_velocity_fraction > 1.0
-        ):
-            raise ValueError(
-                "Invalid deformable_projected_velocity_fraction: "
-                f"{self.deformable_projected_velocity_fraction}. Must be in range [0, 1]."
             )
         if (
             not np.isfinite(self.joint_warmstart_scale)

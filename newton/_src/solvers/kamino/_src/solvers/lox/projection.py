@@ -574,6 +574,7 @@ class ProjectionSchedule:
                 particle_inverse_weight,
                 occupancy,
                 rows.response,
+                self.contact_proximal_regularization,
             ],
             outputs=[particle_delassus, world_failed],
             device=self.device,

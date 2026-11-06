@@ -1258,11 +1258,14 @@ def _prepare_particle_contacts(
     particle_inverse_weight: wp.array[wp.float32],
     occupancy: wp.array2d[wp.int32],
     response: wp.array[mat36f],
+    regularization: wp.float32,
     # Outputs:
     particle_delassus: wp.array[wp.mat33f],
     world_failed: wp.array[wp.bool],
 ):
     """Prepare the mass-split, regularized local Delassus block of each particle contact row.
+
+    The diagonal of the block is scaled by ``1 + regularization``, a proximal term of the local solve only.
 
     A contact between the particles or the bodies of different worlds fails its world.
     """
@@ -1282,6 +1285,8 @@ def _prepare_particle_contacts(
             body_jacobian[row], response[row], _split_factor(bid, color, occupancy), mat36f(0.0), mat36f(0.0), 0.0
         )
     delassus, valid = _regularize_contact_delassus(value, bias[row], friction[row])
+    for axis in range(3):
+        delassus[axis, axis] *= 1.0 + regularization
     particle_delassus[row] = delassus
     if not valid:
         world_failed[row_world[row]] = True
