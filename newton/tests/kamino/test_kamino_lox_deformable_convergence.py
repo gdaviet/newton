@@ -13,26 +13,27 @@ from newton._src.solvers.kamino._src.solvers.lox.deformable.system import Deform
 from newton.tests.kamino import setup_tests, test_context
 
 
-def _build_damped_beam(device):
+def _build_damped_beam(device, *, cell_counts=(24,)):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-    builder.add_soft_grid(
-        pos=wp.vec3(0.0),
-        rot=wp.quat_identity(),
-        vel=wp.vec3(0.0),
-        dim_x=24,
-        dim_y=1,
-        dim_z=1,
-        cell_x=0.04,
-        cell_y=0.04,
-        cell_z=0.04,
-        density=1000.0,
-        k_mu=4.0e6,
-        k_lambda=4.0e6,
-        k_damp=9.117e4,
-        fix_left=True,
-        add_surface_mesh_edges=False,
-        particle_radius=0.0,
-    )
+    for component, cell_count in enumerate(cell_counts):
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, float(component), 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=cell_count,
+            dim_y=1,
+            dim_z=1,
+            cell_x=0.04,
+            cell_y=0.04,
+            cell_z=0.04,
+            density=1000.0,
+            k_mu=4.0e6,
+            k_lambda=4.0e6,
+            k_damp=9.117e4,
+            fix_left=True,
+            add_surface_mesh_edges=False,
+            particle_radius=0.0,
+        )
     builder.color()
     return builder.finalize(device=device)
 
@@ -129,10 +130,11 @@ class TestLOXDeformableConvergence(unittest.TestCase):
         self.assertTrue(np.all(recycling.basis_denominator.numpy()[:, 0] == 0.0))
 
     def test_damped_candidate_multilevel_is_finite(self):
-        """Keep the component-global third level stable for strong damping."""
+        """Keep unequal component coarse blocks stable for strong damping."""
         device = self.default_device
         with wp.ScopedDevice(device):
-            model = _build_damped_beam(device)
+            # Unequal disconnected beams exercise multiple matrix rows at both coarse levels.
+            model = _build_damped_beam(device, cell_counts=(130, 24))
             residuals = _candidate_residual_history(
                 model,
                 preconditioner="multilevel",
