@@ -107,10 +107,11 @@ def _aggregate_component(
 def _assemble_coarse_matrix(
     # Inputs:
     fine_values: wp.array[wp.mat33],
+    coarse_slot_block: wp.array[wp.int32],
     coarse_slot_base: wp.array[wp.int32],
     coarse_slot_dimension: wp.array[wp.int32],
     # Outputs:
-    coarse_matrix: wp.array[wp.float32],
+    coarse_matrix: wp.array2d[wp.float32],
 ):
     """Accumulate each fine block into its aggregate pair block of the dense coarse matrices."""
     slot = wp.tid()
@@ -118,10 +119,11 @@ def _assemble_coarse_matrix(
     if base < 0:
         return
     dimension = coarse_slot_dimension[slot]
+    block = coarse_slot_block[slot]
     value = fine_values[slot]
     for row in range(3):
         for column in range(3):
-            wp.atomic_add(coarse_matrix, base + row * dimension + column, value[row, column])
+            wp.atomic_add(coarse_matrix, block, base + row * dimension + column, value[row, column])
 
 
 @wp.kernel
@@ -385,7 +387,6 @@ class DeformableTwoLevel:
             itype=wp.int32,
             device=self.device,
         )
-        matrix_offsets = np.asarray(info.mio.numpy(), dtype=np.int64)
         vector_offsets = np.asarray(info.vio.numpy(), dtype=np.int64)
 
         particle_coarse_offset = np.full(row_count, -1, dtype=np.int32)
@@ -399,6 +400,7 @@ class DeformableTwoLevel:
         aggregate_coarse_offset = particle_coarse_offset[aggregate_first_particles]
         aggregate_world = packed_world.numpy().astype(np.int32, copy=False)[aggregate_first_particles]
 
+        coarse_slot_block = np.full(columns.shape[0], -1, dtype=np.int32)
         coarse_slot_base = np.full(columns.shape[0], -1, dtype=np.int32)
         coarse_slot_dimension = np.zeros(columns.shape[0], dtype=np.int32)
         valid_slot_mask = (slot_row_aggregate >= 0) & (slot_column_aggregate >= 0)
@@ -412,9 +414,9 @@ class DeformableTwoLevel:
         retained_column_aggregates = valid_column_aggregates[retained_slot_mask]
         retained_blocks = valid_blocks[retained_slot_mask]
         retained_dimensions = 3 * coarse_block_counts[retained_blocks]
+        coarse_slot_block[retained_slots] = retained_blocks
         coarse_slot_base[retained_slots] = (
-            matrix_offsets[retained_blocks]
-            + 3 * aggregate_local[retained_row_aggregates] * retained_dimensions
+            3 * aggregate_local[retained_row_aggregates] * retained_dimensions
             + 3 * aggregate_local[retained_column_aggregates]
         )
         coarse_slot_dimension[retained_slots] = retained_dimensions
@@ -424,9 +426,10 @@ class DeformableTwoLevel:
         self.aggregate_particles = wp.array(aggregate_particles, dtype=wp.int32, device=self.device)
         self.aggregate_coarse_offset = wp.array(aggregate_coarse_offset, dtype=wp.int32, device=self.device)
         self.aggregate_world = wp.array(aggregate_world, dtype=wp.int32, device=self.device)
+        self.coarse_slot_block = wp.array(coarse_slot_block, dtype=wp.int32, device=self.device)
         self.coarse_slot_base = wp.array(coarse_slot_base, dtype=wp.int32, device=self.device)
         self.coarse_slot_dimension = wp.array(coarse_slot_dimension, dtype=wp.int32, device=self.device)
-        self.coarse_matrix = wp.zeros(info.total_mat_size, dtype=wp.float32, device=self.device)
+        self.coarse_matrix = wp.zeros(info.matrix_shape, dtype=wp.float32, device=self.device)
         self.coarse_right_hand_side = wp.zeros(info.total_vec_size, dtype=wp.float32, device=self.device)
         self.coarse_solution = wp.zeros(info.total_vec_size, dtype=wp.float32, device=self.device)
         coarse_operator = DenseLinearOperatorData(info=info, mat=self.coarse_matrix)
@@ -439,6 +442,7 @@ class DeformableTwoLevel:
             device=self.device,
         )
         self.global_coarse_block_count = 0
+        self.global_coarse_slot_block = None
         self.global_coarse_slot_base = None
         self.global_coarse_slot_dimension = None
         self.global_coarse_group_offsets = None
@@ -478,7 +482,6 @@ class DeformableTwoLevel:
                 itype=wp.int32,
                 device=self.device,
             )
-            global_matrix_offsets = np.asarray(global_info.mio.numpy(), dtype=np.int64)
             global_vector_offsets = np.asarray(global_info.vio.numpy(), dtype=np.int64)
 
             particle_global_coarse_offset = np.full(row_count, -1, dtype=np.int32)
@@ -493,20 +496,26 @@ class DeformableTwoLevel:
             global_group_coarse_offset = particle_global_coarse_offset[global_group_first_particles]
             global_group_world = packed_world.numpy().astype(np.int32, copy=False)[global_group_first_particles]
 
+            global_coarse_slot_block = np.full(columns.shape[0], -1, dtype=np.int32)
             global_coarse_slot_base = np.full(columns.shape[0], -1, dtype=np.int32)
             global_coarse_slot_dimension = np.zeros(columns.shape[0], dtype=np.int32)
             valid_row_blocks = aggregate_block[valid_row_aggregates]
             valid_column_blocks = aggregate_block[valid_column_aggregates]
             valid_components = coarse_block_component[valid_row_blocks]
             valid_dimensions = 3 * component_coarse_block_counts[valid_components]
+            global_coarse_slot_block[valid_slots] = valid_components
             global_coarse_slot_base[valid_slots] = (
-                global_matrix_offsets[valid_components]
-                + 3 * coarse_block_local[valid_row_blocks] * valid_dimensions
+                3 * coarse_block_local[valid_row_blocks] * valid_dimensions
                 + 3 * coarse_block_local[valid_column_blocks]
             )
             global_coarse_slot_dimension[valid_slots] = valid_dimensions
 
             self.global_coarse_block_count = coarse_block_count
+            self.global_coarse_slot_block = wp.array(
+                global_coarse_slot_block,
+                dtype=wp.int32,
+                device=self.device,
+            )
             self.global_coarse_slot_base = wp.array(
                 global_coarse_slot_base,
                 dtype=wp.int32,
@@ -539,7 +548,7 @@ class DeformableTwoLevel:
                 device=self.device,
             )
             self.global_coarse_matrix = wp.zeros(
-                global_info.total_mat_size,
+                global_info.matrix_shape,
                 dtype=wp.float32,
                 device=self.device,
             )
@@ -582,7 +591,11 @@ class DeformableTwoLevel:
         """Factor the fine diagonal and block-diagonal Galerkin coarse matrix."""
         self.fine_preconditioner.factorize()
         self._factorize_coarse_level(
-            self.coarse_matrix, self.coarse_slot_base, self.coarse_slot_dimension, self.coarse_solver
+            self.coarse_matrix,
+            self.coarse_slot_block,
+            self.coarse_slot_base,
+            self.coarse_slot_dimension,
+            self.coarse_solver,
         )
         if self.global_coarse_solver is not None:
             self.factorize_global_coarse()
@@ -591,6 +604,7 @@ class DeformableTwoLevel:
         """Factor only the component-global coarse matrix, for :meth:`add_global_coarse_correction`."""
         self._factorize_coarse_level(
             self.global_coarse_matrix,
+            self.global_coarse_slot_block,
             self.global_coarse_slot_base,
             self.global_coarse_slot_dimension,
             self.global_coarse_solver,
@@ -638,7 +652,8 @@ class DeformableTwoLevel:
 
     def _factorize_coarse_level(
         self,
-        coarse_matrix: wp.array[wp.float32],
+        coarse_matrix: wp.array2d[wp.float32],
+        coarse_slot_block: wp.array[wp.int32],
         coarse_slot_base: wp.array[wp.int32],
         coarse_slot_dimension: wp.array[wp.int32],
         coarse_solver: LLTBlockedSolver,
@@ -650,6 +665,7 @@ class DeformableTwoLevel:
             dim=self.system_matrix.values.shape[0],
             inputs=[
                 self.system_matrix.values,
+                coarse_slot_block,
                 coarse_slot_base,
                 coarse_slot_dimension,
             ],

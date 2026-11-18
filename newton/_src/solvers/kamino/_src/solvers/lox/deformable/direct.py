@@ -44,9 +44,8 @@ def _pack_component_matrix(
     particle_direct_block: wp.array[wp.int32],
     particle_component_local: wp.array[wp.int32],
     component_dimensions: wp.array[wp.int32],
-    component_matrix_offsets: wp.array[wp.int32],
     # Outputs:
-    component_matrix: wp.array[wp.float32],
+    component_matrix: wp.array2d[wp.float32],
 ):
     """Copy each block of a direct component into its dense factor block."""
     slot = wp.tid()
@@ -54,14 +53,13 @@ def _pack_component_matrix(
     column = matrix_slot_column[slot]
     component = particle_direct_block[row]
     dimension = component_dimensions[component]
-    matrix_offset = component_matrix_offsets[component]
     row_offset = 3 * particle_component_local[row]
     column_offset = 3 * particle_component_local[column]
     value = matrix_values[matrix_system_slot[slot]]
     for local_row in range(3):
         for local_column in range(3):
-            dense_index = matrix_offset + (row_offset + local_row) * dimension + column_offset + local_column
-            component_matrix[dense_index] = value[local_row, local_column]
+            dense_index = (row_offset + local_row) * dimension + column_offset + local_column
+            component_matrix[component, dense_index] = value[local_row, local_column]
 
 
 @wp.kernel
@@ -208,7 +206,7 @@ class DeformableBlockLLT:
             itype=wp.int32,
             device=self.device,
         )
-        self.matrix = wp.zeros(self.info.total_mat_size, dtype=wp.float32, device=self.device)
+        self.matrix = wp.zeros(self.info.matrix_shape, dtype=wp.float32, device=self.device)
         self.right_hand_side = wp.empty(self.info.total_vec_size, dtype=wp.float32, device=self.device)
         self.solution = wp.empty(self.info.total_vec_size, dtype=wp.float32, device=self.device)
         self.matrix_slot_row = wp.array(direct_matrix_rows_np, dtype=wp.int32, device=self.device)
@@ -251,7 +249,6 @@ class DeformableBlockLLT:
                 self.particle_direct_block,
                 self.particle_component_local,
                 self.info.dim,
-                self.info.mio,
             ],
             outputs=[self.matrix],
             device=self.device,
