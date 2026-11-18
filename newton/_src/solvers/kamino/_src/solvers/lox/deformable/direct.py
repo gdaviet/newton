@@ -13,8 +13,7 @@ import numpy as np
 import warp as wp
 import warp.sparse as wps
 
-from ....linalg import DenseLinearOperatorData, LLTBlockedSolver
-from ..types import DenseBlockInfo
+from ....linalg import DenseLinearOperatorData, DenseSquareMultiLinearInfo, LLTBlockedSolver
 from .types import DeformablePreconditionerStatus
 
 ###
@@ -201,7 +200,7 @@ class DeformableBlockLLT:
         direct_matrix_rows_np = matrix_slot_rows_np[direct_slot_mask]
         direct_matrix_columns_np = matrix_columns_np[direct_slot_mask]
 
-        self.info = DenseBlockInfo()
+        self.info = DenseSquareMultiLinearInfo()
         """Dense layout of the direct component blocks."""
         self.info.finalize(
             dimensions=[3 * int(count) for count in component_particle_counts],

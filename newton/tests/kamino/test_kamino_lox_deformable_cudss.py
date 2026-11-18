@@ -3,7 +3,6 @@
 
 """Tests for the optional cuDSS candidate solver of the LOX deformable system."""
 
-import importlib.util
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +14,7 @@ import newton
 from newton._src.solvers.kamino._src.solvers.lox.deformable.cudss import _build_scalar_lower_structure
 from newton._src.solvers.kamino._src.solvers.lox.deformable.system import DeformableSystem
 from newton.tests.kamino import setup_tests, test_context
+from newton.tests.unittest_utils import requires
 
 
 def _build_cloth(device, cell_count=2):
@@ -79,7 +79,7 @@ class TestLOXDeformableCuDSS(unittest.TestCase):
         self.assertEqual(columns.shape, block_rows.shape)
         self.assertEqual(columns.shape, block_columns.shape)
 
-    @unittest.skipUnless(importlib.util.find_spec("nvmath"), "nvmath-python is not installed")
+    @requires("nvmath")
     def test_capture_factorization_and_solve(self):
         """Capture numerical factorization and candidate solves after eager analysis."""
         device = self._require_cuda_mempool()
@@ -88,6 +88,7 @@ class TestLOXDeformableCuDSS(unittest.TestCase):
             model = _build_cloth(device, cell_count=32)
             system = _make_cudss_system(model)
             data = system.data
+            matrix_velocity = wp.empty_like(data.smooth_velocity)
             state = model.state()
             time_step = wp.array([1.0 / 60.0], dtype=wp.float32, device=device)
             center_values = np.linspace(-0.2, 0.3, 3 * model.particle_count, dtype=np.float32).reshape((-1, 3))
@@ -106,15 +107,15 @@ class TestLOXDeformableCuDSS(unittest.TestCase):
             wps.bsr_mv(
                 data.system_matrix,
                 x=data.smooth_velocity,
-                y=data.matrix_velocity,
+                y=matrix_velocity,
                 alpha=1.0,
                 beta=0.0,
             )
-            residual = candidate_rhs - data.matrix_velocity.numpy()
+            residual = candidate_rhs - matrix_velocity.numpy()
             self.assertLess(float(np.max(np.abs(residual))), 2.0e-5)
             system.direct_solver.close()
 
-    @unittest.skipUnless(importlib.util.find_spec("nvmath"), "nvmath-python is not installed")
+    @requires("nvmath")
     def test_reuse_analysis_and_factorization(self):
         """Analyze once, factor once per time step, and solve every candidate update."""
         device = self.default_device
@@ -133,6 +134,7 @@ class TestLOXDeformableCuDSS(unittest.TestCase):
             model = _build_cloth(device)
             system = _make_cudss_system(model)
             data = system.data
+            matrix_velocity = wp.empty_like(data.smooth_velocity)
             time_step = wp.array([1.0 / 60.0], dtype=wp.float32, device=device)
             center_values = np.linspace(-0.2, 0.3, 3 * model.particle_count, dtype=np.float32).reshape((-1, 3))
             center = wp.array(center_values, dtype=wp.vec3, device=device)
@@ -148,11 +150,11 @@ class TestLOXDeformableCuDSS(unittest.TestCase):
                 wps.bsr_mv(
                     data.system_matrix,
                     x=data.smooth_velocity,
-                    y=data.matrix_velocity,
+                    y=matrix_velocity,
                     alpha=1.0,
                     beta=0.0,
                 )
-                residual = candidate_rhs - data.matrix_velocity.numpy()
+                residual = candidate_rhs - matrix_velocity.numpy()
                 self.assertLess(float(np.max(np.abs(residual))), 2.0e-5)
 
             direct_solver = system.direct_solver
@@ -182,7 +184,7 @@ class TestLOXDeformableCuDSS(unittest.TestCase):
         config.lox.deformable_linear_solver = "cudss_then_cr"
         config.validate()
 
-    @unittest.skipUnless(importlib.util.find_spec("nvmath"), "nvmath-python is not installed")
+    @requires("nvmath")
     def test_fixed_iteration_solver_capture(self):
         """Run exactly the configured LOX iterations in a captured cuDSS step."""
         device = self._require_cuda_mempool()
@@ -209,7 +211,7 @@ class TestLOXDeformableCuDSS(unittest.TestCase):
             self.assertTrue(np.all(np.isfinite(state_out.particle_qd.numpy())))
             solver._solver_kamino.solver_fd.deformables.system.cudss_solver.close()
 
-    @unittest.skipUnless(importlib.util.find_spec("nvmath"), "nvmath-python is not installed")
+    @requires("nvmath")
     def test_cudss_then_conditional_cr_capture(self):
         """Capture one cuDSS candidate before a conditional CR loop."""
         device = self._require_cuda_mempool()

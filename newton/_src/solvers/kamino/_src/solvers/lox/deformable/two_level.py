@@ -17,8 +17,7 @@ import warp as wp
 import warp.sparse as wps
 from warp.optim.linear import LinearOperator
 
-from ....linalg import DenseLinearOperatorData, LLTBlockedSolver
-from ..types import DenseBlockInfo
+from ....linalg import DenseLinearOperatorData, DenseSquareMultiLinearInfo, LLTBlockedSolver
 from .jacobi import DeformableJacobi
 from .types import DeformablePreconditionerStatus
 
@@ -379,7 +378,7 @@ class DeformableTwoLevel:
         aggregate_block = np.repeat(np.arange(coarse_block_counts.size, dtype=np.int32), coarse_block_counts)
         aggregate_local = np.arange(aggregate_count, dtype=np.int32)
         aggregate_local -= np.repeat(coarse_block_offsets[:-1], coarse_block_counts)
-        info = DenseBlockInfo()
+        info = DenseSquareMultiLinearInfo()
         info.finalize(
             dimensions=(3 * coarse_block_counts).tolist(),
             dtype=wp.float32,
@@ -472,7 +471,7 @@ class DeformableTwoLevel:
                 component_coarse_block_counts,
             )
 
-            global_info = DenseBlockInfo()
+            global_info = DenseSquareMultiLinearInfo()
             global_info.finalize(
                 dimensions=(3 * component_coarse_block_counts).tolist(),
                 dtype=wp.float32,
