@@ -38,7 +38,7 @@ import newton.examples
 import newton.ik as ik
 import newton.usd
 import newton.utils
-from newton import Model, ModelBuilder, State, eval_fk
+from newton import ModelBuilder, eval_fk
 from newton.math import quat_velocity
 from newton.solvers import SolverFeatherstone, SolverVBD
 
