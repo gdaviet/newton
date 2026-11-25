@@ -299,10 +299,15 @@ class TestSolverKaminoLOXSelfContact(unittest.TestCase):
             )
 
         self.assertGreater(float(np.max(np.abs(weighted[active] - equal[active]))), 1.0e-4)
-        # The self-contact rows have no body, so their local block is the isotropic particle term
+        # The self-contact rows have no body, so their local block is the isotropic particle term,
+        # with the diagonal proximal scaling of the local solve
         delassus = lox._projection.data.particle_delassus.numpy()[active]
+        proximal_scale = np.float32(1.0 + lox._projection.contact_proximal_regularization)
         np.testing.assert_allclose(
-            delassus, weighted[active, None, None] * np.eye(3, dtype=np.float32), rtol=2.0e-6, atol=2.0e-6
+            delassus,
+            proximal_scale * weighted[active, None, None] * np.eye(3, dtype=np.float32),
+            rtol=2.0e-6,
+            atol=2.0e-6,
         )
 
     def test_step_self_contact_with_alternative_projections(self):
