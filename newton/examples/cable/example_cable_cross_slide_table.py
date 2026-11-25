@@ -892,7 +892,7 @@ class Example:
             config.lox.max_iterations = sim_iterations
             config.lox.projection_sweeps_per_iteration = 10
             config.lox.gauss_seidel_max_colors = 1
-            config.lox.projection_acceleration = "apgd"
+            config.lox.projection_acceleration = "nesterov"
             self.solver = newton.solvers.SolverKamino(self.model, config=config)
 
         self.state_0 = self.model.state()

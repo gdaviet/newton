@@ -30,7 +30,14 @@ from newton.tests.kamino import setup_tests, test_context
 ###
 
 
-_MIXED_PROJECTION_VARIANTS = ((1, "none"), (4, "none"), (1, "nesterov"), (4, "nesterov"), (1, "anderson"), (4, "anderson"))
+_MIXED_PROJECTION_VARIANTS = (
+    (1, "none"),
+    (4, "none"),
+    (1, "nesterov"),
+    (4, "nesterov"),
+    (1, "anderson"),
+    (4, "anderson"),
+)
 """Gauss--Seidel color limits and accelerations of the projection schedules; one color selects Jacobi."""
 
 

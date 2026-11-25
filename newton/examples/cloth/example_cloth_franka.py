@@ -311,7 +311,7 @@ class Example:
                 config.lox.deformable_enable_self_contact = True
                 config.lox.projection_sweeps_per_iteration = 10
                 config.lox.gauss_seidel_max_colors = 1
-                config.lox.projection_acceleration = "apgd"
+                config.lox.projection_acceleration = "nesterov"
                 config.lox.deformable_self_contact_edge_buffer_size = 64
                 config.lox.deformable_self_contact_vertex_buffer_size = 64
                 config.lox.deformable_enable_penetration_free_contact = True
