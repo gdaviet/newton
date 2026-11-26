@@ -10,6 +10,7 @@ import warp as wp
 from warp.fem.linalg import symmetric_eigenvalues_qr
 
 import newton
+from newton._src.solvers.kamino._src.core.materials import MaterialMixMode, get_material_mixing_function
 from newton._src.solvers.kamino._src.core.types import mat36f, mat66f, vec6f
 from newton._src.solvers.kamino._src.solvers.lox.contact import (
     SpatialContactStatus,
@@ -27,6 +28,7 @@ from newton._src.solvers.kamino._src.solvers.lox.contact import (
     solve_spatial_contact,
     spatial_contact_delassus,
 )
+from newton._src.solvers.kamino._src.solvers.lox.deformable.contact_kernels import mix_contact_material
 from newton._src.solvers.kamino._src.solvers.lox.system_kernels import normalize_symmetric_matrix
 from newton.tests.kamino import setup_test_output, setup_tests, test_context
 from newton.tests.unittest_utils import NewtonTestCase
@@ -706,6 +708,51 @@ class TestLOXSymmetricEigenvalues(NewtonTestCase):
         self.assertTrue(np.all(np.isfinite(computed)))
         error = np.abs(computed - reference) / np.abs(reference).max(axis=1, keepdims=True)
         self.assertLess(float(error.max()), 1.0e-5)
+
+
+def _make_material_mix_kernel(mix_mode: MaterialMixMode):
+    """Return a kernel that mixes coefficient pairs with the LOX soft-contact and the shared Kamino mixers."""
+    shared_mix = get_material_mixing_function(mix_mode)
+    mode = wp.constant(int(mix_mode))
+
+    @wp.kernel(module="unique")
+    def mix_materials(
+        value_a: wp.array[wp.float32],
+        value_b: wp.array[wp.float32],
+        soft_mixed: wp.array[wp.float32],
+        shared_mixed: wp.array[wp.float32],
+    ):
+        i = wp.tid()
+        soft_mixed[i] = mix_contact_material(value_a[i], value_b[i], mode)
+        shared_mixed[i] = shared_mix(value_a[i], value_b[i])
+
+    return mix_materials
+
+
+class TestLOXSoftContactMaterialMix(NewtonTestCase):
+    def setUp(self):
+        setup_test_output(self)
+        if not test_context.setup_done:
+            setup_tests(clear_cache=False)
+        self.default_device = wp.get_device(test_context.device)
+
+    def test_soft_contact_mix_matches_shared_mixer(self):
+        """Mix soft-contact coefficients as the shared Kamino mixer does for every mode."""
+        device = self.default_device
+        value_a = wp.array([1.0, 0.0, 0.25, 0.8], dtype=wp.float32, device=device)
+        value_b = wp.array([0.0, 1.0, 0.64, 0.8], dtype=wp.float32, device=device)
+        for mix_mode in MaterialMixMode:
+            with self.subTest(mix_mode=mix_mode.name):
+                soft_mixed = wp.empty(value_a.shape, dtype=wp.float32, device=device)
+                shared_mixed = wp.empty(value_a.shape, dtype=wp.float32, device=device)
+                wp.launch(
+                    _make_material_mix_kernel(mix_mode),
+                    dim=value_a.shape,
+                    inputs=[value_a, value_b],
+                    outputs=[soft_mixed, shared_mixed],
+                    device=device,
+                )
+                np.testing.assert_allclose(soft_mixed.numpy(), shared_mixed.numpy(), rtol=1.0e-6)
 
 
 if __name__ == "__main__":

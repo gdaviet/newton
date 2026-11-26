@@ -108,6 +108,8 @@ def mix_contact_material(value_a: wp.float32, value_b: wp.float32, mix_mode: wp.
         return wp.max(value_a, value_b)
     if mix_mode == MaterialMixMode.MIN:
         return wp.min(value_a, value_b)
+    if mix_mode == MaterialMixMode.GEOMETRIC_AVERAGE:
+        return wp.sqrt(value_a * value_b)
     return 0.5 * (value_a + value_b)
 
 
