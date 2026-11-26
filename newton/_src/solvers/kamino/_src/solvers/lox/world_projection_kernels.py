@@ -35,7 +35,10 @@ from .contact import (
 from .nesterov import (
     NesterovRowState,
     box_restart_dot,
+    box_row_energy,
+    contact_energy,
     contact_restart_dot,
+    energy_momentum,
     extrapolate_body_twist,
     extrapolate_box_nesterov_row,
     extrapolate_contact_nesterov_row,
@@ -50,7 +53,7 @@ from .projection_kernels import (
     scatter_box_impulse,
     scatter_contact_impulse,
 )
-from .system_kernels import ProjectionWeights
+from .system_kernels import ProjectionWeights, apply_body_weight
 from .types import ProjectionAcceleration
 
 ###
@@ -309,7 +312,16 @@ def _apply_world_delta(
 
 @cache
 def make_project_by_world_kernel(
-    spatial: bool, colored: bool, acceleration: ProjectionAcceleration, body_capacity: int
+    spatial: bool,
+    colored: bool,
+    acceleration: ProjectionAcceleration,
+    body_capacity: int,
+    speed_restart: bool = False,
+    checked_recycle: bool = False,
+    gated_recycle: bool = False,
+    weighted_gradient_restart: bool = False,
+    energy_rule: bool = False,
+    energy_de_saxce: bool = False,
 ):
     """Build the kernel that projects one world per block.
 
@@ -319,7 +331,19 @@ def make_project_by_world_kernel(
         acceleration: Acceleration of the projection maps, whose state the kernel takes as one struct:
             :class:`.AndersonWorldState`, :class:`.NesterovRowState`, or :class:`NoAccelerationState`.
         body_capacity: Largest number of bodies of a world, at most :data:`_WORLD_SHARED_BODY_CAPACITY`.
+        speed_restart: Whether the Nesterov momentum restarts on a growing weighted sweep step.
+        checked_recycle: Whether a recycled Nesterov projection keeps only ``theta``, gated on a shrinking
+            warm-start drift, and skips the deferred extrapolation.
+        gated_recycle: Without ``checked_recycle``, whether a recycled Nesterov projection restarts ``theta``
+            before its deferred extrapolation once the warm-start drift grows.
+        weighted_gradient_restart: Whether the Nesterov momentum restarts on a nonpositive weighted restart
+            product ``(v - v_trial) . W (v - v_previous)``, in place of the speed and reaction-space restarts.
+        energy_rule: Whether the Nesterov momentum follows the projection energy, see
+            :attr:`.NesterovAcceleration.energy_rule`; overrides the other restart and recycle switches.
+        energy_de_saxce: With ``energy_rule``, whether the energy slope includes the de Saxce shift of each contact.
     """
+    track_trial = speed_restart or weighted_gradient_restart or energy_rule
+    trial_at_start = speed_restart or weighted_gradient_restart
     anderson = acceleration == ProjectionAcceleration.ANDERSON
     nesterov = acceleration == ProjectionAcceleration.NESTEROV
     AccelerationState = AndersonWorldState if anderson else NesterovRowState if nesterov else NoAccelerationState
@@ -767,10 +791,55 @@ def make_project_by_world_kernel(
             local += stride
 
     @wp.func
+    def world_weighted_change(
+        wid: wp.int32,
+        tid: wp.int32,
+        world_body_offset: wp.array[wp.int32],
+        world_body_count: wp.array[wp.int32],
+        body_weight: wp.array[mat66f],
+        world_twist: wp.array[vec6f],
+        reference: wp.array[vec6f],
+    ) -> wp.float32:
+        """Return the squared ``W``-norm of the change of the body twists of one world, reduced over the block."""
+        value = wp.float32(0.0)
+        local = tid
+        while local < world_body_count[wid]:
+            bid = world_body_offset[wid] + local
+            change = world_twist[bid] - reference[bid]
+            value += wp.dot(change, apply_body_weight(body_weight[bid], change))
+            local += wp.block_dim()
+        total = wp.tile_sum(wp.tile(value))
+        return total[0]
+
+    @wp.func
+    def world_weighted_dot(
+        wid: wp.int32,
+        tid: wp.int32,
+        world_body_offset: wp.array[wp.int32],
+        world_body_count: wp.array[wp.int32],
+        body_weight: wp.array[mat66f],
+        world_twist: wp.array[vec6f],
+        trial: wp.array[vec6f],
+        previous: wp.array[vec6f],
+    ) -> wp.float32:
+        """Return ``(v - v_trial) . W (v - v_previous)`` over the body twists of one world, reduced over the block."""
+        value = wp.float32(0.0)
+        local = tid
+        while local < world_body_count[wid]:
+            bid = world_body_offset[wid] + local
+            value += wp.dot(
+                world_twist[bid] - previous[bid], apply_body_weight(body_weight[bid], world_twist[bid] - trial[bid])
+            )
+            local += wp.block_dim()
+        total = wp.tile_sum(wp.tile(value))
+        return total[0]
+
+    @wp.func
     def extrapolate_world(
         wid: wp.int32,
         tid: wp.int32,
         theta: wp.float32,
+        step_previous: wp.float32,
         world_body_offset: wp.array[wp.int32],
         world_body_count: wp.array[wp.int32],
         world_box_offset: wp.array[wp.int32],
@@ -784,33 +853,139 @@ def make_project_by_world_kernel(
         angular_reaction: wp.array[wp.vec3f],
         state: NesterovRowState,
         world_twist: wp.array[vec6f],
-    ) -> wp.float32:
-        """Update the momentum of one world, extrapolate its rows and body twists, and return the next ``theta``.
+        box_bias: wp.array[wp.float32],
+        contact_bias: wp.array[wp.vec3f],
+        contact_compliance: wp.array[wp.float32],
+        contact_body_a: wp.array[wp.int32],
+        contact_body_b: wp.array[wp.int32],
+        contact_jacobian_a: wp.array[mat36f],
+        contact_jacobian_b: wp.array[mat36f],
+        box_body_a: wp.array[wp.int32],
+        box_body_b: wp.array[wp.int32],
+        box_jacobian_a: wp.array[vec6f],
+        box_jacobian_b: wp.array[vec6f],
+        contact_frame: wp.array[wp.mat33f],
+    ):
+        """Update the momentum of one world, extrapolate its rows and body twists, and return the next ``theta``
+        and the weighted sweep step.
 
         Every thread of the block must call this function, which reduces the restart test over the block. Each
-        thread extrapolates the bodies that it updates in :func:`_apply_world_delta`.
+        thread extrapolates the bodies that it updates in :func:`_apply_world_delta`. With the speed restart, a
+        negative ``step_previous`` marks the first step of a projection, which keeps the momentum.
         """
-        dot = wp.float32(0.0)
-        local, stride = _first_box_row(tid, world_box_count[wid], world_contact_count[wid], contact_row_cost)
-        while local < world_box_count[wid]:
-            dot += box_restart_dot(world_box_offset[wid] + local, box_reaction, state.box_trial, state.box_previous)
-            local += stride
-        local, stride = _first_contact(tid, world_box_count[wid], world_contact_count[wid], contact_row_cost)
-        while local < world_contact_count[wid]:
-            dot += contact_restart_dot(
-                world_contact_offset[wid] + local,
-                contact_reaction,
-                state.contact_trial,
-                state.contact_previous,
-                angular_reaction,
-                state.angular_trial,
-                state.angular_previous,
-                contact_friction,
-                angular_friction,
+        step = wp.float32(0.0)
+        restart_value = wp.float32(0.0)
+        trial_value = wp.float32(0.0)
+        curvature = wp.float32(0.0)
+        if wp.static(energy_rule):
+            # Row terms of the slopes at the current and at the extrapolated point and of the curvature, with
+            # W dv = J^T d; the rows that the last sweep left unchanged add nothing
+            terms = wp.vec3f(0.0)
+            local, stride = _first_box_row(tid, world_box_count[wid], world_contact_count[wid], contact_row_cost)
+            while local < world_box_count[wid]:
+                row = world_box_offset[wid] + local
+                box_change = box_reaction[row] - state.box_previous[row]
+                if box_change != 0.0:
+                    terms += box_row_energy(
+                        row,
+                        box_change,
+                        box_bias[row],
+                        box_body_a,
+                        box_body_b,
+                        box_jacobian_a,
+                        box_jacobian_b,
+                        world_twist,
+                        state.twist_previous,
+                        state.twist_trial,
+                    )
+                local += stride
+            local, stride = _first_contact(tid, world_box_count[wid], world_contact_count[wid], contact_row_cost)
+            while local < world_contact_count[wid]:
+                cid = world_contact_offset[wid] + local
+                current_reaction = contact_reaction[cid]
+                reaction_change = current_reaction - state.contact_previous[cid]
+                angular_change = wp.vec3f(0.0)
+                if wp.static(spatial):
+                    angular_change = angular_reaction[cid] - state.angular_previous[cid]
+                if not (reaction_change == wp.vec3f(0.0) and angular_change == wp.vec3f(0.0)):
+                    compliance = wp.float32(0.0)
+                    if contact_compliance:
+                        compliance = contact_compliance[cid]
+                    terms += contact_energy(
+                        cid,
+                        wp.static(spatial),
+                        current_reaction,
+                        reaction_change,
+                        angular_change,
+                        state.contact_trial[cid][2],
+                        contact_bias[cid],
+                        compliance,
+                        wp.static(energy_de_saxce),
+                        contact_friction[cid],
+                        contact_body_a,
+                        contact_body_b,
+                        contact_jacobian_a,
+                        contact_jacobian_b,
+                        contact_frame,
+                        world_twist,
+                        state.twist_previous,
+                        state.twist_trial,
+                    )
+                local += stride
+            # One block reduction for all terms
+            energy_sum = wp.tile_sum(wp.tile(terms), axis=1)
+            restart_value = energy_sum[0]
+            trial_value = energy_sum[1]
+            curvature = energy_sum[2]
+        elif wp.static(weighted_gradient_restart):
+            restart_value = wp.float32(1.0)
+            product = world_weighted_dot(
+                wid,
+                tid,
+                world_body_offset,
+                world_body_count,
+                state.body_weight,
+                world_twist,
+                state.twist_trial,
+                state.twist_previous,
             )
-            local += stride
-        restart_dot = wp.tile_sum(wp.tile(dot))
-        next_theta, beta = nesterov_momentum(theta, restart_dot[0])
+            if step_previous >= 0.0:
+                restart_value = product
+        elif wp.static(speed_restart):
+            step = world_weighted_change(
+                wid, tid, world_body_offset, world_body_count, state.body_weight, world_twist, state.twist_trial
+            )
+            restart_value = wp.float32(1.0)
+            if step_previous >= 0.0:
+                restart_value = step_previous - step
+        else:
+            dot = wp.float32(0.0)
+            local, stride = _first_box_row(tid, world_box_count[wid], world_contact_count[wid], contact_row_cost)
+            while local < world_box_count[wid]:
+                dot += box_restart_dot(world_box_offset[wid] + local, box_reaction, state.box_trial, state.box_previous)
+                local += stride
+            local, stride = _first_contact(tid, world_box_count[wid], world_contact_count[wid], contact_row_cost)
+            while local < world_contact_count[wid]:
+                dot += contact_restart_dot(
+                    world_contact_offset[wid] + local,
+                    contact_reaction,
+                    state.contact_trial,
+                    state.contact_previous,
+                    angular_reaction,
+                    state.angular_trial,
+                    state.angular_previous,
+                    contact_friction,
+                    angular_friction,
+                )
+                local += stride
+            restart_dot = wp.tile_sum(wp.tile(dot))
+            restart_value = restart_dot[0]
+        next_theta = wp.float32(1.0)
+        beta = wp.float32(0.0)
+        if wp.static(energy_rule):
+            next_theta, beta = energy_momentum(theta, restart_value, trial_value, curvature, step_previous < 0.0)
+        else:
+            next_theta, beta = nesterov_momentum(theta, restart_value)
         local, stride = _first_box_row(tid, world_box_count[wid], world_contact_count[wid], contact_row_cost)
         while local < world_box_count[wid]:
             extrapolate_box_nesterov_row(
@@ -832,10 +1007,13 @@ def make_project_by_world_kernel(
             local += stride
         local = tid
         while local < world_body_count[wid]:
-            extrapolate_body_twist(world_body_offset[wid] + local, beta, world_twist, state.twist_previous)
+            bid = world_body_offset[wid] + local
+            extrapolate_body_twist(bid, beta, world_twist, state.twist_previous)
+            if wp.static(track_trial):
+                state.twist_trial[bid] = world_twist[bid]
             local += wp.block_dim()
         _sync_threads()
-        return next_theta
+        return next_theta, step
 
     @wp.kernel(module="unique", enable_backward=False)
     def project_by_world(
@@ -921,8 +1099,9 @@ def make_project_by_world_kernel(
         _load_world_twists(wid, tid, world_body_offset, world_body_count, projected_twist, world_twist)
 
         keep_history = False
-        if wp.static(nesterov):
+        if wp.static(nesterov and not checked_recycle):
             keep_history = recycle and acceleration_state.history[wid] == 1
+        if wp.static(nesterov):
             if not keep_history:
                 initialize_world_nesterov(
                     wid,
@@ -1009,6 +1188,7 @@ def make_project_by_world_kernel(
             )
 
         theta = wp.float32(1.0)
+        step_previous = wp.float32(-1.0)
         if wp.static(nesterov):
             # The previous twists match the warm-started reactions; a kept history holds the twist change of the
             # last sweep of the previous splitting iteration
@@ -1019,15 +1199,57 @@ def make_project_by_world_kernel(
                     acceleration_state.twist_previous[bid] = world_twist[bid] - acceleration_state.twist_previous[bid]
                 else:
                     acceleration_state.twist_previous[bid] = world_twist[bid]
+                if wp.static(trial_at_start):
+                    acceleration_state.twist_trial[bid] = world_twist[bid]
                 local += wp.block_dim()
             if recycle:
                 theta = acceleration_state.theta[wid]
+            if wp.static(energy_rule):
+                if recycle:
+                    # Keep theta while the candidate drifts less than before and less than the last step, the
+                    # twist change that the kept history holds; a world without history has no step and restarts
+                    drift = wp.float32(0.0)
+                    last_step = wp.float32(0.0)
+                    local = tid
+                    while local < world_body_count[wid]:
+                        bid = world_body_offset[wid] + local
+                        weight = acceleration_state.body_weight[bid]
+                        change = world_twist[bid] - acceleration_state.twist_final[bid]
+                        drift += wp.dot(change, apply_body_weight(weight, change))
+                        step_change = world_twist[bid] - acceleration_state.twist_previous[bid]
+                        last_step += wp.dot(step_change, apply_body_weight(weight, step_change))
+                        local += wp.block_dim()
+                    norms = wp.tile_sum(wp.tile(wp.vec2f(drift, last_step)), axis=1)
+                    drift_previous = acceleration_state.drift_previous[wid]
+                    if not (drift_previous >= 0.0 and norms[0] <= drift_previous and norms[0] <= norms[1]):
+                        theta = wp.float32(1.0)
+                    _sync_threads()
+                    if tid == 0:
+                        acceleration_state.drift_previous[wid] = norms[0]
+            if wp.static(checked_recycle or gated_recycle):
+                if recycle:
+                    # Keep theta while the warm start drifts less from the previous projection than before
+                    drift_previous = acceleration_state.drift_previous[wid]
+                    drift = world_weighted_change(
+                        wid,
+                        tid,
+                        world_body_offset,
+                        world_body_count,
+                        acceleration_state.body_weight,
+                        world_twist,
+                        acceleration_state.twist_final,
+                    )
+                    if not (drift_previous >= 0.0 and drift <= drift_previous):
+                        theta = wp.float32(1.0)
+                    if tid == 0:
+                        acceleration_state.drift_previous[wid] = drift
             if keep_history:
                 # The extrapolation deferred from the last sweep of the previous splitting iteration
-                theta = extrapolate_world(
+                theta, step_previous = extrapolate_world(
                     wid,
                     tid,
                     theta,
+                    step_previous,
                     world_body_offset,
                     world_body_count,
                     world_box_offset,
@@ -1041,6 +1263,18 @@ def make_project_by_world_kernel(
                     angular_reaction,
                     acceleration_state,
                     world_twist,
+                    box_bias,
+                    contact_bias,
+                    contact_compliance,
+                    contact_body_a,
+                    contact_body_b,
+                    contact_jacobian_a,
+                    contact_jacobian_b,
+                    box_body_a,
+                    box_body_b,
+                    box_jacobian_a,
+                    box_jacobian_b,
+                    contact_frame,
                 )
         for iteration in range(iterations):
             if wp.static(colored):
@@ -1187,10 +1421,11 @@ def make_project_by_world_kernel(
                 )
             if wp.static(nesterov):
                 if iteration + 1 < iterations:
-                    theta = extrapolate_world(
+                    theta, step_previous = extrapolate_world(
                         wid,
                         tid,
                         theta,
+                        step_previous,
                         world_body_offset,
                         world_body_count,
                         world_box_offset,
@@ -1204,6 +1439,18 @@ def make_project_by_world_kernel(
                         angular_reaction,
                         acceleration_state,
                         world_twist,
+                        box_bias,
+                        contact_bias,
+                        contact_compliance,
+                        contact_body_a,
+                        contact_body_b,
+                        contact_jacobian_a,
+                        contact_jacobian_b,
+                        box_body_a,
+                        box_body_b,
+                        box_jacobian_a,
+                        box_jacobian_b,
+                        contact_frame,
                     )
 
         if wp.static(colored):
@@ -1265,12 +1512,19 @@ def make_project_by_world_kernel(
         if wp.static(nesterov):
             if tid == 0:
                 acceleration_state.theta[wid] = theta
-                acceleration_state.history[wid] = wp.int32(recycle)
-            # The twist change of the last sweep, for the deferred extrapolation of the next splitting iteration
+                if wp.static(checked_recycle):
+                    acceleration_state.history[wid] = 0
+                else:
+                    acceleration_state.history[wid] = wp.int32(recycle)
             local = tid
             while local < world_body_count[wid]:
                 bid = world_body_offset[wid] + local
-                acceleration_state.twist_previous[bid] = world_twist[bid] - acceleration_state.twist_previous[bid]
+                if wp.static(checked_recycle or gated_recycle or energy_rule):
+                    # The result of the projection, for the warm-start drift of the next splitting iteration
+                    acceleration_state.twist_final[bid] = world_twist[bid]
+                if wp.static(not checked_recycle):
+                    # The twist change of the last sweep, for the deferred extrapolation of the next iteration
+                    acceleration_state.twist_previous[bid] = world_twist[bid] - acceleration_state.twist_previous[bid]
                 local += wp.block_dim()
         _store_world_twists(wid, tid, world_body_offset, world_body_count, world_twist, projected_twist)
 

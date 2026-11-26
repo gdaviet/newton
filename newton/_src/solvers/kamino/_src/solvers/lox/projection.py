@@ -220,6 +220,7 @@ class ProjectionSchedule:
         inverse_weight: wp.array[mat66f],
         world_failed: wp.array[wp.bool],
         particle_inverse_weight: wp.array[wp.float32] | None = None,
+        weight: wp.array[mat66f] | None = None,
     ) -> None:
         """Color the rows and prepare the local blocks for the current body and particle weights.
 
@@ -227,6 +228,7 @@ class ProjectionSchedule:
             inverse_weight: Inverse body weight ``W^-1`` of each body.
             world_failed: Failure flag of each world, set for worlds with an invalid local block.
             particle_inverse_weight: Inverse weight ``w^-1`` of each packed particle, with deformable bodies.
+            weight: Body weight ``W`` of each body, for the weighted step norms of the Nesterov acceleration.
         """
         p = self.problem_data
         self._weights = self._prepare_weights(inverse_weight)
@@ -279,6 +281,7 @@ class ProjectionSchedule:
         if self.anderson is not None:
             self.anderson.reset()
         if self.nesterov is not None:
+            self.nesterov.set_weights(weight, particle_inverse_weight)
             self.nesterov.reset()
 
     def project(
@@ -312,15 +315,28 @@ class ProjectionSchedule:
 
         weights = (self._weights, self._particle_inverse_weight)
         velocities = (projected_twist, projected_velocity)
-        if self.nesterov is not None:
-            self.nesterov.begin(world_active, iterations - 1 + int(recycle), recycle=recycle)
+        nesterov = self.nesterov
+        energy = nesterov is not None and nesterov.energy_rule
+        checked = nesterov is not None and nesterov.checked_recycle and not energy
+        if nesterov is not None:
+            if checked:
+                nesterov.begin(world_active, iterations - 1, recycle=recycle, keep_rows=False)
+            else:
+                nesterov.begin(world_active, iterations - 1 + int(recycle), recycle=recycle)
         self._warmstart(world_active, weights, world_failed)
         self._apply(body_world, world_active, world_failed, velocities)
-        if self.nesterov is not None:
+        if checked:
+            nesterov.begin_twists(body_world, world_active, world_failed, False, projected_twist, projected_velocity)
+            nesterov.begin_checked(body_world, world_active, world_failed, recycle, projected_twist, projected_velocity)
+        elif nesterov is not None:
+            if nesterov.speed_restart or nesterov.weighted_gradient_restart:
+                nesterov._copy_trial(projected_twist, projected_velocity)
             self.nesterov.begin_twists(
-                body_world, world_active, world_failed, recycle, projected_twist, projected_velocity
+                body_world, world_active, world_failed, recycle, projected_twist, projected_velocity, measure=energy
             )
             if recycle:
+                if nesterov.gated_recycle and not energy:
+                    nesterov.gate_recycled(body_world, world_active, world_failed, projected_twist, projected_velocity)
                 # The extrapolation deferred from the last sweep of the previous splitting iteration;
                 # a world without row history restarts its momentum here and stays at its warm start
                 self.nesterov.extrapolate(body_world, world_active, world_failed, projected_twist, projected_velocity)
@@ -347,8 +363,14 @@ class ProjectionSchedule:
             # An order-independent Jacobi sweep restores the symmetry lost to the color ordering.
             self._sweep(0, world_active, weights, velocities, world_failed, smoothing=True)
             self._apply(body_world, world_active, world_failed, velocities)
-        if self.nesterov is not None and recycle:
-            self.nesterov.end_twists(body_world, world_active, world_failed, projected_twist, projected_velocity)
+        if checked:
+            nesterov.end_checked(projected_twist, projected_velocity)
+        elif self.nesterov is not None and recycle:
+            self.nesterov.end_twists(
+                body_world, world_active, world_failed, projected_twist, projected_velocity, keep_final=energy
+            )
+            if self.nesterov.gated_recycle and not energy:
+                self.nesterov.end_checked(projected_twist, projected_velocity)
 
     ###
     # Internals
@@ -790,9 +812,19 @@ class ProjectionSchedule:
             acceleration_state = self.anderson.world_state
         elif self.nesterov is not None:
             acceleration_state = self.nesterov.row_state
+        energy_rule = self.nesterov is not None and self.nesterov.energy_rule
         wp.launch(
             make_project_by_world_kernel(
-                spatial is not None, self.coloring is not None, self._acceleration, p.max_world_body_count
+                spatial is not None,
+                self.coloring is not None,
+                self._acceleration,
+                p.max_world_body_count,
+                self.nesterov is not None and self.nesterov.speed_restart and not energy_rule,
+                self.nesterov is not None and self.nesterov.checked_recycle and not energy_rule,
+                self.nesterov is not None and self.nesterov.gated_recycle and not energy_rule,
+                self.nesterov is not None and self.nesterov.weighted_gradient_restart and not energy_rule,
+                energy_rule=energy_rule,
+                energy_de_saxce=energy_rule and self.nesterov.energy_de_saxce,
             ),
             dim=(p.num_worlds, self._world_block_dim),
             block_dim=self._world_block_dim,

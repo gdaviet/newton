@@ -905,9 +905,12 @@ class LOXSolver:
                 system.data.inverse_weight,
                 self._data.state.world_failed,
                 self._deformables.system_data.inverse_weight,
+                system.data.weight,
             )
         elif system.dynamic_bodies:
-            self._projection.prepare(system.data.inverse_weight, self._data.state.world_failed)
+            self._projection.prepare(
+                system.data.inverse_weight, self._data.state.world_failed, weight=system.data.weight
+            )
 
     def _restore_dual(self) -> None:
         """Convert the warm-start wrench to the scaled splitting dual with the current body weight."""

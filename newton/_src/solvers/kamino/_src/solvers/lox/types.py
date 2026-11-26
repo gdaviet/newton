@@ -1010,6 +1010,26 @@ class NesterovData:
             wp.zeros(problem_data.num_particles, dtype=wp.vec3f, device=device) if particles else None
         )
         """Projected velocity of each packed particle at the previous sweep, with deformable bodies."""
+        num_worlds = problem_data.num_worlds
+        self.twist_trial = wp.zeros(problem_data.num_bodies, dtype=vec6f, device=device)
+        """Projected twist of each body after the last extrapolation, for the weighted sweep step."""
+        self.twist_final = wp.zeros(problem_data.num_bodies, dtype=vec6f, device=device)
+        """Projected twist of each body at the end of the last projection, for the warm-start drift."""
+        self.velocity_trial = wp.zeros(problem_data.num_particles, dtype=wp.vec3f, device=device) if particles else None
+        """Projected particle velocity after the last extrapolation, with deformable bodies."""
+        self.velocity_final = wp.zeros(problem_data.num_particles, dtype=wp.vec3f, device=device) if particles else None
+        """Projected particle velocity at the end of the last projection, with deformable bodies."""
+        self.curvature = wp.zeros((2, num_worlds), dtype=wp.float32, device=device)
+        """Curvature of the projection energy along the last change of each world, with the energy rule."""
+        self.slope_trial = wp.zeros((2, num_worlds), dtype=wp.float32, device=device)
+        """Slope of the projection energy at the extrapolated point along the last change of each world, with
+        the energy rule."""
+        self.step_previous = wp.zeros(num_worlds, dtype=wp.float32, device=device)
+        """Squared weighted sweep step of each world at the previous extrapolation of a speed restart."""
+        self.drift_current = wp.zeros(num_worlds, dtype=wp.float32, device=device)
+        """Squared weighted warm-start drift of each world, accumulated."""
+        self.drift_previous = wp.full(num_worlds, -1.0, dtype=wp.float32, device=device)
+        """Squared weighted warm-start drift of each world at the previous projection, negative before the first."""
 
 
 class ProjectionData:
