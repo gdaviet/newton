@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import warp as wp
 
+from ......geometry.flags import ShapeFlags
 from ......sim import BodyFlags, JointType, Model, ModelFlags
 from ....config import LOXSolverConfig
 from ...core.joints import JointCorrectionMode
@@ -291,6 +292,12 @@ class LOXSolver:
         self._deformables = None
         if has_particles:
             self._deformables = DeformableProblem(source_model, model, data, config, materials)
+        # Newton's hydroelastic contacts carry their pressure stiffness
+        contact_shape_flags = None
+        if config.contact_compliance and source_model is not None:
+            flags = source_model.shape_flags
+            if flags is not None and np.any(flags.numpy() & int(ShapeFlags.HYDROELASTIC)):
+                contact_shape_flags = flags
         self._problem = LOXProblem(
             model=model,
             data=data,
@@ -304,12 +311,13 @@ class LOXSolver:
             contact_compliance=config.contact_compliance,
             contact_implicit_restitution=config.contact_implicit_restitution,
             contact_spatial_friction=config.contact_spatial_friction,
+            contact_shape_flags=contact_shape_flags,
             deformables=self._deformables,
         )
         self._problem.prepare_patch_schur()
         self._data = LOXData(
             model.info.num_bodies.numpy().tolist(),
-            DualSolution(model, config) if compute_solution_metrics else None,
+            DualSolution(model, config, contact_shape_flags) if compute_solution_metrics else None,
             config.min_joint_penalty_ratio,
             self._device,
             particle_world=self._deformables.particle_world if self._deformables is not None else None,

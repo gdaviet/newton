@@ -225,6 +225,7 @@ class LOXProblem:
         contact_compliance: bool = False,
         contact_implicit_restitution: bool = False,
         contact_spatial_friction: bool = False,
+        contact_shape_flags: wp.array[wp.int32] | None = None,
         deformables: DeformableProblem | None = None,
     ):
         self.model = model
@@ -245,6 +246,8 @@ class LOXProblem:
         self.contact_compliance = contact_compliance
         self.contact_implicit_restitution = contact_implicit_restitution
         self.contact_spatial_friction = contact_spatial_friction
+        self.contact_shape_flags = contact_shape_flags if contact_compliance else None
+        """Shape flags of the Newton model, to drop hydroelastic contacts without stiffness, or ``None``."""
         self._has_rod_joints = bool(np.any(model.joints.dof_type.numpy() == JointDoFType.ROD))
         self.deformables = deformables
         """Smooth system and contact rows of the particles of the deformable bodies, or ``None``."""
@@ -1698,6 +1701,8 @@ class LOXProblem:
                     dead_zone,
                     self.contacts.stiffness if self.contact_compliance else None,
                     self.contacts.damping if self.contact_compliance else None,
+                    self.contacts.gid_AB if self.contact_shape_flags is not None else None,
+                    self.contact_shape_flags,
                     self.contact_implicit_restitution,
                     self._data.contact_rows.source_to_internal,
                 ],

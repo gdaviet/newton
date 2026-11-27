@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 import warp as wp
 
 from ...core.types import vec6f
+from .contact import is_force_free_hydroelastic_contact
 
 if TYPE_CHECKING:
     from ....config import LOXSolverConfig
@@ -192,6 +193,8 @@ def _pack_contact_constraint_reactions(
     contact_reaction: wp.array[wp.vec3f],
     contact_angular_friction: wp.array[wp.vec2f],
     contact_stiffness: wp.array[wp.float32],
+    contact_gid_AB: wp.array[wp.vec2i],
+    shape_flags: wp.array[wp.int32],
     use_spatial_friction: wp.bool,
     # Outputs:
     constraint_impulse: wp.array[wp.float32],
@@ -212,6 +215,10 @@ def _pack_contact_constraint_reactions(
     masked = wp.bool(False)
     if contact_stiffness:
         masked = contact_stiffness[cid] > 0.0
+        if shape_flags:
+            masked = masked or is_force_free_hydroelastic_contact(
+                contact_gid_AB[cid], contact_stiffness[cid], shape_flags
+            )
     if use_spatial_friction:
         angular = contact_angular_friction[cid]
         masked = masked or angular[0] != 0.0 or angular[1] != 0.0
@@ -300,14 +307,19 @@ class DualSolution:
     so metrics must be evaluated with ``use_solution_velocity=True``.
     """
 
-    def __init__(self, model: ModelKamino, config: LOXSolverConfig):
+    def __init__(
+        self, model: ModelKamino, config: LOXSolverConfig, contact_shape_flags: wp.array[wp.int32] | None = None
+    ):
         """Allocates the dual solution of a model.
 
         Args:
             model: The model containing the time-invariant simulation data.
             config: The LOX solver config, selecting the contact law.
+            contact_shape_flags: Shape flags of the Newton model, to mask hydroelastic contacts without
+                stiffness, or ``None``.
         """
         self._config = config
+        self._contact_shape_flags = contact_shape_flags if config.contact_compliance else None
         with wp.ScopedDevice(model.device):
             self.sigma = wp.zeros(model.size.num_worlds, dtype=wp.vec2f)
             """Delassus regularization of each world, zero for LOX."""
@@ -450,6 +462,8 @@ class DualSolution:
                     contacts.reaction,
                     contacts.angular_friction,
                     contacts.stiffness if self._config.contact_compliance else None,
+                    contacts.gid_AB if self._contact_shape_flags is not None else None,
+                    self._contact_shape_flags,
                     self._config.contact_spatial_friction,
                 ],
                 outputs=[self.lambdas, self.v_plus],

@@ -1615,9 +1615,11 @@ class LOXSolverConfig:
     [N/m] become implicit spring-dampers with the damping ``d`` [N s/m] of
     :attr:`~newton.Contacts.rigid_contact_damping`: they add ``1 / (dt (k dt + d))``
     to their normal contact operator, recover the fraction ``k dt / (k dt + d)`` of
-    their penetration per step, and ignore restitution. Other contacts, and contacts
-    detected by Kamino's own collision pipelines, remain hard. :class:`~newton.CollisionPipeline`
-    provides per-contact stiffness only for hydroelastic contacts.
+    their penetration per step, and ignore restitution. Contacts between two
+    :attr:`~newton.ShapeFlags.HYDROELASTIC` shapes without positive stiffness have no
+    pressure, so they apply no force. Other contacts, and contacts detected by Kamino's own
+    collision pipelines, remain hard. :class:`~newton.CollisionPipeline` provides per-contact
+    stiffness only for hydroelastic contacts.
     This option requires the LOX backend. For PADMM and SCC, use
     ``constraints.contact_compliance``, which also falls back to shape materials.
     """

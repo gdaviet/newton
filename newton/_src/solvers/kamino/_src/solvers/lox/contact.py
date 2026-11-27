@@ -25,6 +25,7 @@ from enum import IntEnum
 import warp as wp
 from warp.fem.linalg import symmetric_eigenvalues_qr
 
+from ......geometry.flags import ShapeFlags
 from ...core.types import mat36f, mat66f, vec6f
 from ..padmm.math import project_to_coulomb_cone
 from .system_kernels import ProjectionWeights, apply_body_weight, normalize_symmetric_matrix
@@ -129,6 +130,28 @@ mat55f = wp.types.matrix(shape=(5, 5), dtype=wp.float32)
 
 
 @wp.func
+def is_force_free_hydroelastic_contact(
+    shapes: wp.vec2i,
+    stiffness: wp.float32,
+    shape_flags: wp.array[wp.int32],
+) -> wp.bool:
+    """Return whether a contact between two hydroelastic shapes has no stiffness, so it applies no force.
+
+    The hydroelastic pipeline gives every contact between two hydroelastic shapes its pressure stiffness, so
+    a non-positive stiffness there means zero pressure. For other contacts, a zero stiffness selects hard contact.
+
+    Args:
+        shapes: Shape indices of the contact; negative for the world.
+        stiffness: Normal contact stiffness [N/m].
+        shape_flags: Shape flags of the Newton model.
+    """
+    if stiffness > 0.0 or shapes[0] < 0 or shapes[1] < 0:
+        return False
+    hydroelastic = wp.static(int(ShapeFlags.HYDROELASTIC))
+    return (shape_flags[shapes[0]] & hydroelastic) != 0 and (shape_flags[shapes[1]] & hydroelastic) != 0
+
+
+@wp.func
 def compute_contact_normal_compliance(
     stiffness: wp.float32,
     damping: wp.float32,
@@ -142,7 +165,8 @@ def compute_contact_normal_compliance(
     to bodies is ``J^T`` times the reaction change.
 
     Args:
-        stiffness: Normal contact stiffness [N/m]; non-positive selects hard contact.
+        stiffness: Normal contact stiffness [N/m]; non-positive selects hard contact, except between two
+            hydroelastic shapes, where the contact is dropped before (see :func:`is_force_free_hydroelastic_contact`).
         damping: Normal contact damping [N s/m].
         time_step: Time step [s].
 

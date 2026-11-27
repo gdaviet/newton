@@ -162,6 +162,38 @@ class TestSolverKaminoLOXContacts(NewtonTestCase):
         expected = 0.1 / (1.0 + 500.0 * 1.0e-4 + damping * 0.01) * 0.01
         self.assertAlmostEqual(float(0.1 - state.body_q.numpy()[0, 2]), expected, delta=1.0e-5)
 
+    def test_hydroelastic_contact_without_stiffness_applies_no_force(self):
+        """Drop zero-stiffness contacts between hydroelastic shapes and keep other zero-stiffness contacts hard."""
+        dt = 0.01
+        for hydroelastic, stiffness, metrics in (
+            (False, 0.0, False),
+            (True, 0.0, False),
+            (True, 0.0, True),
+            (True, 500.0, False),
+        ):
+            with self.subTest(hydroelastic=hydroelastic, stiffness=stiffness, metrics=metrics):
+                model = self._sphere()
+                state_in = model.state()
+                state_out = model.state()
+                # Detect point contacts first, then flag the shapes as hydroelastic for the solver
+                contacts = self._collide(model, state_in, stiffness=stiffness)
+                if hydroelastic:
+                    flags = model.shape_flags.numpy() | int(newton.ShapeFlags.HYDROELASTIC)
+                    model.shape_flags.assign(flags)
+                solver = self._solver(model, contact_compliance=True, compute_solution_metrics=metrics)
+                solver.step(state_in, state_out, model.control(), contacts, dt=dt)
+                np.testing.assert_array_equal(solver.status.numpy()["failed"], 0)
+                velocity = float(state_out.body_qd.numpy()[0, 2])
+                if not hydroelastic:
+                    # Hard contact holds the sphere
+                    self.assertAlmostEqual(velocity, 0.0, delta=2.0e-4)
+                elif stiffness == 0.0:
+                    # No pressure, so the sphere falls freely
+                    self.assertAlmostEqual(velocity, -10.0 * dt, delta=1.0e-5)
+                else:
+                    # Backward Euler spring from the touching height: v = -m g dt / (m + k dt^2)
+                    self.assertAlmostEqual(velocity, -10.0 * dt / (1.0 + stiffness * dt * dt), delta=1.0e-5)
+
     def test_compliant_contact_ignores_restitution(self):
         """Give compliant contacts the same response for any restitution coefficient."""
         outcomes = []

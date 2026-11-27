@@ -24,6 +24,7 @@ from .contact import (
     compute_contact_penetration_bias,
     compute_contact_recovery_fraction,
     compute_contact_velocity_target,
+    is_force_free_hydroelastic_contact,
 )
 from .solver_kernels import atomic_max_nonnegative
 from .system_kernels import compute_structural_correction, is_rotational_structural_row
@@ -478,6 +479,8 @@ def _load_contacts(
     dead_zone: wp.float32,
     contacts_stiffness: wp.array[wp.float32],
     contacts_damping: wp.array[wp.float32],
+    contacts_gid_AB: wp.array[wp.vec2i],
+    shape_flags: wp.array[wp.int32],
     use_restitution: wp.bool,
     source_to_internal: wp.array[wp.int32],
     # Outputs:
@@ -512,6 +515,11 @@ def _load_contacts(
     if not a_is_dynamic and not b_is_dynamic:
         source_to_internal[cid] = -1
         return
+    if shape_flags:
+        # A hydroelastic contact without stiffness has no pressure, so it gets no row
+        if is_force_free_hydroelastic_contact(contacts_gid_AB[cid], contacts_stiffness[cid], shape_flags):
+            source_to_internal[cid] = -1
+            return
     destination = world_offset[wid] + wp.atomic_add(world_count, wid, 1)
     source_to_internal[cid] = destination
     a_jacobian = mat36f(0.0)
