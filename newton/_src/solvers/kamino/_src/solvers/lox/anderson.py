@@ -21,6 +21,7 @@ from .contact import (
 )
 from .projection_kernels import (
     is_active_row,
+    project_particle_row_reaction,
     scatter_box_impulse,
     scatter_contact_impulse,
     scatter_particle_contact_impulse,
@@ -801,7 +802,7 @@ def _mix_particle_anderson_reactions(
     particle_delta: wp.array[wp.vec3f],
     body_delta: wp.array[vec6f],
 ):
-    """Mix the map image of each particle contact row along the stored direction, project it onto its cone,
+    """Mix the map image of each particle row along the stored direction, project it onto its admissible set,
     and scatter the change."""
     row = wp.tid()
     if row_status[row] != ParticleContactStatus.ACTIVE:
@@ -815,7 +816,7 @@ def _mix_particle_anderson_reactions(
         # The image is the next input; the direction may be stale, from a failed solve
         map_input[row] = current
         return
-    mixed = project_to_coulomb_cone(current + mixing * direction_image[row], friction[row])
+    mixed = project_particle_row_reaction(current + mixing * direction_image[row], friction[row])
     map_input[row] = mixed
     reaction[row] = mixed
     scatter_particle_contact_impulse(

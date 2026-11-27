@@ -293,7 +293,7 @@ attachment rows described under :ref:`Particle-body attachments` and owns those
 with finite stiffness whose body and particle endpoints belong to different entries; rows owned
 entirely by one entry are left to that entry's solver. The coupler logs a warning
 for finite attachments if that solver does not support attachments or if an endpoint is owned by no
-entry. Hard attachments require model-owned rows with both endpoints in one VBD entry;
+entry. Hard attachments require model-owned rows with both endpoints in one VBD entry or one LOX Kamino entry;
 other arrangements raise an error. Rows authored under the legacy ``coupling:body_particle_attachment``
 custom frequency are also consumed by ADMM, so importers that write those
 attributes keep working; these legacy rows remain invisible to

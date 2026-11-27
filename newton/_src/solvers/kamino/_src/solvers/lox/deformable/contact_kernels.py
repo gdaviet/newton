@@ -1,14 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Kernels of the particle contacts of the LOX deformable bodies.
+"""Kernels of the particle contacts and attachments of the LOX deformable bodies.
 
 The loading kernel converts the soft contacts that Newton's collision pipeline
 detects between particle features and collider shapes into particle contact rows:
 the packed particles and interpolation coefficients of the feature, the contact
 frame, the Jacobian of the collider body, the velocity bias, and the mixed
-friction coefficient. The finishing kernel counts the rows that touch each
-particle and body, which split their inverse weights between the rows of a
+friction coefficient. The attachment kernel converts the particle-body attachments
+of the model into bilateral particle rows. The finishing kernel counts the rows that
+touch each particle and body, which split their inverse weights between the rows of a
 Jacobi sweep and select the bodies and particles that receive splitting weights.
 """
 
@@ -21,7 +22,8 @@ from ....core.types import mat36f, vec6f
 from ....geometry.contacts import make_contact_frame_znorm
 from ..contact import compute_contact_velocity_target
 from ..projection_kernels import PARTICLE_COEFFICIENT_TOLERANCE
-from ..types import ParticleContactStatus
+from ..system_kernels import compute_structural_correction
+from ..types import PARTICLE_ROW_BILATERAL, ParticleContactStatus
 from .contact_filter import (
     CONTACT_CONE_INSIDE,
     CONTACT_CONE_OUTSIDE,
@@ -35,6 +37,7 @@ from .contact_filter import (
 
 __all__ = [
     "_finish_particle_contacts",
+    "_load_particle_attachments",
     "_load_particle_contacts",
     "mix_contact_material",
 ]
@@ -548,6 +551,141 @@ def _load_particle_contacts(
     row_bias[cid] = bias
     row_friction[cid] = friction
     row_status[cid] = ParticleContactStatus.ACTIVE
+
+
+@wp.kernel
+def _load_particle_attachments(
+    # Inputs:
+    row_offset: wp.int32,
+    attachment_body: wp.array[wp.int32],
+    attachment_particle: wp.array[wp.int32],
+    attachment_body_point: wp.array[wp.vec3f],
+    attachment_stiffness: wp.array[wp.float32],
+    attachment_damping: wp.array[wp.float32],
+    attachment_enabled: wp.array[wp.bool],
+    particle_q: wp.array[wp.vec3f],
+    particle_qd: wp.array[wp.vec3f],
+    particle_flags: wp.array[wp.int32],
+    newton_to_packed: wp.array[wp.int32],
+    particle_world: wp.array[wp.int32],
+    particle_inverse_weight: wp.array[wp.float32],
+    model_bodies_wid: wp.array[wp.int32],
+    body_com: wp.array[wp.vec3f],
+    data_bodies_q_i: wp.array[wp.transformf],
+    model_time_dt: wp.array[wp.float32],
+    hard_dead_zone: wp.float32,
+    hard_max_correction: wp.float32,
+    # Outputs:
+    row_world: wp.array[wp.int32],
+    row_status: wp.array[wp.int32],
+    row_particle: wp.array2d[wp.int32],
+    row_coefficient: wp.array2d[wp.float32],
+    row_body: wp.array[wp.int32],
+    row_shape: wp.array[wp.int32],
+    row_frame: wp.array[wp.mat33f],
+    row_body_jacobian: wp.array[mat36f],
+    row_gap: wp.array[wp.float32],
+    row_bias: wp.array[wp.vec3f],
+    row_friction: wp.array[wp.float32],
+    row_compliance: wp.array[wp.float32],
+    row_reaction: wp.array[wp.vec3f],
+):
+    """Load each particle-body attachment of the model into its bilateral particle row.
+
+    The row velocity ``u = p - v_b - w_b x r`` is the velocity of the particle relative to the body
+    anchor, in the world frame. A finite attachment of stiffness ``k`` and damping ``d`` is the implicit
+    spring-damper ``u + C lambda + k e / (k dt + d) = 0`` of the begin-step offset ``e`` of the particle
+    from the anchor, with the compliance ``C = 1 / (dt (k dt + d))``. A hard attachment corrects the part
+    of each offset component beyond ``hard_dead_zone``, by at most ``hard_max_correction``, as the
+    positional rows of a joint. Disabled attachments, and attachments without stiffness and damping,
+    leave their row unused.
+    """
+    aid = wp.tid()
+    row = row_offset + aid
+    row_world[row] = -1
+    row_status[row] = ParticleContactStatus.UNUSED
+    for slot in range(4):
+        row_particle[row, slot] = -1
+        row_coefficient[row, slot] = 0.0
+    row_shape[row] = -1
+    row_body[row] = -1
+    row_frame[row] = wp.identity(3, dtype=wp.float32)
+    row_body_jacobian[row] = mat36f(0.0)
+    row_gap[row] = 0.0
+    row_bias[row] = wp.vec3f(0.0)
+    row_friction[row] = PARTICLE_ROW_BILATERAL
+    row_compliance[row] = 0.0
+    row_reaction[row] = wp.vec3f(0.0)
+    if not attachment_enabled[aid]:
+        return
+    stiffness = attachment_stiffness[aid]
+    damping = attachment_damping[aid]
+    hard = wp.isinf(stiffness) and stiffness > 0.0
+    if not hard and stiffness <= 0.0 and damping <= 0.0:
+        return
+
+    source_particle = attachment_particle[aid]
+    bid = attachment_body[aid]
+    if (
+        source_particle < 0
+        or source_particle >= newton_to_packed.shape[0]
+        or bid < 0
+        or bid >= data_bodies_q_i.shape[0]
+        or wp.isnan(stiffness)
+        or stiffness < 0.0
+        or not wp.isfinite(damping)
+        or damping < 0.0
+    ):
+        row_status[row] = ParticleContactStatus.MALFORMED
+        return
+    pid = newton_to_packed[source_particle]
+    if pid < 0:
+        row_status[row] = ParticleContactStatus.MALFORMED
+        return
+    wid = particle_world[pid]
+    row_world[row] = wid
+    if model_bodies_wid[bid] != wid:
+        row_status[row] = ParticleContactStatus.CROSS_WORLD
+        return
+
+    # The velocity of a prescribed particle enters through the bias, as for the contact features
+    prescribed_velocity = wp.vec3f(0.0)
+    if (particle_flags[source_particle] & _PARTICLE_FLAG_ACTIVE) != 0 and particle_inverse_weight[pid] <= 0.0:
+        prescribed_velocity = particle_qd[source_particle]
+    pose = data_bodies_q_i[bid]
+    center_of_mass = wp.transform_get_translation(pose)
+    lever = wp.quat_rotate(wp.transform_get_rotation(pose), attachment_body_point[aid] - body_com[bid])
+    offset = particle_q[source_particle] - (center_of_mass + lever)
+
+    dt = model_time_dt[wid]
+    compliance = wp.float32(0.0)
+    correction = wp.vec3f(0.0)
+    if hard:
+        for axis in range(3):
+            correction[axis] = compute_structural_correction(offset[axis], hard_dead_zone, hard_max_correction)
+    else:
+        response = stiffness * dt + damping
+        compliance = 1.0 / (dt * response)
+        correction = (stiffness * dt / response) * offset
+    bias = prescribed_velocity + correction / dt
+    if not wp.isfinite(bias) or not wp.isfinite(lever) or not wp.isfinite(compliance) or not (dt > 0.0):
+        row_status[row] = ParticleContactStatus.MALFORMED
+        return
+
+    # The anchor velocity is v_b + w_b x r = v_b - [r]x w_b, which the row subtracts
+    body_jacobian = mat36f(0.0)
+    lever_skew = wp.skew(lever)
+    for axis in range(3):
+        body_jacobian[axis, axis] = -1.0
+        for col in range(3):
+            body_jacobian[axis, 3 + col] = lever_skew[axis, col]
+    row_particle[row, 0] = pid
+    row_coefficient[row, 0] = 1.0
+    row_body[row] = bid
+    row_body_jacobian[row] = body_jacobian
+    row_bias[row] = bias
+    row_compliance[row] = compliance
+    row_status[row] = ParticleContactStatus.ACTIVE
 
 
 @wp.kernel

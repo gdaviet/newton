@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Particle contacts of the LOX deformable bodies.
+"""Particle contacts and attachments of the LOX deformable bodies.
 
 :class:`DeformableContacts` loads the soft contacts that Newton's collision pipeline
-detects between the particle features of the deformable bodies and the collider shapes
-into the :class:`..types.ParticleContactRows` of the LOX problem, at the beginning of
-each time step. The projection of :mod:`..projection` then sweeps them together with
-the rigid unilateral rows.
+detects between the particle features of the deformable bodies and the collider shapes,
+and the particle-body attachments of the model, into the
+:class:`..types.ParticleContactRows` of the LOX problem, at the beginning of each time
+step. The projection of :mod:`..projection` then sweeps them together with the rigid
+unilateral rows.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from .......geometry.types import GeoType
 from .......utils.mesh import MeshAdjacency
 from ....core.materials import MaterialMixMode
 from ....core.types import vec6f
-from .contact_kernels import _finish_particle_contacts, _load_particle_contacts
+from .contact_kernels import _finish_particle_contacts, _load_particle_attachments, _load_particle_contacts
 
 if TYPE_CHECKING:
     from .......sim import Contacts, Model
@@ -297,6 +298,74 @@ class DeformableContacts:
                 rows.gap,
                 rows.bias,
                 rows.friction,
+                rows.reaction,
+            ],
+            device=self.device,
+        )
+
+    def load_attachments(
+        self,
+        particle_q: wp.array[wp.vec3f],
+        particle_qd: wp.array[wp.vec3f],
+        particle_inverse_weight: wp.array[wp.float32],
+        time_step: wp.array[wp.float32],
+        hard_dead_zone: float,
+        hard_max_correction: float,
+    ) -> None:
+        """Load the particle-body attachments of the model into the attachment rows.
+
+        The rows read the attachment arrays of the model at every time step, so edits of their
+        stiffness, damping, anchors, and enabled flags apply at the next step.
+
+        Args:
+            particle_q: Begin-step particle positions [m].
+            particle_qd: Begin-step particle velocities [m/s].
+            particle_inverse_weight: Inverse weight of each packed particle; zero for prescribed particles.
+            time_step: Time step of each world [s].
+            hard_dead_zone: Offset component of a hard attachment left uncorrected [m].
+            hard_max_correction: Largest offset component of a hard attachment corrected in one step [m].
+        """
+        rows = self._rows
+        if rows.attachment_capacity == 0:
+            return
+        model = self.model
+        wp.launch(
+            _load_particle_attachments,
+            dim=rows.attachment_capacity,
+            inputs=[
+                rows.attachment_offset,
+                model.attachment_particle_body_body,
+                model.attachment_particle_body_particle,
+                model.attachment_particle_body_body_point,
+                model.attachment_particle_body_stiffness,
+                model.attachment_particle_body_damping,
+                model.attachment_particle_body_enabled,
+                particle_q,
+                particle_qd,
+                model.particle_flags,
+                self.newton_to_packed,
+                self.particle_world,
+                particle_inverse_weight,
+                self.kamino_model.bodies.wid,
+                model.body_com,
+                self.kamino_data.bodies.q_i,
+                time_step,
+                hard_dead_zone,
+                hard_max_correction,
+            ],
+            outputs=[
+                rows.world,
+                rows.status,
+                rows.particle,
+                rows.coefficient,
+                rows.body,
+                rows.shape,
+                rows.frame,
+                rows.body_jacobian,
+                rows.gap,
+                rows.bias,
+                rows.friction,
+                rows.compliance,
                 rows.reaction,
             ],
             device=self.device,

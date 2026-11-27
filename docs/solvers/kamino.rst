@@ -518,6 +518,32 @@ LOX deformables support particles, triangles, bending edges, and tetrahedra;
 models with springs or muscles are rejected. Global particles require a single
 world, and models with particles use the Euler integrator.
 
+.. _kamino-lox-attachments:
+
+LOX particle-body attachments
+-----------------------------
+
+LOX applies the particle-body attachments of
+:meth:`newton.ModelBuilder.add_attachment_particle_body`, see
+:ref:`Particle-body attachments`. Each enabled attachment adds a bilateral row on
+the velocity of the particle relative to its body anchor to the unilateral
+projection, next to the particle contacts, and transfers equal and opposite
+impulses, including the torque about the center of mass of the body.
+
+An attachment of finite ``stiffness`` ``k`` [N/m] and ``damping`` ``d``
+[N s/m] is an implicit spring-damper on the begin-step offset of the particle
+from its anchor: it adds the compliance ``1 / (dt (k dt + d))`` to its row and
+recovers the fraction ``k dt / (k dt + d)`` of the offset per step, so a loaded
+attachment keeps its static spring offset. An attachment with
+``stiffness=math.inf`` is a hard point constraint, which corrects its offset like
+the positional rows of a joint: by at most ``config.lox.joint_max_correction``
+per step, beyond ``config.lox.position_tolerance``. Attachments without
+stiffness and damping apply no force.
+
+LOX reads the attachment arrays of the model at every step, so edits of their
+anchors, coefficients, and ``enabled`` flags apply at the next step without
+:meth:`~newton.solvers.SolverBase.notify_model_changed`.
+
 Inspecting terminal status
 --------------------------
 

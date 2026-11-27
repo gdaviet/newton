@@ -105,6 +105,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _applies_particle_body_attachments(solver: object) -> bool:
+    """Return whether a sub-solver applies the particle-body attachments of its own entry."""
+    from ..kamino.solver_kamino import SolverKamino  # noqa: PLC0415
+    from ..vbd.solver_vbd import SolverVBD  # noqa: PLC0415
+
+    if isinstance(solver, SolverVBD):
+        return True
+    return isinstance(solver, SolverKamino) and solver._config.dynamics_solver == "lox"
+
+
 @wp.kernel(enable_backward=False)
 def _disable_proxy_shape_collisions_kernel(
     shape_body: wp.array[int],
@@ -2852,7 +2862,6 @@ class SolverCoupledADMM(SolverCoupled):
         grouped: dict[tuple[str, str], list[tuple[int, tuple[float, float, float], int, float, float]]] = {}
         unowned: list[str] = []
         unsupported_same_entry: list[tuple[str, str, str]] = []
-        from ..vbd.solver_vbd import SolverVBD  # noqa: PLC0415
 
         for name, body, particle, point, stiffness, damping in rows:
             body_entry = self._entry_name_for_body(body)
@@ -2860,10 +2869,11 @@ class SolverCoupledADMM(SolverCoupled):
             if math.isinf(stiffness) and (
                 body_entry is None
                 or particle_entry != body_entry
-                or not isinstance(self._entries[body_entry].solver, SolverVBD)
+                or not _applies_particle_body_attachments(self._entries[body_entry].solver)
             ):
                 raise ValueError(
-                    "Hard particle-body attachments require both endpoints in the same SolverVBD entry; "
+                    "Hard particle-body attachments require both endpoints in the same SolverVBD entry or "
+                    "LOX SolverKamino entry; "
                     f"attachment {name} has body entry {body_entry!r} and particle entry {particle_entry!r}"
                 )
             if body_entry is None or particle_entry is None:
@@ -2871,7 +2881,7 @@ class SolverCoupledADMM(SolverCoupled):
                 continue
             if body_entry == particle_entry:
                 solver = self._entries[body_entry].solver
-                if not isinstance(solver, SolverVBD):
+                if not _applies_particle_body_attachments(solver):
                     unsupported_same_entry.append((name, body_entry, type(solver).__name__))
                 continue
             grouped.setdefault((body_entry, particle_entry), []).append((body, point, particle, stiffness, damping))
@@ -2887,8 +2897,8 @@ class SolverCoupledADMM(SolverCoupled):
                 for name, entry_name, solver_name in unsupported_same_entry
             )
             logger.warning(
-                f"SolverCoupledADMM found same-entry particle-body attachment {details}, but only SolverVBD "
-                "applies same-entry attachments; these attachments apply no force.",
+                f"SolverCoupledADMM found same-entry particle-body attachment {details}, but only SolverVBD and "
+                "SolverKamino with the LOX backend apply same-entry attachments; these attachments apply no force.",
             )
 
         device = self.model.device

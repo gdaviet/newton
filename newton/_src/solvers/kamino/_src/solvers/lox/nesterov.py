@@ -38,7 +38,12 @@ from .contact import (
     spatial_body_velocity,
     spatial_friction_scaling,
 )
-from .projection_kernels import is_active_row, particle_contact_velocity
+from .projection_kernels import (
+    is_active_row,
+    is_bilateral_particle_row,
+    particle_contact_velocity,
+    project_particle_row_reaction,
+)
 from .system_kernels import apply_body_weight
 from .types import ParticleContactStatus
 
@@ -761,7 +766,8 @@ def particle_row_energy(
     twist_trial: wp.array[vec6f],
 ) -> wp.vec3f:
     """Return the energy slope at the current and at the extrapolated velocities, and the curvature, of one
-    particle contact row along its reaction change ``d``, as :func:`contact_energy`."""
+    particle row along its reaction change ``d``, as :func:`contact_energy`, without the compliance terms of
+    a bilateral row."""
     current = bias + particle_contact_velocity(row, particle, coefficient, body, frame, body_jacobian, velocity, twist)
     trial = bias + particle_contact_velocity(
         row, particle, coefficient, body, frame, body_jacobian, velocity_trial, twist_trial
@@ -771,7 +777,7 @@ def particle_row_energy(
     )
     value = wp.dot(current, change)
     trial_value = wp.dot(trial, change)
-    if de_saxce and change[2] != 0.0:
+    if de_saxce and change[2] != 0.0 and not is_bilateral_particle_row(friction):
         value += de_saxce_shift(current, friction) * change[2]
         trial_value += de_saxce_shift(trial, friction) * change[2]
     return wp.vec3f(value, trial_value, wp.dot(current - previous, change))
@@ -819,6 +825,8 @@ def _accumulate_energy_slope(
     row_bias: wp.array[wp.vec3f],
     row_reaction: wp.array[wp.vec3f],
     row_previous: wp.array[wp.vec3f],
+    row_trial: wp.array[wp.vec3f],
+    row_compliance: wp.array[wp.float32],
     row_de_saxce: wp.bool,
     row_particle: wp.array2d[wp.int32],
     row_coefficient: wp.array2d[wp.float32],
@@ -917,7 +925,8 @@ def _accumulate_energy_slope(
     wid = row_world[prow]
     if not world_active[wid] or world_failed[wid]:
         return
-    row_change = row_reaction[prow] - row_previous[prow]
+    row_current = row_reaction[prow]
+    row_change = row_current - row_previous[prow]
     if row_change == wp.vec3f(0.0):
         return
     row_terms = particle_row_energy(
@@ -938,6 +947,13 @@ def _accumulate_energy_slope(
         twist_previous,
         twist_trial,
     )
+    # The compliance C of a bilateral row adds C lambda . d to the slopes and C d . d to the curvature
+    if row_compliance:
+        row_c = row_compliance[prow]
+        if row_c != 0.0:
+            row_terms += row_c * wp.vec3f(
+                wp.dot(row_current, row_change), wp.dot(row_trial[prow], row_change), wp.dot(row_change, row_change)
+            )
     _add_energy(wid, row_terms[0], row_terms[1], row_terms[2], read, slope, slope_trial, curvature)
 
 
@@ -955,7 +971,7 @@ def _initialize_particle_reactions(
     trial: wp.array[wp.vec3f],
     previous: wp.array[wp.vec3f],
 ):
-    """Project the warm-start reaction of each particle contact row onto its cone and reset its momentum.
+    """Project the warm-start reaction of each particle row onto its admissible set and reset its momentum.
 
     With ``recycle``, the worlds that hold the row history of the previous splitting iteration keep it.
     """
@@ -965,7 +981,7 @@ def _initialize_particle_reactions(
     wid = row_world[row]
     if not world_active[wid] or (recycle and history[wid] == 1):
         return
-    value = project_to_coulomb_cone(reaction[row], friction[row])
+    value = project_particle_row_reaction(reaction[row], friction[row])
     reaction[row] = value
     trial[row] = value
     previous[row] = value
@@ -1696,6 +1712,8 @@ class NesterovAcceleration:
                 rows.bias if has_rows else None,
                 rows.reaction if has_rows else None,
                 self._data.particle_previous if has_rows else None,
+                self._data.particle_trial if has_rows else None,
+                rows.compliance if has_rows else None,
                 self.energy_de_saxce and has_rows,
                 rows.particle if has_rows else None,
                 rows.coefficient if has_rows else None,

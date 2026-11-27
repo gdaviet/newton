@@ -1419,6 +1419,7 @@ class LOXSolver:
                 particle_rows.body_jacobian,
                 particle_rows.bias,
                 particle_rows.friction,
+                particle_rows.compliance,
                 particle_rows.reaction,
                 particle_rows.physical_delassus,
                 particles.projected_velocity,

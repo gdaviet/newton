@@ -560,6 +560,7 @@ class ProjectionSchedule:
                 rows.coefficient,
                 rows.body,
                 rows.body_jacobian,
+                rows.compliance,
                 particle_inverse_weight,
                 rows.response,
             ],
@@ -593,6 +594,7 @@ class ProjectionSchedule:
                 rows.body_jacobian,
                 rows.bias,
                 rows.friction,
+                rows.compliance,
                 particle_weight_sum,
                 particle_inverse_weight,
                 occupancy,
@@ -711,7 +713,7 @@ class ProjectionSchedule:
             particle_delassus = self._data.particle_smoothing_delassus if smoothing else self._data.particle_delassus
             particle_occupancy = self._data.coloring.particle_occupancy if colored else p.particle_incidence
         wp.launch(
-            make_sweep_kernel(spatial is not None, particles),
+            make_sweep_kernel(spatial is not None, particles, particles and rows.attachment_capacity > 0),
             dim=self._worker_count,
             inputs=[
                 self._worker_count,
@@ -762,6 +764,7 @@ class ProjectionSchedule:
                 rows.body_jacobian if particles else None,
                 rows.bias if particles else None,
                 rows.friction if particles else None,
+                rows.compliance if particles else None,
                 particle_delassus if particles else None,
                 particle_inverse_weight,
                 particle_occupancy if particles else None,

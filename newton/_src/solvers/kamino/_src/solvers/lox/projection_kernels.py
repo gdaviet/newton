@@ -31,6 +31,7 @@ from functools import cache
 import warp as wp
 
 from ...core.types import mat36f, mat66f, vec6f
+from ..padmm.math import project_to_coulomb_cone
 from .contact import (
     SpatialContactStatus,
     angular_contact_reaction,
@@ -57,7 +58,7 @@ from .contact import (
 )
 from .solver_kernels import atomic_max_nonnegative, compute_body_iteration_residuals
 from .system_kernels import ProjectionWeights, apply_body_weight
-from .types import ParticleContactStatus
+from .types import PARTICLE_ROW_BILATERAL, ParticleContactStatus
 
 ###
 # Module interface
@@ -77,6 +78,7 @@ __all__ = [
     "_prepare_spatial_contacts",
     "_project_box_row",
     "_project_contact_row",
+    "_project_particle_attachment_row",
     "_project_particle_contact_row",
     "_project_spatial_contact_row",
     "_warmstart_box_rows",
@@ -84,10 +86,12 @@ __all__ = [
     "_warmstart_particle_contacts",
     "_warmstart_spatial_contacts",
     "is_active_row",
+    "is_bilateral_particle_row",
     "make_contact_residuals_kernel",
     "make_iteration_residuals_kernel",
     "make_sweep_kernel",
     "particle_contact_velocity",
+    "project_particle_row_reaction",
     "row_color",
     "scatter_box_impulse",
     "scatter_contact_impulse",
@@ -670,6 +674,27 @@ def particle_contact_velocity(
 
 
 @wp.func
+def is_bilateral_particle_row(friction: wp.float32) -> wp.bool:
+    """Return whether the friction of a particle row marks it as bilateral, such as an attachment."""
+    return friction == PARTICLE_ROW_BILATERAL
+
+
+@wp.func
+def project_particle_row_reaction(reaction: wp.vec3f, friction: wp.float32) -> wp.vec3f:
+    """Project the reaction of a particle row onto its admissible set: the Coulomb cone of a contact,
+    or the whole space for a bilateral row."""
+    if is_bilateral_particle_row(friction):
+        return reaction
+    return project_to_coulomb_cone(reaction, friction)
+
+
+@wp.func
+def _particle_row_law_friction(friction: wp.float32) -> wp.float32:
+    """Return the nonnegative friction that validates the local block of a particle row."""
+    return wp.max(friction, 0.0)
+
+
+@wp.func
 def _particle_weight_term(
     row: wp.int32,
     color: wp.int32,
@@ -705,6 +730,35 @@ def _accumulate_particle_delta(
         particle_delta[pid] += delta
     else:
         wp.atomic_add(particle_delta, pid, delta)
+
+
+@wp.func
+def _scatter_particle_row_delta(
+    row: wp.int32,
+    color: wp.int32,
+    delta: wp.vec3f,
+    particle: wp.array2d[wp.int32],
+    coefficient: wp.array2d[wp.float32],
+    body: wp.array[wp.int32],
+    frame: wp.array[wp.mat33f],
+    particle_inverse_weight: wp.array[wp.float32],
+    weights: ProjectionWeights,
+    particle_occupancy: wp.array2d[wp.int32],
+    occupancy: wp.array2d[wp.int32],
+    particle_delta: wp.array[wp.vec3f],
+    twist_delta: wp.array[vec6f],
+):
+    """Accumulate the weighted particle and body corrections of a reaction change of one particle row."""
+    world_delta = frame[row] @ delta
+    for slot in range(4):
+        pid = particle[row, slot]
+        if pid >= 0:
+            correction = particle_inverse_weight[pid] * coefficient[row, slot] * world_delta
+            _accumulate_particle_delta(pid, color, correction, particle_occupancy, particle_delta)
+    bid = body[row]
+    if bid >= 0:
+        body_correction = wp.transpose(weights.particle_contact_response[row]) @ delta
+        _accumulate_body_delta(bid, color, body_correction, occupancy, twist_delta)
 
 
 @wp.func
@@ -745,16 +799,73 @@ def _project_particle_contact_row(
     delta = reaction_new - reaction_old
     if _is_zero_vec3(delta):
         return
-    world_delta = frame[row] @ delta
-    for slot in range(4):
-        pid = particle[row, slot]
-        if pid >= 0:
-            correction = particle_inverse_weight[pid] * coefficient[row, slot] * world_delta
-            _accumulate_particle_delta(pid, color, correction, particle_occupancy, particle_delta)
-    bid = body[row]
-    if bid >= 0:
-        body_correction = wp.transpose(weights.particle_contact_response[row]) @ delta
-        _accumulate_body_delta(bid, color, body_correction, occupancy, twist_delta)
+    _scatter_particle_row_delta(
+        row,
+        color,
+        delta,
+        particle,
+        coefficient,
+        body,
+        frame,
+        particle_inverse_weight,
+        weights,
+        particle_occupancy,
+        occupancy,
+        particle_delta,
+        twist_delta,
+    )
+
+
+@wp.func
+def _project_particle_attachment_row(
+    row: wp.int32,
+    color: wp.int32,
+    particle: wp.array2d[wp.int32],
+    coefficient: wp.array2d[wp.float32],
+    body: wp.array[wp.int32],
+    frame: wp.array[wp.mat33f],
+    body_jacobian: wp.array[mat36f],
+    bias: wp.array[wp.vec3f],
+    compliance: wp.array[wp.float32],
+    inverse_delassus: wp.array[wp.mat33f],
+    reaction: wp.array[wp.vec3f],
+    particle_inverse_weight: wp.array[wp.float32],
+    weights: ProjectionWeights,
+    particle_occupancy: wp.array2d[wp.int32],
+    occupancy: wp.array2d[wp.int32],
+    projected_velocity: wp.array[wp.vec3f],
+    projected_twist: wp.array[vec6f],
+    particle_delta: wp.array[wp.vec3f],
+    twist_delta: wp.array[vec6f],
+):
+    """Solve the compliant equality ``u + C lambda = 0`` of one bilateral particle row exactly with the
+    prepared inverse of its local block, which includes the compliance ``C``, and accumulate its weighted
+    particle and body corrections."""
+    velocity = bias[row] + particle_contact_velocity(
+        row, particle, coefficient, body, frame, body_jacobian, projected_velocity, projected_twist
+    )
+    reaction_old = reaction[row]
+    velocity += compliance[row] * reaction_old
+    reaction_new = reaction_old - inverse_delassus[row] @ velocity
+    reaction[row] = reaction_new
+    delta = reaction_new - reaction_old
+    if _is_zero_vec3(delta):
+        return
+    _scatter_particle_row_delta(
+        row,
+        color,
+        delta,
+        particle,
+        coefficient,
+        body,
+        frame,
+        particle_inverse_weight,
+        weights,
+        particle_occupancy,
+        occupancy,
+        particle_delta,
+        twist_delta,
+    )
 
 
 @wp.func
@@ -1254,6 +1365,7 @@ def _prepare_particle_contacts(
     body_jacobian: wp.array[mat36f],
     bias: wp.array[wp.vec3f],
     friction: wp.array[wp.float32],
+    compliance: wp.array[wp.float32],
     particle_weight_sum: wp.array2d[wp.float32],
     particle_inverse_weight: wp.array[wp.float32],
     occupancy: wp.array2d[wp.int32],
@@ -1263,9 +1375,11 @@ def _prepare_particle_contacts(
     particle_delassus: wp.array[wp.mat33f],
     world_failed: wp.array[wp.bool],
 ):
-    """Prepare the mass-split, regularized local Delassus block of each particle contact row.
+    """Prepare the mass-split, regularized local Delassus block of each particle row.
 
-    The diagonal of the block is scaled by ``1 + regularization``, a proximal term of the local solve only.
+    The diagonal of the block is scaled by ``1 + regularization``, a proximal term of the local solve only,
+    and then adds the compliance of the row, given with ``compliance``. A bilateral row stores the inverse
+    of its block.
 
     A contact between the particles or the bodies of different worlds fails its world.
     """
@@ -1284,9 +1398,14 @@ def _prepare_particle_contacts(
         value += _compute_contact_delassus(
             body_jacobian[row], response[row], _split_factor(bid, color, occupancy), mat36f(0.0), mat36f(0.0), 0.0
         )
-    delassus, valid = _regularize_contact_delassus(value, bias[row], friction[row])
+    delassus, valid = _regularize_contact_delassus(value, bias[row], _particle_row_law_friction(friction[row]))
     for axis in range(3):
         delassus[axis, axis] *= 1.0 + regularization
+    if compliance:
+        delassus += compliance[row] * wp.identity(3, dtype=wp.float32)
+        # The bilateral rows solve with the inverse block only, so it is inverted once per time step
+        if is_bilateral_particle_row(friction[row]):
+            delassus = wp.inverse(delassus)
     particle_delassus[row] = delassus
     if not valid:
         world_failed[row_world[row]] = True
@@ -1300,12 +1419,14 @@ def _prepare_physical_particle_contacts(
     coefficient: wp.array2d[wp.float32],
     body: wp.array[wp.int32],
     body_jacobian: wp.array[mat36f],
+    compliance: wp.array[wp.float32],
     particle_inverse_weight: wp.array[wp.float32],
     response: wp.array[mat36f],
     # Outputs:
     physical_delassus: wp.array[wp.mat33f],
 ):
-    """Prepare the unsplit Delassus block of each particle contact row, used by the residuals."""
+    """Prepare the unsplit Delassus block of each particle row, with its compliance if ``compliance`` is given,
+    used by the residuals."""
     row = wp.tid()
     if row_status[row] != ParticleContactStatus.ACTIVE:
         return
@@ -1322,6 +1443,8 @@ def _prepare_physical_particle_contacts(
                 if particle[row, later] == pid:
                     total += coefficient[row, later]
             particle_term += total * total * particle_inverse_weight[pid]
+    if compliance:
+        particle_term += compliance[row]
     delassus = particle_term * wp.identity(3, dtype=wp.float32)
     bid = body[row]
     if bid >= 0:
@@ -1401,6 +1524,7 @@ def _compute_particle_contact_residuals(
     body_jacobian: wp.array[mat36f],
     bias: wp.array[wp.vec3f],
     friction: wp.array[wp.float32],
+    compliance: wp.array[wp.float32],
     reaction: wp.array[wp.vec3f],
     physical_delassus: wp.array[wp.mat33f],
     projected_velocity: wp.array[wp.vec3f],
@@ -1415,7 +1539,8 @@ def _compute_particle_contact_residuals(
     world_velocity_residual: wp.array[wp.float32],
     world_lagged_residual: wp.array[wp.float32],
 ):
-    """Evaluate the Delassus-scaled Alart--Curnier residual of each particle contact row.
+    """Evaluate the Delassus-scaled Alart--Curnier residual of each particle contact row, and the
+    Delassus-scaled equality residual ``(u + C lambda) / s`` of each bilateral row, given with ``compliance``.
 
     With ``world_velocity_residual``, also reduce the residual mapped back to velocity by the
     Delassus scale, relative to the velocity tolerance. With ``world_lagged_residual``, also
@@ -1432,9 +1557,16 @@ def _compute_particle_contact_residuals(
         row, particle, coefficient, body, frame, body_jacobian, projected_velocity, projected_twist
     )
     delassus = physical_delassus[row]
-    residual_vector = compute_contact_scaled_alart_curnier_residual(
-        delassus, reaction[row], velocity + bias[row], friction[row]
-    )
+    row_friction = friction[row]
+    residual_vector = wp.vec3f(0.0)
+    if compliance and is_bilateral_particle_row(row_friction):
+        residual_vector = (velocity + bias[row] + compliance[row] * reaction[row]) / compute_contact_delassus_scale(
+            delassus
+        )
+    else:
+        residual_vector = compute_contact_scaled_alart_curnier_residual(
+            delassus, reaction[row], velocity + bias[row], row_friction
+        )
     residual = wp.max(wp.abs(residual_vector))
     atomic_max_nonnegative(world_residual_max, wid, residual)
     if world_velocity_residual:
@@ -1474,9 +1606,10 @@ def _apply_twist_delta(
 
 
 @cache
-def make_sweep_kernel(spatial: bool, particles: bool = False):
+def make_sweep_kernel(spatial: bool, particles: bool = False, attachments: bool = False):
     """Build the sweep kernel, projecting contacts as spatial contacts with angular friction,
-    and projecting the particle contact rows of the deformable bodies."""
+    projecting the particle contact rows of the deformable bodies, and solving their bilateral
+    attachment rows."""
 
     @wp.kernel(module="unique", enable_backward=False)
     def sweep(
@@ -1531,6 +1664,7 @@ def make_sweep_kernel(spatial: bool, particles: bool = False):
         particle_body_jacobian: wp.array[mat36f],
         particle_bias: wp.array[wp.vec3f],
         particle_friction: wp.array[wp.float32],
+        particle_compliance: wp.array[wp.float32],
         particle_delassus: wp.array[wp.mat33f],
         particle_inverse_weight: wp.array[wp.float32],
         particle_occupancy: wp.array2d[wp.int32],
@@ -1659,6 +1793,30 @@ def make_sweep_kernel(spatial: bool, particles: bool = False):
                 wid = particle_row_world[row]
                 if not world_active[wid] or world_failed[wid]:
                     continue
+                if wp.static(attachments):
+                    if is_bilateral_particle_row(particle_friction[row]):
+                        _project_particle_attachment_row(
+                            row,
+                            color,
+                            particle_index,
+                            particle_coefficient,
+                            particle_body,
+                            particle_frame,
+                            particle_body_jacobian,
+                            particle_bias,
+                            particle_compliance,
+                            particle_delassus,
+                            particle_reaction,
+                            particle_inverse_weight,
+                            weights,
+                            particle_occupancy,
+                            occupancy,
+                            projected_velocity,
+                            projected_twist,
+                            particle_delta,
+                            twist_delta,
+                        )
+                        continue
                 _project_particle_contact_row(
                     row,
                     color,

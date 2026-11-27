@@ -12383,7 +12383,8 @@ class ModelBuilder:
 
         The attachment pulls the particle toward a body-local anchor and
         transfers equal-and-opposite forces between both endpoints in
-        :class:`~newton.solvers.SolverVBD`. The constraint is translational;
+        :class:`~newton.solvers.SolverVBD` and in the LOX backend of
+        :class:`~newton.solvers.SolverKamino`. The constraint is translational;
         a single particle does not define an orientation. Finite-stiffness
         attachments whose endpoints are owned by different solvers are
         coupled by
@@ -12396,7 +12397,8 @@ class ModelBuilder:
             body_point: Attachment point in the body's local frame [m]. If
                 ``None``, the body origin is used.
             stiffness: Attachment stiffness [N/m]. Use ``math.inf`` for a hard
-                point constraint in :class:`~newton.solvers.SolverVBD`.
+                point constraint in :class:`~newton.solvers.SolverVBD` and the
+                LOX backend of :class:`~newton.solvers.SolverKamino`.
             damping: Attachment damping [N·s/m]. Ignored for hard attachments.
             enabled: Whether the attachment is active.
             custom_attributes: Dictionary of custom attribute names to values.

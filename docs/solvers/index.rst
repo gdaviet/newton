@@ -496,7 +496,7 @@ motion; see :ref:`passive-joint-springs` for details.
      - |no|
      - |no|
      - |yes| :sup:`14`
-     - |no|
+     - |yes| :sup:`15`
 
 | :sup:`3` Featherstone eliminates follower degrees of freedom from its reduced dynamics and transfers follower forces and inertia to the reference joint.
 | :sup:`4` SemiImplicit enforces joint-owned mimic relationships with penalty springs configured by ``joint_mimic_ke`` and ``joint_mimic_kd``.
@@ -511,6 +511,7 @@ motion; see :ref:`passive-joint-springs` for details.
 | :sup:`13` Steel enforces each mimic relationship within one articulation as one bilateral constraint row per follower coordinate; mimics of BALL, FREE, and DISTANCE joints and mimics across articulations are rejected. It also enforces loop-closing BALL joints as point constraints, loop-closing REVOLUTE joints as point constraints plus two hinge-axis constraints, and loop-closing FIXED joints as point constraints plus three rotation constraints. The propagation contact response (``articulated_contact_response="propagation"``) rejects loop-closing joints and solves mimic rows iteratively.
 | :sup:`14` See :ref:`Particle-body attachments` for authoring and semantics. Attachments spanning two
   solvers are coupled by :class:`~newton.solvers.experimental.coupled.SolverCoupledADMM` instead.
+| :sup:`15` Kamino applies particle-body attachments with its experimental LOX backend only; see :ref:`kamino-lox-attachments`.
 
 .. _Particle-body attachments:
 
@@ -545,14 +546,20 @@ Both endpoints must be integrated by the same solver, so
 :class:`~newton.solvers.SolverVBD` rejects attachments when it is constructed
 with ``integrate_with_external_rigid_solver=True``.
 
+:class:`~newton.solvers.SolverKamino` applies attachments with its LOX backend,
+which simulates both the rigid bodies and the particles. It solves each
+attachment as an implicit spring-damper, or as a hard point constraint for
+``stiffness=math.inf``; see :ref:`kamino-lox-attachments`.
+
 When the endpoints of a finite-stiffness attachment belong to two different solvers in a coupled simulation,
 :class:`~newton.solvers.experimental.coupled.SolverCoupledADMM` turns the same
 model rows into cross-solver interface constraints; see :ref:`ADMM coupling`.
 The two cases are mutually exclusive, so no attachment is applied twice, and a
 row whose body or particle is owned by no solver applies no force at all. The
 coupler also warns when both endpoints belong to one entry whose solver does not
-support attachments. Hard attachments require both endpoints in one VBD entry;
-the coupler raises an error for other ownership arrangements.
+support attachments. Hard attachments require both endpoints in one VBD entry or
+one LOX :class:`~newton.solvers.SolverKamino` entry; the coupler raises an error
+for other ownership arrangements.
 
 .. _Runtime model updates:
 

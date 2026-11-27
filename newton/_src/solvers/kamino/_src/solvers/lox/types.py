@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 ###
 
 __all__ = [
+    "PARTICLE_ROW_BILATERAL",
     "AndersonData",
     "AndersonRowsData",
     "BoxRows",
@@ -93,6 +94,10 @@ class ProjectionAcceleration(IntEnum):
     def __repr__(self):
         """Returns a string representation of the ProjectionAcceleration."""
         return self.__str__()
+
+
+PARTICLE_ROW_BILATERAL = -1.0
+"""Friction coefficient that marks a bilateral particle row, such as a particle-body attachment."""
 
 
 class ParticleContactStatus(IntEnum):
@@ -578,28 +583,46 @@ class EffortRows:
 
 
 class ParticleContactRows:
-    """Contact rows of the particles of the deformable bodies.
+    """Contact and attachment rows of the particles of the deformable bodies.
 
     Each row couples up to four particles, with interpolation coefficients, and at most one
-    body. The rigid-soft contacts take the first :attr:`rigid_capacity` rows and the
-    self-contacts of the deformable surfaces the others. The rows use the normal-last frame of
-    :class:`ContactRows`: the velocity of a row is ``u = bias + sum_i c_i F^T p_i + J v_b`` for
-    the projected velocities ``p_i`` of its particles, its frame ``F``, and the projected twist
-    ``v_b`` of its body. The reactions are impulses that restart from zero at each time step.
+    body. The rigid-soft contacts take the first :attr:`rigid_capacity` rows, the
+    self-contacts of the deformable surfaces the next :attr:`self_capacity` rows, and the
+    particle-body attachments the last :attr:`attachment_capacity` rows. The rows use the
+    normal-last frame of :class:`ContactRows`: the velocity of a row is
+    ``u = bias + sum_i c_i F^T p_i + J v_b`` for the projected velocities ``p_i`` of its
+    particles, its frame ``F``, and the projected twist ``v_b`` of its body. The reactions are
+    impulses that restart from zero at each time step.
+
+    Contact rows follow the Coulomb law of their friction coefficient. Attachment rows are
+    bilateral, marked by the friction :data:`PARTICLE_ROW_BILATERAL`, and solve
+    ``u + C lambda = 0`` with the impulse-space compliance ``C`` of :attr:`compliance`.
 
     Args:
         rigid_capacity: Number of rigid-soft contact rows.
         self_capacity: Number of self-contact rows.
         num_worlds: Number of worlds.
         device: Device of the arrays.
+        attachment_capacity: Number of particle-body attachment rows.
     """
 
-    def __init__(self, rigid_capacity: int, self_capacity: int, num_worlds: int, device: wp.DeviceLike):
+    def __init__(
+        self,
+        rigid_capacity: int,
+        self_capacity: int,
+        num_worlds: int,
+        device: wp.DeviceLike,
+        attachment_capacity: int = 0,
+    ):
         self.rigid_capacity = rigid_capacity
         """Number of rigid-soft contact rows."""
         self.self_capacity = self_capacity
         """Number of self-contact rows."""
-        self.capacity = rigid_capacity + self_capacity
+        self.attachment_capacity = attachment_capacity
+        """Number of particle-body attachment rows."""
+        self.attachment_offset = rigid_capacity + self_capacity
+        """First attachment row."""
+        self.capacity = rigid_capacity + self_capacity + attachment_capacity
         """Total number of rows."""
         capacity = self.capacity
         self.world = wp.full(capacity, -1, dtype=wp.int32, device=device)
@@ -626,7 +649,11 @@ class ParticleContactRows:
         self.bias = wp.zeros(capacity, dtype=wp.vec3f, device=device)
         """Velocity bias of each row (penetration and restitution targets)."""
         self.friction = wp.zeros(capacity, dtype=wp.float32, device=device)
-        """Coulomb friction coefficient of each row."""
+        """Coulomb friction coefficient of each contact row, or :data:`PARTICLE_ROW_BILATERAL` for an
+        attachment row."""
+        self.compliance = wp.zeros(capacity, dtype=wp.float32, device=device) if attachment_capacity > 0 else None
+        """Impulse-space compliance ``C`` [1/kg] of each row, zero for hard attachments and contacts, or ``None``
+        without attachment rows."""
         self.reaction = wp.zeros(capacity, dtype=wp.vec3f, device=device)
         """Normal-last impulse of each row."""
         self.physical_delassus = wp.zeros(capacity, dtype=wp.mat33f, device=device)
@@ -1072,12 +1099,13 @@ class ProjectionData:
         particles = particle_rows is not None
         particle_capacity = particle_rows.capacity if particles else 0
         self.particle_delassus = wp.zeros(particle_capacity, dtype=wp.mat33f, device=device) if particles else None
-        """Mass-split, regularized local Delassus block of each particle contact row, with deformable bodies."""
+        """Mass-split, regularized local Delassus block of each particle contact row, or its inverse for a
+        bilateral row, with deformable bodies."""
         self.particle_smoothing_delassus = (
             wp.zeros(particle_capacity, dtype=wp.mat33f, device=device) if particles and colored else None
         )
-        """Jacobi Delassus block of each particle contact row for the final smoothing sweep, with deformable
-        bodies."""
+        """Jacobi Delassus block of each particle contact row for the final smoothing sweep, or its inverse for
+        a bilateral row, with deformable bodies."""
         self.particle_delta = wp.zeros(problem_data.num_particles, dtype=wp.vec3f, device=device) if particles else None
         """Per-particle correction accumulated by one sweep, zero between sweeps, with deformable bodies."""
         self.anderson = AndersonData(problem_data) if acceleration == ProjectionAcceleration.ANDERSON else None

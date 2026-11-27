@@ -347,6 +347,76 @@ def _build_global_cloth_local_rigid_model(device: wp.DeviceLike) -> tuple[newton
 ###
 
 
+def _build_attachment_model(
+    *,
+    device: wp.DeviceLike,
+    attached: tuple[int, ...],
+    stiffness: float,
+    damping: float = 0.0,
+    is_kinematic: bool = False,
+) -> newton.Model:
+    """Build one cloth square and one body at its center, with the given particles attached at their positions."""
+    builder = newton.ModelBuilder()
+    builder.add_cloth_grid(
+        pos=wp.vec3(0.0, 0.0, 0.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=1,
+        dim_y=1,
+        cell_x=1.0,
+        cell_y=1.0,
+        mass=0.25,
+        tri_ke=100.0,
+        tri_ka=80.0,
+        tri_kd=0.0,
+        edge_ke=2.0,
+        edge_kd=0.0,
+    )
+    center = np.array((0.5, 0.5, 0.0))
+    body = builder.add_body(
+        xform=wp.transform(wp.vec3(*center), wp.quat_identity()),
+        mass=1.0,
+        inertia=wp.mat33(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1),
+        is_kinematic=is_kinematic,
+    )
+    positions = np.array(builder.particle_q)
+    for particle in attached:
+        builder.add_attachment_particle_body(
+            particle,
+            body,
+            body_point=wp.vec3(*(positions[particle] - center)),
+            stiffness=stiffness,
+            damping=damping,
+        )
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+    return model
+
+
+def _attachment_offsets(model: newton.Model, state: newton.State) -> np.ndarray:
+    """Return the offset of each attached particle from its body anchor [m]."""
+    body_q = state.body_q.numpy()
+    particle_q = state.particle_q.numpy()
+    bodies = model.attachment_particle_body_body.numpy()
+    particles = model.attachment_particle_body_particle.numpy()
+    points = model.attachment_particle_body_body_point.numpy()
+    offsets = np.zeros((len(particles), 3))
+    for attachment, (body, particle) in enumerate(zip(bodies, particles, strict=True)):
+        transform = wp.transform(*body_q[body])
+        anchor = np.array(wp.transform_point(transform, wp.vec3(*points[attachment])))
+        offsets[attachment] = particle_q[particle] - anchor
+    return offsets
+
+
+def _step_lox(solver: SolverKamino, model: newton.Model, state: newton.State, steps: int, dt: float) -> newton.State:
+    """Step a LOX solver with ping-pong states and return the final state."""
+    state_out = model.state()
+    for _ in range(steps):
+        solver.step(state, state_out, None, None, dt)
+        state, state_out = state_out, state
+    return state
+
+
 class TestSolverKaminoLOXDeformables(unittest.TestCase):
     """Step deformable particles and their contacts through the LOX backend of SolverKamino."""
 
@@ -1666,6 +1736,93 @@ class TestSolverKaminoLOXDeformables(unittest.TestCase):
         solver.step(state_in, state_out, model.control(), None, 1.0 / 60.0)
         np.testing.assert_array_equal(solver.status.numpy()["failed"], [0])
         self.assertTrue(np.all(np.isfinite(state_out.particle_q.numpy())))
+
+    def test_step_hard_attachment_follows_kinematic_body(self):
+        """Keep hard-attached particles at the anchors of a moving kinematic body while the others hang."""
+        model = _build_attachment_model(
+            device=self.default_device, attached=(0, 1), stiffness=float("inf"), is_kinematic=True
+        )
+        model.set_gravity((0.0, 0.0, -9.81))
+        state = model.state()
+        body_qd = state.body_qd.numpy()
+        body_qd[0] = (0.5, 0.0, 0.0, 0.0, 0.0, 0.0)
+        state.body_qd.assign(body_qd)
+        solver = SolverKamino(model, config=_make_lox_config())
+
+        state = _step_lox(solver, model, state, 20, 0.01)
+
+        np.testing.assert_array_equal(solver.status.numpy()["failed"], [0])
+        np.testing.assert_allclose(state.body_q.numpy()[0, 0], 0.6, atol=1.0e-5)
+        np.testing.assert_allclose(_attachment_offsets(model, state), 0.0, atol=1.0e-5)
+        self.assertTrue(np.all(state.particle_q.numpy()[2:, 2] < -0.05))
+
+    def test_step_finite_attachment_settles_at_spring_offset(self):
+        """Settle particles hanging from finite attachments at the static spring offset ``m g / k``."""
+        stiffness = 100.0
+        model = _build_attachment_model(
+            device=self.default_device,
+            attached=(0, 1, 2, 3),
+            stiffness=stiffness,
+            damping=10.0,
+            is_kinematic=True,
+        )
+        model.set_gravity((0.0, 0.0, -9.81))
+        solver = SolverKamino(model, config=_make_lox_config())
+
+        state = _step_lox(solver, model, model.state(), 100, 0.01)
+
+        np.testing.assert_array_equal(solver.status.numpy()["failed"], [0])
+        offsets = _attachment_offsets(model, state)
+        np.testing.assert_allclose(offsets[:, 2], -0.25 * 9.81 / stiffness, rtol=1.0e-3)
+        np.testing.assert_allclose(offsets[:, :2], 0.0, atol=1.0e-6)
+
+    def test_step_disabled_attachment_applies_no_force(self):
+        """Let the particles of a disabled attachment fall freely next to a kinematic body."""
+        model = _build_attachment_model(
+            device=self.default_device, attached=(0, 1, 2, 3), stiffness=float("inf"), is_kinematic=True
+        )
+        model.set_gravity((0.0, 0.0, -9.81))
+        model.attachment_particle_body_enabled.fill_(False)
+        solver = SolverKamino(model, config=_make_lox_config())
+
+        state = _step_lox(solver, model, model.state(), 5, 0.01)
+
+        np.testing.assert_allclose(state.particle_qd.numpy()[:, 2], -9.81 * 0.05, rtol=1.0e-4)
+
+    def test_step_hard_attachment_conserves_momentum_with_dynamic_body(self):
+        """Share the linear and angular momentum of a spinning body with hard-attached particles."""
+        for colors, acceleration in _MIXED_PROJECTION_VARIANTS:
+            with self.subTest(gauss_seidel_max_colors=colors, projection_acceleration=acceleration):
+                model = _build_attachment_model(device=self.default_device, attached=(0, 3), stiffness=float("inf"))
+                state = model.state()
+                body_qd = state.body_qd.numpy()
+                body_qd[0] = (1.0, 0.0, 0.0, 0.0, 0.0, 2.0)
+                state.body_qd.assign(body_qd)
+                solver = SolverKamino(
+                    model,
+                    config=_make_lox_config(gauss_seidel_max_colors=colors, projection_acceleration=acceleration),
+                )
+
+                state = _step_lox(solver, model, state, 10, 0.01)
+
+                np.testing.assert_array_equal(solver.status.numpy()["failed"], [0])
+                np.testing.assert_allclose(_attachment_offsets(model, state), 0.0, atol=1.0e-4)
+                body_q = state.body_q.numpy()[0]
+                body_qd = state.body_qd.numpy()[0]
+                particle_q = state.particle_q.numpy()
+                particle_qd = state.particle_qd.numpy()
+                momentum = body_qd[:3] + 0.25 * particle_qd.sum(axis=0)
+                angular_momentum = (
+                    0.1 * body_qd[3:]
+                    + np.cross(body_q[:3], body_qd[:3])
+                    + 0.25 * np.cross(particle_q, particle_qd).sum(axis=0)
+                )
+                initial_angular_momentum = 0.2 + np.cross((0.5, 0.5, 0.0), (1.0, 0.0, 0.0))[2]
+                np.testing.assert_allclose(momentum, (1.0, 0.0, 0.0), atol=1.0e-4)
+                # The Euler integration of the rotating anchors keeps the angular momentum to first order in dt
+                np.testing.assert_allclose(angular_momentum[2], initial_angular_momentum, rtol=5.0e-3)
+                # The attached particles move with the anchors, so the body slows down
+                self.assertLess(body_qd[0], 0.9)
 
 
 if __name__ == "__main__":

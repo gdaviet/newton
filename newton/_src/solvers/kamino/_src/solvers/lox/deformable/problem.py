@@ -53,7 +53,7 @@ wp.set_module_options({"enable_backward": False})
 
 
 class DeformableProblem:
-    """Own the smooth system and the contact rows of the particles of the deformable bodies.
+    """Own the smooth system and the contact and attachment rows of the particles of the deformable bodies.
 
     The rigid-soft contact rows are sized by the capacity of the Newton contacts of the first
     time step, see :meth:`ensure_contact_capacity`.
@@ -230,8 +230,10 @@ class DeformableProblem:
         dead_zone: float,
         problem_data: LOXProblemData,
         body_vector_index: wp.array[wp.int32],
+        attachment_dead_zone: float = 0.0,
+        attachment_max_correction: float = float("inf"),
     ) -> None:
-        """Load the particle contact rows of the time step and count their incidences.
+        """Load the particle contact and attachment rows of the time step and count their incidences.
 
         Args:
             contacts: Newton contacts of the time step, or ``None``.
@@ -241,6 +243,8 @@ class DeformableProblem:
             dead_zone: Symmetric contact distance dead zone of the stabilization [m].
             problem_data: Rows and body data of the LOX problem, whose body incidence the rows extend.
             body_vector_index: First entry of each body in the packed body system vectors, or ``-1``.
+            attachment_dead_zone: Offset component of a hard attachment left uncorrected [m].
+            attachment_max_correction: Largest offset component of a hard attachment corrected in one step [m].
         """
         full_inverse_weight = self.system.data.full_inverse_weight
         if self.penetration_limiter is not None:
@@ -266,6 +270,14 @@ class DeformableProblem:
                 time_step,
                 dead_zone,
             )
+        self.contacts.load_attachments(
+            state.particle_q,
+            state.particle_qd,
+            full_inverse_weight,
+            time_step,
+            attachment_dead_zone,
+            attachment_max_correction,
+        )
         self.contacts.finish(problem_data, body_vector_index, full_inverse_weight, self.particle_unilateral_count)
 
     def build_consensus_weights(self) -> None:
@@ -311,7 +323,13 @@ class DeformableProblem:
 
     def _allocate_contacts(self, rigid_capacity: int) -> None:
         self_capacity = self.self_contacts.capacity if self._load_self_contacts else 0
-        rows = ParticleContactRows(rigid_capacity, self_capacity, self.num_worlds, self.device)
+        rows = ParticleContactRows(
+            rigid_capacity,
+            self_capacity,
+            self.num_worlds,
+            self.device,
+            attachment_capacity=int(self.model.attachment_particle_body_count),
+        )
         self.contacts = DeformableContacts(
             self.model,
             self.kamino_model,

@@ -497,6 +497,8 @@ class LOXProblem:
                 contact_dead_zone,
                 self._data,
                 self.system.data.body_vector_index,
+                attachment_dead_zone=joint_translation_dead_zone,
+                attachment_max_correction=joint_max_correction,
             )
         self._select_weighted_bodies()
 
